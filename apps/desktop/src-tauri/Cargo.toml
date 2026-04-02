@@ -1,0 +1,29 @@
+[package]
+name = "dropbox_sync_desktop"
+version = "0.1.0"
+description = "Dropbox Sync Desktop"
+authors = ["dropbox-sync-team"]
+edition = "2021"
+
+[lib]
+name = "dropbox_sync_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+url = "2"
+urlencoding = "2"
+walkdir = "2"
