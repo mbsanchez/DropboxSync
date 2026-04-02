@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  desktop-build:
+    runs-on: macos-latest
+    env:
+      DROPBOX_APP_KEY: dummy
+      DROPBOX_REDIRECT_URI: http://localhost:53682/callback
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: npm install
+      - name: Test frontend build
+        run: npm --workspace apps/desktop run build
+      - name: Build macOS alpha bundle
+        run: npm --workspace apps/desktop run tauri build

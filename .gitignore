@@ -1,0 +1,7 @@
+node_modules/
+dist/
+target/
+artifacts/
+.DS_Store
+*.log
+*.tmp

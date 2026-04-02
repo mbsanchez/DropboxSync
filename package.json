@@ -1,0 +1,16 @@
+{
+  "name": "dropbox-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted Dropbox-like desktop sync client",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm --workspace apps/desktop run tauri dev",
+    "build": "npm --workspace apps/desktop run tauri build",
+    "lint": "npm --workspace apps/desktop run build",
+    "test": "npm --workspace apps/desktop run test"
+  }
+}
