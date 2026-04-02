@@ -4,6 +4,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+/// Dropbox App Console → tu app → pestaña **Settings** → **App key** (OAuth2 `client_id`).
+/// No es un secreto en clientes públicos: el flujo usa PKCE; igualmente no subas una key ajena a repos públicos.
+pub const DROPBOX_APP_KEY: &str = "aauuh6hib5i8crx";
+
+/// Debe coincidir **exactamente** con un redirect URI permitido en la misma app de Dropbox.
+pub const DROPBOX_REDIRECT_URI: &str = "http://localhost:53682/callback";
+
 #[derive(Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -11,8 +18,24 @@ pub struct TokenResponse {
     pub expires_in: Option<i64>,
 }
 
-fn env_or_err(key: &str) -> Result<String, String> {
-    std::env::var(key).map_err(|_| format!("missing env var: {key}"))
+fn resolve_app_key() -> Result<String, String> {
+    let v = std::env::var("DROPBOX_APP_KEY").unwrap_or_else(|_| DROPBOX_APP_KEY.to_string());
+    if v.is_empty() {
+        return Err(
+            "DROPBOX_APP_KEY vacío: edita src-tauri/src/auth/oauth.rs o define la variable de entorno."
+                .to_string(),
+        );
+    }
+    Ok(v)
+}
+
+fn resolve_redirect_uri() -> String {
+    std::env::var("DROPBOX_REDIRECT_URI").unwrap_or_else(|_| DROPBOX_REDIRECT_URI.to_string())
+}
+
+/// Redirect usado para el listener local y para el intercambio de tokens.
+pub fn dropbox_redirect_uri() -> String {
+    resolve_redirect_uri()
 }
 
 fn pkce_verifier() -> String {
@@ -38,8 +61,8 @@ fn random_state() -> String {
 }
 
 pub fn start_oauth() -> Result<(String, String, String), String> {
-    let app_key = env_or_err("DROPBOX_APP_KEY")?;
-    let redirect_uri = env_or_err("DROPBOX_REDIRECT_URI")?;
+    let app_key = resolve_app_key()?;
+    let redirect_uri = resolve_redirect_uri();
     let verifier = pkce_verifier();
 
     let state = random_state();
@@ -57,8 +80,8 @@ pub fn start_oauth() -> Result<(String, String, String), String> {
 }
 
 pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenResponse, String> {
-    let app_key = env_or_err("DROPBOX_APP_KEY")?;
-    let redirect_uri = env_or_err("DROPBOX_REDIRECT_URI")?;
+    let app_key = resolve_app_key()?;
+    let redirect_uri = resolve_redirect_uri();
     let response = Client::new()
         .post("https://api.dropboxapi.com/oauth2/token")
         .form(&[
@@ -86,8 +109,8 @@ pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenRespo
 }
 
 pub fn refresh_access_token_blocking(refresh_token: &str) -> Result<TokenResponse, String> {
-    let app_key = env_or_err("DROPBOX_APP_KEY")?;
-    let redirect_uri = env_or_err("DROPBOX_REDIRECT_URI")?;
+    let app_key = resolve_app_key()?;
+    let redirect_uri = resolve_redirect_uri();
 
     let client = reqwest::blocking::Client::new();
     let response = client

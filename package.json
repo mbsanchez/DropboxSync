@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "dev": "npm --workspace apps/desktop run tauri dev",
+    "start:dev": "npm --workspace apps/desktop run start:dev",
     "build": "npm --workspace apps/desktop run tauri build",
     "lint": "npm --workspace apps/desktop run build",
     "test": "npm --workspace apps/desktop run test"

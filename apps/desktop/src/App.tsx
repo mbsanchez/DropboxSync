@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
@@ -102,10 +102,15 @@ function App() {
 
   const [cloudscEntries, setCloudscEntries] = useState<CloudscPlaceholderInfo[]>([]);
   const [cloudscLoading, setCloudscLoading] = useState(false);
+  const [startupLoading, setStartupLoading] = useState(true);
+  const [authOk, setAuthOk] = useState(false);
+  const [syncFolderOk, setSyncFolderOk] = useState(false);
+  const [showFolderSetup, setShowFolderSetup] = useState(false);
+  const [oauthCallbackReady, setOauthCallbackReady] = useState(false);
 
   const didAutoIndexCloudscRef = useRef(false);
-
-  const canComplete = useMemo(() => oauthCode.length > 4 && state.length > 4, [oauthCode, state]);
+  const schedulerStartedRef = useRef(false);
+  const didHideToTrayRef = useRef(false);
 
   const pushLog = (line: string) =>
     setActivity((prev) => [
@@ -123,6 +128,24 @@ function App() {
     setConflicts(dashboard.conflicts);
     if (dashboard.status.trackedPath) {
       setSyncFolder(dashboard.status.trackedPath);
+    }
+  };
+
+  const refreshStartupRequirements = async () => {
+    try {
+      const requirements = await invoke<{ authOk: boolean; syncFolderOk: boolean; syncFolder?: string }>(
+        "get_startup_requirements"
+      );
+      setAuthOk(requirements.authOk);
+      setSyncFolderOk(requirements.syncFolderOk);
+      if (requirements.syncFolder) {
+        setSyncFolder(requirements.syncFolder);
+      }
+    } catch (error) {
+      pushLog(`Startup check failed: ${String(error)}`);
+      setAuthOk(false);
+    } finally {
+      setStartupLoading(false);
     }
   };
 
@@ -146,6 +169,8 @@ function App() {
       setAuthUrl(payload.authUrl);
       setState(payload.state);
       setAwaitingCallback(true);
+      setOauthCallbackReady(false);
+      setShowFolderSetup(false);
       await openUrl(payload.authUrl);
       pushLog("Opened Dropbox login. Waiting for callback on localhost.");
     } catch (error) {
@@ -159,6 +184,7 @@ function App() {
       await invoke("complete_oauth_flow", { code: codeArg ?? oauthCode, state: stateArg ?? state });
       setAwaitingCallback(false);
       pushLog("Dropbox authentication completed and token session stored securely.");
+      await refreshStartupRequirements();
     } catch (error) {
       pushLog(`Complete login failed: ${String(error)}`);
       throw error;
@@ -169,6 +195,7 @@ function App() {
     await invoke("set_sync_folder", { folder: syncFolder });
     pushLog(`Sync folder configured: ${syncFolder}`);
     await refreshDashboard();
+    await refreshStartupRequirements();
   };
 
   const runTick = async () => {
@@ -197,11 +224,21 @@ function App() {
     const interval = window.setInterval(async () => {
       try {
         const payload = await invoke<OauthCallbackPayload | null>("poll_oauth_callback");
-        if (payload?.code && payload?.state) {
-          setOauthCode(payload.code);
-          setState(payload.state);
-          pushLog("OAuth callback received from browser.");
+        if (!payload?.code || !payload?.state) {
+          return;
+        }
+
+        setOauthCallbackReady(true);
+        setOauthCode(payload.code);
+        setState(payload.state);
+        pushLog("Dropbox callback received. Finalizing login...");
+
+        try {
           await completeOAuth(payload.code, payload.state);
+          setAwaitingCallback(false);
+          setOauthCallbackReady(false);
+        } catch {
+          // Keep waiting state so user can click Continue manually.
         }
       } catch (error) {
         pushLog(`OAuth callback polling error: ${String(error)}`);
@@ -214,9 +251,45 @@ function App() {
   useEffect(() => {
     pushLog("UI ready.");
     refreshDashboard().catch((error) => pushLog(`Dashboard load failed: ${String(error)}`));
+    void refreshStartupRequirements();
   }, []);
 
   useEffect(() => {
+    const onFocus = () => {
+      void refreshStartupRequirements();
+      void refreshDashboard();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  useEffect(() => {
+    if (!authOk || !syncFolderOk || schedulerStartedRef.current) return;
+    invoke<boolean>("start_background_scheduler")
+      .then((started) => {
+        schedulerStartedRef.current = true;
+        if (started) {
+          pushLog("Background sync scheduler started (every 60s).");
+        }
+      })
+      .catch((e) => pushLog(`Failed to start scheduler: ${String(e)}`));
+  }, [authOk, syncFolderOk]);
+
+  useEffect(() => {
+    if (!authOk || !syncFolderOk || didHideToTrayRef.current) return;
+    didHideToTrayRef.current = true;
+    invoke("hide_main_window").catch(() => {});
+    pushLog("App moved to tray. Use tray menu to Exit.");
+  }, [authOk, syncFolderOk]);
+
+  useEffect(() => {
+    if (!authOk) {
+      setShowFolderSetup(false);
+    }
+  }, [authOk]);
+
+  useEffect(() => {
+    if (!authOk || !syncFolderOk) return;
     if (!syncFolder) return;
     // Auto-index root `.cloudsc` placeholders once per app session.
     if (!didAutoIndexCloudscRef.current) {
@@ -235,7 +308,7 @@ function App() {
     } else {
       refreshCloudsc().catch(() => {});
     }
-  }, [syncFolder]);
+  }, [syncFolder, authOk, syncFolderOk]);
 
   useEffect(() => {
     invoke<SelectiveSyncFilters>("get_selective_sync_filters")
@@ -324,34 +397,147 @@ function App() {
 
   return (
     <main className="container">
-      <h1>Dropbox Sync Desktop (Week 2 MVP)</h1>
+      <section className="card hero">
+        <h1 className="title">Dropbox Sync Desktop</h1>
+        <p className="subtitle">Smart placeholders, selective hydration, and background sync.</p>
+      </section>
+
+      {startupLoading && (
+        <section className="card onboarding">
+          <h2>Starting...</h2>
+          <p>Checking Dropbox connection and local sync settings.</p>
+        </section>
+      )}
+
+      {!startupLoading && !authOk && (
+        <section className="card onboarding">
+          <h2>Connect Dropbox</h2>
+          <p>To continue, sign in with Dropbox via OAuth in your browser.</p>
+          <button disabled={awaitingCallback || authOk} onClick={startOAuth}>
+            {awaitingCallback ? "Waiting for Dropbox..." : "Start Dropbox Login"}
+          </button>
+          {awaitingCallback && (
+            <>
+              <p>Waiting for Dropbox confirmation...</p>
+              {oauthCallbackReady && (
+                <button
+                onClick={async () => {
+                  try {
+                    await completeOAuth();
+                    setAwaitingCallback(false);
+                    setOauthCallbackReady(false);
+                  } catch (e) {
+                    pushLog(`Manual OAuth completion failed: ${String(e)}`);
+                  }
+                }}
+              >
+                Continue
+              </button>
+              )}
+            </>
+          )}
+        </section>
+      )}
+
+      {!startupLoading && authOk && !syncFolderOk && !showFolderSetup && (
+        <section className="card onboarding">
+          <h2>Dropbox connected</h2>
+          <p>Your token was registered successfully. Continue to choose the local sync folder.</p>
+          <button onClick={() => setShowFolderSetup(true)}>Siguiente</button>
+        </section>
+      )}
+
+      {!startupLoading && authOk && !syncFolderOk && showFolderSetup && (
+        <section className="card onboarding">
+          <h2>Choose Sync Folder</h2>
+          <p>Select the local folder where placeholders and hydrated files will be stored.</p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={syncFolder}
+              onChange={(e) => setSyncFolder(e.currentTarget.value)}
+              placeholder="/Users/me/DropboxSync"
+            />
+            <button
+              onClick={async () => {
+                const selected = await invoke<string | null>("pick_sync_folder_dialog");
+                if (selected) {
+                  setSyncFolder(selected);
+                }
+              }}
+            >
+              ...
+            </button>
+            <button onClick={saveFolder}>Save</button>
+          </div>
+        </section>
+      )}
+
+      {!startupLoading && authOk && syncFolderOk && (
+        <>
+
+      <section className="card dashboard">
+        <h2>Dashboard</h2>
+        <p className="subtitle" style={{ marginTop: 0 }}>
+          Estado global de sincronización, cola y registro reciente.
+        </p>
+        <div className="dashboard-grid">
+          <div>
+            <h3>Estado</h3>
+            <p>Salud: {status.health}</p>
+            <p>Cola: {status.queueDepth} trabajos pendientes</p>
+            <p>Carpeta: {status.trackedPath || "—"}</p>
+            <p>Último escaneo: {status.lastScanAt || "nunca"}</p>
+            <p>Procesados: {status.processedJobs}</p>
+            <p>Conflictos detectados: {status.conflictsDetected}</p>
+            <p>Sincronizando: {status.syncRunning ? "sí" : "no"}</p>
+            <p>Último error: {status.lastError || "ninguno"}</p>
+          </div>
+          <div>
+            <h3>Cola (reciente)</h3>
+            <ul>
+              {jobs.length === 0 && <li>Cola vacía</li>}
+              {jobs.slice(0, 8).map((job) => (
+                <li key={job.id}>
+                  #{job.id} {queueActionLabel(job.jobType)} {job.targetPath || "-"} | {job.status} | intento{" "}
+                  {job.attemptCount}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <h3>Conflictos</h3>
+            <ul>
+              {conflicts.length === 0 && <li>Sin conflictos</li>}
+              {conflicts.map((conflict) => (
+                <li key={conflict.id}>
+                  {conflict.localPath} — {conflict.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+        <h3>Actividad / logs</h3>
+        <ul className="activity-list">
+          {activity.length === 0 && <li>Sin entradas todavía.</li>}
+          {activity.map((entry) => (
+            <li key={entry.id}>{entry.message}</li>
+          ))}
+        </ul>
+      </section>
 
       <section className="card">
-        <h2>1) Dropbox OAuth</h2>
-        <button onClick={startOAuth}>Start Dropbox Login</button>
+        <h2>Conexión y carpeta local</h2>
+        <p className="subtitle" style={{ marginTop: 0 }}>
+          Reconectar Dropbox, cambiar la carpeta o lanzar un tick manual.
+        </p>
+        <h3>Dropbox OAuth</h3>
+        <button onClick={startOAuth}>Reconnect Dropbox</button>
         {authUrl && (
           <p>
             Authorization URL: <a href={authUrl}>{authUrl}</a>
           </p>
         )}
-        <input value={state} onChange={(e) => setState(e.currentTarget.value)} placeholder="state" />
-        <input
-          value={oauthCode}
-          onChange={(e) => setOauthCode(e.currentTarget.value)}
-          placeholder="code from redirect"
-        />
-        <button
-          disabled={!canComplete}
-          onClick={() => {
-            completeOAuth().catch(() => {});
-          }}
-        >
-          Complete Login
-        </button>
-      </section>
-
-      <section className="card">
-        <h2>2) Sync folder</h2>
+        <h3>Carpeta de sync</h3>
         <input
           value={syncFolder}
           onChange={(e) => setSyncFolder(e.currentTarget.value)}
@@ -365,7 +551,7 @@ function App() {
       </section>
 
       <section className="card">
-        <h2>3) Remote Browser (On-demand)</h2>
+        <h2>Remote Browser (On-demand)</h2>
         <p>Se lista lo remoto sin descargar. Click en “Sync” hidrata archivos/carpetas.</p>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -461,7 +647,7 @@ function App() {
       </section>
 
       <section className="card">
-        <h2>4) `.cloudsc` Placeholders (no descargar hasta click)</h2>
+        <h2>`.cloudsc` Placeholders (no descargar hasta click)</h2>
         <p>
           En el <code>Sync folder</code> aparecen archivos <code>*.cloudsc</code> con metadata. Si
           hidratas un placeholder, se descarga solo ese archivo o carpeta (y sus hijos inmediatos).
@@ -522,50 +708,8 @@ function App() {
         </ul>
       </section>
 
-      <section className="card">
-        <h2>3) Status</h2>
-        <p>Health: {status.health}</p>
-        <p>Queue depth: {status.queueDepth}</p>
-        <p>Tracked path: {status.trackedPath || "not configured"}</p>
-        <p>Last scan: {status.lastScanAt || "never"}</p>
-        <p>Processed jobs: {status.processedJobs}</p>
-        <p>Conflicts detected: {status.conflictsDetected}</p>
-        <p>Sync running: {status.syncRunning ? "yes" : "no"}</p>
-        <p>Last error: {status.lastError || "none"}</p>
-      </section>
-
-      <section className="card">
-        <h2>4) Queue and errors</h2>
-        <ul>
-          {jobs.slice(0, 8).map((job) => (
-            <li key={job.id}>
-              #{job.id} {queueActionLabel(job.jobType)} {job.targetPath || "-"} | {job.status} | attempt{" "}
-              {job.attemptCount}
-            </li>
-          ))}
-        </ul>
-      </section>
-
-      <section className="card">
-        <h2>5) Conflicts</h2>
-        <ul>
-          {conflicts.length === 0 && <li>No conflicts</li>}
-          {conflicts.map((conflict) => (
-            <li key={conflict.id}>
-              {conflict.localPath} - {conflict.reason}
-            </li>
-          ))}
-        </ul>
-      </section>
-
-      <section className="card">
-        <h2>Activity</h2>
-        <ul>
-          {activity.map((entry) => (
-            <li key={entry.id}>{entry.message}</li>
-          ))}
-        </ul>
-      </section>
+        </>
+      )}
     </main>
   );
 }

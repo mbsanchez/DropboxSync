@@ -2,7 +2,7 @@ mod auth;
 mod storage;
 mod sync;
 
-use auth::oauth::{complete_oauth, refresh_access_token_blocking, start_oauth};
+use auth::oauth::{complete_oauth, dropbox_redirect_uri, refresh_access_token_blocking, start_oauth};
 use chrono::{Duration, Utc};
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -14,6 +14,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
+use tauri::image::Image;
+use tauri::Manager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use storage::db::{ConflictRow, Db, FileIndexRow, SyncJobRow};
 use storage::secure_store::SecureStore;
 use sync::engine::{OauthCallbackPayload, SyncEngine, SyncStatus};
@@ -26,6 +31,7 @@ struct AppState {
     db: Arc<Db>,
     sync_engine: Arc<Mutex<SyncEngine>>,
     token_cache: Arc<Mutex<Option<storage::secure_store::TokenSession>>>,
+    scheduler_started: Arc<Mutex<bool>>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +102,14 @@ struct ListRemoteFolderResponse {
 #[serde(rename_all = "camelCase")]
 struct TriggerActionResponse {
     accepted: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupRequirementsResponse {
+    auth_ok: bool,
+    sync_folder_ok: bool,
+    sync_folder: Option<String>,
 }
 
 const CLOUDSC_MAGIC: &str = "CLOUDSC1";
@@ -198,6 +212,17 @@ fn is_path_allowed(relative: &str, include_prefixes: &[String], exclude_prefixes
     true
 }
 
+fn has_stored_credentials(state: &AppState) -> bool {
+    state.secure_store.get_session().is_ok() || state.secure_store.get_token().is_ok()
+}
+
+/// True when the user must sign in again (not transient network/keychain noise).
+fn is_hard_auth_failure(err: &str) -> bool {
+    err.contains("dropbox token expired and no refresh_token available")
+        || err.contains("missing dropbox token session:")
+        || err.contains("dropbox refresh token exchange failed with status")
+}
+
 fn get_access_token(state: &AppState) -> Result<String, String> {
     fn session_expired(session: &storage::secure_store::TokenSession) -> bool {
         let Some(expires_at) = session.expires_at.as_ref() else {
@@ -225,10 +250,23 @@ fn get_access_token(state: &AppState) -> Result<String, String> {
         }
     }
 
-    let mut session = state
-        .secure_store
-        .get_session()
-        .map_err(|e| format!("missing dropbox token session: {e}"))?;
+    let mut session = match state.secure_store.get_session() {
+        Ok(s) => s,
+        Err(_) => {
+            // Backward compatibility: migrate legacy stored access token into session format.
+            let legacy_token = state
+                .secure_store
+                .get_token()
+                .map_err(|e| format!("missing dropbox token session: {e}"))?;
+            let migrated = storage::secure_store::TokenSession {
+                access_token: legacy_token,
+                refresh_token: None,
+                expires_at: None,
+            };
+            let _ = state.secure_store.store_session(&migrated);
+            migrated
+        }
+    };
 
     if session_expired(&session) {
         if let Some(refresh_token) = session.refresh_token.as_deref() {
@@ -262,6 +300,47 @@ fn get_access_token(state: &AppState) -> Result<String, String> {
     }
 
     Ok(session.access_token)
+}
+
+fn verify_dropbox_token_internal(state: &AppState) -> Result<bool, String> {
+    let token = get_access_token(state)?;
+    let response = match Client::new()
+        .post("https://api.dropboxapi.com/2/users/get_current_account")
+        .bearer_auth(&token)
+        .json(&serde_json::json!({}))
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => {
+            // Offline or transient network: keep showing the main UI if credentials exist.
+            return Ok(true);
+        }
+    };
+    if response.status().is_success() {
+        return Ok(true);
+    }
+    if response.status().as_u16() == 401 {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn current_tray_status_label(state: &AppState) -> String {
+    if let Ok(engine) = state.sync_engine.lock() {
+        if engine.is_sync_running() {
+            return "Syncing".to_string();
+        }
+        if engine.current_status().last_error.is_some() {
+            return "Error".to_string();
+        }
+    }
+    "Idle".to_string()
+}
+
+fn update_tray_tooltip(app: &tauri::AppHandle, label: &str) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(format!("DropboxSyncDesktop - {label}")));
+    }
 }
 
 #[derive(Serialize)]
@@ -322,6 +401,10 @@ async fn complete_oauth_flow(
     code: String,
     state: String,
 ) -> Result<(), String> {
+    complete_oauth_internal(app_state.inner(), code, state).await
+}
+
+async fn complete_oauth_internal(app_state: &AppState, code: String, state: String) -> Result<(), String> {
     let (expected_state, verifier) = {
         let engine = app_state
             .sync_engine
@@ -360,6 +443,22 @@ async fn complete_oauth_flow(
 }
 
 #[tauri::command]
+async fn complete_oauth_from_callback(app_state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let callback = {
+        let mut engine = app_state
+            .sync_engine
+            .lock()
+            .map_err(|_| "sync engine lock poisoned".to_string())?;
+        engine.consume_oauth_callback()
+    };
+    let Some(payload) = callback else {
+        return Ok(false);
+    };
+    complete_oauth_internal(app_state.inner(), payload.code, payload.state).await?;
+    Ok(true)
+}
+
+#[tauri::command]
 fn poll_oauth_callback(
     state: tauri::State<AppState>,
 ) -> Result<Option<OauthCallbackPayload>, String> {
@@ -384,6 +483,95 @@ fn set_sync_folder(state: tauri::State<AppState>, folder: String) -> Result<(), 
         .lock()
         .map_err(|_| "sync engine lock poisoned".to_string())?;
     engine.set_tracked_path(folder);
+    Ok(())
+}
+
+#[tauri::command]
+fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
+    let picked = rfd::FileDialog::new().pick_folder();
+    Ok(picked.map(|p| p.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn get_startup_requirements(state: tauri::State<AppState>) -> Result<StartupRequirementsResponse, String> {
+    let sync_folder = state.db.get_sync_folder()?;
+    let sync_folder_ok = sync_folder
+        .as_ref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let has_creds = has_stored_credentials(state.inner());
+    let auth_ok = if !has_creds {
+        false
+    } else {
+        match verify_dropbox_token_internal(state.inner()) {
+            Ok(v) => v,
+            Err(e) => !is_hard_auth_failure(&e),
+        }
+    };
+
+    Ok(StartupRequirementsResponse {
+        auth_ok,
+        sync_folder_ok,
+        sync_folder,
+    })
+}
+
+#[tauri::command]
+fn start_background_scheduler(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    {
+        let mut started = state
+            .scheduler_started
+            .lock()
+            .map_err(|_| "scheduler lock poisoned".to_string())?;
+        if *started {
+            return Ok(false);
+        }
+        *started = true;
+    }
+
+    let app_state = state.inner().clone();
+    std::thread::spawn(move || loop {
+        update_tray_tooltip(&app, &current_tray_status_label(&app_state));
+        let ready = app_state
+            .db
+            .get_sync_folder()
+            .ok()
+            .flatten()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if ready {
+            let can_run = app_state
+                .sync_engine
+                .lock()
+                .map(|e| !e.is_sync_running())
+                .unwrap_or(false);
+            if can_run {
+                if let Ok(mut engine) = app_state.sync_engine.lock() {
+                    engine.set_sync_running(true);
+                }
+                let _ = index_remote_root_children_as_cloudsc_placeholders_internal(&app_state);
+                let _ = run_sync_tick_internal(&app_state);
+                if let Ok(mut engine) = app_state.sync_engine.lock() {
+                    engine.set_sync_running(false);
+                }
+                update_tray_tooltip(&app, &current_tray_status_label(&app_state));
+            }
+        }
+        std::thread::sleep(StdDuration::from_secs(60));
+    });
+
+    Ok(true)
+}
+
+#[tauri::command]
+fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1312,15 +1500,63 @@ pub fn run() {
         db: Arc::new(db),
         sync_engine: Arc::new(Mutex::new(sync_engine)),
         token_cache: Arc::new(Mutex::new(None)),
+        scheduler_started: Arc::new(Mutex::new(false)),
     };
 
     tauri::Builder::default()
         .manage(app_state)
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let open_dashboard = MenuItem::with_id(app, "open_dashboard", "Open Dashboard", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_dashboard, &quit])?;
+            // Must match `tray_by_id("main")` below. Include a real PNG: title-only / no-icon
+            // trays are easy to miss on macOS (layout + template rendering).
+            let tray_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let tray_builder = TrayIconBuilder::with_id("main")
+                .icon(tray_image)
+                .icon_as_template(true)
+                .menu(&menu)
+                .tooltip("DropboxSyncDesktop - Idle")
+                .on_menu_event(move |app, event| {
+                    if event.id.as_ref() == "open_dashboard" {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    } else if event.id.as_ref() == "quit" {
+                        app.exit(0);
+                    }
+                });
+
+            let tray_ok = match tray_builder.build(app) {
+                Ok(_) => true,
+                Err(err) => {
+                    eprintln!("failed to create tray icon: {err}");
+                    false
+                }
+            };
+
+            // Menubar-only behavior only when tray is actually available.
+            if tray_ok {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_oauth_flow,
             complete_oauth_flow,
+            complete_oauth_from_callback,
             poll_oauth_callback,
+            get_startup_requirements,
+            pick_sync_folder_dialog,
+            start_background_scheduler,
+            hide_main_window,
             set_sync_folder,
             get_sync_status,
             get_sync_dashboard,
@@ -1342,8 +1578,7 @@ pub fn run() {
 }
 
 fn start_oauth_callback_listener(sync_engine: Arc<Mutex<SyncEngine>>) -> Result<(), String> {
-    let redirect_uri = std::env::var("DROPBOX_REDIRECT_URI")
-        .map_err(|_| "missing env var: DROPBOX_REDIRECT_URI".to_string())?;
+    let redirect_uri = dropbox_redirect_uri();
     let url = Url::parse(&redirect_uri).map_err(|e| format!("invalid redirect uri: {e}"))?;
     let host = url
         .host_str()
@@ -1359,56 +1594,69 @@ fn start_oauth_callback_listener(sync_engine: Arc<Mutex<SyncEngine>>) -> Result<
             Ok(v) => v,
             Err(_) => return,
         };
-        let stream = match listener.incoming().next() {
-            Some(Ok(s)) => s,
-            _ => return,
-        };
 
-        let mut reader = BufReader::new(&stream);
-        let mut first_line = String::new();
-        if reader.read_line(&mut first_line).is_err() {
-            return;
-        }
-        let request_path = first_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or_default()
-            .to_string();
-        if !request_path.starts_with(&callback_path) {
-            return;
-        }
-        if let Some(query) = request_path.split('?').nth(1) {
-            let mut code = None;
-            let mut state = None;
-            for pair in query.split('&') {
-                let mut parts = pair.splitn(2, '=');
-                let key = parts.next().unwrap_or_default();
-                let value = parts.next().unwrap_or_default();
-                let decoded = urlencoding::decode(value)
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                if key == "code" {
-                    code = Some(decoded);
-                } else if key == "state" {
-                    state = Some(decoded);
+        // Process multiple incoming connections so we don't miss callback due to
+        // preflight/browser extra requests (favicon, speculative load, etc).
+        for incoming in listener.incoming().take(8) {
+            let Ok(mut stream) = incoming else {
+                continue;
+            };
+
+            let mut reader = BufReader::new(&stream);
+            let mut first_line = String::new();
+            if reader.read_line(&mut first_line).is_err() {
+                continue;
+            }
+
+            let request_path = first_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+
+            let mut callback_captured = false;
+            if request_path.starts_with(&callback_path) {
+                if let Some(query) = request_path.split('?').nth(1) {
+                    let mut code = None;
+                    let mut state = None;
+                    for pair in query.split('&') {
+                        let mut parts = pair.splitn(2, '=');
+                        let key = parts.next().unwrap_or_default();
+                        let value = parts.next().unwrap_or_default();
+                        let decoded = urlencoding::decode(value)
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        if key == "code" {
+                            code = Some(decoded);
+                        } else if key == "state" {
+                            state = Some(decoded);
+                        }
+                    }
+                    if let (Some(code), Some(state_value)) = (code, state) {
+                        if let Ok(mut engine) = sync_engine.lock() {
+                            engine.set_oauth_callback(code, state_value);
+                            callback_captured = true;
+                        }
+                    }
                 }
             }
-            if let (Some(code), Some(state_value)) = (code, state) {
-                if let Ok(mut engine) = sync_engine.lock() {
-                    engine.set_oauth_callback(code, state_value);
-                }
+
+            let body = if callback_captured {
+                "<html><body><h3>Dropbox login completed</h3><p>You can return to the app.</p></body></html>"
+            } else {
+                "<html><body><h3>Waiting for Dropbox callback...</h3></body></html>"
+            };
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+
+            if callback_captured {
+                break;
             }
         }
-
-        let mut stream = stream;
-        let _ = stream.write_all(
-            b"HTTP/1.1 200 OK
-Content-Type: text/html; charset=utf-8
-Connection: close
-
-<html><body><h3>Dropbox login completed</h3><p>You can return to the app.</p></body></html>",
-        );
-        let _ = stream.flush();
     });
 
     Ok(())

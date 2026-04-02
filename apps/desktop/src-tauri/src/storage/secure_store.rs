@@ -16,11 +16,6 @@ impl SecureStore {
         Self
     }
 
-    pub fn store_token(&self, token: &str) -> Result<(), keyring::Error> {
-        let entry = Entry::new("dropbox-sync-desktop", "dropbox-access-token")?;
-        entry.set_password(token)
-    }
-
     pub fn get_token(&self) -> Result<String, keyring::Error> {
         let entry = Entry::new("dropbox-sync-desktop", "dropbox-access-token")?;
         entry.get_password()
