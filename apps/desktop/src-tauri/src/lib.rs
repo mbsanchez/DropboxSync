@@ -69,6 +69,9 @@ struct DropboxEntry {
     #[serde(rename = ".tag")]
     tag: String,
     path_display: Option<String>,
+    content_hash: Option<String>,
+    rev: Option<String>,
+    server_modified: Option<String>,
     size: Option<i64>,
 }
 
@@ -137,6 +140,11 @@ fn cloudsc_target_path(placeholder_path: &Path) -> PathBuf {
     // Remove the last extension ('.cloudsc'), keeping the original filename.
     // Example: 'a.txt.cloudsc' -> 'a.txt'
     placeholder_path.with_extension("")
+}
+
+fn should_ignore_local_path(relative: &str) -> bool {
+    let p = relative.replace('\\', "/");
+    p == ".DS_Store" || p.ends_with("/.DS_Store") || p.starts_with("._") || p.contains("/._")
 }
 
 fn relpath_under(sync_folder: &Path, absolute: &Path) -> Result<String, String> {
@@ -454,6 +462,9 @@ fn scan_local_changes_internal(state: &AppState) -> Result<usize, String> {
         if relative.ends_with(".cloudsc") {
             continue;
         }
+        if should_ignore_local_path(&relative) {
+            continue;
+        }
 
         seen_paths.insert(relative.clone());
 
@@ -515,6 +526,9 @@ fn scan_local_changes_internal(state: &AppState) -> Result<usize, String> {
             // `.cloudsc` son placeholders de metadata: no deben disparar borrados/subidas.
             continue;
         }
+        if should_ignore_local_path(&prev.relative_path) {
+            continue;
+        }
         if !seen_paths.contains(&prev.relative_path) {
             state.db.enqueue_job(
                 "delete",
@@ -526,6 +540,8 @@ fn scan_local_changes_internal(state: &AppState) -> Result<usize, String> {
         }
     }
 
+    let remote_enqueued = refresh_remote_index_and_enqueue_downloads_internal(state)?;
+
     {
         let mut engine = state
             .sync_engine
@@ -535,7 +551,7 @@ fn scan_local_changes_internal(state: &AppState) -> Result<usize, String> {
     }
 
     refresh_queue_depth_internal(state)?;
-    Ok(enqueued_jobs)
+    Ok(enqueued_jobs + remote_enqueued)
 }
 
 #[tauri::command]
@@ -565,6 +581,12 @@ fn process_sync_queue_internal(state: &AppState) -> Result<bool, String> {
             .or(job.source_path.as_deref())
             .ok_or_else(|| "delete job missing target_path/source_path".to_string())
             .and_then(|rel| delete_remote_file_internal(state, rel)),
+        "download" => job
+            .target_path
+            .as_deref()
+            .or(job.source_path.as_deref())
+            .ok_or_else(|| "download job missing target_path/source_path".to_string())
+            .and_then(|rel| download_remote_file_internal(state, &normalize_dropbox_path(rel))),
         other => Err(format!("unknown job_type: {other}")),
     };
 
@@ -780,10 +802,8 @@ fn index_remote_folder_children_as_cloudsc_placeholders_internal(
         if placeholder_path.exists() {
             continue;
         }
-        // Para archivos: si el archivo ya está hidratado localmente, no creamos placeholder.
-        // Para carpetas: aunque el directorio exista (por sesiones previas), queremos un placeholder
-        // para que el UX muestre el "estado remoto" y permita expandir/hidratar bajo demanda.
-        if tag == "file" && target_path.exists() {
+        // Si el item ya está hidratado (archivo o carpeta real), no debe volver como placeholder.
+        if target_path.exists() {
             continue;
         }
 
@@ -856,7 +876,8 @@ fn index_remote_root_children_as_cloudsc_placeholders_internal(state: &AppState)
         if placeholder_path.exists() {
             continue;
         }
-        if tag == "file" && target_path.exists() {
+        // Si el item ya está hidratado (archivo o carpeta real), no debe volver como placeholder.
+        if target_path.exists() {
             continue;
         }
 
@@ -1402,6 +1423,119 @@ fn refresh_queue_depth_internal(state: &AppState) -> Result<(), String> {
         .map_err(|_| "sync engine lock poisoned".to_string())?;
     engine.set_queue_depth(queue_depth);
     Ok(())
+}
+
+#[derive(Clone)]
+struct RemoteFileMeta {
+    content_hash: String,
+    rev: String,
+    modified_ts: i64,
+}
+
+fn parse_rfc3339_ts_to_unix(input: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(input)
+        .map(|v| v.with_timezone(&Utc).timestamp())
+        .unwrap_or(0)
+}
+
+fn fetch_remote_file_metadata(state: &AppState, relative: &str) -> Result<Option<RemoteFileMeta>, String> {
+    let token = get_access_token(state)?;
+    let client = Client::new();
+    let dropbox_path = normalize_dropbox_path(relative);
+
+    let response = client
+        .post("https://api.dropboxapi.com/2/files/get_metadata")
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "path": dropbox_path,
+            "include_media_info": false,
+            "include_deleted": false
+        }))
+        .send()
+        .map_err(|e| format!("get_metadata request failed for {relative}: {e}"))?;
+
+    if response.status().is_success() {
+        let entry: DropboxEntry = response
+            .json()
+            .map_err(|e| format!("get_metadata parse failed for {relative}: {e}"))?;
+        if entry.tag != "file" {
+            return Ok(None);
+        }
+        let content_hash = entry.content_hash.unwrap_or_default();
+        let rev = entry.rev.unwrap_or_default();
+        let modified_ts = entry
+            .server_modified
+            .as_deref()
+            .map(parse_rfc3339_ts_to_unix)
+            .unwrap_or(0);
+        if content_hash.is_empty() || rev.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(RemoteFileMeta {
+            content_hash,
+            rev,
+            modified_ts,
+        }));
+    }
+
+    // If file no longer exists remotely, caller can map this to delete logic later.
+    let status = response.status();
+    let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+    if status.as_u16() == 409 && (body.contains("not_found") || body.contains("path")) {
+        return Ok(None);
+    }
+    Err(format!(
+        "get_metadata status error for {relative}: {status}; body: {body}"
+    ))
+}
+
+fn refresh_remote_index_and_enqueue_downloads_internal(state: &AppState) -> Result<usize, String> {
+    let local_files = state.db.list_local_files()?;
+    if local_files.is_empty() {
+        return Ok(0);
+    }
+
+    let existing_jobs = state.db.list_recent_jobs(400)?;
+    let pending_targets: HashSet<String> = existing_jobs
+        .iter()
+        .filter(|j| j.status == "queued" || j.status == "retry_wait" || j.status == "running")
+        .filter_map(|j| j.target_path.clone().or(j.source_path.clone()))
+        .collect();
+
+    let mut enqueued = 0usize;
+    for local in local_files {
+        let rel = local.relative_path;
+        if rel.ends_with(".cloudsc") {
+            continue;
+        }
+        if pending_targets.contains(&rel) {
+            continue;
+        }
+
+        let prev_remote = state.db.get_remote_file(&rel)?;
+        let remote_meta = fetch_remote_file_metadata(state, &rel)?;
+        let Some(remote_meta) = remote_meta else {
+            // Missing in remote: keep current behavior (local changes win), do not auto-delete local.
+            continue;
+        };
+
+        let should_download = match prev_remote {
+            None => false,
+            Some(prev) => prev.content_hash != remote_meta.content_hash,
+        };
+
+        state
+            .db
+            .upsert_remote_file(&rel, &remote_meta.content_hash, &remote_meta.rev, remote_meta.modified_ts)?;
+
+        // If remote changed and diverges from local hash, enqueue download.
+        if should_download && local.hash != remote_meta.content_hash {
+            state.db.enqueue_job("download", Some(&rel), Some(&rel))?;
+            enqueued += 1;
+        }
+    }
+
+    Ok(enqueued)
 }
 
 fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {

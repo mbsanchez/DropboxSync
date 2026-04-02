@@ -69,12 +69,17 @@ type CloudscPlaceholderInfo = {
   remotePathDisplay: string;
 };
 
+type ActivityEntry = {
+  id: string;
+  message: string;
+};
+
 function App() {
   const [authUrl, setAuthUrl] = useState("");
   const [oauthCode, setOauthCode] = useState("");
   const [state, setState] = useState("");
   const [syncFolder, setSyncFolder] = useState("");
-  const [activity, setActivity] = useState<string[]>([]);
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [status, setStatus] = useState<SyncStatus>({
     health: "idle",
     queueDepth: 0,
@@ -102,7 +107,14 @@ function App() {
 
   const canComplete = useMemo(() => oauthCode.length > 4 && state.length > 4, [oauthCode, state]);
 
-  const pushLog = (line: string) => setActivity((prev) => [line, ...prev].slice(0, 20));
+  const pushLog = (line: string) =>
+    setActivity((prev) => [
+      {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        message: `${new Date().toLocaleTimeString()} - ${line}`,
+      },
+      ...prev,
+    ].slice(0, 40));
 
   const refreshDashboard = async () => {
     const dashboard = await invoke<SyncDashboard>("get_sync_dashboard");
@@ -200,6 +212,7 @@ function App() {
   }, [awaitingCallback]);
 
   useEffect(() => {
+    pushLog("UI ready.");
     refreshDashboard().catch((error) => pushLog(`Dashboard load failed: ${String(error)}`));
   }, []);
 
@@ -254,6 +267,19 @@ function App() {
     const parts = noTrailing.split("/").filter(Boolean);
     parts.pop();
     return parts.length ? `/${parts.join("/")}` : "";
+  };
+
+  const queueActionLabel = (jobType: string) => {
+    switch (jobType) {
+      case "upload":
+        return "Upload (local -> Dropbox)";
+      case "download":
+        return "Download (Dropbox -> local)";
+      case "delete":
+        return "Delete (Dropbox)";
+      default:
+        return jobType;
+    }
   };
 
   // Mientras el sync corre en segundo plano, refrescar el dashboard sin bloquear el hilo de UI.
@@ -513,7 +539,8 @@ function App() {
         <ul>
           {jobs.slice(0, 8).map((job) => (
             <li key={job.id}>
-              #{job.id} {job.jobType} {job.targetPath || "-"} | {job.status} | attempt {job.attemptCount}
+              #{job.id} {queueActionLabel(job.jobType)} {job.targetPath || "-"} | {job.status} | attempt{" "}
+              {job.attemptCount}
             </li>
           ))}
         </ul>
@@ -534,8 +561,8 @@ function App() {
       <section className="card">
         <h2>Activity</h2>
         <ul>
-          {activity.map((line) => (
-            <li key={line}>{line}</li>
+          {activity.map((entry) => (
+            <li key={entry.id}>{entry.message}</li>
           ))}
         </ul>
       </section>

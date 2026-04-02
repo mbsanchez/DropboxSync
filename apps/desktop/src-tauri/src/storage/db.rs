@@ -15,6 +15,15 @@ pub struct FileIndexRow {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteFileIndexRow {
+    pub relative_path: String,
+    pub content_hash: String,
+    pub rev: String,
+    pub modified_ts: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncJobRow {
     pub id: i64,
     pub job_type: String,
@@ -91,6 +100,7 @@ impl Db {
     pub fn reset_sync_state(&self) -> Result<(), String> {
         let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
         conn.execute("DELETE FROM local_file_index", []).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM remote_file_index", []).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM sync_jobs", []).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM sync_conflicts", []).map_err(|e| e.to_string())?;
         Ok(())
@@ -212,6 +222,55 @@ impl Db {
                 params![relative_path],
             )
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_remote_file(&self, relative_path: &str) -> Result<Option<RemoteFileIndexRow>, String> {
+        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT relative_path, content_hash, rev, modified_ts
+                FROM remote_file_index
+                WHERE relative_path = ?1
+                LIMIT 1
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![relative_path]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            return Ok(Some(RemoteFileIndexRow {
+                relative_path: row.get(0).map_err(|e| e.to_string())?,
+                content_hash: row.get(1).map_err(|e| e.to_string())?,
+                rev: row.get(2).map_err(|e| e.to_string())?,
+                modified_ts: row.get(3).map_err(|e| e.to_string())?,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn upsert_remote_file(
+        &self,
+        relative_path: &str,
+        content_hash: &str,
+        rev: &str,
+        modified_ts: i64,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        conn.execute(
+            "
+            INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at)
+            VALUES(?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(relative_path) DO UPDATE SET
+              content_hash=excluded.content_hash,
+              rev=excluded.rev,
+              modified_ts=excluded.modified_ts,
+              updated_at=excluded.updated_at
+            ",
+            params![relative_path, content_hash, rev, modified_ts, now],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -447,6 +506,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             modified_ts INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS remote_file_index (
+            relative_path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            rev TEXT NOT NULL,
+            modified_ts INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         ",
     )
     .map_err(|e| e.to_string())
@@ -455,7 +522,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
 fn db_path() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME env var not found".to_string())?;
     let mut path = PathBuf::from(home);
-    path.push(".dropbox-sync-desktop");
+    // Requested location for local persistent index/queue database.
+    path.push("Library");
+    path.push("Applications");
+    path.push("DropboxSyncDesktop");
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     path.push("app.db");
     Ok(path)
