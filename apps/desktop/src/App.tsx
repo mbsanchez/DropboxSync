@@ -357,7 +357,7 @@ function App() {
     }
   };
 
-  // Mientras el sync corre en segundo plano, refrescar el dashboard sin bloquear el hilo de UI.
+  // While sync runs in the background, refresh the dashboard without blocking the UI thread.
   useEffect(() => {
     if (!status.syncRunning) return;
     const id = window.setInterval(() => {
@@ -385,7 +385,7 @@ function App() {
       refreshDashboard().catch(() => {});
       refreshCloudsc().catch(() => {});
       if (remoteCurrentPath !== undefined) {
-        // Recargar el árbol remoto para reflejar hidratas/descargas hechas en background.
+        // Reload the remote tree to reflect hydrations/downloads done in the background.
         loadRemoteFolder(remoteCurrentPath).catch(() => {});
       }
       if (status.lastError) {
@@ -445,7 +445,7 @@ function App() {
         <section className="card onboarding">
           <h2>Dropbox connected</h2>
           <p>Your token was registered successfully. Continue to choose the local sync folder.</p>
-          <button onClick={() => setShowFolderSetup(true)}>Siguiente</button>
+          <button onClick={() => setShowFolderSetup(true)}>Next</button>
         </section>
       )}
 
@@ -480,36 +480,36 @@ function App() {
       <section className="card dashboard">
         <h2>Dashboard</h2>
         <p className="subtitle" style={{ marginTop: 0 }}>
-          Estado global de sincronización, cola y registro reciente.
+          Global sync status, queue, and recent activity.
         </p>
         <div className="dashboard-grid">
           <div>
-            <h3>Estado</h3>
-            <p>Salud: {status.health}</p>
-            <p>Cola: {status.queueDepth} trabajos pendientes</p>
-            <p>Carpeta: {status.trackedPath || "—"}</p>
-            <p>Último escaneo: {status.lastScanAt || "nunca"}</p>
-            <p>Procesados: {status.processedJobs}</p>
-            <p>Conflictos detectados: {status.conflictsDetected}</p>
-            <p>Sincronizando: {status.syncRunning ? "sí" : "no"}</p>
-            <p>Último error: {status.lastError || "ninguno"}</p>
+            <h3>Status</h3>
+            <p>Health: {status.health}</p>
+            <p>Queue: {status.queueDepth} pending jobs</p>
+            <p>Folder: {status.trackedPath || "—"}</p>
+            <p>Last scan: {status.lastScanAt || "never"}</p>
+            <p>Processed: {status.processedJobs}</p>
+            <p>Conflicts detected: {status.conflictsDetected}</p>
+            <p>Syncing: {status.syncRunning ? "yes" : "no"}</p>
+            <p>Last error: {status.lastError || "none"}</p>
           </div>
           <div>
-            <h3>Cola (reciente)</h3>
+            <h3>Queue (recent)</h3>
             <ul>
-              {jobs.length === 0 && <li>Cola vacía</li>}
+              {jobs.length === 0 && <li>Queue empty</li>}
               {jobs.slice(0, 8).map((job) => (
                 <li key={job.id}>
-                  #{job.id} {queueActionLabel(job.jobType)} {job.targetPath || "-"} | {job.status} | intento{" "}
+                  #{job.id} {queueActionLabel(job.jobType)} {job.targetPath || "-"} | {job.status} | attempt{" "}
                   {job.attemptCount}
                 </li>
               ))}
             </ul>
           </div>
           <div>
-            <h3>Conflictos</h3>
+            <h3>Conflicts</h3>
             <ul>
-              {conflicts.length === 0 && <li>Sin conflictos</li>}
+              {conflicts.length === 0 && <li>No conflicts</li>}
               {conflicts.map((conflict) => (
                 <li key={conflict.id}>
                   {conflict.localPath} — {conflict.reason}
@@ -518,9 +518,9 @@ function App() {
             </ul>
           </div>
         </div>
-        <h3>Actividad / logs</h3>
+        <h3>Activity / logs</h3>
         <ul className="activity-list">
-          {activity.length === 0 && <li>Sin entradas todavía.</li>}
+          {activity.length === 0 && <li>No entries yet.</li>}
           {activity.map((entry) => (
             <li key={entry.id}>{entry.message}</li>
           ))}
@@ -528,9 +528,9 @@ function App() {
       </section>
 
       <section className="card">
-        <h2>Conexión y carpeta local</h2>
+        <h2>Connection and local folder</h2>
         <p className="subtitle" style={{ marginTop: 0 }}>
-          Reconectar Dropbox, cambiar la carpeta o lanzar un tick manual.
+          Reconnect Dropbox, change the folder, or run a manual sync tick.
         </p>
         <h3>Dropbox OAuth</h3>
         <button onClick={startOAuth}>Reconnect Dropbox</button>
@@ -539,7 +539,7 @@ function App() {
             Authorization URL: <a href={authUrl}>{authUrl}</a>
           </p>
         )}
-        <h3>Carpeta de sync</h3>
+        <h3>Sync folder</h3>
         <input
           value={syncFolder}
           onChange={(e) => setSyncFolder(e.currentTarget.value)}
@@ -554,7 +554,7 @@ function App() {
 
       <section className="card">
         <h2>Remote Browser (On-demand)</h2>
-        <p>Se lista lo remoto sin descargar. Click en “Sync” hidrata archivos/carpetas.</p>
+        <p>Lists the remote tree without downloading. Use “Sync” to hydrate files or folders.</p>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
           <button disabled={remoteLoading} onClick={() => loadRemoteFolder("")}>
@@ -649,10 +649,10 @@ function App() {
       </section>
 
       <section className="card">
-        <h2>`.cloudsc` Placeholders (no descargar hasta click)</h2>
+        <h2>`.cloudsc` placeholders (on-demand download)</h2>
         <p>
-          En el <code>Sync folder</code> aparecen archivos <code>*.cloudsc</code> con metadata. Si
-          hidratas un placeholder, se descarga solo ese archivo o carpeta (y sus hijos inmediatos).
+          The <code>Sync folder</code> may contain <code>*.cloudsc</code> metadata placeholders.
+          Hydrating a placeholder downloads only that file or folder (and its immediate children for folders).
         </p>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -677,7 +677,9 @@ function App() {
         </div>
 
         <ul>
-          {cloudscEntries.length === 0 && <li>No placeholders. Click “Index remote root” o esperá el index inicial.</li>}
+          {cloudscEntries.length === 0 && (
+            <li>No placeholders. Click “Index remote root” or wait for the initial index.</li>
+          )}
           {cloudscEntries.map((entry) => {
             const label = entry.tag === "folder" ? "[DIR]" : "[FILE]";
             return (

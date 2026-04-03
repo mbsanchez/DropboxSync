@@ -1,0 +1,12 @@
+---
+description: Collaborative repo language — commits and code comments in English
+alwaysApply: true
+---
+
+# Language
+
+- **Git commit messages**: write in English (imperative mood, concise subject line).
+- **Code comments, doc comments (`///`), and user-facing developer strings** in source: English only.
+- UI copy for end users may stay English for this project unless product requirements specify otherwise.
+
+The maintainer may communicate in Spanish; repository artifacts stay English for collaborators.

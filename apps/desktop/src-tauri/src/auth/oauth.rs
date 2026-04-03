@@ -4,11 +4,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// Dropbox App Console → tu app → pestaña **Settings** → **App key** (OAuth2 `client_id`).
-/// No es un secreto en clientes públicos: el flujo usa PKCE; igualmente no subas una key ajena a repos públicos.
+/// Dropbox App Console → your app → **Settings** → **App key** (OAuth2 `client_id`).
+/// Not a secret in public clients: the flow uses PKCE; still, do not commit someone else's key to public repos.
 pub const DROPBOX_APP_KEY: &str = "aauuh6hib5i8crx";
 
-/// Debe coincidir **exactamente** con un redirect URI permitido en la misma app de Dropbox.
+/// Must match **exactly** a redirect URI allowed on the same Dropbox app.
 pub const DROPBOX_REDIRECT_URI: &str = "http://localhost:53682/callback";
 
 #[derive(Deserialize)]
@@ -22,7 +22,7 @@ fn resolve_app_key() -> Result<String, String> {
     let v = std::env::var("DROPBOX_APP_KEY").unwrap_or_else(|_| DROPBOX_APP_KEY.to_string());
     if v.is_empty() {
         return Err(
-            "DROPBOX_APP_KEY vacío: edita src-tauri/src/auth/oauth.rs o define la variable de entorno."
+            "DROPBOX_APP_KEY is empty: set it in src-tauri/src/auth/oauth.rs or via the environment variable."
                 .to_string(),
         );
     }
@@ -33,7 +33,7 @@ fn resolve_redirect_uri() -> String {
     std::env::var("DROPBOX_REDIRECT_URI").unwrap_or_else(|_| DROPBOX_REDIRECT_URI.to_string())
 }
 
-/// Redirect usado para el listener local y para el intercambio de tokens.
+/// Redirect URI used for the local listener and for the token exchange.
 pub fn dropbox_redirect_uri() -> String {
     resolve_redirect_uri()
 }

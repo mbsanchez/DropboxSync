@@ -45,7 +45,7 @@ pub struct ConflictRow {
     pub created_at: String,
 }
 
-/// Conexiones separadas lectura/escritura + WAL: la UI puede consultar sin esperar al sync.
+/// Separate read/write connections plus WAL so the UI can query without blocking on sync writes.
 pub struct Db {
     write: Mutex<Connection>,
     read: Mutex<Connection>,
@@ -96,7 +96,7 @@ impl Db {
         Ok(())
     }
 
-    /// Resetea el estado local de sync para evitar jobs fantasma cuando cambia el folder.
+    /// Clears local sync state to avoid stale jobs when the sync folder changes.
     pub fn reset_sync_state(&self) -> Result<(), String> {
         let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
         conn.execute("DELETE FROM local_file_index", []).map_err(|e| e.to_string())?;
