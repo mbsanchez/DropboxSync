@@ -1,6 +1,7 @@
 node_modules/
 dist/
 target/
+.cargo-target-check/
 artifacts/
 .DS_Store
 *.log
