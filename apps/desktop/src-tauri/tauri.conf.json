@@ -35,6 +35,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["cloudsc"],
+        "name": "Cloudsc placeholder",
+        "description": "Placeholder .cloudsc (Dropbox Sync Desktop)",
+        "mimeType": "application/x-cloudsc-placeholder",
+        "role": "Editor"
+      }
     ]
   }
 }

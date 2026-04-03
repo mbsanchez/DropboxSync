@@ -350,6 +350,8 @@ function App() {
         return "Download (Dropbox -> local)";
       case "delete":
         return "Delete (Dropbox)";
+      case "hydrate_cloudsc":
+        return "Hydrate (.cloudsc)";
       default:
         return jobType;
     }
