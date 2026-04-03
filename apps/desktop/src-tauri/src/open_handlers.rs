@@ -89,11 +89,6 @@ pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<Pa
         }
     }
     if any_queued {
-        if let Some(w) = app_handle.get_webview_window("main") {
-            let _ = w.show();
-            let _ = w.unminimize();
-            let _ = w.set_focus();
-        }
         spawn_drain_sync_queue_if_idle(app_state);
     }
 }
