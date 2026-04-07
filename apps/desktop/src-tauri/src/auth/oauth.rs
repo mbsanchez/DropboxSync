@@ -5,11 +5,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Dropbox App Console → your app → **Settings** → **App key** (OAuth2 `client_id`).
-/// Not a secret in public clients: the flow uses PKCE; still, do not commit someone else's key to public repos.
-pub const DROPBOX_APP_KEY: &str = "aauuh6hib5i8crx";
+/// Prefer providing this value via `DROPBOX_APP_KEY` in `.env` for dev/build.
+/// The build command embeds it at compile time via `option_env!`.
+pub const DROPBOX_APP_KEY: &str = option_env!("DROPBOX_APP_KEY").unwrap_or("");
 
 /// Must match **exactly** a redirect URI allowed on the same Dropbox app.
-pub const DROPBOX_REDIRECT_URI: &str = "http://localhost:53682/callback";
+/// Can be overridden via `DROPBOX_REDIRECT_URI` in `.env`.
+pub const DROPBOX_REDIRECT_URI: &str =
+    option_env!("DROPBOX_REDIRECT_URI").unwrap_or("http://localhost:53682/callback");
 
 #[derive(Deserialize)]
 pub struct TokenResponse {
@@ -22,7 +25,7 @@ fn resolve_app_key() -> Result<String, String> {
     let v = std::env::var("DROPBOX_APP_KEY").unwrap_or_else(|_| DROPBOX_APP_KEY.to_string());
     if v.is_empty() {
         return Err(
-            "DROPBOX_APP_KEY is empty: set it in src-tauri/src/auth/oauth.rs or via the environment variable."
+            "DROPBOX_APP_KEY is empty: set it in apps/desktop/.env (and run build again) or export it in the environment."
                 .to_string(),
         );
     }

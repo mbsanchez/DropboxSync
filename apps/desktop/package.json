@@ -8,8 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "npm run build",
-    "tauri": "tauri",
-    "bundle:dev": "CI=false tauri build --bundles app",
+    "tauri": "dotenv -e .env -- tauri",
+    "bundle:dev": "dotenv -e .env -- tauri build --bundles app",
     "start:dev": "npm run bundle:dev && open src-tauri/target/release/bundle/macos/DropboxSyncDesktop.app",
     "build:finder-sync": "bash native/macos/FinderSyncExtension/build-appex.sh",
     "tauri:before-build": "node scripts/tauri-before-build.mjs"
@@ -26,6 +26,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "5.6.3",
+    "dotenv-cli": "^8.0.0",
     "vite": "5.4.10"
   }
 }
