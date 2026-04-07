@@ -467,6 +467,24 @@ impl Db {
 
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
+
+    pub fn list_unresolved_conflict_local_paths(&self) -> Result<Vec<String>, String> {
+        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT DISTINCT local_path
+                FROM sync_conflicts
+                WHERE resolved = 0
+                ORDER BY local_path
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {
@@ -519,14 +537,32 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Shared app data directory (SQLite DB, overlay_state.json for shell extensions).
+pub fn app_data_dir() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let base =
+            std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA env var not found".to_string())?;
+        let mut path = PathBuf::from(base);
+        path.push("DropboxSyncDesktop");
+        std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        return Ok(path);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").map_err(|_| "HOME env var not found".to_string())?;
+        let mut path = PathBuf::from(home);
+        // Requested location for local persistent index/queue database.
+        path.push("Library");
+        path.push("Applications");
+        path.push("DropboxSyncDesktop");
+        std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+}
+
 fn db_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME env var not found".to_string())?;
-    let mut path = PathBuf::from(home);
-    // Requested location for local persistent index/queue database.
-    path.push("Library");
-    path.push("Applications");
-    path.push("DropboxSyncDesktop");
-    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    let mut path = app_data_dir()?;
     path.push("app.db");
     Ok(path)
 }

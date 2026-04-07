@@ -1,12 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  // macOS: Finder Sync extension is bundled via bundle.macOS.files; build it with `npm run build:finder-sync`
+  // (runs automatically on macOS from beforeBuildCommand). For badges to load reliably, avoid ad-hoc signing:
+  // set bundle.macOS.signingIdentity to your certificate (e.g. "Apple Development: Your Name (TEAMID)" or
+  // "Developer ID Application: …"). Use the same Apple team for the .appex: export APPLE_TEAM_ID=XXXXXXXX
+  // before `npm run tauri build` so xcodebuild picks DEVELOPMENT_TEAM (also used for notarization env vars).
   "productName": "DropboxSyncDesktop",
   "version": "0.1.0",
   "identifier": "com.mobsanchez.dropboxsyncdesktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run tauri:before-build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -28,7 +33,10 @@
     "macOS": {
       "minimumSystemVersion": "12.0",
       "infoPlist": "Info.plist",
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "files": {
+        "PlugIns/DropboxSyncFinderSync.appex": "../native/macos/FinderSyncExtension/build/DropboxSyncFinderSync.appex"
+      }
     },
     "icon": [
       "icons/32x32.png",

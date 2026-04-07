@@ -10,9 +10,12 @@ pub(crate) fn has_stored_credentials(state: &AppState) -> bool {
 }
 
 pub(crate) fn is_hard_auth_failure(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
     err.contains("dropbox token expired and no refresh_token available")
         || err.contains("missing dropbox token session")
-        || err.contains("dropbox refresh token exchange failed with status")
+        // Only treat refresh failures as hard when Dropbox explicitly rejects the grant.
+        || (err.contains("dropbox refresh token exchange failed with status")
+            && (lower.contains("invalid_grant") || lower.contains("invalid_client")))
 }
 
 /// Returns true when we should exchange the refresh token for a new access token.

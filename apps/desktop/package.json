@@ -10,7 +10,9 @@
     "test": "npm run build",
     "tauri": "tauri",
     "bundle:dev": "CI=false tauri build --bundles app",
-    "start:dev": "npm run bundle:dev && open src-tauri/target/release/bundle/macos/DropboxSyncDesktop.app"
+    "start:dev": "npm run bundle:dev && open src-tauri/target/release/bundle/macos/DropboxSyncDesktop.app",
+    "build:finder-sync": "bash native/macos/FinderSyncExtension/build-appex.sh",
+    "tauri:before-build": "node scripts/tauri-before-build.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

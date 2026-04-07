@@ -1,0 +1,244 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		DBFC00000000000000000021 /* SyncExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000001 /* SyncExtension.swift */; };
+		DBFC00000000000000000022 /* cloud-check.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000002 /* cloud-check.png */; };
+		DBFC00000000000000000023 /* cloud-alert.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000003 /* cloud-alert.png */; };
+		DBFC00000000000000000024 /* cloud-sync.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000004 /* cloud-sync.png */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		DBFC00000000000000000001 /* SyncExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncExtension.swift; sourceTree = "<group>"; };
+		DBFC00000000000000000002 /* cloud-check.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = cloud-check.png; sourceTree = "<group>"; };
+		DBFC00000000000000000003 /* cloud-alert.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = cloud-alert.png; sourceTree = "<group>"; };
+		DBFC00000000000000000004 /* cloud-sync.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = cloud-sync.png; sourceTree = "<group>"; };
+		DBFC00000000000000000005 /* DropboxSyncFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = DropboxSyncFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		DBFC00000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DBFC00000000000000000031 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		DBFC00000000000000000040 = {
+			isa = PBXGroup;
+			children = (
+				DBFC00000000000000000041 /* FinderSyncExtension */,
+				DBFC00000000000000000042 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		DBFC00000000000000000041 /* FinderSyncExtension */ = {
+			isa = PBXGroup;
+			children = (
+				DBFC00000000000000000001 /* SyncExtension.swift */,
+				DBFC00000000000000000006 /* Info.plist */,
+				DBFC00000000000000000043 /* Assets */,
+			);
+			name = FinderSyncExtension;
+			sourceTree = "<group>";
+		};
+		DBFC00000000000000000042 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				DBFC00000000000000000005 /* DropboxSyncFinderSync.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		DBFC00000000000000000043 /* Assets */ = {
+			isa = PBXGroup;
+			children = (
+				DBFC00000000000000000002 /* cloud-check.png */,
+				DBFC00000000000000000003 /* cloud-alert.png */,
+				DBFC00000000000000000004 /* cloud-sync.png */,
+			);
+			path = Assets;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		DBFC00000000000000000050 /* DropboxSyncFinderSync */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DBFC00000000000000000060 /* Build configuration list for PBXNativeTarget "DropboxSyncFinderSync" */;
+			buildPhases = (
+				DBFC00000000000000000032 /* Sources */,
+				DBFC00000000000000000031 /* Frameworks */,
+				DBFC00000000000000000033 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DropboxSyncFinderSync;
+			productName = DropboxSyncFinderSync;
+			productReference = DBFC00000000000000000005 /* DropboxSyncFinderSync.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		DBFC00000000000000000051 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					DBFC00000000000000000050 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = DBFC00000000000000000061 /* Build configuration list for PBXProject "DropboxSyncFinderSync" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = DBFC00000000000000000040;
+			productRefGroup = DBFC00000000000000000042 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				DBFC00000000000000000050 /* DropboxSyncFinderSync */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		DBFC00000000000000000033 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DBFC00000000000000000022 /* cloud-check.png in Resources */,
+				DBFC00000000000000000023 /* cloud-alert.png in Resources */,
+				DBFC00000000000000000024 /* cloud-sync.png in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		DBFC00000000000000000032 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DBFC00000000000000000021 /* SyncExtension.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		DBFC00000000000000000070 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Dropbox Sync Finder";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mobsanchez.dropboxsyncdesktop.findersync;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				WRAPPER_EXTENSION = appex;
+			};
+			name = Debug;
+		};
+		DBFC00000000000000000071 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Dropbox Sync Finder";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mobsanchez.dropboxsyncdesktop.findersync;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				WRAPPER_EXTENSION = appex;
+			};
+			name = Release;
+		};
+		DBFC00000000000000000072 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		DBFC00000000000000000073 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		DBFC00000000000000000060 /* Build configuration list for PBXNativeTarget "DropboxSyncFinderSync" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DBFC00000000000000000070 /* Debug */,
+				DBFC00000000000000000071 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		DBFC00000000000000000061 /* Build configuration list for PBXProject "DropboxSyncFinderSync" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DBFC00000000000000000072 /* Debug */,
+				DBFC00000000000000000073 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = DBFC00000000000000000051 /* Project object */;
+}

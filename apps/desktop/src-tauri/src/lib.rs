@@ -7,6 +7,7 @@ mod dropbox_transfer;
 mod models;
 mod oauth_listener;
 mod open_handlers;
+mod overlay_state;
 mod path_util;
 mod remote_index;
 mod run_events;
@@ -82,6 +83,10 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            }
+
+            if let Some(state) = app.try_state::<AppState>() {
+                crate::overlay_state::refresh_overlay_state_internal(state.inner());
             }
 
             Ok(())

@@ -14,6 +14,7 @@ use crate::path_util::{
     should_ignore_local_path,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
+use crate::overlay_state;
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
 
@@ -25,6 +26,7 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> Result<(), Strin
         .lock()
         .map_err(|_| "sync engine lock poisoned".to_string())?;
     engine.set_queue_depth(queue_depth);
+    overlay_state::refresh_overlay_state_internal(state);
     Ok(())
 }
 

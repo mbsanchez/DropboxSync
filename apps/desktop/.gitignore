@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Finder Sync extension Xcode output (see npm run build:finder-sync)
+native/macos/FinderSyncExtension/build/
