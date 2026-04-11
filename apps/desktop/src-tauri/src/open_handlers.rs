@@ -57,6 +57,34 @@ pub(crate) fn spawn_drain_sync_queue_if_idle(app_state: AppState) {
     });
 }
 
+/// Collects existing `.cloudsc` file paths from a process argument list (argv), skipping the executable.
+pub(crate) fn cloudsc_paths_from_argv(args: &[String]) -> Vec<PathBuf> {
+    args.iter()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("cloudsc"))
+        })
+        .collect()
+}
+
+/// Same as [`cloudsc_paths_from_argv`] but uses `args_os` for the current process (Windows/Linux cold start).
+pub(crate) fn cloudsc_paths_from_current_exe_args() -> Vec<PathBuf> {
+    std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("cloudsc"))
+        })
+        .collect()
+}
+
 pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<PathBuf>) {
     let Some(state) = app_handle.try_state::<AppState>() else {
         eprintln!("handle_cloudsc_paths_from_os: AppState not available");

@@ -15,6 +15,8 @@ mod state;
 mod storage;
 mod sync;
 mod sync_pipeline;
+#[cfg(windows)]
+mod windows_file_assoc;
 
 use std::sync::{Arc, Mutex};
 
@@ -43,12 +45,63 @@ pub fn run() {
         oauth_listener: Arc::new(Mutex::new(None)),
     };
 
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .manage(app_state)
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let paths = crate::open_handlers::cloudsc_paths_from_argv(&argv);
+            if !paths.is_empty() {
+                eprintln!("DropboxSyncDesktop: file open on running instance: {paths:?}");
+                crate::open_handlers::handle_cloudsc_paths_from_os(&app, paths);
+            }
+            // Do not raise an empty dashboard when the user is fully set up (tray-only workflow).
+            if let Some(state) = app.try_state::<AppState>() {
+                if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        }));
+    }
+
+    let app = builder
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_dock_visibility(false);
+
+            #[cfg(windows)]
+            {
+                let skip = std::env::var("DROPBOXSYNC_SKIP_WINDOWS_FILE_ASSOC")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if skip {
+                    eprintln!("Skipping per-user .cloudsc registration (DROPBOXSYNC_SKIP_WINDOWS_FILE_ASSOC).");
+                } else {
+                    match crate::windows_file_assoc::register_user_cloudsc_association() {
+                        Ok(()) => eprintln!(
+                            "Registered per-user .cloudsc association (HKCU) for portable testing."
+                        ),
+                        Err(e) => eprintln!("Per-user .cloudsc association failed: {e}"),
+                    }
+                }
+            }
+
+            // Windows/Linux: double-clicking `.cloudsc` runs `app.exe "path\to\file.cloudsc"`; there is no
+            // `RunEvent::Opened` (macOS/iOS only). Handle argv on first launch here.
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            {
+                let paths = crate::open_handlers::cloudsc_paths_from_current_exe_args();
+                if !paths.is_empty() {
+                    eprintln!("DropboxSyncDesktop: startup file args: {paths:?}");
+                    crate::open_handlers::handle_cloudsc_paths_from_os(&app.handle().clone(), paths);
+                }
+            }
 
             let app_handle = app.handle().clone();
 

@@ -119,10 +119,8 @@ pub fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
     Ok(picked.map(|p| p.to_string_lossy().to_string()))
 }
 
-#[tauri::command]
-pub fn get_startup_requirements(
-    state: tauri::State<AppState>,
-) -> Result<StartupRequirementsResponse, String> {
+/// Same logic as [`get_startup_requirements`] for use from Rust (e.g. window visibility).
+pub(crate) fn compute_startup_requirements(state: &AppState) -> Result<StartupRequirementsResponse, String> {
     let sync_folder = state.db.get_sync_folder()?;
     let sync_folder_ok = sync_folder
         .as_ref()
@@ -141,11 +139,11 @@ pub fn get_startup_requirements(
         }
     }
 
-    let has_creds = has_stored_credentials(state.inner());
+    let has_creds = has_stored_credentials(state);
     let auth_ok = if !has_creds {
         false
     } else {
-        match verify_dropbox_token_internal(state.inner()) {
+        match verify_dropbox_token_internal(state) {
             Ok(v) => v,
             Err(e) => !is_hard_auth_failure(&e),
         }
@@ -156,6 +154,22 @@ pub fn get_startup_requirements(
         sync_folder_ok,
         sync_folder,
     })
+}
+
+/// When `true`, the main window should be visible (Connect Dropbox / folder setup). When `false`, the
+/// app can stay tray-only (e.g. `.cloudsc` open or background sync without flashing an empty UI).
+pub(crate) fn should_show_main_window_for_onboarding(state: &AppState) -> bool {
+    match compute_startup_requirements(state) {
+        Ok(r) => !r.auth_ok || !r.sync_folder_ok,
+        Err(_) => true,
+    }
+}
+
+#[tauri::command]
+pub fn get_startup_requirements(
+    state: tauri::State<AppState>,
+) -> Result<StartupRequirementsResponse, String> {
+    compute_startup_requirements(state.inner())
 }
 
 #[tauri::command]

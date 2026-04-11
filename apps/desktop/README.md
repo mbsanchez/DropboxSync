@@ -152,6 +152,12 @@ Schema summary:
 - See `native/windows/shell-overlay/README.md`
 - COM overlay DLL implementation and installer registration are still pending
 
+### Windows `.cloudsc` association (open / hydrate)
+
+- `bundle.fileAssociations` in `src-tauri/tauri.conf.json` is applied when you build an **NSIS** or **MSI** installer (`tauri build` with those targets). A release `.exe` only (e.g. `npm run bundle:win` with `--no-bundle`) does **not** register file types; install the generated installer to get “Open with” / default app for `.cloudsc`.
+- **Portable testing (no installer):** on each launch the app registers a **per-user** association under `HKCU\Software\Classes` pointing `.cloudsc` at the **current** executable (ProgID `DropboxSyncDesktop.CloudscPortable.1`). That lets double-click work without NSIS. Set `DROPBOXSYNC_SKIP_WINDOWS_FILE_ASSOC=1` to disable this. If Windows still opens another handler by default, use **Open with → Choose another app** once.
+- On **Windows and Linux**, the shell passes the file path on the process command line (there is no `RunEvent::Opened` like on macOS/iOS). The app reads those args on startup and uses `tauri-plugin-single-instance` when a second launch occurs while the app is already running.
+
 ## Authentication behavior
 
 - Full token session (`access_token`, `refresh_token`, `expires_at`) is persisted in keychain.
