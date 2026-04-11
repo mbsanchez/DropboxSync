@@ -7,12 +7,17 @@ use sha2::{Digest, Sha256};
 /// Dropbox App Console → your app → **Settings** → **App key** (OAuth2 `client_id`).
 /// Prefer providing this value via `DROPBOX_APP_KEY` in `.env` for dev/build.
 /// The build command embeds it at compile time via `option_env!`.
-pub const DROPBOX_APP_KEY: &str = option_env!("DROPBOX_APP_KEY").unwrap_or("");
+pub const DROPBOX_APP_KEY: &str = match option_env!("DROPBOX_APP_KEY") {
+    Some(k) => k,
+    None => "",
+};
 
 /// Must match **exactly** a redirect URI allowed on the same Dropbox app.
 /// Can be overridden via `DROPBOX_REDIRECT_URI` in `.env`.
-pub const DROPBOX_REDIRECT_URI: &str =
-    option_env!("DROPBOX_REDIRECT_URI").unwrap_or("http://localhost:53682/callback");
+pub const DROPBOX_REDIRECT_URI: &str = match option_env!("DROPBOX_REDIRECT_URI") {
+    Some(u) => u,
+    None => "http://localhost:53682/callback",
+};
 
 #[derive(Deserialize)]
 pub struct TokenResponse {
@@ -98,15 +103,19 @@ pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenRespo
         .await
         .map_err(|e| format!("token request failed: {e}"))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        return Err(format!("dropbox token exchange failed with status {status}"));
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("token response body failed: {e}"))?;
+
+    if !status.is_success() {
+        let text = String::from_utf8_lossy(&body);
+        return Err(format!("dropbox token exchange failed ({status}): {text}"));
     }
 
-    let token = response
-        .json::<TokenResponse>()
-        .await
-        .map_err(|e| format!("token parse failed: {e}"))?;
+    let token = serde_json::from_slice::<TokenResponse>(&body)
+        .map_err(|e| format!("token parse failed: {e}; body: {}", String::from_utf8_lossy(&body)))?;
 
     Ok(token)
 }

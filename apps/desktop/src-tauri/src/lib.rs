@@ -25,7 +25,7 @@ use sync::engine::SyncEngine;
 use tauri::image::Image;
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -40,6 +40,7 @@ pub fn run() {
         sync_engine: Arc::new(Mutex::new(sync_engine)),
         token_cache: Arc::new(Mutex::new(None)),
         scheduler_started: Arc::new(Mutex::new(false)),
+        oauth_listener: Arc::new(Mutex::new(None)),
     };
 
     let app = tauri::Builder::default()
@@ -48,6 +49,8 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_dock_visibility(false);
+
+            let app_handle = app.handle().clone();
 
             let open_dashboard = MenuItem::with_id(app, "open_dashboard", "Open Dashboard", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
@@ -59,6 +62,15 @@ pub fn run() {
                 .icon_as_template(true)
                 .menu(&menu)
                 .tooltip("DropboxSyncDesktop - Idle")
+                .on_tray_icon_event(move |_tray, event| {
+                    if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
                 .on_menu_event(move |app, event| {
                     if event.id.as_ref() == "open_dashboard" {
                         if let Some(window) = app.get_webview_window("main") {
@@ -79,6 +91,7 @@ pub fn run() {
                 }
             };
 
+            // Step 0: start with the main window hidden; the UI shows it when setup is incomplete.
             if tray_ok {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
@@ -94,12 +107,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::start_oauth_flow,
             commands::complete_oauth_flow,
-            commands::complete_oauth_from_callback,
-            commands::poll_oauth_callback,
+            commands::cancel_oauth_flow,
             commands::get_startup_requirements,
             commands::pick_sync_folder_dialog,
             commands::start_background_scheduler,
             commands::hide_main_window,
+            commands::show_main_window,
             commands::set_sync_folder,
             commands::get_sync_status,
             commands::get_sync_dashboard,

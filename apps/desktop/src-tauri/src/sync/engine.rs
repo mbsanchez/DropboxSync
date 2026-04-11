@@ -2,13 +2,6 @@ use serde::Serialize;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OauthCallbackPayload {
-    pub code: String,
-    pub state: String,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
     pub health: String,
     pub queue_depth: usize,
@@ -23,7 +16,6 @@ pub struct SyncStatus {
 pub struct SyncEngine {
     pending_oauth_state: Option<String>,
     pending_pkce_verifier: Option<String>,
-    pending_oauth_callback: Option<OauthCallbackPayload>,
     tracked_path: Option<String>,
     queue_depth: usize,
     last_error: Option<String>,
@@ -38,7 +30,6 @@ impl SyncEngine {
         Self {
             pending_oauth_state: None,
             pending_pkce_verifier: None,
-            pending_oauth_callback: None,
             tracked_path: None,
             queue_depth: 0,
             last_error: None,
@@ -62,12 +53,10 @@ impl SyncEngine {
         self.pending_pkce_verifier.clone()
     }
 
-    pub fn set_oauth_callback(&mut self, code: String, state: String) {
-        self.pending_oauth_callback = Some(OauthCallbackPayload { code, state });
-    }
-
-    pub fn consume_oauth_callback(&mut self) -> Option<OauthCallbackPayload> {
-        self.pending_oauth_callback.take()
+    /// Clears in-flight OAuth state (e.g. user cancelled or will retry login).
+    pub fn clear_oauth_pending(&mut self) {
+        self.pending_oauth_state = None;
+        self.pending_pkce_verifier = None;
     }
 
     pub fn set_tracked_path(&mut self, path: String) {

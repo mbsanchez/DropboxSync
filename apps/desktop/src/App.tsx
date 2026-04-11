@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
+
+type StartupRequirements = {
+  authOk: boolean;
+  syncFolderOk: boolean;
+  syncFolder?: string;
+};
 
 type SyncStatus = {
   health: "idle" | "syncing" | "error";
@@ -12,11 +19,6 @@ type SyncStatus = {
   processedJobs: number;
   conflictsDetected: number;
   syncRunning: boolean;
-};
-
-type OauthCallbackPayload = {
-  code: string;
-  state: string;
 };
 
 type SyncJob = {
@@ -76,8 +78,6 @@ type ActivityEntry = {
 
 function App() {
   const [authUrl, setAuthUrl] = useState("");
-  const [oauthCode, setOauthCode] = useState("");
-  const [state, setState] = useState("");
   const [syncFolder, setSyncFolder] = useState("");
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [status, setStatus] = useState<SyncStatus>({
@@ -106,11 +106,12 @@ function App() {
   const [authOk, setAuthOk] = useState(false);
   const [syncFolderOk, setSyncFolderOk] = useState(false);
   const [showFolderSetup, setShowFolderSetup] = useState(false);
-  const [oauthCallbackReady, setOauthCallbackReady] = useState(false);
+  /** Shown on the Connect card (activity log is hidden until the dashboard is reachable). */
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   const didAutoIndexCloudscRef = useRef(false);
   const schedulerStartedRef = useRef(false);
-  const didHideToTrayRef = useRef(false);
+  const loggedTrayHideRef = useRef(false);
 
   const pushLog = (line: string) =>
     setActivity((prev) => [
@@ -133,13 +134,14 @@ function App() {
 
   const refreshStartupRequirements = async () => {
     try {
-      const requirements = await invoke<{ authOk: boolean; syncFolderOk: boolean; syncFolder?: string }>(
-        "get_startup_requirements"
-      );
+      const requirements = await invoke<StartupRequirements>("get_startup_requirements");
       setAuthOk(requirements.authOk);
       setSyncFolderOk(requirements.syncFolderOk);
       if (requirements.syncFolder) {
         setSyncFolder(requirements.syncFolder);
+      }
+      if (requirements.authOk) {
+        setAwaitingCallback(false);
       }
     } catch (error) {
       pushLog(`Startup check failed: ${String(error)}`);
@@ -148,6 +150,9 @@ function App() {
       setStartupLoading(false);
     }
   };
+
+  const refreshStartupRequirementsRef = useRef(refreshStartupRequirements);
+  refreshStartupRequirementsRef.current = refreshStartupRequirements;
 
   const refreshCloudsc = async (limit = 200) => {
     setCloudscLoading(true);
@@ -163,31 +168,31 @@ function App() {
     }
   };
 
+  const cancelOAuth = async () => {
+    try {
+      await invoke("cancel_oauth_flow");
+    } catch (error) {
+      pushLog(`Cancel OAuth failed: ${String(error)}`);
+    }
+    setAwaitingCallback(false);
+    setConnectError(null);
+    pushLog("Dropbox login cancelled. You can start again when ready.");
+  };
+
   const startOAuth = async () => {
+    setConnectError(null);
     try {
       const payload = await invoke<{ authUrl: string; state: string }>("start_oauth_flow");
       setAuthUrl(payload.authUrl);
-      setState(payload.state);
       setAwaitingCallback(true);
-      setOauthCallbackReady(false);
       setShowFolderSetup(false);
       await openUrl(payload.authUrl);
       pushLog("Opened Dropbox login. Waiting for callback on localhost.");
     } catch (error) {
-      pushLog(`Could not open browser automatically: ${String(error)}`);
-    }
-  };
-
-  const completeOAuth = async (codeArg?: string, stateArg?: string) => {
-    pushLog("Completing Dropbox login...");
-    try {
-      await invoke("complete_oauth_flow", { code: codeArg ?? oauthCode, state: stateArg ?? state });
+      const msg = String(error);
+      setConnectError(msg);
+      pushLog(`Could not start OAuth: ${msg}`);
       setAwaitingCallback(false);
-      pushLog("Dropbox authentication completed and token session stored securely.");
-      await refreshStartupRequirements();
-    } catch (error) {
-      pushLog(`Complete login failed: ${String(error)}`);
-      throw error;
     }
   };
 
@@ -218,34 +223,72 @@ function App() {
     }
   };
 
+  // Primary: Rust emits `dropbox-oauth-finished` after token exchange (works while WebView is throttled).
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    void listen<{ ok: boolean; message?: string }>("dropbox-oauth-finished", (event) => {
+      if (!active) return;
+      setAwaitingCallback(false);
+      if (event.payload.ok) {
+        setConnectError(null);
+        setAuthOk(true);
+        setStartupLoading(false);
+        pushLog("Dropbox authentication completed and token session stored securely.");
+        void refreshStartupRequirementsRef.current();
+      } else {
+        const msg = event.payload.message ?? "unknown error";
+        setConnectError(msg);
+        pushLog(`Dropbox login failed: ${msg}`);
+      }
+    }).then((fn) => {
+      if (!active) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  // Fallback while waiting: slow poll (WebView often throttles `setInterval` when the browser has focus).
   useEffect(() => {
     if (!awaitingCallback) return;
 
-    const interval = window.setInterval(async () => {
+    let disposed = false;
+
+    const tick = async () => {
+      if (disposed) return;
       try {
-        const payload = await invoke<OauthCallbackPayload | null>("poll_oauth_callback");
-        if (!payload?.code || !payload?.state) {
-          return;
+        const requirements = await invoke<StartupRequirements>("get_startup_requirements");
+        if (disposed || !requirements.authOk) return;
+        setAwaitingCallback(false);
+        setAuthOk(true);
+        setSyncFolderOk(requirements.syncFolderOk);
+        if (requirements.syncFolder) {
+          setSyncFolder(requirements.syncFolder);
         }
-
-        setOauthCallbackReady(true);
-        setOauthCode(payload.code);
-        setState(payload.state);
-        pushLog("Dropbox callback received. Finalizing login...");
-
-        try {
-          await completeOAuth(payload.code, payload.state);
-          setAwaitingCallback(false);
-          setOauthCallbackReady(false);
-        } catch {
-          // Keep waiting state so user can click Continue manually.
-        }
-      } catch (error) {
-        pushLog(`OAuth callback polling error: ${String(error)}`);
+        setStartupLoading(false);
+        pushLog("Dropbox authentication completed and token session stored securely.");
+      } catch (e) {
+        pushLog(`OAuth status check failed: ${String(e)}`);
       }
-    }, 1000);
+    };
 
-    return () => window.clearInterval(interval);
+    const interval = window.setInterval(() => {
+      void tick();
+    }, 1500);
+    void tick();
+
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
   }, [awaitingCallback]);
 
   useEffect(() => {
@@ -276,11 +319,19 @@ function App() {
   }, [authOk, syncFolderOk]);
 
   useEffect(() => {
-    if (!authOk || !syncFolderOk || didHideToTrayRef.current) return;
-    didHideToTrayRef.current = true;
-    invoke("hide_main_window").catch(() => {});
-    pushLog("App moved to tray. Use tray menu to Exit.");
-  }, [authOk, syncFolderOk]);
+    if (startupLoading) return;
+    const fullyReady = authOk && syncFolderOk;
+    if (fullyReady) {
+      invoke("hide_main_window").catch(() => {});
+      if (!loggedTrayHideRef.current) {
+        loggedTrayHideRef.current = true;
+        pushLog("App moved to tray. Use tray menu to Exit.");
+      }
+    } else {
+      loggedTrayHideRef.current = false;
+      invoke("show_main_window").catch(() => {});
+    }
+  }, [startupLoading, authOk, syncFolderOk]);
 
   useEffect(() => {
     if (!authOk) {
@@ -414,29 +465,22 @@ function App() {
       {!startupLoading && !authOk && (
         <section className="card onboarding">
           <h2>Connect Dropbox</h2>
-          <p>To continue, sign in with Dropbox via OAuth in your browser.</p>
-          <button disabled={awaitingCallback || authOk} onClick={startOAuth}>
-            {awaitingCallback ? "Waiting for Dropbox..." : "Start Dropbox Login"}
-          </button>
-          {awaitingCallback && (
-            <>
-              <p>Waiting for Dropbox confirmation...</p>
-              {oauthCallbackReady && (
-                <button
-                onClick={async () => {
-                  try {
-                    await completeOAuth();
-                    setAwaitingCallback(false);
-                    setOauthCallbackReady(false);
-                  } catch (e) {
-                    pushLog(`Manual OAuth completion failed: ${String(e)}`);
-                  }
-                }}
-              >
-                Continue
+          <p>Sign in with Dropbox in your browser. Use Retry if the browser tab closed or something went wrong.</p>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <button type="button" disabled={authOk} onClick={startOAuth}>
+              {awaitingCallback ? "Retry login" : "Start Dropbox login"}
+            </button>
+            {awaitingCallback && (
+              <button type="button" onClick={cancelOAuth}>
+                Cancel
               </button>
-              )}
-            </>
+            )}
+          </div>
+          {awaitingCallback && <p>Waiting for Dropbox confirmation...</p>}
+          {connectError && (
+            <p role="alert" style={{ color: "#b00020", marginTop: 12, whiteSpace: "pre-wrap" }}>
+              {connectError}
+            </p>
           )}
         </section>
       )}
@@ -533,7 +577,16 @@ function App() {
           Reconnect Dropbox, change the folder, or run a manual sync tick.
         </p>
         <h3>Dropbox OAuth</h3>
-        <button onClick={startOAuth}>Reconnect Dropbox</button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <button type="button" onClick={startOAuth}>
+            Reconnect Dropbox
+          </button>
+          {awaitingCallback && (
+            <button type="button" onClick={cancelOAuth}>
+              Cancel OAuth
+            </button>
+          )}
+        </div>
         {authUrl && (
           <p>
             Authorization URL: <a href={authUrl}>{authUrl}</a>

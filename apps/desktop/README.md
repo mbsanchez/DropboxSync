@@ -176,6 +176,7 @@ Schema summary:
 - `npm run build`
 - `npm run tauri`
 - `npm run bundle:dev`
-- `npm run start:dev`
+- `npm run dev:mac` (macOS: build app bundle and open it)
+- `npm run bundle:win` / `npm run dev:win` (Windows: release `.exe` only, no NSIS/MSI installer; `dev:win` also launches it)
 - `npm run tauri:before-build`
 - `npm run build:finder-sync`

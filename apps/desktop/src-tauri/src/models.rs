@@ -81,6 +81,15 @@ pub(crate) struct StartupRequirementsResponse {
     pub sync_folder: Option<String>,
 }
 
+/// Emitted to the webview after the localhost OAuth redirect is handled (success or failure).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DropboxOauthFinishedEvent {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CloudscMeta {
     pub version: u8,

@@ -16,13 +16,16 @@ npm install
 npm run dev
 ```
 
-Other useful commands:
+Other useful commands (use `dev:mac` on macOS and `dev:win` on Windows):
 
 ```bash
-npm run start:dev
+npm run dev:mac
+npm run dev:win
 npm run build
 npm run test
 ```
+
+On Windows, `dev:win` compiles the release `.exe` without generating an installer (NSIS/MSI) and starts that executable.
 
 ## Workspace layout
 

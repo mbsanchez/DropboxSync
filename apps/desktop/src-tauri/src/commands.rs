@@ -1,11 +1,11 @@
 use std::fs;
 use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
-use tauri::AppHandle;
-use tauri::Manager;
+use chrono::Utc;
+use tauri::{AppHandle, Manager};
 
-use crate::auth::oauth::{complete_oauth, start_oauth};
+use crate::auth::oauth::start_oauth;
+use crate::auth::oauth_complete::complete_oauth_internal;
 use crate::auth_session::{
     current_tray_status_label, has_stored_credentials, is_hard_auth_failure,
     update_tray_tooltip, verify_dropbox_token_internal,
@@ -15,57 +15,13 @@ use crate::cloudsc_ops::{
 };
 use crate::dropbox_transfer::{download_remote_file_internal, hydrate_remote_folder_internal};
 use crate::models::*;
-use crate::oauth_listener::start_oauth_callback_listener;
+use crate::oauth_listener::{start_oauth_callback_listener, stop_oauth_listener};
 use crate::state::AppState;
-use crate::storage;
-use crate::sync::engine::{OauthCallbackPayload, SyncStatus};
+use crate::sync::engine::SyncStatus;
 use crate::sync_pipeline::{
     process_sync_queue_internal, refresh_queue_depth_internal, run_sync_tick_internal,
     scan_local_changes_internal,
 };
-
-async fn complete_oauth_internal(
-    app_state: &AppState,
-    code: String,
-    state: String,
-) -> Result<(), String> {
-    let (expected_state, verifier) = {
-        let engine = app_state
-            .sync_engine
-            .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
-        (
-            engine.pending_oauth_state().unwrap_or_default(),
-            engine.pending_pkce_verifier().unwrap_or_default(),
-        )
-    };
-
-    if expected_state != state {
-        return Err("invalid oauth state".to_string());
-    }
-
-    let token = complete_oauth(code, verifier).await?;
-
-    let expires_at = token
-        .expires_in
-        .map(|in_s| (Utc::now() + Duration::seconds(in_s)).to_rfc3339());
-    let session = storage::secure_store::TokenSession {
-        access_token: token.access_token.clone(),
-        refresh_token: token.refresh_token.clone(),
-        expires_at,
-    };
-
-    app_state
-        .secure_store
-        .store_session(&session)
-        .map_err(|e| format!("failed to store token session: {e}"))?;
-
-    if let Ok(mut cache) = app_state.token_cache.lock() {
-        *cache = Some(session);
-    }
-
-    Ok(())
-}
 
 #[tauri::command]
 pub fn get_selective_sync_filters(
@@ -97,7 +53,10 @@ pub fn set_selective_sync_filters(
 }
 
 #[tauri::command]
-pub fn start_oauth_flow(state: tauri::State<AppState>) -> Result<OauthStartResponse, String> {
+pub fn start_oauth_flow(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<OauthStartResponse, String> {
     let (auth_url, oauth_state, verifier) = start_oauth()?;
     {
         let mut engine = state
@@ -106,7 +65,11 @@ pub fn start_oauth_flow(state: tauri::State<AppState>) -> Result<OauthStartRespo
             .map_err(|_| "sync engine lock poisoned".to_string())?;
         engine.set_oauth_context(oauth_state.clone(), verifier);
     }
-    start_oauth_callback_listener(state.sync_engine.clone())?;
+    start_oauth_callback_listener(
+        app,
+        state.inner().clone(),
+        state.oauth_listener.clone(),
+    )?;
 
     Ok(OauthStartResponse {
         auth_url,
@@ -124,32 +87,14 @@ pub async fn complete_oauth_flow(
 }
 
 #[tauri::command]
-pub async fn complete_oauth_from_callback(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
-    let callback = {
-        let mut engine = app_state
-            .sync_engine
-            .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
-        engine.consume_oauth_callback()
-    };
-    let Some(payload) = callback else {
-        return Ok(false);
-    };
-    complete_oauth_internal(app_state.inner(), payload.code, payload.state).await?;
-    Ok(true)
-}
-
-#[tauri::command]
-pub fn poll_oauth_callback(
-    state: tauri::State<AppState>,
-) -> Result<Option<OauthCallbackPayload>, String> {
+pub fn cancel_oauth_flow(state: tauri::State<AppState>) -> Result<(), String> {
+    stop_oauth_listener(&state.oauth_listener)?;
     let mut engine = state
         .sync_engine
         .lock()
         .map_err(|_| "sync engine lock poisoned".to_string())?;
-    Ok(engine.consume_oauth_callback())
+    engine.clear_oauth_pending();
+    Ok(())
 }
 
 #[tauri::command]
@@ -183,6 +128,18 @@ pub fn get_startup_requirements(
         .as_ref()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
+
+    // In-memory session (e.g. just completed OAuth): trust it for onboarding without a network probe.
+    // Keychain reads can lag on some platforms; do not require `has_stored_credentials` here.
+    if let Ok(cache) = state.token_cache.lock() {
+        if cache.is_some() {
+            return Ok(StartupRequirementsResponse {
+                auth_ok: true,
+                sync_folder_ok,
+                sync_folder,
+            });
+        }
+    }
 
     let has_creds = has_stored_credentials(state.inner());
     let auth_ok = if !has_creds {
@@ -255,6 +212,16 @@ pub fn start_background_scheduler(
 pub fn hide_main_window(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn show_main_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|e| e.to_string())?;
+        let _ = window.unminimize();
+        let _ = window.set_focus();
     }
     Ok(())
 }
