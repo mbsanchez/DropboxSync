@@ -63,19 +63,69 @@ pub(crate) fn is_path_allowed(
     true
 }
 
+/// Block size used by the Dropbox content_hash algorithm (4 MiB).
+const DROPBOX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Compute a [Dropbox content_hash](https://www.dropbox.com/developers/reference/content-hash)
+/// for the file at `path`.
+///
+/// The algorithm:
+/// 1. Split the file into 4 MiB blocks (last block may be smaller).
+/// 2. SHA-256 each block individually.
+/// 3. Concatenate the raw 32-byte block digests.
+/// 4. SHA-256 the concatenation.
+/// 5. Return the result as a lowercase hex string.
+///
+/// Returns `(content_hash_hex, file_size_bytes, modified_unix_timestamp)`.
+///
+/// # Errors
+///
+/// Returns an error string if the file cannot be opened, read, or stat-ed.
 pub(crate) fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {
     let mut file = File::open(path).map_err(|e| format!("cannot open file for hash: {e}"))?;
-    let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];
+
+    // Accumulates the raw 32-byte SHA-256 digest of each 4 MiB block.
+    let mut block_digests: Vec<u8> = Vec::new();
+    let mut block_hasher = Sha256::new();
+    let mut bytes_in_block: usize = 0;
+
     loop {
         let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+
+        let mut remaining = &buffer[..read];
+        while !remaining.is_empty() {
+            let space_in_block = DROPBOX_BLOCK_SIZE - bytes_in_block;
+            let to_consume = remaining.len().min(space_in_block);
+            block_hasher.update(&remaining[..to_consume]);
+            bytes_in_block += to_consume;
+            remaining = &remaining[to_consume..];
+
+            if bytes_in_block == DROPBOX_BLOCK_SIZE {
+                // Finalise this block and start the next one.
+                let digest = block_hasher.finalize_reset();
+                block_digests.extend_from_slice(&digest);
+                bytes_in_block = 0;
+            }
+        }
     }
 
-    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    // Finalise the trailing partial block (if any bytes were buffered).
+    // An empty file has zero blocks: block_digests stays empty, and
+    // SHA-256(b"") = e3b0c44298fc1c149afbf4c8996fb924... — which is the
+    // correct Dropbox content_hash for an empty file.
+    if bytes_in_block > 0 {
+        let digest = block_hasher.finalize();
+        block_digests.extend_from_slice(&digest);
+    }
+
+    // SHA-256 the concatenation of all block digests.
+    let content_hash = Sha256::digest(&block_digests);
+
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
     let size = metadata.len() as i64;
     let modified = metadata
         .modified()
@@ -84,7 +134,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    Ok((format!("{:x}", hasher.finalize()), size, modified))
+    Ok((format!("{:x}", content_hash), size, modified))
 }
 
 pub(crate) fn create_conflicted_copy(path: &Path) -> Result<PathBuf, String> {
@@ -115,12 +165,147 @@ pub(crate) fn backoff_seconds(attempt: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::backoff_seconds;
+    use std::io::Write;
+
+    use sha2::{Digest, Sha256};
+    use tempfile::NamedTempFile;
+
+    use super::{backoff_seconds, hash_file, DROPBOX_BLOCK_SIZE};
+
+    // ---------------------------------------------------------------------------
+    // Helper: compute the Dropbox content_hash for an in-memory byte slice so
+    // that tests can build the expected value without touching disk.
+    // ---------------------------------------------------------------------------
+    fn expected_content_hash(data: &[u8]) -> String {
+        let mut block_digests: Vec<u8> = Vec::new();
+        let mut block_hasher = Sha256::new();
+        let mut bytes_in_block: usize = 0;
+
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let space_in_block = DROPBOX_BLOCK_SIZE - bytes_in_block;
+            let to_consume = remaining.len().min(space_in_block);
+            block_hasher.update(&remaining[..to_consume]);
+            bytes_in_block += to_consume;
+            remaining = &remaining[to_consume..];
+
+            if bytes_in_block == DROPBOX_BLOCK_SIZE {
+                let digest = block_hasher.finalize_reset();
+                block_digests.extend_from_slice(&digest);
+                bytes_in_block = 0;
+            }
+        }
+        if bytes_in_block > 0 {
+            let digest = block_hasher.finalize();
+            block_digests.extend_from_slice(&digest);
+        }
+        format!("{:x}", Sha256::digest(&block_digests))
+    }
+
+    // ---------------------------------------------------------------------------
+    // Existing test
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn backoff_grows_exponentially() {
         assert_eq!(backoff_seconds(1), 2);
         assert_eq!(backoff_seconds(2), 4);
         assert_eq!(backoff_seconds(3), 8);
+    }
+
+    // ---------------------------------------------------------------------------
+    // content_hash tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn content_hash_empty_file() {
+        let tmp = NamedTempFile::new().expect("tempfile");
+        let (hash, size, mtime) = hash_file(tmp.path()).expect("hash_file");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "empty file must match SHA-256 of empty bytes"
+        );
+        assert_eq!(size, 0);
+        // mtime may legally be 0 on some platforms, so just assert it is non-negative.
+        assert!(mtime >= 0);
+    }
+
+    #[test]
+    fn content_hash_small_file() {
+        // A file smaller than 4 MiB has exactly one block.
+        // content_hash = SHA-256( SHA-256(content) )
+        let content = b"hello, dropbox content hash!";
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(content).expect("write");
+        tmp.flush().expect("flush");
+
+        let (hash, size, mtime) = hash_file(tmp.path()).expect("hash_file");
+
+        let expected = expected_content_hash(content);
+        assert_eq!(hash, expected);
+        assert_eq!(size, content.len() as i64);
+        assert!(mtime > 0, "modified timestamp should be non-zero");
+    }
+
+    #[test]
+    fn content_hash_exactly_one_block() {
+        // Exactly 4 MiB of zeros: one full block, no remainder.
+        let content = vec![0_u8; DROPBOX_BLOCK_SIZE];
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(&content).expect("write");
+        tmp.flush().expect("flush");
+
+        let (hash, size, _mtime) = hash_file(tmp.path()).expect("hash_file");
+
+        let expected = expected_content_hash(&content);
+        assert_eq!(hash, expected);
+        assert_eq!(size, DROPBOX_BLOCK_SIZE as i64);
+    }
+
+    #[test]
+    fn content_hash_one_block_plus_one_byte() {
+        // 4 MiB + 1 byte: two blocks (one full, one 1-byte).
+        let mut content = vec![0_u8; DROPBOX_BLOCK_SIZE];
+        content.push(0_u8);
+
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(&content).expect("write");
+        tmp.flush().expect("flush");
+
+        let (hash, size, _mtime) = hash_file(tmp.path()).expect("hash_file");
+
+        let expected = expected_content_hash(&content);
+        assert_eq!(hash, expected);
+        assert_eq!(size, (DROPBOX_BLOCK_SIZE + 1) as i64);
+    }
+
+    #[test]
+    fn content_hash_known_value_independent() {
+        // Independent cross-check: compute expected hash WITHOUT using the
+        // helper function, to avoid the "same oracle" testing pitfall.
+        // For a single-block file: content_hash = SHA-256(SHA-256(content)).
+        let content = b"hello, dropbox content hash!";
+        let inner_digest = Sha256::digest(content);
+        let expected = format!("{:x}", Sha256::digest(inner_digest));
+
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(content).expect("write");
+        tmp.flush().expect("flush");
+
+        let (hash, _, _) = hash_file(tmp.path()).expect("hash_file");
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn content_hash_returns_correct_size_and_mtime() {
+        let content = b"size and mtime check";
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(content).expect("write");
+        tmp.flush().expect("flush");
+
+        let (_hash, size, mtime) = hash_file(tmp.path()).expect("hash_file");
+        assert_eq!(size, content.len() as i64);
+        assert!(mtime > 0, "modified timestamp must be non-zero for a newly created file");
     }
 }
