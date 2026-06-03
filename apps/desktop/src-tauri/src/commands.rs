@@ -269,6 +269,14 @@ pub fn get_sync_dashboard(state: tauri::State<AppState>) -> Result<SyncDashboard
     })
 }
 
+/// Reset all permanently-failed jobs back to `queued` so the next tick retries them.
+#[tauri::command]
+pub fn retry_failed_jobs(state: tauri::State<AppState>) -> Result<usize, String> {
+    let requeued = state.db.requeue_failed_jobs()?;
+    refresh_queue_depth_internal(state.inner())?;
+    Ok(requeued)
+}
+
 #[tauri::command]
 pub fn scan_local_changes(state: tauri::State<AppState>) -> Result<usize, String> {
     scan_local_changes_internal(state.inner())

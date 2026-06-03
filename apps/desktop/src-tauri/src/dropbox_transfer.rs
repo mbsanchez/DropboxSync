@@ -93,6 +93,23 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
         return Err(format!("local file missing for upload: {relative}"));
     }
 
+    // Skip the upload when Dropbox already holds identical content. This avoids
+    // re-uploading files that originated from Dropbox (e.g. after a sync-state
+    // reset re-indexes existing downloads as "new" local files).
+    if let Some(local) = state.db.get_local_file(relative)? {
+        if let Some(remote) = crate::remote_index::fetch_remote_file_metadata(state, relative)? {
+            if remote.content_hash == local.hash {
+                state.db.upsert_remote_file(
+                    relative,
+                    &remote.content_hash,
+                    &remote.rev,
+                    remote.modified_ts,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
     let bytes = fs::read(&local_path)
         .map_err(|e| format!("failed reading local file bytes for upload: {e}"))?;
 

@@ -33,6 +33,7 @@ pub struct SyncJobRow {
     pub attempt_count: i64,
     pub next_retry_at: Option<String>,
     pub updated_at: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -194,6 +195,25 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
+    pub fn get_local_file(&self, relative_path: &str) -> Result<Option<FileIndexRow>, String> {
+        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT relative_path, hash, size_bytes, modified_ts FROM local_file_index WHERE relative_path = ?1 LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![relative_path]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            return Ok(Some(FileIndexRow {
+                relative_path: row.get(0).map_err(|e| e.to_string())?,
+                hash: row.get(1).map_err(|e| e.to_string())?,
+                size_bytes: row.get(2).map_err(|e| e.to_string())?,
+                modified_ts: row.get(3).map_err(|e| e.to_string())?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn upsert_local_file(
         &self,
         relative_path: &str,
@@ -317,7 +337,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error
                 FROM sync_jobs
                 ORDER BY id DESC
                 LIMIT ?1
@@ -336,6 +356,7 @@ impl Db {
                     attempt_count: row.get(5)?,
                     next_retry_at: row.get(6)?,
                     updated_at: row.get(7)?,
+                    last_error: row.get(8)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -350,7 +371,7 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "
-                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error
                 FROM sync_jobs
                 WHERE status = 'queued' OR (status = 'retry_wait' AND (next_retry_at IS NULL OR next_retry_at <= ?1))
                 ORDER BY id ASC
@@ -370,6 +391,7 @@ impl Db {
                     attempt_count: row.get(5).map_err(|e| e.to_string())?,
                     next_retry_at: row.get(6).map_err(|e| e.to_string())?,
                     updated_at: row.get(7).map_err(|e| e.to_string())?,
+                    last_error: row.get(8).map_err(|e| e.to_string())?,
                 })
             } else {
                 None
@@ -390,7 +412,7 @@ impl Db {
         let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
         conn
             .execute(
-                "UPDATE sync_jobs SET status='done', updated_at=?2 WHERE id=?1",
+                "UPDATE sync_jobs SET status='done', last_error=NULL, updated_at=?2 WHERE id=?1",
                 params![id, Utc::now().to_rfc3339()],
             )
             .map_err(|e| e.to_string())?;
@@ -402,34 +424,79 @@ impl Db {
         id: i64,
         attempt_count: i64,
         next_retry_at: &str,
+        last_error: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
         conn
             .execute(
                 "
                 UPDATE sync_jobs
-                SET status='retry_wait', attempt_count=?2, next_retry_at=?3, updated_at=?4
+                SET status='retry_wait', attempt_count=?2, next_retry_at=?3, last_error=?4, updated_at=?5
                 WHERE id=?1
                 ",
-                params![id, attempt_count, next_retry_at, Utc::now().to_rfc3339()],
+                params![id, attempt_count, next_retry_at, last_error, Utc::now().to_rfc3339()],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn mark_job_failed(&self, id: i64, attempt_count: i64) -> Result<(), String> {
+    pub fn mark_job_failed(
+        &self,
+        id: i64,
+        attempt_count: i64,
+        last_error: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
         conn
             .execute(
                 "
                 UPDATE sync_jobs
-                SET status='failed', attempt_count=?2, updated_at=?3
+                SET status='failed', attempt_count=?2, last_error=?3, updated_at=?4
                 WHERE id=?1
                 ",
-                params![id, attempt_count, Utc::now().to_rfc3339()],
+                params![id, attempt_count, last_error, Utc::now().to_rfc3339()],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// The most recent failed job's error message, or `None` if no jobs are failed.
+    /// Drives the dashboard's global error/health so a later unrelated success
+    /// doesn't mask that failures are still present.
+    pub fn latest_failed_error(&self) -> Result<Option<String>, String> {
+        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT last_error FROM sync_jobs
+                WHERE status='failed'
+                ORDER BY id DESC
+                LIMIT 1
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let msg: Option<String> = row.get(0).map_err(|e| e.to_string())?;
+            return Ok(Some(msg.unwrap_or_else(|| "job failed".to_string())));
+        }
+        Ok(None)
+    }
+
+    /// Resets all `failed` jobs back to `queued` so they are retried. Returns the count.
+    pub fn requeue_failed_jobs(&self) -> Result<usize, String> {
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let n = conn
+            .execute(
+                "
+                UPDATE sync_jobs
+                SET status='queued', attempt_count=0, next_retry_at=NULL, last_error=NULL, updated_at=?1
+                WHERE status='failed'
+                ",
+                params![Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n)
     }
 
     pub fn add_conflict(&self, local_path: &str, remote_path: &str, reason: &str) -> Result<(), String> {
@@ -540,7 +607,42 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         );
         ",
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Additive migrations for databases created before a column existed.
+    add_column_if_missing(conn, "sync_jobs", "last_error", "TEXT")?;
+    Ok(())
+}
+
+/// Adds `column` to `table` if it isn't already present. Idempotent so it can run
+/// on every startup without failing on databases that already have the column.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let mut exists = false;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?;
+    for name in names {
+        if name.map_err(|e| e.to_string())? == column {
+            exists = true;
+            break;
+        }
+    }
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Shared app data directory (SQLite DB, overlay_state.json for shell extensions).
