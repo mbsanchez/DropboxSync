@@ -53,8 +53,14 @@ pub struct Db {
 
 impl Db {
     pub fn new() -> Result<Self, String> {
-        let path = db_path()?;
-        let write = Connection::open(&path).map_err(|e| e.to_string())?;
+        Self::new_at(&db_path()?)
+    }
+
+    /// Open a database at an explicit path. Used by tests to stay fully isolated
+    /// from the production database (which `db_path()` resolves via OS-specific
+    /// app-data dirs), so running `cargo test` never touches a user's real DB.
+    pub fn new_at(path: &std::path::Path) -> Result<Self, String> {
+        let write = Connection::open(path).map_err(|e| e.to_string())?;
         write
             .execute_batch(
                 "
@@ -67,7 +73,7 @@ impl Db {
         migrate(&write)?;
 
         let read = Connection::open_with_flags(
-            path.as_path(),
+            path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| e.to_string())?;
@@ -570,22 +576,23 @@ fn db_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::Db;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_home() -> String {
+    /// A unique temp DB file path so tests never touch the production database.
+    fn unique_db_path() -> PathBuf {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("dropbox-sync-test-{ts}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        dir.to_string_lossy().to_string()
+        dir.join("app.db")
     }
 
     #[test]
     fn persists_local_file_index_and_jobs() {
-        std::env::set_var("HOME", unique_home());
-        let db = Db::new().expect("db init");
+        let db = Db::new_at(&unique_db_path()).expect("db init");
         db.set_sync_folder("/tmp/folder").expect("set folder");
         db.upsert_local_file("a.txt", "abc123", 10, 123)
             .expect("upsert");

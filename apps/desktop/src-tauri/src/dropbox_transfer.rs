@@ -109,6 +109,7 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
             })
             .to_string(),
         )
+        .header("Content-Type", "application/octet-stream")
         .body(bytes)
         .send()
         .map_err(|e| format!("upload request failed: {e}"))?;

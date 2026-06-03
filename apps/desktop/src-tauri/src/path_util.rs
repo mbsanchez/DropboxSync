@@ -22,10 +22,12 @@ pub(crate) fn normalize_dropbox_path(input: &str) -> String {
     if input.is_empty() {
         return "".to_string();
     }
-    if input.starts_with('/') {
-        input.to_string()
+    // Windows relative paths use `\` separators; Dropbox requires `/`.
+    let forward = input.replace('\\', "/");
+    if forward.starts_with('/') {
+        forward
     } else {
-        format!("/{}", input)
+        format!("/{}", forward)
     }
 }
 
