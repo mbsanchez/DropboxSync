@@ -170,6 +170,25 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
     Ok(())
 }
 
+/// Removes a local file that was deleted on the remote (remote-wins deletion).
+/// Cleans both index tables so the file is not re-detected on the next tick.
+pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Result<(), String> {
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| "sync folder not configured".to_string())?;
+
+    let local_path = PathBuf::from(&folder).join(relative);
+    if local_path.exists() {
+        fs::remove_file(&local_path)
+            .map_err(|e| format!("failed to delete local file {relative}: {e}"))?;
+    }
+
+    state.db.remove_local_file(relative)?;
+    state.db.remove_remote_file(relative)?;
+    Ok(())
+}
+
 pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> Result<(), String> {
     let token = get_access_token(state)?;
     let folder = state

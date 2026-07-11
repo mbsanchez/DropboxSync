@@ -102,6 +102,29 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
         let prev_remote = state.db.get_remote_file(&rel)?;
         let remote_meta = fetch_remote_file_metadata(state, &rel)?;
         let Some(remote_meta) = remote_meta else {
+            // Remote copy is gone. Only propagate the deletion when we had
+            // previously indexed a remote copy (otherwise the file may simply
+            // never have been uploaded yet).
+            if let Some(prev) = prev_remote {
+                if local.hash == prev.content_hash {
+                    // Local matches the last-synced remote content: safe to
+                    // delete locally (remote-wins).
+                    state.db.enqueue_job("local_delete", Some(&rel), Some(&rel))?;
+                    enqueued += 1;
+                } else {
+                    // Local was modified while the remote was deleted: keep the
+                    // local copy and flag a conflict instead of losing data.
+                    state.db.add_conflict(
+                        &rel,
+                        &rel,
+                        "remote deleted while local had unsynced changes",
+                    )?;
+                    state.db.remove_remote_file(&rel)?;
+                    if let Ok(mut engine) = state.sync_engine.lock() {
+                        engine.record_conflict();
+                    }
+                }
+            }
             continue;
         };
 

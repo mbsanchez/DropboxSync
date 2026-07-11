@@ -300,6 +300,17 @@ impl Db {
         Ok(())
     }
 
+    pub fn remove_remote_file(&self, relative_path: &str) -> Result<(), String> {
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        conn
+            .execute(
+                "DELETE FROM remote_file_index WHERE relative_path = ?1",
+                params![relative_path],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn enqueue_job(
         &self,
         job_type: &str,

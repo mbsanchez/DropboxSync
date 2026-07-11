@@ -6,7 +6,8 @@ use walkdir::WalkDir;
 
 use crate::cloudsc_ops::hydrate_cloudsc_placeholder_internal;
 use crate::dropbox_transfer::{
-    delete_remote_file_internal, download_remote_file_internal, upload_local_file_internal,
+    delete_local_file_internal, delete_remote_file_internal, download_remote_file_internal,
+    upload_local_file_internal,
 };
 use crate::models::SyncTickResult;
 use crate::path_util::{
@@ -186,6 +187,12 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
             .or(job.source_path.as_deref())
             .ok_or_else(|| "delete job missing target_path/source_path".to_string())
             .and_then(|rel| delete_remote_file_internal(state, rel)),
+        "local_delete" => job
+            .target_path
+            .as_deref()
+            .or(job.source_path.as_deref())
+            .ok_or_else(|| "local_delete job missing target_path/source_path".to_string())
+            .and_then(|rel| delete_local_file_internal(state, rel)),
         "download" => job
             .target_path
             .as_deref()
