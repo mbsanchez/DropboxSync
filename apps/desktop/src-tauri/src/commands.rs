@@ -209,12 +209,17 @@ pub fn start_background_scheduler(
                 if let Ok(mut engine) = app_state.sync_engine.lock() {
                     engine.set_sync_running(true);
                 }
+                // Run the sync tick first so a local folder deletion is detected,
+                // its `delete` job enqueued, and drained within this same tick
+                // (deleting the folder remotely) before discovery runs. Otherwise
+                // discovery would still see the (now-orphaned) remote folder and
+                // re-create its `.cloudsc` placeholder.
+                let _ = run_sync_tick_internal(&app_state);
                 match index_materialized_folders_as_cloudsc_placeholders_internal(&app_state) {
                     Ok(n) if n > 0 => eprintln!("indexed {n} new remote placeholder(s)"),
                     Ok(_) => {}
                     Err(e) => eprintln!("remote placeholder indexing failed: {e}"),
                 }
-                let _ = run_sync_tick_internal(&app_state);
                 if let Ok(mut engine) = app_state.sync_engine.lock() {
                     engine.set_sync_running(false);
                 }

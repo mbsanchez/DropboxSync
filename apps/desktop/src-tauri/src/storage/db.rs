@@ -110,6 +110,49 @@ impl Db {
         conn.execute("DELETE FROM remote_file_index", []).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM sync_jobs", []).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM sync_conflicts", []).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM known_folders", []).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Records that `relative_path` is a currently-materialized (real, on-disk)
+    /// folder under the sync root, so a later scan can detect it being deleted
+    /// locally even though folders themselves have no content to diff.
+    pub fn upsert_known_folder(&self, relative_path: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        conn
+            .execute(
+                "
+                INSERT INTO known_folders(relative_path, updated_at)
+                VALUES(?1, ?2)
+                ON CONFLICT(relative_path) DO UPDATE SET
+                  updated_at=excluded.updated_at
+                ",
+                params![relative_path, now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_known_folders(&self) -> Result<Vec<String>, String> {
+        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT relative_path FROM known_folders ORDER BY relative_path")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn remove_known_folder(&self, relative_path: &str) -> Result<(), String> {
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        conn
+            .execute(
+                "DELETE FROM known_folders WHERE relative_path = ?1",
+                params![relative_path],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -731,6 +774,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             modified_ts INTEGER NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS known_folders (
+            relative_path TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL
+        );
         ",
     )
     .map_err(|e| e.to_string())?;
@@ -927,5 +975,31 @@ mod tests {
         let second = db.get_upload_checkpoint(job.id).expect("get second");
         assert_eq!(second, Some(("sess-b".to_string(), 0, 6_000, 1_800_000_000)));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn known_folders_upsert_list_remove_round_trip() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("Cocina/Test").expect("upsert 1");
+        db.upsert_known_folder("Cocina/Otra").expect("upsert 2");
+
+        let mut folders = db.list_known_folders().expect("list");
+        folders.sort();
+        assert_eq!(folders, vec!["Cocina/Otra".to_string(), "Cocina/Test".to_string()]);
+
+        db.remove_known_folder("Cocina/Otra").expect("remove");
+        let folders = db.list_known_folders().expect("list after remove");
+        assert_eq!(folders, vec!["Cocina/Test".to_string()]);
+    }
+
+    #[test]
+    fn reset_sync_state_clears_known_folders() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("Cocina/Test").expect("upsert");
+        assert_eq!(db.list_known_folders().expect("list").len(), 1);
+
+        db.reset_sync_state().expect("reset");
+
+        assert!(db.list_known_folders().expect("list after reset").is_empty());
     }
 }

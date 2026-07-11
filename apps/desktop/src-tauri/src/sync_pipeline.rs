@@ -57,6 +57,15 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
         .collect();
 
     let tracked_root = PathBuf::from(&folder);
+
+    // Safety guard against catastrophic mass-deletion: if the sync folder is
+    // missing or inaccessible (unmounted drive, transient FS error, wrong path),
+    // WalkDir yields nothing and every known file/folder would look "deleted",
+    // enqueuing recursive remote deletes. Bail out instead of propagating that.
+    if !tracked_root.is_dir() {
+        return Ok(0);
+    }
+
     let known_map: HashMap<String, FileIndexRow> = known
         .iter()
         .map(|f| (f.relative_path.clone(), f.clone()))
@@ -65,12 +74,24 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
     let mut pending_targets = pending_targets;
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut enqueued_jobs = 0usize;
+    // If any directory can't be read mid-walk (permission denied, AV/network
+    // hiccup, root momentarily unlistable), its entries never enter
+    // `seen_paths`/`seen_dirs` and would be mistaken for deletions — triggering
+    // recursive remote `delete_v2`. Track that and skip deletion detection when
+    // the walk was incomplete; uploads/downloads still proceed safely.
+    let mut walk_had_error = false;
 
-    for entry in WalkDir::new(&tracked_root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in WalkDir::new(&tracked_root).into_iter() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                walk_had_error = true;
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let absolute = entry.path().to_path_buf();
         let relative = absolute
             .strip_prefix(&tracked_root)
@@ -138,21 +159,71 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
         }
     }
 
-    for prev in known {
-        if prev.relative_path.ends_with(".cloudsc") {
+    // Only propagate FILE deletions when we trust the walk was complete.
+    if !walk_had_error {
+        for prev in known {
+            if prev.relative_path.ends_with(".cloudsc") {
+                continue;
+            }
+            if should_ignore_local_path(&prev.relative_path) {
+                continue;
+            }
+            if !seen_paths.contains(&prev.relative_path) {
+                state.db.enqueue_job(
+                    "delete",
+                    Some(&prev.relative_path),
+                    Some(&prev.relative_path),
+                )?;
+                state.db.remove_local_file(&prev.relative_path)?;
+                enqueued_jobs += 1;
+            }
+        }
+    }
+
+    // Track real (materialized) directories so a folder deletion — which has no
+    // file content to diff — can still be detected: any previously-known folder
+    // that is no longer present on disk must have been deleted locally, so its
+    // remote counterpart needs to be deleted too (delete_v2 is recursive).
+    let mut seen_dirs: HashSet<String> = HashSet::new();
+    for entry in WalkDir::new(&tracked_root).into_iter() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                walk_had_error = true;
+                continue;
+            }
+        };
+        if !entry.file_type().is_dir() {
             continue;
         }
-        if should_ignore_local_path(&prev.relative_path) {
+        let absolute = entry.path().to_path_buf();
+        let relative = absolute
+            .strip_prefix(&tracked_root)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .to_string();
+
+        if relative.is_empty() {
+            continue; // skip the sync root itself
+        }
+        if should_ignore_local_path(&relative) {
             continue;
         }
-        if !seen_paths.contains(&prev.relative_path) {
-            state.db.enqueue_job(
-                "delete",
-                Some(&prev.relative_path),
-                Some(&prev.relative_path),
-            )?;
-            state.db.remove_local_file(&prev.relative_path)?;
-            enqueued_jobs += 1;
+
+        seen_dirs.insert(relative.clone());
+        state.db.upsert_known_folder(&relative)?;
+    }
+
+    // Only propagate FOLDER deletions (recursive remote delete) when the dir
+    // walk was fully readable — a partial walk must never be treated as a batch
+    // of deletions.
+    if !walk_had_error {
+        for rel in state.db.list_known_folders()? {
+            if !seen_dirs.contains(&rel) {
+                state.db.enqueue_job("delete", Some(&rel), Some(&rel))?;
+                state.db.remove_known_folder(&rel)?;
+                enqueued_jobs += 1;
+            }
         }
     }
 

@@ -56,7 +56,7 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             // A local directory with no Dropbox counterpart (e.g. a local-only
             // folder pending upload) is not an error for this indexer — it simply
             // has nothing to placeholder. Don't spam the log or fail the sweep.
-            if body.contains("path/not_found") || body.contains("not_found") {
+            if body.contains("path/not_found") {
                 return Ok(0);
             }
             return Err(format!(
