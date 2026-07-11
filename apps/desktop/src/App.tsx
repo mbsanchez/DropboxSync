@@ -267,6 +267,29 @@ function App() {
     };
   }, []);
 
+  // Rust emits `upload-progress` while streaming a large file through the chunked
+  // upload-session API, so the log shows liveness for uploads that take a while.
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    void listen<{ path: string; transferred: number; total: number }>("upload-progress", (event) => {
+      if (!active) return;
+      pushLog(`Uploading ${event.payload.path}: ${event.payload.transferred}/${event.payload.total} bytes`);
+    }).then((fn) => {
+      if (!active) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
   // Fallback while waiting: slow poll (WebView often throttles `setInterval` when the browser has focus).
   useEffect(() => {
     if (!awaitingCallback) return;
