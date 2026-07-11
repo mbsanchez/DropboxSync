@@ -152,6 +152,17 @@ pub fn run() {
             }
 
             if let Some(state) = app.try_state::<AppState>() {
+                // Recover jobs stuck in `running` from a previous crash/kill before the
+                // background scheduler starts processing the queue, so a large in-flight
+                // upload resumes from its checkpoint instead of being silently zombied.
+                match state.db.recover_running_jobs() {
+                    Ok(count) if count > 0 => {
+                        eprintln!("DropboxSyncDesktop: recovered {count} stale running job(s) on startup");
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("DropboxSyncDesktop: failed to recover running jobs: {e}"),
+                }
+
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
             }
 

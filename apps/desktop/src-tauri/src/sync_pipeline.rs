@@ -185,7 +185,7 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
             .source_path
             .as_deref()
             .ok_or_else(|| "upload job missing source_path".to_string())
-            .and_then(|rel| upload_local_file_internal(state, rel)),
+            .and_then(|rel| upload_local_file_internal(state, rel, job.id)),
         "delete" => job
             .target_path
             .as_deref()
