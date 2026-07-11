@@ -289,16 +289,9 @@ pub fn process_sync_queue(state: tauri::State<AppState>) -> Result<bool, String>
 
 #[tauri::command]
 pub fn sync_tick(state: tauri::State<AppState>) -> Result<SyncTickResult, String> {
-    let enqueued_jobs = scan_local_changes_internal(state.inner())?;
-    let processed_job = process_sync_queue_internal(state.inner())?;
-
-    let scanned_files = state.db.list_local_files()?.len();
-
-    Ok(SyncTickResult {
-        scanned_files,
-        enqueued_jobs,
-        processed_job,
-    })
+    // Delegate to the shared implementation so this IPC entry point drains the
+    // queue in batches too (DBSYNC-10), instead of only one job per call.
+    run_sync_tick_internal(state.inner())
 }
 
 #[tauri::command]
