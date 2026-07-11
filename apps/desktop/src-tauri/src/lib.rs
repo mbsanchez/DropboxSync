@@ -155,6 +155,11 @@ pub fn run() {
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
             }
 
+            // Single set-once site for `state::APP_HANDLE`, read by
+            // `dropbox_transfer::emit_upload_progress` to emit `upload-progress` events
+            // from background sync work. Not duplicated in `start_background_scheduler`.
+            let _ = crate::state::APP_HANDLE.set(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

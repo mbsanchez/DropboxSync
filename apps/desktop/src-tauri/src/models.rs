@@ -40,6 +40,11 @@ pub(crate) struct DropboxListFolderResponse {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct UploadSessionStartResponse {
+    pub session_id: String,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct DropboxEntry {
     #[serde(rename = ".tag")]
     pub tag: String,
@@ -88,6 +93,16 @@ pub(crate) struct DropboxOauthFinishedEvent {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Emitted to the webview while `upload_via_session` streams a large file, so the UI can
+/// show progress without polling.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UploadProgressEvent {
+    pub path: String,
+    pub transferred: u64,
+    pub total: u64,
 }
 
 #[derive(Serialize, Deserialize)]
