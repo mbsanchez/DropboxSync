@@ -93,6 +93,23 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
         return Err(format!("local file missing for upload: {relative}"));
     }
 
+    // Skip the upload when Dropbox already holds identical content. This avoids
+    // re-uploading files that originated from Dropbox (e.g. after a sync-state
+    // reset re-indexes existing downloads as "new" local files).
+    if let Some(local) = state.db.get_local_file(relative)? {
+        if let Some(remote) = crate::remote_index::fetch_remote_file_metadata(state, relative)? {
+            if remote.content_hash == local.hash {
+                state.db.upsert_remote_file(
+                    relative,
+                    &remote.content_hash,
+                    &remote.rev,
+                    remote.modified_ts,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
     let bytes = fs::read(&local_path)
         .map_err(|e| format!("failed reading local file bytes for upload: {e}"))?;
 
@@ -109,6 +126,7 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
             })
             .to_string(),
         )
+        .header("Content-Type", "application/octet-stream")
         .body(bytes)
         .send()
         .map_err(|e| format!("upload request failed: {e}"))?;
@@ -149,6 +167,25 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
         ));
     }
 
+    Ok(())
+}
+
+/// Removes a local file that was deleted on the remote (remote-wins deletion).
+/// Cleans both index tables so the file is not re-detected on the next tick.
+pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Result<(), String> {
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| "sync folder not configured".to_string())?;
+
+    let local_path = PathBuf::from(&folder).join(relative);
+    if local_path.exists() {
+        fs::remove_file(&local_path)
+            .map_err(|e| format!("failed to delete local file {relative}: {e}"))?;
+    }
+
+    state.db.remove_local_file(relative)?;
+    state.db.remove_remote_file(relative)?;
     Ok(())
 }
 

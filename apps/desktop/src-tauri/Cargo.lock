@@ -930,6 +930,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tempfile",
  "url",
  "urlencoding",
  "walkdir",

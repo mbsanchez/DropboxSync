@@ -6,7 +6,8 @@ use walkdir::WalkDir;
 
 use crate::cloudsc_ops::hydrate_cloudsc_placeholder_internal;
 use crate::dropbox_transfer::{
-    delete_remote_file_internal, download_remote_file_internal, upload_local_file_internal,
+    delete_local_file_internal, delete_remote_file_internal, download_remote_file_internal,
+    upload_local_file_internal,
 };
 use crate::models::SyncTickResult;
 use crate::path_util::{
@@ -21,11 +22,18 @@ use crate::storage::db::FileIndexRow;
 pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> Result<(), String> {
     let queue_depth = state.db.count_active_jobs()?;
 
+    let failed_error = state.db.latest_failed_error()?;
+
     let mut engine = state
         .sync_engine
         .lock()
         .map_err(|_| "sync engine lock poisoned".to_string())?;
     engine.set_queue_depth(queue_depth);
+    match failed_error {
+        Some(msg) => engine.set_last_error(msg),
+        None => engine.clear_last_error(),
+    }
+    drop(engine);
     overlay_state::refresh_overlay_state_internal(state);
     Ok(())
 }
@@ -179,6 +187,12 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
             .or(job.source_path.as_deref())
             .ok_or_else(|| "delete job missing target_path/source_path".to_string())
             .and_then(|rel| delete_remote_file_internal(state, rel)),
+        "local_delete" => job
+            .target_path
+            .as_deref()
+            .or(job.source_path.as_deref())
+            .ok_or_else(|| "local_delete job missing target_path/source_path".to_string())
+            .and_then(|rel| delete_local_file_internal(state, rel)),
         "download" => job
             .target_path
             .as_deref()
@@ -198,29 +212,28 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
             state.db.mark_job_completed(job.id)?;
             if let Ok(mut engine) = state.sync_engine.lock() {
                 engine.record_job_processed();
-                engine.clear_last_error();
             }
         }
         Err(err) => {
             if attempt >= max_attempts {
-                state.db.mark_job_failed(job.id, attempt)?;
-                if let Ok(mut engine) = state.sync_engine.lock() {
-                    engine.set_last_error(format!("job {} failed: {err}", job.id));
-                }
+                let msg = format!("job {} failed: {err}", job.id);
+                state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
             } else {
                 let wait_secs = backoff_seconds(attempt);
                 let retry_at = (Utc::now() + Duration::seconds(wait_secs)).to_rfc3339();
-                state.db.mark_job_retry_wait(job.id, attempt, &retry_at)?;
-                if let Ok(mut engine) = state.sync_engine.lock() {
-                    engine.set_last_error(format!(
-                        "job {} retry scheduled in {}s (attempt {}): {err}",
-                        job.id, wait_secs, attempt
-                    ));
-                }
+                let msg = format!(
+                    "job {} retry scheduled in {}s (attempt {}): {err}",
+                    job.id, wait_secs, attempt
+                );
+                state
+                    .db
+                    .mark_job_retry_wait(job.id, attempt, &retry_at, Some(&msg))?;
             }
         }
     }
 
+    // `refresh_queue_depth_internal` reconciles the engine's global error/health
+    // from the DB, so per-job success no longer masks still-failed jobs.
     refresh_queue_depth_internal(state)?;
     Ok(true)
 }

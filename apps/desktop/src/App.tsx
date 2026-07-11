@@ -28,6 +28,7 @@ type SyncJob = {
   status: string;
   attemptCount: number;
   nextRetryAt?: string;
+  lastError?: string;
 };
 
 type SyncConflict = {
@@ -193,6 +194,16 @@ function App() {
       setConnectError(msg);
       pushLog(`Could not start OAuth: ${msg}`);
       setAwaitingCallback(false);
+    }
+  };
+
+  const retryFailedJobs = async () => {
+    try {
+      const requeued = await invoke<number>("retry_failed_jobs");
+      pushLog(`Requeued ${requeued} failed job(s).`);
+      await refreshDashboard();
+    } catch (error) {
+      pushLog(`Retry failed jobs error: ${String(error)}`);
     }
   };
 
@@ -540,12 +551,22 @@ function App() {
           </div>
           <div>
             <h3>Queue (recent)</h3>
+            {jobs.some((job) => job.status === "failed") && (
+              <button type="button" onClick={retryFailedJobs}>
+                Retry failed jobs
+              </button>
+            )}
             <ul>
               {jobs.length === 0 && <li>Queue empty</li>}
               {jobs.slice(0, 8).map((job) => (
                 <li key={job.id}>
                   #{job.id} {queueActionLabel(job.jobType)} {job.targetPath || "-"} | {job.status} | attempt{" "}
                   {job.attemptCount}
+                  {job.lastError && (
+                    <div className="job-error" style={{ color: "#c0392b", fontSize: "0.85em" }}>
+                      {job.lastError}
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>

@@ -169,6 +169,7 @@ pub fn run() {
             commands::set_sync_folder,
             commands::get_sync_status,
             commands::get_sync_dashboard,
+            commands::retry_failed_jobs,
             commands::scan_local_changes,
             commands::process_sync_queue,
             commands::sync_tick,
