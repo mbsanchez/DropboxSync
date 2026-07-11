@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -68,6 +69,10 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             .map_err(|e| format!("list_folder parse failed: {e}"))?
     };
 
+    // Names of every remote child in this folder (regardless of selective-sync
+    // filtering), used below to prune placeholders whose remote target is gone.
+    let mut remote_child_names: HashSet<String> = HashSet::new();
+
     loop {
         for entry in entries_resp.entries {
             let tag = entry.tag;
@@ -76,16 +81,19 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                 None => continue,
             };
 
+            let child_name = path_display
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path_display)
+                .to_string();
+            remote_child_names.insert(child_name.clone());
+
             let relative = path_display.trim_start_matches('/').to_string();
             if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
                 continue;
             }
 
-            let child_name = path_display
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(&path_display);
             let placeholder_path = local_dir.join(format!("{child_name}.cloudsc"));
             let target_path = cloudsc_target_path(&placeholder_path);
             // Skip if already represented locally: as a placeholder, or as a real
@@ -126,6 +134,25 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
         entries_resp = response
             .json()
             .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
+    }
+
+    // Remote-wins for placeholders: a `<X>.cloudsc` whose remote target `X` no
+    // longer appears in this folder's listing was deleted remotely, so prune the
+    // stale placeholder. This runs ONLY after a complete, successful pagination
+    // (any list error returns earlier), so a failed/partial listing never deletes
+    // placeholders. Hydrated content (real files/dirs) is untouched — only
+    // `.cloudsc` files are considered.
+    for dir_entry in fs::read_dir(local_dir).map_err(|e| format!("failed reading local dir: {e}"))? {
+        let dir_entry = match dir_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = dir_entry.file_name().to_string_lossy().to_string();
+        if let Some(target) = name.strip_suffix(".cloudsc") {
+            if !remote_child_names.contains(target) {
+                let _ = fs::remove_file(dir_entry.path());
+            }
+        }
     }
 
     Ok(created)
