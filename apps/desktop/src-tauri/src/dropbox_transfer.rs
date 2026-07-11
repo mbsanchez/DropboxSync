@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use reqwest::blocking::{Body, Client};
 use tauri::{Emitter, EventTarget};
@@ -74,6 +75,71 @@ fn atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
     })
 }
 
+/// Builds an HTTP client for transfer (upload/download) requests with explicit
+/// timeouts: a fast connect timeout for genuinely dead endpoints, and a generous
+/// per-request timeout that tolerates a very slow multi-megabyte chunk while
+/// still failing a truly stalled connection instead of hanging forever.
+fn http_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))
+}
+
+/// Walks a `reqwest::Error`'s `source()` chain and joins every message so the
+/// real underlying cause (connection reset, timed out, TLS failure, etc.) is
+/// surfaced instead of the generic top-level "error sending request for url".
+fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut cause = std::error::Error::source(e);
+    while let Some(err) = cause {
+        msg.push_str(" | caused by: ");
+        msg.push_str(&err.to_string());
+        cause = err.source();
+    }
+    msg
+}
+
+/// Retries `f` up to `max_attempts` times when it fails with a *transient*
+/// error: our transport-error marker (the message contains "request failed",
+/// set by every `.map_err` around a `.send()` call), a Dropbox rate-limit
+/// (`too_many_write_operations` / `too_many_requests` / HTTP 429), or a
+/// server-side error (HTTP 5xx) — all of which are worth backing off and
+/// retrying rather than failing the whole job outright. Other HTTP status
+/// errors (e.g. plain 4xx) are not retried here since those are either
+/// handled by session-resume logic or should bubble straight up.
+/// Uses a linear backoff (`2s * attempt`) between attempts.
+fn retry_transient<T>(
+    label: &str,
+    max_attempts: u32,
+    mut f: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut attempt: u32 = 1;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let transient = e.contains("request failed")
+                    || e.contains("too_many_write_operations")
+                    || e.contains("too_many_requests")
+                    || e.contains("status error: 429")
+                    || e.contains("status error: 5");
+                if transient && attempt < max_attempts {
+                    let wait_secs = 2u64 * attempt as u64;
+                    eprintln!(
+                        "{label}: transient error on attempt {attempt}/{max_attempts}, retrying in {wait_secs}s: {e}"
+                    );
+                    std::thread::sleep(Duration::from_secs(wait_secs));
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Downloads `path_display` from Dropbox and writes it to `target` without
 /// buffering the whole response body in memory: the body is streamed straight
 /// to a same-directory temp file, which is then atomically renamed onto
@@ -105,7 +171,7 @@ fn fetch_and_write_file(
             serde_json::json!({ "path": path_display }).to_string(),
         )
         .send()
-        .map_err(|e| format!("download request failed: {e}"))?;
+        .map_err(|e| format!("download request failed: {}", describe_reqwest_error(&e)))?;
 
     if !download_resp.status().is_success() {
         let status = download_resp.status();
@@ -233,7 +299,7 @@ fn start_upload_session(client: &Client, token: &str) -> Result<String, String> 
         .header("Content-Type", "application/octet-stream")
         .body(Vec::<u8>::new())
         .send()
-        .map_err(|e| format!("upload_session/start request failed: {e}"))?;
+        .map_err(|e| format!("upload_session/start request failed: {}", describe_reqwest_error(&e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -272,7 +338,7 @@ fn append_upload_chunk(
         .header("Content-Type", "application/octet-stream")
         .body(chunk.to_vec())
         .send()
-        .map_err(|e| format!("upload_session/append_v2 request failed: {e}"))?;
+        .map_err(|e| format!("upload_session/append_v2 request failed: {}", describe_reqwest_error(&e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -312,7 +378,7 @@ fn finish_upload_session(
         .header("Content-Type", "application/octet-stream")
         .body(last_chunk.to_vec())
         .send()
-        .map_err(|e| format!("upload_session/finish request failed: {e}"))?;
+        .map_err(|e| format!("upload_session/finish request failed: {}", describe_reqwest_error(&e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -357,6 +423,62 @@ fn emit_upload_progress(path: &str, transferred: u64, total: u64) {
     }
 }
 
+/// Heuristic: does this error (as produced by `append_upload_chunk` /
+/// `finish_upload_session`'s "status error" formatting) indicate the upload
+/// session itself is no longer usable (expired/closed/offset mismatch), as
+/// opposed to a transient transport failure or an unrelated 4xx/5xx? Used to
+/// decide whether to abandon the current session and start a fresh one.
+///
+/// Deliberately does NOT match a bare "409" — a 409 Conflict can also mean
+/// `too_many_write_operations` (write-lock contention on the destination),
+/// which is a transient condition handled by `retry_transient`, not a dead
+/// session; treating every 409 as session-invalid would trigger a full
+/// re-upload from scratch for what is really just lock contention.
+fn is_session_invalid_error(e: &str) -> bool {
+    e.contains("status error")
+        && (e.contains("lookup_failed")
+            || e.contains("not_found")
+            || e.contains("incorrect_offset")
+            || e.contains("closed")
+            || e.contains("not_closed"))
+}
+
+/// Bundles the mutable session-cursor state (`session_id`/`offset`) that
+/// `restart_session` needs to overwrite, so the function's parameter count
+/// stays within clippy's `too_many_arguments` threshold.
+struct SessionCursor<'a> {
+    session_id: &'a mut String,
+    offset: &'a mut u64,
+}
+
+/// Starts a brand-new upload session (with retry), rewinds `file` to the
+/// start, and persists the fresh checkpoint (including the file-identity
+/// fields — `file_identity` is `(file_len, file_mtime)` — so a later resume
+/// attempt can validate against them). Used when the in-progress session is
+/// found to be invalid/expired partway through the upload.
+fn restart_session(
+    state: &AppState,
+    job_id: i64,
+    client: &Client,
+    token: &str,
+    file: &mut File,
+    cursor: &mut SessionCursor,
+    file_identity: (u64, i64),
+) -> Result<(), String> {
+    let (file_len, file_mtime) = file_identity;
+    let sid = retry_transient("upload_session/start", 4, || {
+        start_upload_session(client, token)
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("failed seeking to restart upload session: {e}"))?;
+    *cursor.session_id = sid;
+    *cursor.offset = 0;
+    state
+        .db
+        .save_upload_checkpoint(job_id, cursor.session_id, 0, file_len, file_mtime)?;
+    Ok(())
+}
+
 /// Uploads `file` (of `len` bytes) to `dropbox_path` via the Dropbox chunked
 /// upload-session API, reading and sending at most `UPLOAD_CHUNK_SIZE` bytes
 /// at a time so peak memory stays bounded regardless of file size.
@@ -365,17 +487,58 @@ fn emit_upload_progress(path: &str, transferred: u64, total: u64) {
 /// once by the caller. If the file is truncated concurrently, EOF is reached
 /// before `offset` hits `len` and the session is finished with whatever bytes
 /// were read (never a busy-loop). Concurrent growth beyond `len` is ignored.
+///
+/// Resumable across app restarts: the session id, byte offset, and file
+/// identity (`len` + mtime) are checkpointed in the DB
+/// (`sync_jobs.upload_session_id`/`upload_session_offset`/
+/// `upload_session_file_len`/`upload_session_file_mtime`) after every
+/// successful chunk, keyed by `job_id`. On entry, an existing checkpoint is
+/// resumed from ONLY when its stored file length and mtime both match the
+/// file currently being uploaded (in addition to the offset fitting within
+/// `len`) — this guards against silently appending new bytes onto a stale
+/// session if the local file was modified between attempts, which would
+/// otherwise commit a corrupt object. Any mismatch starts a brand-new
+/// session at offset 0 instead. Each `append_v2`/`finish` call is itself
+/// wrapped in `retry_transient` for transient network/rate-limit/server
+/// errors; if the session is found to be invalid/expired, it is abandoned
+/// and replaced with a fresh one (bounded to one restart per call).
 fn upload_via_session(
+    state: &AppState,
     token: &str,
     mut file: File,
     len: u64,
     dropbox_path: &str,
+    job_id: i64,
 ) -> Result<(), String> {
-    let client = Client::new();
-    let session_id = start_upload_session(&client, token)?;
+    let client = http_client()?;
+
+    let file_mtime = file
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let (mut session_id, mut offset) = match state.db.get_upload_checkpoint(job_id)? {
+        Some((sid, off, ck_len, ck_mtime)) if off <= len && ck_len == len && ck_mtime == file_mtime => {
+            file.seek(SeekFrom::Start(off))
+                .map_err(|e| format!("failed seeking to resume upload: {e}"))?;
+            (sid, off)
+        }
+        _ => {
+            let sid = retry_transient("upload_session/start", 4, || {
+                start_upload_session(&client, token)
+            })?;
+            state
+                .db
+                .save_upload_checkpoint(job_id, &sid, 0, len, file_mtime)?;
+            (sid, 0)
+        }
+    };
 
     let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
-    let mut offset: u64 = 0;
+    let mut restarted = false;
 
     loop {
         let mut n = 0usize;
@@ -393,27 +556,107 @@ fn upload_via_session(
         // avoids an infinite loop of empty `append_v2` calls when `offset < len`.
         // When `is_final_chunk` is already true this is a no-op distinction.
         if n == 0 && !is_final_chunk(offset, n, len) {
-            finish_upload_session(&client, token, &session_id, offset, dropbox_path, &[])?;
-            emit_upload_progress(dropbox_path, offset, len);
-            break;
+            let chunk_offset = offset;
+            let result = retry_transient("upload_session/finish", 4, || {
+                finish_upload_session(&client, token, &session_id, chunk_offset, dropbox_path, &[])
+            });
+            match result {
+                Ok(()) => {
+                    state.db.clear_upload_checkpoint(job_id)?;
+                    emit_upload_progress(dropbox_path, offset, len);
+                    break;
+                }
+                Err(e) if !restarted && is_session_invalid_error(&e) => {
+                    restarted = true;
+                    restart_session(
+                        state,
+                        job_id,
+                        &client,
+                        token,
+                        &mut file,
+                        &mut SessionCursor {
+                            session_id: &mut session_id,
+                            offset: &mut offset,
+                        },
+                        (len, file_mtime),
+                    )?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         if is_final_chunk(offset, n, len) {
-            finish_upload_session(&client, token, &session_id, offset, dropbox_path, &buf[..n])?;
-            offset += n as u64;
-            emit_upload_progress(dropbox_path, offset, len);
-            break;
+            let chunk_offset = offset;
+            let result = retry_transient("upload_session/finish", 4, || {
+                finish_upload_session(&client, token, &session_id, chunk_offset, dropbox_path, &buf[..n])
+            });
+            match result {
+                Ok(()) => {
+                    offset += n as u64;
+                    state.db.clear_upload_checkpoint(job_id)?;
+                    emit_upload_progress(dropbox_path, offset, len);
+                    break;
+                }
+                Err(e) if !restarted && is_session_invalid_error(&e) => {
+                    restarted = true;
+                    restart_session(
+                        state,
+                        job_id,
+                        &client,
+                        token,
+                        &mut file,
+                        &mut SessionCursor {
+                            session_id: &mut session_id,
+                            offset: &mut offset,
+                        },
+                        (len, file_mtime),
+                    )?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         } else {
-            append_upload_chunk(&client, token, &session_id, offset, &buf[..n])?;
-            offset += n as u64;
-            emit_upload_progress(dropbox_path, offset, len);
+            let chunk_offset = offset;
+            let result = retry_transient("upload_session/append_v2", 4, || {
+                append_upload_chunk(&client, token, &session_id, chunk_offset, &buf[..n])
+            });
+            match result {
+                Ok(()) => {
+                    offset += n as u64;
+                    state
+                        .db
+                        .save_upload_checkpoint(job_id, &session_id, offset, len, file_mtime)?;
+                    emit_upload_progress(dropbox_path, offset, len);
+                }
+                Err(e) if !restarted && is_session_invalid_error(&e) => {
+                    restarted = true;
+                    restart_session(
+                        state,
+                        job_id,
+                        &client,
+                        token,
+                        &mut file,
+                        &mut SessionCursor {
+                            session_id: &mut session_id,
+                            offset: &mut offset,
+                        },
+                        (len, file_mtime),
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
     Ok(())
 }
 
-pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Result<(), String> {
+pub(crate) fn upload_local_file_internal(
+    state: &AppState,
+    relative: &str,
+    job_id: i64,
+) -> Result<(), String> {
     if relative.ends_with(".cloudsc") {
         return Ok(());
     }
@@ -457,7 +700,7 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
 
     match choose_upload_strategy(len) {
         UploadStrategy::SingleShot => {
-            let client = Client::new();
+            let client = http_client()?;
             let resp = client
                 .post("https://content.dropboxapi.com/2/files/upload")
                 .bearer_auth(&token)
@@ -472,7 +715,7 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
                 .header("Content-Type", "application/octet-stream")
                 .body(Body::sized(file, len))
                 .send()
-                .map_err(|e| format!("upload request failed: {e}"))?;
+                .map_err(|e| format!("upload request failed: {}", describe_reqwest_error(&e)))?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -483,7 +726,7 @@ pub(crate) fn upload_local_file_internal(state: &AppState, relative: &str) -> Re
             }
         }
         UploadStrategy::Session => {
-            upload_via_session(&token, file, len, &dropbox_path)?;
+            upload_via_session(state, &token, file, len, &dropbox_path, job_id)?;
         }
     }
 
@@ -552,7 +795,7 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
     }
 
     let target = PathBuf::from(&folder).join(&relative);
-    fetch_and_write_file(&Client::new(), &token, path_display, &target)?;
+    fetch_and_write_file(&http_client()?, &token, path_display, &target)?;
 
     let (hash, size_bytes, modified_ts) = hash_file(&target)?;
     state
@@ -576,7 +819,7 @@ pub(crate) fn hydrate_remote_folder_internal(
 
     fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
 
-    let client = Client::new();
+    let client = http_client()?;
     let mut downloaded = 0usize;
 
     let response = client
@@ -654,7 +897,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
         .ok_or_else(|| "sync folder not configured".to_string())?;
     fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
 
-    let client = Client::new();
+    let client = http_client()?;
     let mut downloaded = 0usize;
     let known_map: HashMap<String, FileIndexRow> = state
         .db
@@ -735,8 +978,10 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
 mod tests {
     use super::{
         atomic_replace, choose_upload_strategy, emit_upload_progress, is_final_chunk,
-        UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        is_session_invalid_error, retry_transient, UploadStrategy, UPLOAD_CHUNK_SIZE,
+        UPLOAD_SESSION_THRESHOLD_BYTES,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // `fetch_and_write_file` performs live HTTP calls against the Dropbox API
     // and is intentionally left to manual QA (large-file download against a
@@ -865,5 +1110,101 @@ mod tests {
         // `state::APP_HANDLE` is unset in this offline test binary (`setup()` never
         // runs), so this must not panic and must not attempt to emit anything.
         emit_upload_progress("x/y.txt", 10, 20);
+    }
+
+    #[test]
+    fn retry_transient_retries_transport_errors_then_succeeds() {
+        // Only fails once (single ~2s backoff sleep) to keep the test fast while
+        // still exercising the retry-then-succeed path.
+        let calls = AtomicUsize::new(0);
+        let result: Result<&str, String> = retry_transient("test", 4, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n < 2 {
+                Err(format!("upload_session/append_v2 request failed: simulated transport error {n}"))
+            } else {
+                Ok("done")
+            }
+        });
+
+        assert_eq!(result, Ok("done"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retry_transient_does_not_retry_status_errors() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), String> = retry_transient("test", 4, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("upload_session/append_v2 status error: 400 Bad Request; body: {}".to_string())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retry_transient_gives_up_after_max_attempts() {
+        // max_attempts=2 keeps this to a single ~2s backoff sleep before giving up.
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), String> = retry_transient("test", 2, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("upload_session/append_v2 request failed: still broken".to_string())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retry_transient_retries_rate_limit_status_errors() {
+        // A 429 (rate limit) must be retried with backoff, unlike a plain 4xx.
+        let calls = AtomicUsize::new(0);
+        let result: Result<&str, String> = retry_transient("test", 2, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n < 2 {
+                Err("upload_session/append_v2 status error: 429 Too Many Requests; body: {}".to_string())
+            } else {
+                Ok("done")
+            }
+        });
+
+        assert_eq!(result, Ok("done"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retry_transient_does_not_retry_plain_400() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), String> = retry_transient("test", 4, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("upload_session/append_v2 status error: 400 Bad Request; body: {}".to_string())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn is_session_invalid_error_detects_known_markers() {
+        assert!(is_session_invalid_error(
+            "upload_session/append_v2 status error: 409 Conflict; body: {\"error\": {\".tag\": \"lookup_failed\"}}"
+        ));
+        assert!(is_session_invalid_error(
+            "upload_session/finish status error: 409 Conflict; body: {\"error_summary\": \"incorrect_offset\"}"
+        ));
+        assert!(is_session_invalid_error(
+            "upload_session/finish status error: 409 Conflict; body: {\"error_summary\": \"not_closed\"}"
+        ));
+        assert!(!is_session_invalid_error(
+            "upload_session/append_v2 request failed: connection reset"
+        ));
+        assert!(!is_session_invalid_error(
+            "upload_session/append_v2 status error: 400 Bad Request; body: {}"
+        ));
+        // A bare 409 that is actually write-lock contention (not a dead session)
+        // must NOT be treated as session-invalid.
+        assert!(!is_session_invalid_error(
+            "upload_session/finish status error: 409 Conflict; body: {\"error_summary\": \"too_many_write_operations/...\"}"
+        ));
     }
 }

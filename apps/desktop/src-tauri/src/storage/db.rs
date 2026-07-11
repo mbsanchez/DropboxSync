@@ -462,10 +462,125 @@ impl Db {
             .execute(
                 "
                 UPDATE sync_jobs
-                SET status='failed', attempt_count=?2, last_error=?3, updated_at=?4
+                SET status='failed', attempt_count=?2, last_error=?3, updated_at=?4,
+                    upload_session_id=NULL, upload_session_offset=NULL,
+                    upload_session_file_len=NULL, upload_session_file_mtime=NULL
                 WHERE id=?1
                 ",
                 params![id, attempt_count, last_error, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Resets jobs stuck in `running` (e.g. the app was killed mid-upload) back to
+    /// `queued` with a clean attempt count, since an interruption is not a genuine
+    /// failed attempt. Deliberately leaves `upload_session_id`/`upload_session_offset`
+    /// untouched so an interrupted large-file upload resumes from its last checkpoint
+    /// instead of restarting from byte 0. Returns the number of rows recovered.
+    pub fn recover_running_jobs(&self) -> Result<usize, String> {
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let n = conn
+            .execute(
+                "
+                UPDATE sync_jobs
+                SET status='queued', attempt_count=0, next_retry_at=NULL, updated_at=?1
+                WHERE status='running'
+                ",
+                params![Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
+    /// Persists the in-progress Dropbox upload-session checkpoint for `job_id` so a
+    /// restart (or a retried attempt) can resume the chunked upload instead of
+    /// starting over from byte 0. `file_len`/`file_mtime` record the identity of
+    /// the local file at the time of the checkpoint, so a later resume attempt can
+    /// detect whether the file changed underneath the job (see `get_upload_checkpoint`
+    /// and the resume guard in `dropbox_transfer::upload_via_session`) and refuse to
+    /// silently append new content onto a stale session.
+    pub fn save_upload_checkpoint(
+        &self,
+        job_id: i64,
+        session_id: &str,
+        offset: u64,
+        file_len: u64,
+        file_mtime: i64,
+    ) -> Result<(), String> {
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        conn
+            .execute(
+                "
+                UPDATE sync_jobs
+                SET upload_session_id=?2, upload_session_offset=?3,
+                    upload_session_file_len=?4, upload_session_file_mtime=?5, updated_at=?6
+                WHERE id=?1
+                ",
+                params![
+                    job_id,
+                    session_id,
+                    offset as i64,
+                    file_len as i64,
+                    file_mtime,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Returns the saved upload-session checkpoint for `job_id`, if any, as
+    /// `(session_id, offset, file_len, file_mtime)`. `file_len`/`file_mtime` default
+    /// to 0 when NULL (checkpoints saved before this column existed). Callers must
+    /// compare `file_len`/`file_mtime` against the file currently being uploaded
+    /// before resuming — this method only round-trips the stored values, it does
+    /// not itself validate identity.
+    pub fn get_upload_checkpoint(
+        &self,
+        job_id: i64,
+    ) -> Result<Option<(String, u64, u64, i64)>, String> {
+        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT upload_session_id, upload_session_offset,
+                       upload_session_file_len, upload_session_file_mtime
+                FROM sync_jobs WHERE id=?1
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![job_id]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let session_id: Option<String> = row.get(0).map_err(|e| e.to_string())?;
+            let offset: Option<i64> = row.get(1).map_err(|e| e.to_string())?;
+            let file_len: Option<i64> = row.get(2).map_err(|e| e.to_string())?;
+            let file_mtime: Option<i64> = row.get(3).map_err(|e| e.to_string())?;
+            if let Some(session_id) = session_id {
+                return Ok(Some((
+                    session_id,
+                    offset.unwrap_or(0) as u64,
+                    file_len.unwrap_or(0) as u64,
+                    file_mtime.unwrap_or(0),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Clears the upload-session checkpoint for `job_id` (called once the upload
+    /// finishes successfully, or when the job is abandoned).
+    pub fn clear_upload_checkpoint(&self, job_id: i64) -> Result<(), String> {
+        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        conn
+            .execute(
+                "
+                UPDATE sync_jobs
+                SET upload_session_id=NULL, upload_session_offset=NULL,
+                    upload_session_file_len=NULL, upload_session_file_mtime=NULL, updated_at=?2
+                WHERE id=?1
+                ",
+                params![job_id, Utc::now().to_rfc3339()],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -622,6 +737,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
 
     // Additive migrations for databases created before a column existed.
     add_column_if_missing(conn, "sync_jobs", "last_error", "TEXT")?;
+    add_column_if_missing(conn, "sync_jobs", "upload_session_id", "TEXT")?;
+    add_column_if_missing(conn, "sync_jobs", "upload_session_offset", "INTEGER")?;
+    add_column_if_missing(conn, "sync_jobs", "upload_session_file_len", "INTEGER")?;
+    add_column_if_missing(conn, "sync_jobs", "upload_session_file_mtime", "INTEGER")?;
     Ok(())
 }
 
@@ -721,5 +840,92 @@ mod tests {
         assert_eq!(active, 1);
         assert_eq!(files[0].relative_path, "a.txt");
         assert_eq!(jobs[0].status, "queued");
+    }
+
+    #[test]
+    fn recover_running_jobs_resets_to_queued_with_clean_attempts() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.enqueue_job("upload", Some("big.bin"), Some("big.bin"))
+            .expect("enqueue");
+
+        let job = db.pick_next_due_job().expect("pick").expect("some job");
+        assert_eq!(job.status, "queued"); // status pre-update snapshot returned by pick
+
+        let jobs_before = db.list_recent_jobs(10).expect("jobs");
+        assert_eq!(jobs_before[0].status, "running");
+
+        let recovered = db.recover_running_jobs().expect("recover");
+        assert_eq!(recovered, 1);
+
+        let jobs_after = db.list_recent_jobs(10).expect("jobs");
+        assert_eq!(jobs_after[0].status, "queued");
+        assert_eq!(jobs_after[0].attempt_count, 0);
+        assert!(jobs_after[0].next_retry_at.is_none());
+    }
+
+    #[test]
+    fn recover_running_jobs_preserves_upload_checkpoint() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.enqueue_job("upload", Some("big.bin"), Some("big.bin"))
+            .expect("enqueue");
+        let job = db.pick_next_due_job().expect("pick").expect("some job");
+
+        db.save_upload_checkpoint(job.id, "sess-abc", 123456, 999_999_999, 1_700_000_000)
+            .expect("save checkpoint");
+
+        db.recover_running_jobs().expect("recover");
+
+        let checkpoint = db.get_upload_checkpoint(job.id).expect("get checkpoint");
+        assert_eq!(
+            checkpoint,
+            Some(("sess-abc".to_string(), 123456, 999_999_999, 1_700_000_000))
+        );
+    }
+
+    #[test]
+    fn upload_checkpoint_round_trip() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.enqueue_job("upload", Some("big.bin"), Some("big.bin"))
+            .expect("enqueue");
+        let job = db.pick_next_due_job().expect("pick").expect("some job");
+
+        assert_eq!(db.get_upload_checkpoint(job.id).expect("get"), None);
+
+        db.save_upload_checkpoint(job.id, "sess-1", 8 * 1024 * 1024, 10 * 1024 * 1024, 1_700_000_000)
+            .expect("save");
+        assert_eq!(
+            db.get_upload_checkpoint(job.id).expect("get"),
+            Some(("sess-1".to_string(), 8 * 1024 * 1024, 10 * 1024 * 1024, 1_700_000_000))
+        );
+
+        db.clear_upload_checkpoint(job.id).expect("clear");
+        assert_eq!(db.get_upload_checkpoint(job.id).expect("get"), None);
+    }
+
+    #[test]
+    fn upload_checkpoint_round_trips_file_identity_for_resume_guard() {
+        // This is a pure DB round-trip test: the actual "refuse to resume when
+        // identity differs" guard lives in `dropbox_transfer::upload_via_session`
+        // (it compares the returned file_len/file_mtime against the file currently
+        // being uploaded). Here we just verify the stored identity values are
+        // exactly what was saved, including when they differ between two saves,
+        // since that's what the resume guard depends on being accurate.
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.enqueue_job("upload", Some("big.bin"), Some("big.bin"))
+            .expect("enqueue");
+        let job = db.pick_next_due_job().expect("pick").expect("some job");
+
+        db.save_upload_checkpoint(job.id, "sess-a", 100, 5_000, 1_700_000_000)
+            .expect("save first");
+        let first = db.get_upload_checkpoint(job.id).expect("get first");
+        assert_eq!(first, Some(("sess-a".to_string(), 100, 5_000, 1_700_000_000)));
+
+        // Simulate the file changing underneath the job (different len and mtime):
+        // a fresh session checkpoint overwrites the old identity entirely.
+        db.save_upload_checkpoint(job.id, "sess-b", 0, 6_000, 1_800_000_000)
+            .expect("save second");
+        let second = db.get_upload_checkpoint(job.id).expect("get second");
+        assert_eq!(second, Some(("sess-b".to_string(), 0, 6_000, 1_800_000_000)));
+        assert_ne!(first, second);
     }
 }
