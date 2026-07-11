@@ -753,6 +753,13 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+        // Already gone (or never existed on the remote): folder deletes for
+        // local-only folders, and redundant per-file deletes under a folder
+        // that was just recursively deleted, both land here. Treat as a no-op
+        // rather than a failure.
+        if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
+            return Ok(());
+        }
         return Err(format!(
             "delete status error for {dropbox_path}: {status}; body: {body}"
         ));

@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 use walkdir::WalkDir;
@@ -12,7 +14,7 @@ use crate::dropbox_transfer::download_remote_file_internal;
 use crate::models::{
     CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
 };
-use crate::path_util::{is_path_allowed, parse_prefix_csv, relpath_under};
+use crate::path_util::{is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under};
 use crate::state::AppState;
 
 pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
@@ -26,139 +28,171 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
     fs::create_dir_all(local_dir).map_err(|e| format!("failed creating local dir: {e}"))?;
 
-    let client = Client::new();
-    let response = client
-        .post("https://api.dropboxapi.com/2/files/list_folder")
-        .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "path": remote_folder_path_display,
-            "recursive": false,
-            "include_deleted": false
-        }))
-        .send()
-        .map_err(|e| format!("list_folder request failed: {e}"))?;
+    // Timeouts bound a hung metadata call so it can't stall the whole
+    // materialized-folder sweep (which issues one list_folder per real dir).
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let mut created = 0usize;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "list_folder status error for {remote_folder_path_display}: {status}; body: {body}"
-        ));
+    // Page through the folder with cursor + has_more; a folder with more than one
+    // page of entries (Dropbox returns up to ~2000 per page) would otherwise be
+    // silently truncated to its first page.
+    let mut entries_resp: DropboxListFolderResponse = {
+        let response = client
+            .post("https://api.dropboxapi.com/2/files/list_folder")
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "path": remote_folder_path_display,
+                "recursive": false,
+                "include_deleted": false
+            }))
+            .send()
+            .map_err(|e| format!("list_folder request failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            // A local directory with no Dropbox counterpart (e.g. a local-only
+            // folder pending upload) is not an error for this indexer — it simply
+            // has nothing to placeholder. Don't spam the log or fail the sweep.
+            if body.contains("path/not_found") {
+                return Ok(0);
+            }
+            return Err(format!(
+                "list_folder status error for {remote_folder_path_display}: {status}; body: {body}"
+            ));
+        }
+        response
+            .json()
+            .map_err(|e| format!("list_folder parse failed: {e}"))?
+    };
+
+    // Names of every remote child in this folder (regardless of selective-sync
+    // filtering), used below to prune placeholders whose remote target is gone.
+    let mut remote_child_names: HashSet<String> = HashSet::new();
+
+    loop {
+        for entry in entries_resp.entries {
+            let tag = entry.tag;
+            let path_display = match entry.path_display {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let child_name = path_display
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&path_display)
+                .to_string();
+            remote_child_names.insert(child_name.clone());
+
+            let relative = path_display.trim_start_matches('/').to_string();
+            if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
+                continue;
+            }
+
+            let placeholder_path = local_dir.join(format!("{child_name}.cloudsc"));
+            let target_path = cloudsc_target_path(&placeholder_path);
+            // Skip if already represented locally: as a placeholder, or as a real
+            // file/dir (a hydrated folder is a real dir, so we never shadow it with
+            // a `<name>.cloudsc`).
+            if placeholder_path.exists() {
+                continue;
+            }
+            if target_path.exists() {
+                continue;
+            }
+
+            let meta = CloudscMeta {
+                version: 1,
+                tag,
+                remote_path_display: path_display,
+            };
+            write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
+            created += 1;
+        }
+
+        if !entries_resp.has_more {
+            break;
+        }
+        let response = client
+            .post("https://api.dropboxapi.com/2/files/list_folder/continue")
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "cursor": entries_resp.cursor }))
+            .send()
+            .map_err(|e| format!("list_folder/continue request failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            return Err(format!(
+                "list_folder/continue status error for {remote_folder_path_display}: {status}; body: {body}"
+            ));
+        }
+        entries_resp = response
+            .json()
+            .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
     }
 
-    let entries_resp: DropboxListFolderResponse = response
-        .json()
-        .map_err(|e| format!("list_folder parse failed: {e}"))?;
-
-    let mut created = 0usize;
-    for entry in entries_resp.entries {
-        let tag = entry.tag;
-        let path_display = match entry.path_display {
-            Some(p) => p,
-            None => continue,
+    // Remote-wins for placeholders: a `<X>.cloudsc` whose remote target `X` no
+    // longer appears in this folder's listing was deleted remotely, so prune the
+    // stale placeholder. This runs ONLY after a complete, successful pagination
+    // (any list error returns earlier), so a failed/partial listing never deletes
+    // placeholders. Hydrated content (real files/dirs) is untouched — only
+    // `.cloudsc` files are considered.
+    for dir_entry in fs::read_dir(local_dir).map_err(|e| format!("failed reading local dir: {e}"))? {
+        let dir_entry = match dir_entry {
+            Ok(e) => e,
+            Err(_) => continue,
         };
-
-        let relative = path_display.trim_start_matches('/').to_string();
-        if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
-            continue;
+        let name = dir_entry.file_name().to_string_lossy().to_string();
+        if let Some(target) = name.strip_suffix(".cloudsc") {
+            if !remote_child_names.contains(target) {
+                let _ = fs::remove_file(dir_entry.path());
+            }
         }
-
-        let child_name = path_display
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(&path_display);
-        let placeholder_path = local_dir.join(format!("{child_name}.cloudsc"));
-        let target_path = cloudsc_target_path(&placeholder_path);
-        if placeholder_path.exists() {
-            continue;
-        }
-        if target_path.exists() {
-            continue;
-        }
-
-        let meta = CloudscMeta {
-            version: 1,
-            tag,
-            remote_path_display: path_display,
-        };
-        write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
-        created += 1;
     }
 
     Ok(created)
 }
 
-pub(crate) fn index_remote_root_children_as_cloudsc_placeholders_internal(
+/// Discovers new remote content in every folder that already exists locally as a
+/// real directory (the sync root plus any hydrated folder) and creates a
+/// `.cloudsc` placeholder for each remote child — file OR folder — that is not
+/// already represented locally.
+///
+/// This keeps the "folder = single `.cloudsc` placeholder" model: we only index
+/// inside real directories, never descending into unopened folder placeholders
+/// (they are files, so `WalkDir` doesn't recurse into them, and a hydrated folder
+/// is a real dir that `target_path.exists()` already protects from being shadowed).
+/// A brand-new remote folder therefore surfaces as `<name>.cloudsc` under its
+/// (real) parent, exactly like a new remote file.
+pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
     state: &AppState,
 ) -> Result<usize, String> {
-    let token = get_access_token(state)?;
     let sync_folder_str = state
         .db
         .get_sync_folder()?
         .ok_or_else(|| "sync folder not configured".to_string())?;
-    let sync_folder = PathBuf::from(sync_folder_str);
+    let sync_folder = PathBuf::from(&sync_folder_str);
     fs::create_dir_all(&sync_folder).map_err(|e| format!("failed creating sync folder: {e}"))?;
 
-    let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
-    let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
-
-    let client = Client::new();
-    let response = client
-        .post("https://api.dropboxapi.com/2/files/list_folder")
-        .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "path": "",
-            "recursive": false,
-            "include_deleted": false
-        }))
-        .send()
-        .map_err(|e| format!("list_folder request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!("list_folder status error for root: {status}; body: {body}"));
-    }
-
-    let entries_resp: DropboxListFolderResponse = response
-        .json()
-        .map_err(|e| format!("list_folder parse failed: {e}"))?;
-
     let mut created = 0usize;
-    for entry in entries_resp.entries {
-        let tag = entry.tag;
-        let path_display = match entry.path_display {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let relative = path_display.trim_start_matches('/').to_string();
-        if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
+    for entry in WalkDir::new(&sync_folder).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_dir() {
             continue;
         }
-
-        let child_name = path_display
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(&path_display);
-        let placeholder_path = sync_folder.join(format!("{child_name}.cloudsc"));
-        let target_path = cloudsc_target_path(&placeholder_path);
-        if placeholder_path.exists() {
-            continue;
+        let dir = entry.path();
+        let rel = relpath_under(&sync_folder, dir)?; // "" for the sync root itself
+        let remote_path = normalize_dropbox_path(&rel); // "" for root, "/Cocina", ...
+        match index_remote_folder_children_as_cloudsc_placeholders_internal(state, &remote_path, dir)
+        {
+            Ok(n) => created += n,
+            // One unreadable folder must not abort the whole sweep.
+            Err(e) => eprintln!("index remote folder '{remote_path}': {e}"),
         }
-        if target_path.exists() {
-            continue;
-        }
-
-        let meta = CloudscMeta {
-            version: 1,
-            tag,
-            remote_path_display: path_display,
-        };
-        write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
-        created += 1;
     }
 
     Ok(created)
@@ -231,5 +265,30 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
             &meta.remote_path_display,
             &target_path,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The materialized-folder sweep maps each real local directory to its Dropbox
+    // list_folder path via `normalize_dropbox_path(relpath_under(root, dir))`. The
+    // root must map to "" (Dropbox root), never "/", and nested dirs must use
+    // forward slashes regardless of the OS separator.
+    #[test]
+    fn root_dir_maps_to_empty_dropbox_path() {
+        let root = PathBuf::from("/sync/root");
+        let rel = relpath_under(&root, &root).expect("relpath");
+        assert_eq!(normalize_dropbox_path(&rel), "");
+    }
+
+    #[test]
+    fn nested_dir_maps_to_leading_slash_forward_path() {
+        let root = PathBuf::from("/sync/root");
+        let dir = root.join("Cocina").join("Pizza");
+        let rel = relpath_under(&root, &dir).expect("relpath");
+        // `normalize_dropbox_path` itself converts OS separators to '/'.
+        assert_eq!(normalize_dropbox_path(&rel), "/Cocina/Pizza");
     }
 }

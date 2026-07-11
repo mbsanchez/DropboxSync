@@ -11,7 +11,8 @@ use crate::auth_session::{
     update_tray_tooltip, verify_dropbox_token_internal,
 };
 use crate::cloudsc_ops::{
-    hydrate_cloudsc_placeholder_internal, index_remote_root_children_as_cloudsc_placeholders_internal,
+    hydrate_cloudsc_placeholder_internal,
+    index_materialized_folders_as_cloudsc_placeholders_internal,
 };
 use crate::dropbox_transfer::{download_remote_file_internal, hydrate_remote_folder_internal};
 use crate::models::*;
@@ -208,8 +209,17 @@ pub fn start_background_scheduler(
                 if let Ok(mut engine) = app_state.sync_engine.lock() {
                     engine.set_sync_running(true);
                 }
-                let _ = index_remote_root_children_as_cloudsc_placeholders_internal(&app_state);
+                // Run the sync tick first so a local folder deletion is detected,
+                // its `delete` job enqueued, and drained within this same tick
+                // (deleting the folder remotely) before discovery runs. Otherwise
+                // discovery would still see the (now-orphaned) remote folder and
+                // re-create its `.cloudsc` placeholder.
                 let _ = run_sync_tick_internal(&app_state);
+                match index_materialized_folders_as_cloudsc_placeholders_internal(&app_state) {
+                    Ok(n) if n > 0 => eprintln!("indexed {n} new remote placeholder(s)"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("remote placeholder indexing failed: {e}"),
+                }
                 if let Ok(mut engine) = app_state.sync_engine.lock() {
                     engine.set_sync_running(false);
                 }
@@ -333,7 +343,9 @@ pub fn list_remote_folder(
 
 #[tauri::command]
 pub fn index_remote_root_placeholders(state: tauri::State<AppState>) -> Result<usize, String> {
-    index_remote_root_children_as_cloudsc_placeholders_internal(state.inner())
+    // Now recurses into every materialized (real) folder, not just the root, so
+    // new remote content in already-hydrated folders is discovered too.
+    index_materialized_folders_as_cloudsc_placeholders_internal(state.inner())
 }
 
 #[tauri::command]
