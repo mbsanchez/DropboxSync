@@ -57,7 +57,7 @@ fn unresolved_conflict_paths(db: &db::Db) -> Result<HashSet<String>, String> {
 /// Recomputes per-file overlay tiers and atomically writes `overlay_state.json` under [`db::app_data_dir`].
 pub(crate) fn refresh_overlay_state_internal(state: &AppState) {
     if let Err(e) = refresh_overlay_state_inner(state) {
-        eprintln!("overlay_state: {e}");
+        tracing::error!(error = %e, "refresh overlay state failed");
     }
 }
 

@@ -183,7 +183,7 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
         {
             Ok(n) => created += n,
             // One unreadable folder must not abort the whole sweep.
-            Err(e) => eprintln!("index remote folder '{remote_path}': {e}"),
+            Err(e) => tracing::error!(remote_path = %remote_path, error = %e, "index remote folder failed"),
         }
     }
 

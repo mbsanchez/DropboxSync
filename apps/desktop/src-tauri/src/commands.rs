@@ -213,9 +213,9 @@ pub fn start_background_scheduler(
             // re-create its `.cloudsc` placeholder.
             let _ = run_sync_tick_internal(&app_state);
             match index_materialized_folders_as_cloudsc_placeholders_internal(&app_state) {
-                Ok(n) if n > 0 => eprintln!("indexed {n} new remote placeholder(s)"),
+                Ok(n) if n > 0 => tracing::info!(count = n, "indexed new remote placeholder(s)"),
                 Ok(_) => {}
-                Err(e) => eprintln!("remote placeholder indexing failed: {e}"),
+                Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed"),
             }
             app_state.sync_running.store(false, Ordering::Release);
             update_tray_tooltip(&app, &current_tray_status_label(&app_state));

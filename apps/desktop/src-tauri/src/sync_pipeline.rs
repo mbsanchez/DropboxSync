@@ -331,7 +331,7 @@ pub(crate) fn run_sync_tick_internal(state: &AppState) -> Result<SyncTickResult,
             Ok(true) => processed_job = true,
             Ok(false) => break,
             Err(e) => {
-                eprintln!("process_sync_queue (sync tick): {e}");
+                tracing::error!(error = %e, "process_sync_queue failed (sync tick)");
                 break;
             }
         }

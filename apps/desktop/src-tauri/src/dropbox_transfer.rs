@@ -118,8 +118,13 @@ fn retry_transient<T>(
                     || e.contains("timeout");
                 if transient && attempt < max_attempts {
                     let wait_secs = 2u64 * attempt as u64;
-                    eprintln!(
-                        "{label}: transient error on attempt {attempt}/{max_attempts}, retrying in {wait_secs}s: {e}"
+                    tracing::warn!(
+                        label,
+                        attempt,
+                        max_attempts,
+                        wait_secs,
+                        error = %e,
+                        "transient error, retrying"
                     );
                     std::thread::sleep(Duration::from_secs(wait_secs));
                     attempt += 1;
@@ -472,9 +477,9 @@ fn emit_upload_progress(path: &str, transferred: u64, total: u64) {
     match handle.emit_to(EventTarget::webview_window("main"), "upload-progress", event.clone()) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("emit_to webview_window(main): {e}");
+            tracing::error!(error = %e, "emit_to webview_window(main) failed");
             if let Err(e2) = handle.emit("upload-progress", event) {
-                eprintln!("emit global upload-progress: {e2}");
+                tracing::error!(error = %e2, "emit global upload-progress failed");
             }
         }
     }
@@ -497,9 +502,9 @@ fn emit_sync_conflict(path: &str, conflict_path: &str, reason: &str) {
     match handle.emit_to(EventTarget::webview_window("main"), "sync-conflict", event.clone()) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("emit_to webview_window(main): {e}");
+            tracing::error!(error = %e, "emit_to webview_window(main) failed");
             if let Err(e2) = handle.emit("sync-conflict", event) {
-                eprintln!("emit global sync-conflict: {e2}");
+                tracing::error!(error = %e2, "emit global sync-conflict failed");
             }
         }
     }
