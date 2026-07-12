@@ -129,12 +129,16 @@ function App() {
     ].slice(0, 40));
 
   const refreshDashboard = async () => {
-    const dashboard = await invoke<SyncDashboard>("get_sync_dashboard");
-    setStatus(dashboard.status);
-    setJobs(dashboard.jobs);
-    setConflicts(dashboard.conflicts);
-    if (dashboard.status.trackedPath) {
-      setSyncFolder(dashboard.status.trackedPath);
+    try {
+      const dashboard = await invoke<SyncDashboard>("get_sync_dashboard");
+      setStatus(dashboard.status);
+      setJobs(dashboard.jobs);
+      setConflicts(dashboard.conflicts);
+      if (dashboard.status.trackedPath) {
+        setSyncFolder(dashboard.status.trackedPath);
+      }
+    } catch (e) {
+      pushLog(`Dashboard refresh failed: ${String(e)}`);
     }
   };
 
@@ -215,10 +219,14 @@ function App() {
   };
 
   const saveFolder = async () => {
-    await invoke("set_sync_folder", { folder: syncFolder });
-    pushLog(`Sync folder configured: ${syncFolder}`);
-    await refreshDashboard();
-    await refreshStartupRequirements();
+    try {
+      await invoke("set_sync_folder", { folder: syncFolder });
+      pushLog(`Sync folder configured: ${syncFolder}`);
+      await refreshDashboard();
+      await refreshStartupRequirements();
+    } catch (e) {
+      pushLog(`Failed to save sync folder: ${String(e)}`);
+    }
   };
 
   const runTick = async () => {
@@ -236,6 +244,8 @@ function App() {
       window.setTimeout(() => {
         refreshDashboard().catch((error) => pushLog(`Dashboard refresh failed: ${String(error)}`));
       }, 350);
+    } catch (e) {
+      pushLog(`Sync tick failed: ${String(e)}`);
     } finally {
       tickInFlightRef.current = false;
     }
@@ -446,6 +456,8 @@ function App() {
       setRemoteCurrentPath(resp.currentPath);
       setRemoteEntries(resp.entries);
       pushLog(`Remote folder loaded: ${resp.currentPath || "/"} (${resp.entries.length} entries)`);
+    } catch (e) {
+      pushLog(`Failed to load remote folder: ${String(e)}`);
     } finally {
       setRemoteLoading(false);
     }
@@ -574,9 +586,13 @@ function App() {
             />
             <button
               onClick={async () => {
-                const selected = await invoke<string | null>("pick_sync_folder_dialog");
-                if (selected) {
-                  setSyncFolder(selected);
+                try {
+                  const selected = await invoke<string | null>("pick_sync_folder_dialog");
+                  if (selected) {
+                    setSyncFolder(selected);
+                  }
+                } catch (e) {
+                  pushLog(`Folder picker failed: ${String(e)}`);
                 }
               }}
             >
@@ -715,13 +731,17 @@ function App() {
           />
           <button
             onClick={async () => {
-              await invoke("set_selective_sync_filters", {
-                include_csv: includeCsv,
-                exclude_csv: excludeCsv,
-              });
-              pushLog("Selective sync filters saved.");
-              if (!remoteLoading) {
-                await loadRemoteFolder(remoteCurrentPath || "");
+              try {
+                await invoke("set_selective_sync_filters", {
+                  include_csv: includeCsv,
+                  exclude_csv: excludeCsv,
+                });
+                pushLog("Selective sync filters saved.");
+                if (!remoteLoading) {
+                  await loadRemoteFolder(remoteCurrentPath || "");
+                }
+              } catch (e) {
+                pushLog(`Failed to save selective sync filters: ${String(e)}`);
               }
             }}
           >
@@ -748,11 +768,15 @@ function App() {
                     <button
                       disabled={remoteLoading || entry.isExcluded || status.syncRunning}
                       onClick={async () => {
-                        const res = await invoke<TriggerActionResponse>("trigger_hydrate_remote_folder", {
-                          folder_path_display: entry.pathDisplay,
-                        });
-                        if (res.accepted) {
-                          pushLog("Hydrating remote folder in background...");
+                        try {
+                          const res = await invoke<TriggerActionResponse>("trigger_hydrate_remote_folder", {
+                            folder_path_display: entry.pathDisplay,
+                          });
+                          if (res.accepted) {
+                            pushLog("Hydrating remote folder in background...");
+                          }
+                        } catch (e) {
+                          pushLog(`Hydrate remote folder failed: ${String(e)}`);
                         }
                       }}
                     >
@@ -763,11 +787,15 @@ function App() {
                   <button
                     disabled={remoteLoading || entry.isExcluded || status.syncRunning}
                     onClick={async () => {
-                      const res = await invoke<TriggerActionResponse>("trigger_download_remote_file", {
-                        path_display: entry.pathDisplay,
-                      });
-                      if (res.accepted) {
-                        pushLog("Syncing remote file in background...");
+                      try {
+                        const res = await invoke<TriggerActionResponse>("trigger_download_remote_file", {
+                          path_display: entry.pathDisplay,
+                        });
+                        if (res.accepted) {
+                          pushLog("Syncing remote file in background...");
+                        }
+                      } catch (e) {
+                        pushLog(`Download remote file failed: ${String(e)}`);
                       }
                     }}
                   >
@@ -796,6 +824,8 @@ function App() {
                 const created = await invoke<number>("index_remote_root_placeholders");
                 pushLog(`Indexed remote root placeholders. New: ${created}`);
                 await refreshCloudsc().catch(() => {});
+              } catch (e) {
+                pushLog(`Indexing remote root placeholders failed: ${String(e)}`);
               } finally {
                 setCloudscLoading(false);
               }
