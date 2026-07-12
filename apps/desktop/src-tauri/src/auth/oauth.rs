@@ -90,7 +90,11 @@ pub fn start_oauth() -> Result<(String, String, String), String> {
 pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenResponse, String> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
-    let response = Client::new()
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("failed to build oauth http client: {e}"))?;
+    let response = client
         .post("https://api.dropboxapi.com/oauth2/token")
         .form(&[
             ("code", code),

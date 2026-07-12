@@ -39,15 +39,17 @@ pub(crate) struct AppState {
 
 /// Builds the single shared blocking HTTP client stored on `AppState`.
 ///
-/// Timeouts: a 15s connect timeout catches dead endpoints fast; the 600s total
-/// request timeout matches the previous transfer-only client (`dropbox_transfer.rs`'s
-/// old per-call `http_client()` also used 600s) so large uploads/downloads are
-/// unaffected, while the previously-unbounded metadata/list/delete calls now get a
-/// generous, non-regressing cap.
+/// Timeouts: a 10s connect timeout catches dead endpoints fast. The 30s total
+/// request timeout is the *default* applied to every request that doesn't
+/// override it — i.e. the quick metadata/list_folder/delete/token-verify-probe/
+/// refresh calls, which should never legitimately take longer than that. Transfer
+/// requests (uploads/downloads) are expected to run longer than 30s and override
+/// this default with a per-request `.timeout(...)` set on the individual
+/// `RequestBuilder` in `dropbox_transfer.rs`.
 pub(crate) fn build_http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("DropboxSyncDesktop/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("failed to build shared reqwest client")

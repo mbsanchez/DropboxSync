@@ -113,7 +113,9 @@ fn retry_transient<T>(
                     || e.contains("too_many_write_operations")
                     || e.contains("too_many_requests")
                     || e.contains("status error: 429")
-                    || e.contains("status error: 5");
+                    || e.contains("status error: 5")
+                    || e.contains("timed out")
+                    || e.contains("timeout");
                 if transient && attempt < max_attempts {
                     let wait_secs = 2u64 * attempt as u64;
                     eprintln!(
@@ -152,6 +154,13 @@ fn fetch_and_write_file(
         rand::random::<u64>()
     ));
 
+    // 300s (not the 120s used for upload-session/single-shot-upload requests):
+    // reqwest's blocking `timeout` bounds the *entire* request including
+    // streaming the full response body, and this is a single-request
+    // whole-file download — a large placeholder hydration could legitimately
+    // exceed 120s on a slow link, so 120s would regress large-file hydration.
+    // 300s still bounds a true stall. A future ranged/chunked download could
+    // tighten this back down.
     let mut download_resp = client
         .post("https://content.dropboxapi.com/2/files/download")
         .bearer_auth(token)
@@ -159,6 +168,7 @@ fn fetch_and_write_file(
             "Dropbox-API-Arg",
             serde_json::json!({ "path": path_display }).to_string(),
         )
+        .timeout(Duration::from_secs(300))
         .send()
         .map_err(|e| format!("download request failed: {}", describe_reqwest_error(&e)))?;
 
@@ -287,6 +297,7 @@ fn start_upload_session(client: &Client, token: &str) -> Result<String, String> 
         .header("Dropbox-API-Arg", serde_json::json!({ "close": false }).to_string())
         .header("Content-Type", "application/octet-stream")
         .body(Vec::<u8>::new())
+        .timeout(Duration::from_secs(120))
         .send()
         .map_err(|e| format!("upload_session/start request failed: {}", describe_reqwest_error(&e)))?;
 
@@ -326,6 +337,7 @@ fn append_upload_chunk(
         )
         .header("Content-Type", "application/octet-stream")
         .body(chunk.to_vec())
+        .timeout(Duration::from_secs(120))
         .send()
         .map_err(|e| format!("upload_session/append_v2 request failed: {}", describe_reqwest_error(&e)))?;
 
@@ -366,6 +378,7 @@ fn finish_upload_session(
         )
         .header("Content-Type", "application/octet-stream")
         .body(last_chunk.to_vec())
+        .timeout(Duration::from_secs(120))
         .send()
         .map_err(|e| format!("upload_session/finish request failed: {}", describe_reqwest_error(&e)))?;
 
@@ -783,6 +796,11 @@ pub(crate) fn upload_local_file_internal(
                 )
                 .header("Content-Type", "application/octet-stream")
                 .body(Body::sized(file, len))
+                // Whole-file single-shot upload (up to UPLOAD_SESSION_THRESHOLD_BYTES = 150 MiB in
+                // one request): use 300s like the whole-file download, not the 120s used for bounded
+                // upload-session chunks — 120s would abort a legitimate large single-shot upload on a
+                // slow link. Files above the threshold take the chunked session path (safe at 120s/chunk).
+                .timeout(Duration::from_secs(300))
                 .send()
                 .map_err(|e| format!("upload request failed: {}", describe_reqwest_error(&e)))?;
 
