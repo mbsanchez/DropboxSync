@@ -823,27 +823,148 @@ fn add_column_if_missing(
     Ok(())
 }
 
-/// Shared app data directory (SQLite DB, overlay_state.json for shell extensions).
-pub fn app_data_dir() -> Result<PathBuf, String> {
+/// Platform whose data-dir convention to follow. Split out from the real OS so the
+/// path logic below is deterministic and unit-testable on any build target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataDirOs {
+    Windows,
+    Macos,
+    Unix,
+}
+
+fn current_data_dir_os() -> DataDirOs {
     #[cfg(target_os = "windows")]
     {
-        let base =
-            std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA env var not found".to_string())?;
-        let mut path = PathBuf::from(base);
-        path.push("DropboxSyncDesktop");
-        std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-        return Ok(path);
+        return DataDirOs::Windows;
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        let home = std::env::var("HOME").map_err(|_| "HOME env var not found".to_string())?;
-        let mut path = PathBuf::from(home);
-        // Requested location for local persistent index/queue database.
-        path.push("Library");
-        path.push("Applications");
-        path.push("DropboxSyncDesktop");
-        std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-        Ok(path)
+        return DataDirOs::Macos;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        return DataDirOs::Unix;
+    }
+}
+
+/// Pure resolver for the app data directory, given the relevant env vars. Kept free
+/// of env/FS access so every platform branch can be exercised in unit tests.
+///
+/// - Windows: `%LOCALAPPDATA%\DropboxSyncDesktop`
+/// - macOS: `~/Library/Application Support/DropboxSyncDesktop`
+/// - Linux/other Unix: `$XDG_DATA_HOME/DropboxSyncDesktop`, else `~/.local/share/DropboxSyncDesktop`
+fn data_dir_for(
+    os: DataDirOs,
+    localappdata: Option<&str>,
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    match os {
+        DataDirOs::Windows => {
+            let base = localappdata
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "LOCALAPPDATA env var not found".to_string())?;
+            Ok(PathBuf::from(base).join("DropboxSyncDesktop"))
+        }
+        DataDirOs::Macos => {
+            let home = home
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "HOME env var not found".to_string())?;
+            Ok(PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("DropboxSyncDesktop"))
+        }
+        DataDirOs::Unix => {
+            let base = match xdg_data_home.filter(|s| !s.is_empty()) {
+                Some(v) => PathBuf::from(v),
+                None => {
+                    let home = home
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "HOME env var not found".to_string())?;
+                    PathBuf::from(home).join(".local").join("share")
+                }
+            };
+            Ok(base.join("DropboxSyncDesktop"))
+        }
+    }
+}
+
+fn resolve_app_data_dir() -> Result<PathBuf, String> {
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    data_dir_for(
+        current_data_dir_os(),
+        localappdata.as_deref(),
+        xdg_data_home.as_deref(),
+        home.as_deref(),
+    )
+}
+
+/// Shared app data directory (SQLite DB, overlay_state.json for shell extensions).
+pub fn app_data_dir() -> Result<PathBuf, String> {
+    let path = resolve_app_data_dir()?;
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod app_data_dir_tests {
+    use super::{data_dir_for, DataDirOs};
+    use std::path::PathBuf;
+
+    #[test]
+    fn windows_uses_localappdata() {
+        let got = data_dir_for(DataDirOs::Windows, Some("C:\\Users\\u\\AppData\\Local"), None, None)
+            .expect("windows path");
+        assert_eq!(
+            got,
+            PathBuf::from("C:\\Users\\u\\AppData\\Local").join("DropboxSyncDesktop")
+        );
+    }
+
+    #[test]
+    fn macos_uses_application_support_not_applications() {
+        let got = data_dir_for(DataDirOs::Macos, None, None, Some("/Users/u")).expect("macos path");
+        assert_eq!(
+            got,
+            PathBuf::from("/Users/u")
+                .join("Library")
+                .join("Application Support")
+                .join("DropboxSyncDesktop")
+        );
+    }
+
+    #[test]
+    fn linux_prefers_xdg_data_home() {
+        let got = data_dir_for(DataDirOs::Unix, None, Some("/custom/xdg"), Some("/home/u"))
+            .expect("linux xdg path");
+        assert_eq!(got, PathBuf::from("/custom/xdg").join("DropboxSyncDesktop"));
+    }
+
+    #[test]
+    fn linux_falls_back_to_local_share() {
+        // Missing and empty XDG_DATA_HOME both fall back to ~/.local/share.
+        let expected = PathBuf::from("/home/u")
+            .join(".local")
+            .join("share")
+            .join("DropboxSyncDesktop");
+        assert_eq!(
+            data_dir_for(DataDirOs::Unix, None, None, Some("/home/u")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            data_dir_for(DataDirOs::Unix, None, Some(""), Some("/home/u")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn missing_required_env_is_an_error() {
+        assert!(data_dir_for(DataDirOs::Windows, None, None, None).is_err());
+        assert!(data_dir_for(DataDirOs::Macos, None, None, None).is_err());
+        assert!(data_dir_for(DataDirOs::Unix, None, None, None).is_err());
     }
 }
 
