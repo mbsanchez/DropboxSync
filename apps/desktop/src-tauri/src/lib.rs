@@ -4,6 +4,7 @@ mod cloudsc;
 mod cloudsc_ops;
 mod commands;
 mod dropbox_transfer;
+mod error;
 mod logging;
 mod models;
 mod oauth_listener;
