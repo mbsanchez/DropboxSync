@@ -22,7 +22,6 @@ pub struct SyncEngine {
     last_scan_at: Option<String>,
     processed_jobs: usize,
     conflicts_detected: usize,
-    sync_running: bool,
 }
 
 impl SyncEngine {
@@ -36,7 +35,6 @@ impl SyncEngine {
             last_scan_at: None,
             processed_jobs: 0,
             conflicts_detected: 0,
-            sync_running: false,
         }
     }
 
@@ -87,15 +85,7 @@ impl SyncEngine {
         self.last_error = None;
     }
 
-    pub fn set_sync_running(&mut self, value: bool) {
-        self.sync_running = value;
-    }
-
-    pub fn is_sync_running(&self) -> bool {
-        self.sync_running
-    }
-
-    pub fn current_status(&self) -> SyncStatus {
+    pub fn current_status(&self, sync_running: bool) -> SyncStatus {
         SyncStatus {
             health: if self.last_error.is_some() {
                 "error".to_string()
@@ -110,7 +100,7 @@ impl SyncEngine {
             last_scan_at: self.last_scan_at.clone(),
             processed_jobs: self.processed_jobs,
             conflicts_detected: self.conflicts_detected,
-            sync_running: self.sync_running,
+            sync_running,
         }
     }
 }

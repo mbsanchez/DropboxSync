@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::atomic::Ordering;
 use std::time::Duration as StdDuration;
 
 use chrono::Utc;
@@ -199,32 +200,25 @@ pub fn start_background_scheduler(
             .flatten()
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false);
-        if ready {
-            let can_run = app_state
-                .sync_engine
-                .lock()
-                .map(|e| !e.is_sync_running())
-                .unwrap_or(false);
-            if can_run {
-                if let Ok(mut engine) = app_state.sync_engine.lock() {
-                    engine.set_sync_running(true);
-                }
-                // Run the sync tick first so a local folder deletion is detected,
-                // its `delete` job enqueued, and drained within this same tick
-                // (deleting the folder remotely) before discovery runs. Otherwise
-                // discovery would still see the (now-orphaned) remote folder and
-                // re-create its `.cloudsc` placeholder.
-                let _ = run_sync_tick_internal(&app_state);
-                match index_materialized_folders_as_cloudsc_placeholders_internal(&app_state) {
-                    Ok(n) if n > 0 => eprintln!("indexed {n} new remote placeholder(s)"),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("remote placeholder indexing failed: {e}"),
-                }
-                if let Ok(mut engine) = app_state.sync_engine.lock() {
-                    engine.set_sync_running(false);
-                }
-                update_tray_tooltip(&app, &current_tray_status_label(&app_state));
+        if ready
+            && app_state
+                .sync_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // Run the sync tick first so a local folder deletion is detected,
+            // its `delete` job enqueued, and drained within this same tick
+            // (deleting the folder remotely) before discovery runs. Otherwise
+            // discovery would still see the (now-orphaned) remote folder and
+            // re-create its `.cloudsc` placeholder.
+            let _ = run_sync_tick_internal(&app_state);
+            match index_materialized_folders_as_cloudsc_placeholders_internal(&app_state) {
+                Ok(n) if n > 0 => eprintln!("indexed {n} new remote placeholder(s)"),
+                Ok(_) => {}
+                Err(e) => eprintln!("remote placeholder indexing failed: {e}"),
             }
+            app_state.sync_running.store(false, Ordering::Release);
+            update_tray_tooltip(&app, &current_tray_status_label(&app_state));
         }
         std::thread::sleep(StdDuration::from_secs(60));
     });
@@ -257,7 +251,7 @@ pub fn get_sync_status(state: tauri::State<AppState>) -> Result<SyncStatus, Stri
         .sync_engine
         .lock()
         .map_err(|_| "sync engine lock poisoned".to_string())?;
-    Ok(engine.current_status())
+    Ok(engine.current_status(state.sync_running.load(Ordering::Acquire)))
 }
 
 #[tauri::command]
@@ -270,7 +264,7 @@ pub fn get_sync_dashboard(state: tauri::State<AppState>) -> Result<SyncDashboard
         .sync_engine
         .lock()
         .map_err(|_| "sync engine lock poisoned".to_string())?
-        .current_status();
+        .current_status(state.sync_running.load(Ordering::Acquire));
 
     Ok(SyncDashboard {
         status,
@@ -306,15 +300,12 @@ pub fn sync_tick(state: tauri::State<AppState>) -> Result<SyncTickResult, String
 
 #[tauri::command]
 pub fn trigger_sync_tick(state: tauri::State<AppState>) -> Result<TriggerSyncResponse, String> {
+    if state
+        .sync_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let mut engine = state
-            .sync_engine
-            .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
-        if engine.is_sync_running() {
-            return Ok(TriggerSyncResponse { accepted: false });
-        }
-        engine.set_sync_running(true);
+        return Ok(TriggerSyncResponse { accepted: false });
     }
 
     let app_state = state.inner().clone();
@@ -325,9 +316,7 @@ pub fn trigger_sync_tick(state: tauri::State<AppState>) -> Result<TriggerSyncRes
                 engine.set_last_error(format!("sync tick failed: {err}"));
             }
         }
-        if let Ok(mut engine) = app_state.sync_engine.lock() {
-            engine.set_sync_running(false);
-        }
+        app_state.sync_running.store(false, Ordering::Release);
     });
 
     Ok(TriggerSyncResponse { accepted: true })
@@ -361,15 +350,12 @@ pub fn trigger_hydrate_cloudsc_placeholder(
     state: tauri::State<AppState>,
     placeholder_local_rel_path: String,
 ) -> Result<TriggerActionResponse, String> {
+    if state
+        .sync_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let mut engine = state
-            .sync_engine
-            .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
-        if engine.is_sync_running() {
-            return Ok(TriggerActionResponse { accepted: false });
-        }
-        engine.set_sync_running(true);
+        return Ok(TriggerActionResponse { accepted: false });
     }
 
     let app_state = state.inner().clone();
@@ -384,8 +370,8 @@ pub fn trigger_hydrate_cloudsc_placeholder(
         }
         if let Ok(mut engine) = app_state.sync_engine.lock() {
             engine.set_last_scan_at(Utc::now().to_rfc3339());
-            engine.set_sync_running(false);
         }
+        app_state.sync_running.store(false, Ordering::Release);
     });
 
     Ok(TriggerActionResponse { accepted: true })
@@ -396,15 +382,12 @@ pub fn trigger_download_remote_file(
     state: tauri::State<AppState>,
     path_display: String,
 ) -> Result<TriggerActionResponse, String> {
+    if state
+        .sync_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let mut engine = state
-            .sync_engine
-            .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
-        if engine.is_sync_running() {
-            return Ok(TriggerActionResponse { accepted: false });
-        }
-        engine.set_sync_running(true);
+        return Ok(TriggerActionResponse { accepted: false });
     }
 
     let app_state = state.inner().clone();
@@ -417,8 +400,8 @@ pub fn trigger_download_remote_file(
         }
         if let Ok(mut engine) = app_state.sync_engine.lock() {
             engine.set_last_scan_at(Utc::now().to_rfc3339());
-            engine.set_sync_running(false);
         }
+        app_state.sync_running.store(false, Ordering::Release);
     });
 
     Ok(TriggerActionResponse { accepted: true })
@@ -429,15 +412,12 @@ pub fn trigger_hydrate_remote_folder(
     state: tauri::State<AppState>,
     folder_path_display: String,
 ) -> Result<TriggerActionResponse, String> {
+    if state
+        .sync_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let mut engine = state
-            .sync_engine
-            .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
-        if engine.is_sync_running() {
-            return Ok(TriggerActionResponse { accepted: false });
-        }
-        engine.set_sync_running(true);
+        return Ok(TriggerActionResponse { accepted: false });
     }
 
     let app_state = state.inner().clone();
@@ -452,8 +432,8 @@ pub fn trigger_hydrate_remote_folder(
         }
         if let Ok(mut engine) = app_state.sync_engine.lock() {
             engine.set_last_scan_at(Utc::now().to_rfc3339());
-            engine.set_sync_running(false);
         }
+        app_state.sync_running.store(false, Ordering::Release);
     });
 
     Ok(TriggerActionResponse { accepted: true })

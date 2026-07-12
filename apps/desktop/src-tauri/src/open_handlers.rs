@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use tauri::AppHandle;
 use tauri::Manager;
@@ -29,15 +30,12 @@ pub(crate) fn resolve_cloudsc_rel_path(state: &AppState, abs: &Path) -> Result<S
 
 pub(crate) fn spawn_drain_sync_queue_if_idle(app_state: AppState) {
     std::thread::spawn(move || {
+        if app_state
+            .sync_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            let mut engine = match app_state.sync_engine.lock() {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-            if engine.is_sync_running() {
-                return;
-            }
-            engine.set_sync_running(true);
+            return;
         }
         let mut safety = 0usize;
         while safety < 1000 {
@@ -51,9 +49,7 @@ pub(crate) fn spawn_drain_sync_queue_if_idle(app_state: AppState) {
                 }
             }
         }
-        if let Ok(mut engine) = app_state.sync_engine.lock() {
-            engine.set_sync_running(false);
-        }
+        app_state.sync_running.store(false, Ordering::Release);
     });
 }
 

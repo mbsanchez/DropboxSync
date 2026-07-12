@@ -347,6 +347,7 @@ pub(crate) fn run_sync_tick_internal(state: &AppState) -> Result<SyncTickResult,
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use chrono::{Duration, Utc};
@@ -383,6 +384,8 @@ mod tests {
             token_cache: Arc::new(Mutex::new(None)),
             scheduler_started: Arc::new(Mutex::new(false)),
             oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
