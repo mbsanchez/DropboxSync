@@ -9,6 +9,7 @@ use crate::cloudsc::{
     cloudsc_target_path, read_cloudsc_placeholder_file, write_cloudsc_placeholder_file,
 };
 use crate::dropbox_transfer::download_remote_file_internal;
+use crate::error::{AppError, AppResult};
 use crate::models::{
     CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
 };
@@ -19,12 +20,13 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     state: &AppState,
     remote_folder_path_display: &str,
     local_dir: &Path,
-) -> Result<usize, String> {
+) -> AppResult<usize> {
     let token = get_access_token(state)?;
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
     let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
 
-    fs::create_dir_all(local_dir).map_err(|e| format!("failed creating local dir: {e}"))?;
+    fs::create_dir_all(local_dir)
+        .map_err(|e| AppError::Io(format!("failed creating local dir: {e}")))?;
 
     let client = &state.http_client;
     let mut created = 0usize;
@@ -42,7 +44,7 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                 "include_deleted": false
             }))
             .send()
-            .map_err(|e| format!("list_folder request failed: {e}"))?;
+            .map_err(|e| AppError::Network(format!("list_folder request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
@@ -52,13 +54,14 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             if body.contains("path/not_found") {
                 return Ok(0);
             }
-            return Err(format!(
-                "list_folder status error for {remote_folder_path_display}: {status}; body: {body}"
-            ));
+            return Err(AppError::Dropbox {
+                status: status.as_u16(),
+                message: format!("list_folder for {remote_folder_path_display}: {body}"),
+            });
         }
         response
             .json()
-            .map_err(|e| format!("list_folder parse failed: {e}"))?
+            .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?
     };
 
     // Names of every remote child in this folder (regardless of selective-sync
@@ -115,17 +118,18 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             .bearer_auth(&token)
             .json(&serde_json::json!({ "cursor": entries_resp.cursor }))
             .send()
-            .map_err(|e| format!("list_folder/continue request failed: {e}"))?;
+            .map_err(|e| AppError::Network(format!("list_folder/continue request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-            return Err(format!(
-                "list_folder/continue status error for {remote_folder_path_display}: {status}; body: {body}"
-            ));
+            return Err(AppError::Dropbox {
+                status: status.as_u16(),
+                message: format!("list_folder/continue for {remote_folder_path_display}: {body}"),
+            });
         }
         entries_resp = response
             .json()
-            .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
+            .map_err(|e| AppError::Other(format!("list_folder/continue parse failed: {e}")))?;
     }
 
     // Remote-wins for placeholders: a `<X>.cloudsc` whose remote target `X` no
@@ -134,7 +138,9 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     // (any list error returns earlier), so a failed/partial listing never deletes
     // placeholders. Hydrated content (real files/dirs) is untouched — only
     // `.cloudsc` files are considered.
-    for dir_entry in fs::read_dir(local_dir).map_err(|e| format!("failed reading local dir: {e}"))? {
+    for dir_entry in
+        fs::read_dir(local_dir).map_err(|e| AppError::Io(format!("failed reading local dir: {e}")))?
+    {
         let dir_entry = match dir_entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -163,13 +169,14 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 /// (real) parent, exactly like a new remote file.
 pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
     state: &AppState,
-) -> Result<usize, String> {
+) -> AppResult<usize> {
     let sync_folder_str = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
     let sync_folder = PathBuf::from(&sync_folder_str);
-    fs::create_dir_all(&sync_folder).map_err(|e| format!("failed creating sync folder: {e}"))?;
+    fs::create_dir_all(&sync_folder)
+        .map_err(|e| AppError::Io(format!("failed creating sync folder: {e}")))?;
 
     let mut created = 0usize;
     for entry in WalkDir::new(&sync_folder).into_iter().filter_map(|e| e.ok()) {
@@ -193,16 +200,16 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
 pub(crate) fn list_cloudsc_placeholders(
     state: &AppState,
     limit: usize,
-) -> Result<Vec<CloudscPlaceholderInfo>, String> {
+) -> AppResult<Vec<CloudscPlaceholderInfo>> {
     let sync_folder_str = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
     let sync_folder = PathBuf::from(sync_folder_str);
 
     let mut out: Vec<CloudscPlaceholderInfo> = Vec::new();
     for entry in WalkDir::new(&sync_folder).min_depth(1) {
-        let entry = entry.map_err(|e| format!("walk dir error: {e}"))?;
+        let entry = entry.map_err(|e| AppError::Io(format!("walk dir error: {e}")))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -228,15 +235,17 @@ pub(crate) fn list_cloudsc_placeholders(
 pub(crate) fn hydrate_cloudsc_placeholder_internal(
     state: &AppState,
     placeholder_local_rel_path: &str,
-) -> Result<usize, String> {
+) -> AppResult<usize> {
     let sync_folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let placeholder_path = PathBuf::from(&sync_folder).join(placeholder_local_rel_path);
     if !placeholder_path.exists() {
-        return Err(format!("placeholder not found: {placeholder_local_rel_path}"));
+        return Err(AppError::Sync(format!(
+            "placeholder not found: {placeholder_local_rel_path}"
+        )));
     }
 
     let meta = read_cloudsc_placeholder_file(&placeholder_path)?;
@@ -244,13 +253,14 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
 
     if meta.tag == "file" {
         download_remote_file_internal(state, &meta.remote_path_display)?;
-        fs::remove_file(&placeholder_path).map_err(|e| format!("failed removing placeholder: {e}"))?;
+        fs::remove_file(&placeholder_path)
+            .map_err(|e| AppError::Io(format!("failed removing placeholder: {e}")))?;
         Ok(1)
     } else {
         fs::create_dir_all(&target_path)
-            .map_err(|e| format!("failed creating hydrated folder: {e}"))?;
+            .map_err(|e| AppError::Io(format!("failed creating hydrated folder: {e}")))?;
         fs::remove_file(&placeholder_path)
-            .map_err(|e| format!("failed removing folder placeholder: {e}"))?;
+            .map_err(|e| AppError::Io(format!("failed removing folder placeholder: {e}")))?;
 
         index_remote_folder_children_as_cloudsc_placeholders_internal(
             state,

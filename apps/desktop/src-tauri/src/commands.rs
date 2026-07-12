@@ -16,6 +16,7 @@ use crate::cloudsc_ops::{
     index_materialized_folders_as_cloudsc_placeholders_internal,
 };
 use crate::dropbox_transfer::{download_remote_file_internal, hydrate_remote_folder_internal};
+use crate::error::AppResult;
 use crate::models::*;
 use crate::oauth_listener::{start_oauth_callback_listener, stop_oauth_listener};
 use crate::state::AppState;
@@ -116,7 +117,7 @@ pub fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
 /// Same logic as [`get_startup_requirements`] for use from Rust (e.g. window visibility).
 pub(crate) fn compute_startup_requirements(
     state: &AppState,
-) -> Result<StartupRequirementsResponse, String> {
+) -> AppResult<StartupRequirementsResponse> {
     let sync_folder = state.db.get_sync_folder()?;
     let sync_folder_ok = sync_folder
         .as_ref()
@@ -165,7 +166,7 @@ pub(crate) fn should_show_main_window_for_onboarding(state: &AppState) -> bool {
 pub fn get_startup_requirements(
     state: tauri::State<AppState>,
 ) -> Result<StartupRequirementsResponse, String> {
-    compute_startup_requirements(state.inner())
+    compute_startup_requirements(state.inner()).map_err(String::from)
 }
 
 #[tauri::command]
@@ -277,19 +278,19 @@ pub fn retry_failed_jobs(state: tauri::State<AppState>) -> Result<usize, String>
 
 #[tauri::command]
 pub fn scan_local_changes(state: tauri::State<AppState>) -> Result<usize, String> {
-    scan_local_changes_internal(state.inner())
+    scan_local_changes_internal(state.inner()).map_err(String::from)
 }
 
 #[tauri::command]
 pub fn process_sync_queue(state: tauri::State<AppState>) -> Result<bool, String> {
-    process_sync_queue_internal(state.inner())
+    process_sync_queue_internal(state.inner()).map_err(String::from)
 }
 
 #[tauri::command]
 pub fn sync_tick(state: tauri::State<AppState>) -> Result<SyncTickResult, String> {
     // Delegate to the shared implementation so this IPC entry point drains the
     // queue in batches too (DBSYNC-10), instead of only one job per call.
-    run_sync_tick_internal(state.inner())
+    run_sync_tick_internal(state.inner()).map_err(String::from)
 }
 
 #[tauri::command]
@@ -328,7 +329,7 @@ pub fn list_remote_folder(
 pub fn index_remote_root_placeholders(state: tauri::State<AppState>) -> Result<usize, String> {
     // Now recurses into every materialized (real) folder, not just the root, so
     // new remote content in already-hydrated folders is discovered too.
-    index_materialized_folders_as_cloudsc_placeholders_internal(state.inner())
+    index_materialized_folders_as_cloudsc_placeholders_internal(state.inner()).map_err(String::from)
 }
 
 #[tauri::command]
@@ -336,7 +337,7 @@ pub fn list_cloudsc_placeholders(
     state: tauri::State<AppState>,
     limit: usize,
 ) -> Result<Vec<CloudscPlaceholderInfo>, String> {
-    crate::cloudsc_ops::list_cloudsc_placeholders(state.inner(), limit)
+    crate::cloudsc_ops::list_cloudsc_placeholders(state.inner(), limit).map_err(String::from)
 }
 
 #[tauri::command]

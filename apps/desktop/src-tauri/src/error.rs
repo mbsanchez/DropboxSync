@@ -1,12 +1,10 @@
 //! Typed application error, replacing ad-hoc `Result<_, String>` across the crate.
 //!
-//! Internal functions return [`AppResult<T>`]; the Tauri command boundary converts
-//! to `String` for IPC serialization via the `From<AppError> for String` bridge.
-//!
-//! This is phase A of the `Result<_, String>` -> typed error migration (DBSYNC-17):
-//! only a handful of leaf modules use [`AppError`] so far. The bridge `From` impls
-//! between `AppError` and `String` let migrated and not-yet-migrated modules
-//! interoperate through `?` during the transition.
+//! Internal functions return [`AppResult<T>`]. The Tauri command boundary
+//! (`#[tauri::command]` functions in `commands.rs`) converts to `String` for
+//! IPC serialization via the `From<AppError> for String` conversion below;
+//! that is the only place in the crate an `AppError` is turned into a `String`
+//! (DBSYNC-17).
 
 use thiserror::Error;
 
@@ -50,36 +48,16 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-// --- Migration bridges (temporary, removed in the final phase) ---
-// TODO(DBSYNC-17): remove once every module is migrated
+// --- IPC boundary conversion ---
+// The single sanctioned `AppError` -> `String` conversion. `#[tauri::command]`
+// functions in `commands.rs` return `Result<_, String>` (Tauri IPC requires a
+// serializable error type); every command converts its `AppResult` internals
+// via this `From` impl (through `?` or an explicit `.map_err(String::from)`).
+// No other module should need to go the other way (`String` -> `AppError`):
+// every internal function returns `AppResult` directly.
 impl From<AppError> for String {
     fn from(e: AppError) -> Self {
         e.to_string()
-    }
-}
-
-// TODO(DBSYNC-17): remove once every module is migrated. Now exercised by
-// not-yet-migrated modules (e.g. `auth_session::get_access_token`, still
-// `Result<_, String>`) whose errors flow through `?` into `AppResult`-returning
-// callers such as `dropbox_transfer`.
-impl From<String> for AppError {
-    fn from(s: String) -> Self {
-        AppError::Other(s)
-    }
-}
-
-// TODO(DBSYNC-17): remove once every module is migrated. Not yet exercised by
-// any call site (no not-yet-migrated module currently propagates a bare
-// `&str` error into an `AppResult`-returning function via `?`), but kept for
-// symmetry with `From<String>` and to avoid breaking a future caller that
-// does.
-#[allow(
-    dead_code,
-    reason = "not yet exercised by any call site; see comment above"
-)]
-impl From<&str> for AppError {
-    fn from(s: &str) -> Self {
-        AppError::Other(s.to_string())
     }
 }
 
@@ -132,8 +110,8 @@ impl AppError {
     /// (missing session, no refresh token, or Dropbox explicitly rejecting the
     /// refresh grant), as opposed to a transient refresh failure that is worth
     /// retrying later? Used by `auth_session::verify_dropbox_token_internal`
-    /// (and the not-yet-migrated `commands::compute_startup_requirements`) to
-    /// decide whether to surface the user as logged-out.
+    /// and `commands::compute_startup_requirements` to decide whether to
+    /// surface the user as logged-out.
     ///
     /// Uses `Display` (`self.to_string()`) to inspect the message: the `Auth`
     /// variant's `"auth error: "` prefix does not interfere with any of the

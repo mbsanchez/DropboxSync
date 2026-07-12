@@ -9,6 +9,7 @@ use crate::dropbox_transfer::{
     delete_local_file_internal, delete_remote_file_internal, download_remote_file_internal,
     upload_local_file_internal,
 };
+use crate::error::{AppError, AppResult};
 use crate::models::SyncTickResult;
 use crate::path_util::{
     backoff_seconds, create_conflicted_copy, hash_file, normalize_dropbox_path,
@@ -24,7 +25,7 @@ use crate::storage::db::FileIndexRow;
 /// one job every 60s (see DBSYNC-10).
 const SYNC_BATCH_CAP: usize = 50;
 
-pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> Result<(), String> {
+pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
     let queue_depth = state.db.count_active_jobs()?;
 
     let failed_error = state.db.latest_failed_error()?;
@@ -32,7 +33,7 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> Result<(), Strin
     let mut engine = state
         .sync_engine
         .lock()
-        .map_err(|_| "sync engine lock poisoned".to_string())?;
+        .map_err(|_| AppError::Sync("sync engine lock poisoned".to_string()))?;
     engine.set_queue_depth(queue_depth);
     match failed_error {
         Some(msg) => engine.set_last_error(msg),
@@ -43,11 +44,11 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, String> {
+pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
     let known = state.db.list_local_files()?;
     let existing_jobs = state.db.list_recent_jobs(200)?;
     let pending_targets: HashSet<String> = existing_jobs
@@ -95,7 +96,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
         let absolute = entry.path().to_path_buf();
         let relative = absolute
             .strip_prefix(&tracked_root)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| AppError::Io(e.to_string()))?
             .to_string_lossy()
             .to_string();
 
@@ -124,7 +125,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
                     let conflicted_path = create_conflicted_copy(&absolute)?;
                     let conflicted_rel = conflicted_path
                         .strip_prefix(&tracked_root)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|e| AppError::Io(e.to_string()))?
                         .to_string_lossy()
                         .to_string();
                     {
@@ -199,7 +200,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
         let absolute = entry.path().to_path_buf();
         let relative = absolute
             .strip_prefix(&tracked_root)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| AppError::Io(e.to_string()))?
             .to_string_lossy()
             .to_string();
 
@@ -233,7 +234,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
         let mut engine = state
             .sync_engine
             .lock()
-            .map_err(|_| "sync engine lock poisoned".to_string())?;
+            .map_err(|_| AppError::Sync("sync engine lock poisoned".to_string()))?;
         engine.set_last_scan_at(Utc::now().to_rfc3339());
     }
 
@@ -241,7 +242,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> Result<usize, Str
     Ok(enqueued_jobs + remote_enqueued)
 }
 
-pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, String> {
+pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     let next = state.db.pick_next_due_job()?;
     let Some(job) = next else {
         refresh_queue_depth_internal(state)?;
@@ -251,39 +252,38 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
     let max_attempts = 5;
     let attempt = job.attempt_count + 1;
 
-    let op_result: Result<(), String> = match job.job_type.as_str() {
+    let op_result: AppResult<()> = match job.job_type.as_str() {
         "upload" => job
             .source_path
             .as_deref()
-            .ok_or_else(|| "upload job missing source_path".to_string())
-            .and_then(|rel| upload_local_file_internal(state, rel, job.id).map_err(String::from)),
+            .ok_or_else(|| AppError::Sync("upload job missing source_path".to_string()))
+            .and_then(|rel| upload_local_file_internal(state, rel, job.id)),
         "delete" => job
             .target_path
             .as_deref()
             .or(job.source_path.as_deref())
-            .ok_or_else(|| "delete job missing target_path/source_path".to_string())
-            .and_then(|rel| delete_remote_file_internal(state, rel).map_err(String::from)),
+            .ok_or_else(|| AppError::Sync("delete job missing target_path/source_path".to_string()))
+            .and_then(|rel| delete_remote_file_internal(state, rel)),
         "local_delete" => job
             .target_path
             .as_deref()
             .or(job.source_path.as_deref())
-            .ok_or_else(|| "local_delete job missing target_path/source_path".to_string())
-            .and_then(|rel| delete_local_file_internal(state, rel).map_err(String::from)),
+            .ok_or_else(|| {
+                AppError::Sync("local_delete job missing target_path/source_path".to_string())
+            })
+            .and_then(|rel| delete_local_file_internal(state, rel)),
         "download" => job
             .target_path
             .as_deref()
             .or(job.source_path.as_deref())
-            .ok_or_else(|| "download job missing target_path/source_path".to_string())
-            .and_then(|rel| {
-                download_remote_file_internal(state, &normalize_dropbox_path(rel))
-                    .map_err(String::from)
-            }),
+            .ok_or_else(|| AppError::Sync("download job missing target_path/source_path".to_string()))
+            .and_then(|rel| download_remote_file_internal(state, &normalize_dropbox_path(rel))),
         "hydrate_cloudsc" => job
             .source_path
             .as_deref()
-            .ok_or_else(|| "hydrate_cloudsc job missing source_path".to_string())
+            .ok_or_else(|| AppError::Sync("hydrate_cloudsc job missing source_path".to_string()))
             .and_then(|rel| hydrate_cloudsc_placeholder_internal(state, rel).map(|_| ())),
-        other => Err(format!("unknown job_type: {other}")),
+        other => Err(AppError::Sync(format!("unknown job_type: {other}"))),
     };
 
     match op_result {
@@ -317,7 +317,7 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
     Ok(true)
 }
 
-pub(crate) fn run_sync_tick_internal(state: &AppState) -> Result<SyncTickResult, String> {
+pub(crate) fn run_sync_tick_internal(state: &AppState) -> AppResult<SyncTickResult> {
     let enqueued_jobs = scan_local_changes_internal(state)?;
 
     // Drain up to `SYNC_BATCH_CAP` due jobs in this tick instead of exactly one,

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 
 use crate::auth_session::get_access_token;
+use crate::error::{AppError, AppResult};
 use crate::models::{DropboxEntry, DropboxListFolderResponse};
 use crate::path_util::normalize_dropbox_path;
 use crate::state::AppState;
@@ -23,7 +24,7 @@ pub(crate) fn parse_rfc3339_ts_to_unix(input: &str) -> i64 {
 pub(crate) fn fetch_remote_file_metadata(
     state: &AppState,
     relative: &str,
-) -> Result<Option<RemoteFileMeta>, String> {
+) -> AppResult<Option<RemoteFileMeta>> {
     let token = get_access_token(state)?;
     let client = &state.http_client;
     let dropbox_path = normalize_dropbox_path(relative);
@@ -37,12 +38,12 @@ pub(crate) fn fetch_remote_file_metadata(
             "include_deleted": false
         }))
         .send()
-        .map_err(|e| format!("get_metadata request failed for {relative}: {e}"))?;
+        .map_err(|e| AppError::Network(format!("get_metadata request failed for {relative}: {e}")))?;
 
     if response.status().is_success() {
         let entry: DropboxEntry = response
             .json()
-            .map_err(|e| format!("get_metadata parse failed for {relative}: {e}"))?;
+            .map_err(|e| AppError::Other(format!("get_metadata parse failed for {relative}: {e}")))?;
         if entry.tag != "file" {
             return Ok(None);
         }
@@ -68,9 +69,10 @@ pub(crate) fn fetch_remote_file_metadata(
     if status.as_u16() == 409 && (body.contains("not_found") || body.contains("path")) {
         return Ok(None);
     }
-    Err(format!(
-        "get_metadata status error for {relative}: {status}; body: {body}"
-    ))
+    Err(AppError::Dropbox {
+        status: status.as_u16(),
+        message: format!("get_metadata for {relative}: {body}"),
+    })
 }
 
 /// Maps a single `list_folder`/`list_folder/continue` entry to the
@@ -116,7 +118,7 @@ fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMet
 /// of returning whatever was collected so far.
 pub(crate) fn fetch_all_remote_file_metadata(
     state: &AppState,
-) -> Result<HashMap<String, RemoteFileMeta>, String> {
+) -> AppResult<HashMap<String, RemoteFileMeta>> {
     let token = get_access_token(state)?;
     let client = &state.http_client;
 
@@ -132,17 +134,18 @@ pub(crate) fn fetch_all_remote_file_metadata(
                 "include_deleted": false
             }))
             .send()
-            .map_err(|e| format!("list_folder request failed: {e}"))?;
+            .map_err(|e| AppError::Network(format!("list_folder request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-            return Err(format!(
-                "list_folder status error for account root: {status}; body: {body}"
-            ));
+            return Err(AppError::Dropbox {
+                status: status.as_u16(),
+                message: format!("list_folder for account root: {body}"),
+            });
         }
         response
             .json()
-            .map_err(|e| format!("list_folder parse failed: {e}"))?
+            .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?
     };
 
     loop {
@@ -160,17 +163,18 @@ pub(crate) fn fetch_all_remote_file_metadata(
             .bearer_auth(&token)
             .json(&serde_json::json!({ "cursor": entries_resp.cursor }))
             .send()
-            .map_err(|e| format!("list_folder/continue request failed: {e}"))?;
+            .map_err(|e| AppError::Network(format!("list_folder/continue request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-            return Err(format!(
-                "list_folder/continue status error for account root: {status}; body: {body}"
-            ));
+            return Err(AppError::Dropbox {
+                status: status.as_u16(),
+                message: format!("list_folder/continue for account root: {body}"),
+            });
         }
         entries_resp = response
             .json()
-            .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
+            .map_err(|e| AppError::Other(format!("list_folder/continue parse failed: {e}")))?;
     }
 
     Ok(remote_by_path)
@@ -178,7 +182,7 @@ pub(crate) fn fetch_all_remote_file_metadata(
 
 pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     state: &AppState,
-) -> Result<usize, String> {
+) -> AppResult<usize> {
     let local_files = state.db.list_local_files()?;
     if local_files.is_empty() {
         return Ok(0);
