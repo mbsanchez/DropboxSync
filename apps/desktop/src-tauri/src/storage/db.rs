@@ -825,6 +825,11 @@ fn add_column_if_missing(
 
 /// Platform whose data-dir convention to follow. Split out from the real OS so the
 /// path logic below is deterministic and unit-testable on any build target.
+///
+/// Every variant is constructed on some platform (or in tests), but on any single
+/// build target `current_data_dir_os()` only builds one of them, so `dead_code`
+/// would otherwise flag the others as never-constructed.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataDirOs {
     Windows,

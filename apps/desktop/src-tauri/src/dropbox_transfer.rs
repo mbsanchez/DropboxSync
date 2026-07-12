@@ -76,18 +76,6 @@ fn atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
     })
 }
 
-/// Builds an HTTP client for transfer (upload/download) requests with explicit
-/// timeouts: a fast connect timeout for genuinely dead endpoints, and a generous
-/// per-request timeout that tolerates a very slow multi-megabyte chunk while
-/// still failing a truly stalled connection instead of hanging forever.
-fn http_client() -> Result<Client, String> {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))
-}
-
 /// Walks a `reqwest::Error`'s `source()` chain and joins every message so the
 /// real underlying cause (connection reset, timed out, TLS failure, etc.) is
 /// surfaced instead of the generic top-level "error sending request for url".
@@ -218,7 +206,7 @@ pub(crate) fn list_remote_folder(
 
     let dropbox_path = normalize_dropbox_path(&path);
 
-    let client = Client::new();
+    let client = &state.http_client;
     let response = client
         .post("https://api.dropboxapi.com/2/files/list_folder")
         .bearer_auth(&token)
@@ -591,7 +579,7 @@ fn upload_via_session(
     dropbox_path: &str,
     job_id: i64,
 ) -> Result<(), String> {
-    let client = http_client()?;
+    let client = &state.http_client;
 
     let file_mtime = file
         .metadata()
@@ -609,7 +597,7 @@ fn upload_via_session(
         }
         _ => {
             let sid = retry_transient("upload_session/start", 4, || {
-                start_upload_session(&client, token)
+                start_upload_session(client, token)
             })?;
             state
                 .db
@@ -639,7 +627,7 @@ fn upload_via_session(
         if n == 0 && !is_final_chunk(offset, n, len) {
             let chunk_offset = offset;
             let result = retry_transient("upload_session/finish", 4, || {
-                finish_upload_session(&client, token, &session_id, chunk_offset, dropbox_path, &[])
+                finish_upload_session(client, token, &session_id, chunk_offset, dropbox_path, &[])
             });
             match result {
                 Ok(()) => {
@@ -652,7 +640,7 @@ fn upload_via_session(
                     restart_session(
                         state,
                         job_id,
-                        &client,
+                        client,
                         token,
                         &mut file,
                         &mut SessionCursor {
@@ -670,7 +658,7 @@ fn upload_via_session(
         if is_final_chunk(offset, n, len) {
             let chunk_offset = offset;
             let result = retry_transient("upload_session/finish", 4, || {
-                finish_upload_session(&client, token, &session_id, chunk_offset, dropbox_path, &buf[..n])
+                finish_upload_session(client, token, &session_id, chunk_offset, dropbox_path, &buf[..n])
             });
             match result {
                 Ok(()) => {
@@ -684,7 +672,7 @@ fn upload_via_session(
                     restart_session(
                         state,
                         job_id,
-                        &client,
+                        client,
                         token,
                         &mut file,
                         &mut SessionCursor {
@@ -700,7 +688,7 @@ fn upload_via_session(
         } else {
             let chunk_offset = offset;
             let result = retry_transient("upload_session/append_v2", 4, || {
-                append_upload_chunk(&client, token, &session_id, chunk_offset, &buf[..n])
+                append_upload_chunk(client, token, &session_id, chunk_offset, &buf[..n])
             });
             match result {
                 Ok(()) => {
@@ -715,7 +703,7 @@ fn upload_via_session(
                     restart_session(
                         state,
                         job_id,
-                        &client,
+                        client,
                         token,
                         &mut file,
                         &mut SessionCursor {
@@ -781,7 +769,7 @@ pub(crate) fn upload_local_file_internal(
 
     match choose_upload_strategy(len) {
         UploadStrategy::SingleShot => {
-            let client = http_client()?;
+            let client = &state.http_client;
             let resp = client
                 .post("https://content.dropboxapi.com/2/files/upload")
                 .bearer_auth(&token)
@@ -821,7 +809,7 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
 
     let token = get_access_token(state)?;
     let dropbox_path = normalize_dropbox_path(relative);
-    let client = Client::new();
+    let client = &state.http_client;
     let resp = client
         .post("https://api.dropboxapi.com/2/files/delete_v2")
         .bearer_auth(&token)
@@ -910,7 +898,7 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         }
     }
 
-    fetch_and_write_file(&http_client()?, &token, path_display, &target)?;
+    fetch_and_write_file(&state.http_client, &token, path_display, &target)?;
 
     let (hash, size_bytes, modified_ts) = hash_file(&target)?;
     state
@@ -934,7 +922,7 @@ pub(crate) fn hydrate_remote_folder_internal(
 
     fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
 
-    let client = http_client()?;
+    let client = &state.http_client;
     let mut downloaded = 0usize;
 
     let response = client
@@ -974,7 +962,7 @@ pub(crate) fn hydrate_remote_folder_internal(
             }
 
             let target = PathBuf::from(&folder).join(&relative);
-            fetch_and_write_file(&client, &token, path_display, &target)?;
+            fetch_and_write_file(client, &token, path_display, &target)?;
 
             let (hash, size_bytes, modified_ts) = hash_file(&target)?;
             state.db.upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
@@ -1012,7 +1000,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
         .ok_or_else(|| "sync folder not configured".to_string())?;
     fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
 
-    let client = http_client()?;
+    let client = &state.http_client;
     let mut downloaded = 0usize;
     let known_map: HashMap<String, FileIndexRow> = state
         .db
@@ -1056,7 +1044,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
                 continue;
             }
 
-            fetch_and_write_file(&client, &token, path_display, &target)?;
+            fetch_and_write_file(client, &token, path_display, &target)?;
             let (hash, size_bytes, modified_ts) = hash_file(&target)?;
             state
                 .db

@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use reqwest::blocking::Client;
 use walkdir::WalkDir;
 
 use crate::auth_session::get_access_token;
@@ -28,13 +26,7 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
     fs::create_dir_all(local_dir).map_err(|e| format!("failed creating local dir: {e}"))?;
 
-    // Timeouts bound a hung metadata call so it can't stall the whole
-    // materialized-folder sweep (which issues one list_folder per real dir).
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = &state.http_client;
     let mut created = 0usize;
 
     // Page through the folder with cursor + has_more; a folder with more than one

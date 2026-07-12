@@ -2,7 +2,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
-use reqwest::blocking::Client;
 
 use crate::auth::oauth::refresh_access_token_blocking;
 use crate::state::AppState;
@@ -97,7 +96,7 @@ pub(crate) fn force_refresh_session(state: &AppState) -> Result<TokenSession, St
     };
 
     refresh_token_guarded(&state.token_cache, &state.token_refresh_lock, true, || {
-        let refreshed = refresh_access_token_blocking(&refresh_token)?;
+        let refreshed = refresh_access_token_blocking(&state.http_client, &refresh_token)?;
 
         let new_refresh_token = refreshed
             .refresh_token
@@ -162,7 +161,7 @@ pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
 
     let refreshed_session =
         refresh_token_guarded(&state.token_cache, &state.token_refresh_lock, false, || {
-            let refreshed = refresh_access_token_blocking(&refresh_token)?;
+            let refreshed = refresh_access_token_blocking(&state.http_client, &refresh_token)?;
 
             let new_refresh_token = refreshed
                 .refresh_token
@@ -191,8 +190,8 @@ pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
 }
 
 pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> Result<bool, String> {
-    fn probe(token: &str) -> Result<reqwest::blocking::Response, ()> {
-        Client::new()
+    fn probe(client: &reqwest::blocking::Client, token: &str) -> Result<reqwest::blocking::Response, ()> {
+        client
             .post("https://api.dropboxapi.com/2/users/get_current_account")
             .bearer_auth(token)
             .json(&serde_json::json!({}))
@@ -201,7 +200,7 @@ pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> Result<bool, St
     }
 
     let token = get_access_token(state)?;
-    let response = match probe(&token) {
+    let response = match probe(&state.http_client, &token) {
         Ok(r) => r,
         Err(()) => return Ok(true),
     };
@@ -217,7 +216,7 @@ pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> Result<bool, St
         return match force_refresh_session(state) {
             Ok(session) => {
                 let token2 = session.access_token;
-                match probe(&token2) {
+                match probe(&state.http_client, &token2) {
                     Ok(r2) if r2.status().is_success() => Ok(true),
                     Ok(r2) if r2.status().as_u16() == 401 => Ok(false),
                     Ok(_) => Ok(true),

@@ -120,11 +120,13 @@ pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenRespo
     Ok(token)
 }
 
-pub fn refresh_access_token_blocking(refresh_token: &str) -> Result<TokenResponse, String> {
+pub fn refresh_access_token_blocking(
+    client: &reqwest::blocking::Client,
+    refresh_token: &str,
+) -> Result<TokenResponse, String> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
 
-    let client = reqwest::blocking::Client::new();
     let response = client
         .post("https://api.dropboxapi.com/oauth2/token")
         .form(&[

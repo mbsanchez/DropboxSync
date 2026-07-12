@@ -46,6 +46,7 @@ pub fn run() {
         oauth_listener: Arc::new(Mutex::new(None)),
         sync_running: Arc::new(AtomicBool::new(false)),
         token_refresh_lock: Arc::new(Mutex::new(())),
+        http_client: state::build_http_client(),
     };
 
     let mut builder = tauri::Builder::default()
