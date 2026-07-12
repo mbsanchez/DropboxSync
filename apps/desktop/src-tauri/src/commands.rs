@@ -8,8 +8,8 @@ use tauri::{AppHandle, Manager};
 use crate::auth::oauth::start_oauth;
 use crate::auth::oauth_complete::complete_oauth_internal;
 use crate::auth_session::{
-    current_tray_status_label, has_stored_credentials, is_hard_auth_failure,
-    update_tray_tooltip, verify_dropbox_token_internal,
+    current_tray_status_label, has_stored_credentials, update_tray_tooltip,
+    verify_dropbox_token_internal,
 };
 use crate::cloudsc_ops::{
     hydrate_cloudsc_placeholder_internal,
@@ -29,14 +29,8 @@ use crate::sync_pipeline::{
 pub fn get_selective_sync_filters(
     state: tauri::State<AppState>,
 ) -> Result<SelectiveSyncFilters, String> {
-    let include_csv = state
-        .db
-        .get_include_prefixes_csv()?
-        .unwrap_or_default();
-    let exclude_csv = state
-        .db
-        .get_exclude_prefixes_csv()?
-        .unwrap_or_default();
+    let include_csv = state.db.get_include_prefixes_csv()?.unwrap_or_default();
+    let exclude_csv = state.db.get_exclude_prefixes_csv()?.unwrap_or_default();
     Ok(SelectiveSyncFilters {
         include_csv,
         exclude_csv,
@@ -67,11 +61,7 @@ pub fn start_oauth_flow(
             .map_err(|_| "sync engine lock poisoned".to_string())?;
         engine.set_oauth_context(oauth_state.clone(), verifier);
     }
-    start_oauth_callback_listener(
-        app,
-        state.inner().clone(),
-        state.oauth_listener.clone(),
-    )?;
+    start_oauth_callback_listener(app, state.inner().clone(), state.oauth_listener.clone())?;
 
     Ok(OauthStartResponse {
         auth_url,
@@ -85,7 +75,9 @@ pub async fn complete_oauth_flow(
     code: String,
     state: String,
 ) -> Result<(), String> {
-    complete_oauth_internal(app_state.inner(), code, state).await
+    complete_oauth_internal(app_state.inner(), code, state)
+        .await
+        .map_err(String::from)
 }
 
 #[tauri::command]
@@ -122,7 +114,9 @@ pub fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
 }
 
 /// Same logic as [`get_startup_requirements`] for use from Rust (e.g. window visibility).
-pub(crate) fn compute_startup_requirements(state: &AppState) -> Result<StartupRequirementsResponse, String> {
+pub(crate) fn compute_startup_requirements(
+    state: &AppState,
+) -> Result<StartupRequirementsResponse, String> {
     let sync_folder = state.db.get_sync_folder()?;
     let sync_folder_ok = sync_folder
         .as_ref()
@@ -147,7 +141,7 @@ pub(crate) fn compute_startup_requirements(state: &AppState) -> Result<StartupRe
     } else {
         match verify_dropbox_token_internal(state) {
             Ok(v) => v,
-            Err(e) => !is_hard_auth_failure(&e),
+            Err(e) => !e.is_hard_auth(),
         }
     };
 

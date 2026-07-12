@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::auth::oauth::dropbox_redirect_uri;
 use crate::auth::oauth_complete::complete_oauth_internal;
+use crate::error::{AppError, AppResult};
 use crate::models::DropboxOauthFinishedEvent;
 use crate::state::{AppState, OauthListenerControl};
 
@@ -31,8 +32,13 @@ fn normalize_path(path: &str) -> String {
 /// Result of parsing the HTTP request-target for an OAuth redirect (RFC 7230 origin-form or
 /// absolute-form `http://host/...`).
 enum OauthRedirectParse {
-    Success { code: String, state: String },
-    OAuthDenied { message: String },
+    Success {
+        code: String,
+        state: String,
+    },
+    OAuthDenied {
+        message: String,
+    },
     /// Callback path matched but query is incomplete (or favicon noise on another path).
     Incomplete,
     /// Not our OAuth callback path (e.g. `/favicon.ico`).
@@ -103,10 +109,10 @@ fn emit_oauth_finished(app: &AppHandle, event: DropboxOauthFinishedEvent) {
 /// Stops any running localhost OAuth listener and joins its thread so the TCP port is released.
 pub(crate) fn stop_oauth_listener(
     oauth_listener: &Arc<Mutex<Option<OauthListenerControl>>>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let mut guard = oauth_listener
         .lock()
-        .map_err(|_| "oauth listener mutex poisoned".to_string())?;
+        .map_err(|_| AppError::Auth("oauth listener mutex poisoned".to_string()))?;
     if let Some(ctrl) = guard.take() {
         ctrl.cancel.store(true, Ordering::SeqCst);
         let _ = ctrl.handle.join();
@@ -118,44 +124,41 @@ pub(crate) fn start_oauth_callback_listener(
     app: AppHandle,
     app_state: AppState,
     oauth_listener: Arc<Mutex<Option<OauthListenerControl>>>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     stop_oauth_listener(&oauth_listener)?;
 
     let redirect_uri = dropbox_redirect_uri();
-    let url = Url::parse(&redirect_uri).map_err(|e| format!("invalid redirect uri: {e}"))?;
+    let url = Url::parse(&redirect_uri)
+        .map_err(|e| AppError::Auth(format!("invalid redirect uri: {e}")))?;
     let host = url
         .host_str()
-        .ok_or_else(|| "redirect uri must contain host".to_string())?;
+        .ok_or_else(|| AppError::Auth("redirect uri must contain host".to_string()))?;
     let port = url
         .port_or_known_default()
-        .ok_or_else(|| "redirect uri must contain port".to_string())?;
+        .ok_or_else(|| AppError::Auth("redirect uri must contain port".to_string()))?;
     let callback_path = url.path().to_string();
     let bind_addr = loopback_bind_address(host, port);
 
     let listener = TcpListener::bind(&bind_addr).map_err(|e| {
-        format!("cannot bind OAuth callback listener on {bind_addr}: {e}. Close other apps using this port or cancel OAuth and retry.")
+        AppError::Network(format!(
+            "cannot bind OAuth callback listener on {bind_addr}: {e}. Close other apps using this port or cancel OAuth and retry."
+        ))
     })?;
     listener
         .set_nonblocking(true)
-        .map_err(|e| format!("set_nonblocking: {e}"))?;
+        .map_err(|e| AppError::Network(format!("set_nonblocking: {e}")))?;
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
 
     let handle = thread::spawn(move || {
-        run_oauth_listener_loop(
-            listener,
-            cancel_for_thread,
-            app,
-            app_state,
-            callback_path,
-        );
+        run_oauth_listener_loop(listener, cancel_for_thread, app, app_state, callback_path);
     });
 
     {
         let mut guard = oauth_listener
             .lock()
-            .map_err(|_| "oauth listener mutex poisoned".to_string())?;
+            .map_err(|_| AppError::Auth("oauth listener mutex poisoned".to_string()))?;
         *guard = Some(OauthListenerControl { cancel, handle });
     }
 
@@ -238,7 +241,7 @@ fn run_oauth_listener_loop(
                         }
                         let event = DropboxOauthFinishedEvent {
                             ok: result.is_ok(),
-                            message: result.err(),
+                            message: result.err().map(String::from),
                         };
                         emit_oauth_finished(&app, event);
                     }

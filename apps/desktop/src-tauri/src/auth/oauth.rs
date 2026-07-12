@@ -4,6 +4,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::error::{AppError, AppResult};
+
 /// Dropbox App Console → your app → **Settings** → **App key** (OAuth2 `client_id`).
 /// Prefer providing this value via `DROPBOX_APP_KEY` in `.env` for dev/build.
 /// The build command embeds it at compile time via `option_env!`.
@@ -26,13 +28,13 @@ pub struct TokenResponse {
     pub expires_in: Option<i64>,
 }
 
-fn resolve_app_key() -> Result<String, String> {
+fn resolve_app_key() -> AppResult<String> {
     let v = std::env::var("DROPBOX_APP_KEY").unwrap_or_else(|_| DROPBOX_APP_KEY.to_string());
     if v.is_empty() {
-        return Err(
+        return Err(AppError::Auth(
             "DROPBOX_APP_KEY is empty: set it in apps/desktop/.env (and run build again) or export it in the environment."
                 .to_string(),
-        );
+        ));
     }
     Ok(v)
 }
@@ -68,7 +70,7 @@ fn random_state() -> String {
         .collect()
 }
 
-pub fn start_oauth() -> Result<(String, String, String), String> {
+pub fn start_oauth() -> AppResult<(String, String, String)> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
     let verifier = pkce_verifier();
@@ -87,13 +89,13 @@ pub fn start_oauth() -> Result<(String, String, String), String> {
     Ok((auth_url, state, verifier))
 }
 
-pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenResponse, String> {
+pub async fn complete_oauth(code: String, verifier: String) -> AppResult<TokenResponse> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("failed to build oauth http client: {e}"))?;
+        .map_err(|e| AppError::Network(format!("failed to build oauth http client: {e}")))?;
     let response = client
         .post("https://api.dropboxapi.com/oauth2/token")
         .form(&[
@@ -105,21 +107,27 @@ pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenRespo
         ])
         .send()
         .await
-        .map_err(|e| format!("token request failed: {e}"))?;
+        .map_err(|e| AppError::Network(format!("token request failed: {e}")))?;
 
     let status = response.status();
     let body = response
         .bytes()
         .await
-        .map_err(|e| format!("token response body failed: {e}"))?;
+        .map_err(|e| AppError::Network(format!("token response body failed: {e}")))?;
 
     if !status.is_success() {
         let text = String::from_utf8_lossy(&body);
-        return Err(format!("dropbox token exchange failed ({status}): {text}"));
+        return Err(AppError::Auth(format!(
+            "dropbox token exchange failed ({status}): {text}"
+        )));
     }
 
-    let token = serde_json::from_slice::<TokenResponse>(&body)
-        .map_err(|e| format!("token parse failed: {e}; body: {}", String::from_utf8_lossy(&body)))?;
+    let token = serde_json::from_slice::<TokenResponse>(&body).map_err(|e| {
+        AppError::Auth(format!(
+            "token parse failed: {e}; body: {}",
+            String::from_utf8_lossy(&body)
+        ))
+    })?;
 
     Ok(token)
 }
@@ -127,7 +135,7 @@ pub async fn complete_oauth(code: String, verifier: String) -> Result<TokenRespo
 pub fn refresh_access_token_blocking(
     client: &reqwest::blocking::Client,
     refresh_token: &str,
-) -> Result<TokenResponse, String> {
+) -> AppResult<TokenResponse> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
 
@@ -140,17 +148,19 @@ pub fn refresh_access_token_blocking(
             ("redirect_uri", redirect_uri),
         ])
         .send()
-        .map_err(|e| format!("refresh token request failed: {e}"))?;
+        .map_err(|e| AppError::Network(format!("refresh token request failed: {e}")))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        return Err(AppError::Auth(format!(
             "dropbox refresh token exchange failed with status {status}; body: {body}"
-        ));
+        )));
     }
 
     response
         .json::<TokenResponse>()
-        .map_err(|e| format!("refresh token parse failed: {e}"))
+        .map_err(|e| AppError::Auth(format!("refresh token parse failed: {e}")))
 }
