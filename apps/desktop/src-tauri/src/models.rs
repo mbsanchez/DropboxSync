@@ -105,6 +105,16 @@ pub(crate) struct UploadProgressEvent {
     pub total: u64,
 }
 
+/// Emitted to the webview when a remote download would clobber unsynced local
+/// changes, so the UI can notify the user without polling.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SyncConflictEvent {
+    pub path: String,
+    pub conflict_path: String,
+    pub reason: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CloudscMeta {
     pub version: u8,

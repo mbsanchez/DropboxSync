@@ -10,11 +10,12 @@ use tauri::{Emitter, EventTarget};
 
 use crate::auth_session::get_access_token;
 use crate::models::{
-    DropboxListFolderResponse, ListRemoteFolderResponse, RemoteEntry, UploadProgressEvent,
-    UploadSessionStartResponse,
+    DropboxListFolderResponse, ListRemoteFolderResponse, RemoteEntry, SyncConflictEvent,
+    UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
-    hash_file, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
+    create_conflicted_copy, hash_file, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
+    relpath_under,
 };
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
@@ -398,6 +399,61 @@ fn is_final_chunk(offset: u64, bytes_read: usize, total_len: u64) -> bool {
     offset + bytes_read as u64 >= total_len
 }
 
+/// Would writing the freshly-downloaded remote content over `target` destroy
+/// local changes that were never synced? True only when the file exists on
+/// disk, we have a previously-synced baseline hash for it, and the current
+/// on-disk hash differs from that baseline (i.e. the user edited the file
+/// locally since the last sync, and the remote copy is not simply
+/// re-affirming what we already have).
+fn download_would_conflict(
+    target_exists: bool,
+    on_disk_hash: &str,
+    baseline_hash: Option<&str>,
+) -> bool {
+    if !target_exists {
+        return false;
+    }
+    match baseline_hash {
+        None => false, // never indexed locally — nothing to protect against
+        Some(baseline) => on_disk_hash != baseline,
+    }
+}
+
+/// Does a conflicted-copy sibling of `target` already hold exactly `content_hash`?
+///
+/// Dedupe guard for the download-conflict path: a `download` job that fails its
+/// network fetch is retried (up to `max_attempts`), and each retry re-observes the
+/// same unsynced local edit — without this check it would spawn a fresh
+/// `(conflicted copy …)` file and a duplicate `sync_conflicts` row every attempt.
+/// Matching by CONTENT (not by path/existence) means a genuinely different *later*
+/// local edit still produces a new copy, and it survives app restarts since the
+/// copies live on disk. Best-effort: any read/hash error is treated as "not found"
+/// so it can never suppress a real conflict copy.
+fn conflict_copy_with_content_exists(target: &Path, content_hash: &str) -> Result<bool, String> {
+    let (Some(parent), Some(stem)) = (target.parent(), target.file_stem()) else {
+        return Ok(false);
+    };
+    let prefix = format!("{} (conflicted copy ", stem.to_string_lossy());
+    let entries = match std::fs::read_dir(parent) {
+        Ok(e) => e,
+        Err(_) => return Ok(false),
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        if let Ok((hash, _size, _mtime)) = hash_file(&entry.path()) {
+            if hash == content_hash {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Emits an `upload-progress` event to the main webview, if an `AppHandle` has been set
 /// on `state::APP_HANDLE` (see its doc comment). No-ops silently when no handle is set
 /// yet, which keeps offline unit tests (which never call `setup()`) window/handle-free.
@@ -418,6 +474,31 @@ fn emit_upload_progress(path: &str, transferred: u64, total: u64) {
             eprintln!("emit_to webview_window(main): {e}");
             if let Err(e2) = handle.emit("upload-progress", event) {
                 eprintln!("emit global upload-progress: {e2}");
+            }
+        }
+    }
+}
+
+/// Emits a `sync-conflict` event to the main webview, if an `AppHandle` has been set
+/// on `state::APP_HANDLE` (see its doc comment). No-ops silently when no handle is set
+/// yet, which keeps offline unit tests (which never call `setup()`) window/handle-free.
+fn emit_sync_conflict(path: &str, conflict_path: &str, reason: &str) {
+    let Some(handle) = crate::state::APP_HANDLE.get() else {
+        return;
+    };
+
+    let event = SyncConflictEvent {
+        path: path.to_string(),
+        conflict_path: conflict_path.to_string(),
+        reason: reason.to_string(),
+    };
+
+    match handle.emit_to(EventTarget::webview_window("main"), "sync-conflict", event.clone()) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("emit_to webview_window(main): {e}");
+            if let Err(e2) = handle.emit("sync-conflict", event) {
+                eprintln!("emit global sync-conflict: {e2}");
             }
         }
     }
@@ -802,6 +883,33 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
     }
 
     let target = PathBuf::from(&folder).join(&relative);
+
+    // Remote-wins conflict guard: preserve unsynced local edits before the atomic
+    // overwrite below. (There is an inherent, benign TOCTOU window — an edit made
+    // during the subsequent network fetch is not captured here, but the next scan
+    // tick re-detects it as a local change. A `None` baseline, only possible for
+    // the manual/hydration call sites, is intentionally NOT treated as a conflict:
+    // with no last-synced hash there is nothing to prove a local modification.)
+    if target.exists() {
+        let (on_disk_hash, _size, _mtime) = hash_file(&target)?;
+        let baseline_hash = state.db.get_local_file(&relative)?.map(|row| row.hash);
+
+        if download_would_conflict(true, &on_disk_hash, baseline_hash.as_deref())
+            && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
+        {
+            let conflicted_path = create_conflicted_copy(&target)?;
+            let conflicted_rel = relpath_under(Path::new(&folder), &conflicted_path)?;
+            let reason = format!(
+                "remote download would overwrite unsynced local changes; local copy preserved as {conflicted_rel}"
+            );
+            state.db.add_conflict(&relative, &relative, &reason)?;
+            if let Ok(mut engine) = state.sync_engine.lock() {
+                engine.record_conflict();
+            }
+            emit_sync_conflict(&relative, &conflicted_rel, &reason);
+        }
+    }
+
     fetch_and_write_file(&http_client()?, &token, path_display, &target)?;
 
     let (hash, size_bytes, modified_ts) = hash_file(&target)?;
@@ -984,10 +1092,12 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_replace, choose_upload_strategy, emit_upload_progress, is_final_chunk,
+        atomic_replace, choose_upload_strategy, conflict_copy_with_content_exists,
+        download_would_conflict, emit_sync_conflict, emit_upload_progress, is_final_chunk,
         is_session_invalid_error, retry_transient, UploadStrategy, UPLOAD_CHUNK_SIZE,
         UPLOAD_SESSION_THRESHOLD_BYTES,
     };
+    use crate::path_util::hash_file;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // `fetch_and_write_file` performs live HTTP calls against the Dropbox API
@@ -1120,6 +1230,13 @@ mod tests {
     }
 
     #[test]
+    fn emit_sync_conflict_is_a_no_op_without_app_handle() {
+        // `state::APP_HANDLE` is unset in this offline test binary (`setup()` never
+        // runs), so this must not panic and must not attempt to emit anything.
+        emit_sync_conflict("a", "b", "c");
+    }
+
+    #[test]
     fn retry_transient_retries_transport_errors_then_succeeds() {
         // Only fails once (single ~2s backoff sleep) to keep the test fast while
         // still exercising the retry-then-succeed path.
@@ -1189,6 +1306,54 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn download_would_conflict_false_when_target_absent() {
+        assert!(!download_would_conflict(false, "on-disk-hash", None));
+        assert!(!download_would_conflict(false, "on-disk-hash", Some("baseline-hash")));
+    }
+
+    #[test]
+    fn download_would_conflict_false_when_baseline_none() {
+        assert!(!download_would_conflict(true, "on-disk-hash", None));
+    }
+
+    #[test]
+    fn download_would_conflict_false_when_hash_matches_baseline() {
+        assert!(!download_would_conflict(true, "same-hash", Some("same-hash")));
+    }
+
+    #[test]
+    fn download_would_conflict_true_when_hash_diverges() {
+        assert!(download_would_conflict(true, "local-hash", Some("baseline-hash")));
+    }
+
+    #[test]
+    fn conflict_copy_dedup_matches_by_content_not_existence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("report.txt");
+        std::fs::write(&target, b"local edit").expect("write target");
+        let (on_disk_hash, _s, _m) = hash_file(&target).expect("hash target");
+
+        // No conflicted-copy sibling yet.
+        assert!(!conflict_copy_with_content_exists(&target, &on_disk_hash).unwrap());
+
+        // A sibling with DIFFERENT content does not count as a dedup match.
+        std::fs::write(
+            dir.path().join("report (conflicted copy 20260101000000).txt"),
+            b"some other content",
+        )
+        .expect("write other copy");
+        assert!(!conflict_copy_with_content_exists(&target, &on_disk_hash).unwrap());
+
+        // A sibling holding the SAME content as the target dedupes (retry case).
+        std::fs::write(
+            dir.path().join("report (conflicted copy 20260101000005).txt"),
+            b"local edit",
+        )
+        .expect("write matching copy");
+        assert!(conflict_copy_with_content_exists(&target, &on_disk_hash).unwrap());
     }
 
     #[test]

@@ -290,6 +290,30 @@ function App() {
     };
   }, []);
 
+  // Rust emits `sync-conflict` when a remote download would overwrite unsynced local
+  // changes, so the log and dashboard reflect the preserved conflicted copy immediately.
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    void listen<{ path: string; conflictPath: string; reason: string }>("sync-conflict", (event) => {
+      if (!active) return;
+      pushLog(`Conflict on ${event.payload.path}: local changes preserved as ${event.payload.conflictPath} (${event.payload.reason})`);
+      void refreshDashboard().catch((error) => pushLog(`Dashboard refresh failed: ${String(error)}`));
+    }).then((fn) => {
+      if (!active) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
   // Fallback while waiting: slow poll (WebView often throttles `setInterval` when the browser has focus).
   useEffect(() => {
     if (!awaitingCallback) return;
