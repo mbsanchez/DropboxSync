@@ -5,15 +5,17 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use crate::error::{AppError, AppResult};
+
 pub(crate) fn should_ignore_local_path(relative: &str) -> bool {
     let p = relative.replace('\\', "/");
     p == ".DS_Store" || p.ends_with("/.DS_Store") || p.starts_with("._") || p.contains("/._")
 }
 
-pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> Result<String, String> {
+pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
     Ok(absolute
         .strip_prefix(sync_folder)
-        .map_err(|e| format!("failed to compute relative path: {e}"))?
+        .map_err(|e| AppError::Other(format!("failed to compute relative path: {e}")))?
         .to_string_lossy()
         .to_string())
 }
@@ -83,8 +85,9 @@ const DROPBOX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// # Errors
 ///
 /// Returns an error string if the file cannot be opened, read, or stat-ed.
-pub(crate) fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {
-    let mut file = File::open(path).map_err(|e| format!("cannot open file for hash: {e}"))?;
+pub(crate) fn hash_file(path: &Path) -> AppResult<(String, i64, i64)> {
+    let mut file =
+        File::open(path).map_err(|e| AppError::Io(format!("cannot open file for hash: {e}")))?;
     let mut buffer = [0_u8; 8192];
 
     // Accumulates the raw 32-byte SHA-256 digest of each 4 MiB block.
@@ -93,7 +96,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {
     let mut bytes_in_block: usize = 0;
 
     loop {
-        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -127,7 +130,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {
     // SHA-256 the concatenation of all block digests.
     let content_hash = Sha256::digest(&block_digests);
 
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let metadata = file.metadata()?;
     let size = metadata.len() as i64;
     let modified = metadata
         .modified()
@@ -139,13 +142,13 @@ pub(crate) fn hash_file(path: &Path) -> Result<(String, i64, i64), String> {
     Ok((format!("{:x}", content_hash), size, modified))
 }
 
-pub(crate) fn create_conflicted_copy(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn create_conflicted_copy(path: &Path) -> AppResult<PathBuf> {
     let parent = path
         .parent()
-        .ok_or_else(|| "file has no parent for conflict copy".to_string())?;
+        .ok_or_else(|| AppError::Other("file has no parent for conflict copy".to_string()))?;
     let stem = path
         .file_stem()
-        .ok_or_else(|| "missing file stem".to_string())?
+        .ok_or_else(|| AppError::Other("missing file stem".to_string()))?
         .to_string_lossy();
     let ext = path.extension().map(|e| e.to_string_lossy().to_string());
     let ts = Utc::now().format("%Y%m%d%H%M%S");
@@ -156,7 +159,8 @@ pub(crate) fn create_conflicted_copy(path: &Path) -> Result<PathBuf, String> {
     };
 
     let dest = parent.join(name);
-    fs::copy(path, &dest).map_err(|e| format!("failed to create conflicted copy: {e}"))?;
+    fs::copy(path, &dest)
+        .map_err(|e| AppError::Io(format!("failed to create conflicted copy: {e}")))?;
     Ok(dest)
 }
 

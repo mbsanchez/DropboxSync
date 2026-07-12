@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::error::AppResult;
 use crate::state::AppState;
 use crate::storage::db;
 
@@ -29,7 +30,7 @@ struct OverlayStateFile {
     paths: HashMap<String, OverlayTier>,
 }
 
-fn active_job_paths(db: &db::Db) -> Result<HashSet<String>, String> {
+fn active_job_paths(db: &db::Db) -> AppResult<HashSet<String>> {
     let jobs = db.list_recent_jobs(10_000)?;
     let mut set = HashSet::new();
     for j in jobs {
@@ -50,7 +51,7 @@ fn active_job_paths(db: &db::Db) -> Result<HashSet<String>, String> {
     Ok(set)
 }
 
-fn unresolved_conflict_paths(db: &db::Db) -> Result<HashSet<String>, String> {
+fn unresolved_conflict_paths(db: &db::Db) -> AppResult<HashSet<String>> {
     Ok(db.list_unresolved_conflict_local_paths()?.into_iter().collect())
 }
 
@@ -61,7 +62,7 @@ pub(crate) fn refresh_overlay_state_internal(state: &AppState) {
     }
 }
 
-fn refresh_overlay_state_inner(state: &AppState) -> Result<(), String> {
+fn refresh_overlay_state_inner(state: &AppState) -> AppResult<()> {
     let sync_folder = state.db.get_sync_folder()?;
     let job_paths = active_job_paths(&state.db)?;
     let conflict_paths = unresolved_conflict_paths(&state.db)?;
@@ -102,11 +103,11 @@ fn refresh_overlay_state_inner(state: &AppState) -> Result<(), String> {
 
     let dir = db::app_data_dir()?;
     let dest = overlay_state_path(&dir);
-    let json = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&payload)?;
 
     let tmp = dest.with_extension("json.tmp");
-    fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    fs::write(&tmp, json.as_bytes())?;
+    fs::rename(&tmp, &dest)?;
     Ok(())
 }
 
