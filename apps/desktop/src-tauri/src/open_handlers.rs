@@ -4,26 +4,27 @@ use std::sync::atomic::Ordering;
 use tauri::AppHandle;
 use tauri::Manager;
 
+use crate::error::{AppError, AppResult};
 use crate::path_util::relpath_under;
 use crate::state::AppState;
 use crate::sync_pipeline::{process_sync_queue_internal, refresh_queue_depth_internal};
 
-pub(crate) fn resolve_cloudsc_rel_path(state: &AppState, abs: &Path) -> Result<String, String> {
+pub(crate) fn resolve_cloudsc_rel_path(state: &AppState, abs: &Path) -> AppResult<String> {
     let sync_folder_str = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
     let sync_folder = PathBuf::from(&sync_folder_str);
     let abs_canon = abs
         .canonicalize()
-        .map_err(|e| format!("invalid file path: {e}"))?;
+        .map_err(|e| AppError::Io(format!("invalid file path: {e}")))?;
     let sync_canon = sync_folder
         .canonicalize()
-        .map_err(|e| format!("invalid sync folder: {e}"))?;
+        .map_err(|e| AppError::Io(format!("invalid sync folder: {e}")))?;
     let rel = relpath_under(&sync_canon, &abs_canon)?;
     let rel = rel.replace('\\', "/");
     if !rel.ends_with(".cloudsc") {
-        return Err("not a .cloudsc placeholder".to_string());
+        return Err(AppError::Sync("not a .cloudsc placeholder".to_string()));
     }
     Ok(rel)
 }
