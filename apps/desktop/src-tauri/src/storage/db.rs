@@ -1,3 +1,4 @@
+use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
@@ -53,31 +54,28 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> AppResult<Self> {
         Self::new_at(&db_path()?)
     }
 
     /// Open a database at an explicit path. Used by tests to stay fully isolated
     /// from the production database (which `db_path()` resolves via OS-specific
     /// app-data dirs), so running `cargo test` never touches a user's real DB.
-    pub fn new_at(path: &std::path::Path) -> Result<Self, String> {
-        let write = Connection::open(path).map_err(|e| e.to_string())?;
-        write
-            .execute_batch(
-                "
+    pub fn new_at(path: &std::path::Path) -> AppResult<Self> {
+        let write = Connection::open(path)?;
+        write.execute_batch(
+            "
                 PRAGMA foreign_keys = ON;
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
                 ",
-            )
-            .map_err(|e| e.to_string())?;
+        )?;
         migrate(&write)?;
 
         let read = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
 
         Ok(Self {
             write: Mutex::new(write),
@@ -85,93 +83,104 @@ impl Db {
         })
     }
 
-    pub fn set_sync_folder(&self, folder: &str) -> Result<(), String> {
+    pub fn set_sync_folder(&self, folder: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
                 INSERT INTO app_config (key, value, updated_at)
                 VALUES ('sync_folder', ?1, ?2)
                 ON CONFLICT(key) DO UPDATE SET
                   value=excluded.value,
                   updated_at=excluded.updated_at
                 ",
-                params![folder, now],
-            )
-            .map_err(|e| e.to_string())?;
+            params![folder, now],
+        )?;
         Ok(())
     }
 
     /// Clears local sync state to avoid stale jobs when the sync folder changes.
-    pub fn reset_sync_state(&self) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn.execute("DELETE FROM local_file_index", []).map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM remote_file_index", []).map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM sync_jobs", []).map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM sync_conflicts", []).map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM known_folders", []).map_err(|e| e.to_string())?;
+    pub fn reset_sync_state(&self) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute("DELETE FROM local_file_index", [])?;
+        conn.execute("DELETE FROM remote_file_index", [])?;
+        conn.execute("DELETE FROM sync_jobs", [])?;
+        conn.execute("DELETE FROM sync_conflicts", [])?;
+        conn.execute("DELETE FROM known_folders", [])?;
         Ok(())
     }
 
     /// Records that `relative_path` is a currently-materialized (real, on-disk)
     /// folder under the sync root, so a later scan can detect it being deleted
     /// locally even though folders themselves have no content to diff.
-    pub fn upsert_known_folder(&self, relative_path: &str) -> Result<(), String> {
+    pub fn upsert_known_folder(&self, relative_path: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
                 INSERT INTO known_folders(relative_path, updated_at)
                 VALUES(?1, ?2)
                 ON CONFLICT(relative_path) DO UPDATE SET
                   updated_at=excluded.updated_at
                 ",
-                params![relative_path, now],
-            )
-            .map_err(|e| e.to_string())?;
+            params![relative_path, now],
+        )?;
         Ok(())
     }
 
-    pub fn list_known_folders(&self) -> Result<Vec<String>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare("SELECT relative_path FROM known_folders ORDER BY relative_path")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    pub fn list_known_folders(&self) -> AppResult<Vec<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt =
+            conn.prepare("SELECT relative_path FROM known_folders ORDER BY relative_path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn remove_known_folder(&self, relative_path: &str) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "DELETE FROM known_folders WHERE relative_path = ?1",
-                params![relative_path],
-            )
-            .map_err(|e| e.to_string())?;
+    pub fn remove_known_folder(&self, relative_path: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM known_folders WHERE relative_path = ?1",
+            params![relative_path],
+        )?;
         Ok(())
     }
 
-    pub fn get_sync_folder(&self) -> Result<Option<String>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare("SELECT value FROM app_config WHERE key = 'sync_folder' LIMIT 1")
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let value: String = row.get(0).map_err(|e| e.to_string())?;
+    pub fn get_sync_folder(&self) -> AppResult<Option<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt =
+            conn.prepare("SELECT value FROM app_config WHERE key = 'sync_folder' LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
             return Ok(Some(value));
         }
         Ok(None)
     }
 
-    pub fn set_app_config(&self, key: &str, value: &str) -> Result<(), String> {
+    pub fn set_app_config(&self, key: &str, value: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn.execute(
             "
             INSERT INTO app_config (key, value, updated_at)
@@ -181,77 +190,81 @@ impl Db {
               updated_at=excluded.updated_at
             ",
             params![key, value, now],
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         Ok(())
     }
 
-    pub fn get_app_config(&self, key: &str) -> Result<Option<String>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare("SELECT value FROM app_config WHERE key = ?1 LIMIT 1")
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query(params![key]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let value: String = row.get(0).map_err(|e| e.to_string())?;
+    pub fn get_app_config(&self, key: &str) -> AppResult<Option<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare("SELECT value FROM app_config WHERE key = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![key])?;
+        if let Some(row) = rows.next()? {
+            let value: String = row.get(0)?;
             return Ok(Some(value));
         }
         Ok(None)
     }
 
     // Selective sync (prefix-based). CSV of prefixes without leading '/' (e.g. "Fotos,Videos/2024").
-    pub fn set_include_prefixes_csv(&self, csv: &str) -> Result<(), String> {
+    pub fn set_include_prefixes_csv(&self, csv: &str) -> AppResult<()> {
         self.set_app_config("include_prefixes_csv", csv)
     }
 
-    pub fn get_include_prefixes_csv(&self) -> Result<Option<String>, String> {
+    pub fn get_include_prefixes_csv(&self) -> AppResult<Option<String>> {
         self.get_app_config("include_prefixes_csv")
     }
 
-    pub fn set_exclude_prefixes_csv(&self, csv: &str) -> Result<(), String> {
+    pub fn set_exclude_prefixes_csv(&self, csv: &str) -> AppResult<()> {
         self.set_app_config("exclude_prefixes_csv", csv)
     }
 
-    pub fn get_exclude_prefixes_csv(&self) -> Result<Option<String>, String> {
+    pub fn get_exclude_prefixes_csv(&self) -> AppResult<Option<String>> {
         self.get_app_config("exclude_prefixes_csv")
     }
 
-    pub fn list_local_files(&self) -> Result<Vec<FileIndexRow>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+    pub fn list_local_files(&self) -> AppResult<Vec<FileIndexRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT relative_path, hash, size_bytes, modified_ts FROM local_file_index ORDER BY relative_path",
             )
-            .map_err(|e| e.to_string())?;
+            ?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(FileIndexRow {
-                    relative_path: row.get(0)?,
-                    hash: row.get(1)?,
-                    size_bytes: row.get(2)?,
-                    modified_ts: row.get(3)?,
-                })
+        let rows = stmt.query_map([], |row| {
+            Ok(FileIndexRow {
+                relative_path: row.get(0)?,
+                hash: row.get(1)?,
+                size_bytes: row.get(2)?,
+                modified_ts: row.get(3)?,
             })
-            .map_err(|e| e.to_string())?;
+        })?;
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn get_local_file(&self, relative_path: &str) -> Result<Option<FileIndexRow>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+    pub fn get_local_file(&self, relative_path: &str) -> AppResult<Option<FileIndexRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT relative_path, hash, size_bytes, modified_ts FROM local_file_index WHERE relative_path = ?1 LIMIT 1",
             )
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query(params![relative_path]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            ?;
+        let mut rows = stmt.query(params![relative_path])?;
+        if let Some(row) = rows.next()? {
             return Ok(Some(FileIndexRow {
-                relative_path: row.get(0).map_err(|e| e.to_string())?,
-                hash: row.get(1).map_err(|e| e.to_string())?,
-                size_bytes: row.get(2).map_err(|e| e.to_string())?,
-                modified_ts: row.get(3).map_err(|e| e.to_string())?,
+                relative_path: row.get(0)?,
+                hash: row.get(1)?,
+                size_bytes: row.get(2)?,
+                modified_ts: row.get(3)?,
             }));
         }
         Ok(None)
@@ -263,9 +276,12 @@ impl Db {
         hash: &str,
         size_bytes: i64,
         modified_ts: i64,
-    ) -> Result<(), String> {
+    ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn
             .execute(
                 "
@@ -279,40 +295,42 @@ impl Db {
                 ",
                 params![relative_path, hash, size_bytes, modified_ts, now],
             )
-            .map_err(|e| e.to_string())?;
+            ?;
         Ok(())
     }
 
-    pub fn remove_local_file(&self, relative_path: &str) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "DELETE FROM local_file_index WHERE relative_path = ?1",
-                params![relative_path],
-            )
-            .map_err(|e| e.to_string())?;
+    pub fn remove_local_file(&self, relative_path: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM local_file_index WHERE relative_path = ?1",
+            params![relative_path],
+        )?;
         Ok(())
     }
 
-    pub fn get_remote_file(&self, relative_path: &str) -> Result<Option<RemoteFileIndexRow>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "
+    pub fn get_remote_file(&self, relative_path: &str) -> AppResult<Option<RemoteFileIndexRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
                 SELECT relative_path, content_hash, rev, modified_ts
                 FROM remote_file_index
                 WHERE relative_path = ?1
                 LIMIT 1
                 ",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query(params![relative_path]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        )?;
+        let mut rows = stmt.query(params![relative_path])?;
+        if let Some(row) = rows.next()? {
             return Ok(Some(RemoteFileIndexRow {
-                relative_path: row.get(0).map_err(|e| e.to_string())?,
-                content_hash: row.get(1).map_err(|e| e.to_string())?,
-                rev: row.get(2).map_err(|e| e.to_string())?,
-                modified_ts: row.get(3).map_err(|e| e.to_string())?,
+                relative_path: row.get(0)?,
+                content_hash: row.get(1)?,
+                rev: row.get(2)?,
+                modified_ts: row.get(3)?,
             }));
         }
         Ok(None)
@@ -324,9 +342,12 @@ impl Db {
         content_hash: &str,
         rev: &str,
         modified_ts: i64,
-    ) -> Result<(), String> {
+    ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn.execute(
             "
             INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at)
@@ -338,19 +359,19 @@ impl Db {
               updated_at=excluded.updated_at
             ",
             params![relative_path, content_hash, rev, modified_ts, now],
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         Ok(())
     }
 
-    pub fn remove_remote_file(&self, relative_path: &str) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "DELETE FROM remote_file_index WHERE relative_path = ?1",
-                params![relative_path],
-            )
-            .map_err(|e| e.to_string())?;
+    pub fn remove_remote_file(&self, relative_path: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM remote_file_index WHERE relative_path = ?1",
+            params![relative_path],
+        )?;
         Ok(())
     }
 
@@ -359,9 +380,12 @@ impl Db {
         job_type: &str,
         source_path: Option<&str>,
         target_path: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn
             .execute(
                 "
@@ -370,24 +394,28 @@ impl Db {
                 ",
                 params![job_type, source_path, target_path, now],
             )
-            .map_err(|e| e.to_string())?;
+            ?;
         Ok(())
     }
 
-    pub fn count_active_jobs(&self) -> Result<usize, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_jobs WHERE status IN ('queued', 'retry_wait', 'running')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+    pub fn count_active_jobs(&self) -> AppResult<usize> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sync_jobs WHERE status IN ('queued', 'retry_wait', 'running')",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 
-    pub fn list_recent_jobs(&self, limit: i64) -> Result<Vec<SyncJobRow>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
+    pub fn list_recent_jobs(&self, limit: i64) -> AppResult<Vec<SyncJobRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
                 "
@@ -397,30 +425,31 @@ impl Db {
                 LIMIT ?1
                 ",
             )
-            .map_err(|e| e.to_string())?;
+            ?;
 
-        let rows = stmt
-            .query_map(params![limit], |row| {
-                Ok(SyncJobRow {
-                    id: row.get(0)?,
-                    job_type: row.get(1)?,
-                    source_path: row.get(2)?,
-                    target_path: row.get(3)?,
-                    status: row.get(4)?,
-                    attempt_count: row.get(5)?,
-                    next_retry_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                    last_error: row.get(8)?,
-                })
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(SyncJobRow {
+                id: row.get(0)?,
+                job_type: row.get(1)?,
+                source_path: row.get(2)?,
+                target_path: row.get(3)?,
+                status: row.get(4)?,
+                attempt_count: row.get(5)?,
+                next_retry_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                last_error: row.get(8)?,
             })
-            .map_err(|e| e.to_string())?;
+        })?;
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn pick_next_due_job(&self) -> Result<Option<SyncJobRow>, String> {
+    pub fn pick_next_due_job(&self) -> AppResult<Option<SyncJobRow>> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         let job_opt: Option<SyncJobRow> = {
             let mut stmt = conn
                 .prepare(
@@ -432,20 +461,20 @@ impl Db {
                 LIMIT 1
                 ",
                 )
-                .map_err(|e| e.to_string())?;
+                ?;
 
-            let mut rows = stmt.query(params![now]).map_err(|e| e.to_string())?;
-            if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let mut rows = stmt.query(params![now])?;
+            if let Some(row) = rows.next()? {
                 Some(SyncJobRow {
-                    id: row.get(0).map_err(|e| e.to_string())?,
-                    job_type: row.get(1).map_err(|e| e.to_string())?,
-                    source_path: row.get(2).map_err(|e| e.to_string())?,
-                    target_path: row.get(3).map_err(|e| e.to_string())?,
-                    status: row.get(4).map_err(|e| e.to_string())?,
-                    attempt_count: row.get(5).map_err(|e| e.to_string())?,
-                    next_retry_at: row.get(6).map_err(|e| e.to_string())?,
-                    updated_at: row.get(7).map_err(|e| e.to_string())?,
-                    last_error: row.get(8).map_err(|e| e.to_string())?,
+                    id: row.get(0)?,
+                    job_type: row.get(1)?,
+                    source_path: row.get(2)?,
+                    target_path: row.get(3)?,
+                    status: row.get(4)?,
+                    attempt_count: row.get(5)?,
+                    next_retry_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    last_error: row.get(8)?,
                 })
             } else {
                 None
@@ -456,20 +485,20 @@ impl Db {
             conn.execute(
                 "UPDATE sync_jobs SET status='running', updated_at=?2 WHERE id=?1",
                 params![job.id, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
         }
         Ok(job_opt)
     }
 
-    pub fn mark_job_completed(&self, id: i64) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "UPDATE sync_jobs SET status='done', last_error=NULL, updated_at=?2 WHERE id=?1",
-                params![id, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+    pub fn mark_job_completed(&self, id: i64) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE sync_jobs SET status='done', last_error=NULL, updated_at=?2 WHERE id=?1",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -479,8 +508,11 @@ impl Db {
         attempt_count: i64,
         next_retry_at: &str,
         last_error: Option<&str>,
-    ) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+    ) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn
             .execute(
                 "
@@ -490,7 +522,7 @@ impl Db {
                 ",
                 params![id, attempt_count, next_retry_at, last_error, Utc::now().to_rfc3339()],
             )
-            .map_err(|e| e.to_string())?;
+            ?;
         Ok(())
     }
 
@@ -499,20 +531,21 @@ impl Db {
         id: i64,
         attempt_count: i64,
         last_error: Option<&str>,
-    ) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "
+    ) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
                 UPDATE sync_jobs
                 SET status='failed', attempt_count=?2, last_error=?3, updated_at=?4,
                     upload_session_id=NULL, upload_session_offset=NULL,
                     upload_session_file_len=NULL, upload_session_file_mtime=NULL
                 WHERE id=?1
                 ",
-                params![id, attempt_count, last_error, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+            params![id, attempt_count, last_error, Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -521,18 +554,19 @@ impl Db {
     /// failed attempt. Deliberately leaves `upload_session_id`/`upload_session_offset`
     /// untouched so an interrupted large-file upload resumes from its last checkpoint
     /// instead of restarting from byte 0. Returns the number of rows recovered.
-    pub fn recover_running_jobs(&self) -> Result<usize, String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        let n = conn
-            .execute(
-                "
+    pub fn recover_running_jobs(&self) -> AppResult<usize> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let n = conn.execute(
+            "
                 UPDATE sync_jobs
                 SET status='queued', attempt_count=0, next_retry_at=NULL, updated_at=?1
                 WHERE status='running'
                 ",
-                params![Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+            params![Utc::now().to_rfc3339()],
+        )?;
         Ok(n)
     }
 
@@ -550,26 +584,27 @@ impl Db {
         offset: u64,
         file_len: u64,
         file_mtime: i64,
-    ) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "
+    ) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
                 UPDATE sync_jobs
                 SET upload_session_id=?2, upload_session_offset=?3,
                     upload_session_file_len=?4, upload_session_file_mtime=?5, updated_at=?6
                 WHERE id=?1
                 ",
-                params![
-                    job_id,
-                    session_id,
-                    offset as i64,
-                    file_len as i64,
-                    file_mtime,
-                    Utc::now().to_rfc3339()
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+            params![
+                job_id,
+                session_id,
+                offset as i64,
+                file_len as i64,
+                file_mtime,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
         Ok(())
     }
 
@@ -579,26 +614,24 @@ impl Db {
     /// compare `file_len`/`file_mtime` against the file currently being uploaded
     /// before resuming — this method only round-trips the stored values, it does
     /// not itself validate identity.
-    pub fn get_upload_checkpoint(
-        &self,
-        job_id: i64,
-    ) -> Result<Option<(String, u64, u64, i64)>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "
+    pub fn get_upload_checkpoint(&self, job_id: i64) -> AppResult<Option<(String, u64, u64, i64)>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
                 SELECT upload_session_id, upload_session_offset,
                        upload_session_file_len, upload_session_file_mtime
                 FROM sync_jobs WHERE id=?1
                 ",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query(params![job_id]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let session_id: Option<String> = row.get(0).map_err(|e| e.to_string())?;
-            let offset: Option<i64> = row.get(1).map_err(|e| e.to_string())?;
-            let file_len: Option<i64> = row.get(2).map_err(|e| e.to_string())?;
-            let file_mtime: Option<i64> = row.get(3).map_err(|e| e.to_string())?;
+        )?;
+        let mut rows = stmt.query(params![job_id])?;
+        if let Some(row) = rows.next()? {
+            let session_id: Option<String> = row.get(0)?;
+            let offset: Option<i64> = row.get(1)?;
+            let file_len: Option<i64> = row.get(2)?;
+            let file_mtime: Option<i64> = row.get(3)?;
             if let Some(session_id) = session_id {
                 return Ok(Some((
                     session_id,
@@ -613,48 +646,53 @@ impl Db {
 
     /// Clears the upload-session checkpoint for `job_id` (called once the upload
     /// finishes successfully, or when the job is abandoned).
-    pub fn clear_upload_checkpoint(&self, job_id: i64) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "
+    pub fn clear_upload_checkpoint(&self, job_id: i64) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
                 UPDATE sync_jobs
                 SET upload_session_id=NULL, upload_session_offset=NULL,
                     upload_session_file_len=NULL, upload_session_file_mtime=NULL, updated_at=?2
                 WHERE id=?1
                 ",
-                params![job_id, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+            params![job_id, Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
     /// The most recent failed job's error message, or `None` if no jobs are failed.
     /// Drives the dashboard's global error/health so a later unrelated success
     /// doesn't mask that failures are still present.
-    pub fn latest_failed_error(&self) -> Result<Option<String>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "
+    pub fn latest_failed_error(&self) -> AppResult<Option<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
                 SELECT last_error FROM sync_jobs
                 WHERE status='failed'
                 ORDER BY id DESC
                 LIMIT 1
                 ",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let msg: Option<String> = row.get(0).map_err(|e| e.to_string())?;
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let msg: Option<String> = row.get(0)?;
             return Ok(Some(msg.unwrap_or_else(|| "job failed".to_string())));
         }
         Ok(None)
     }
 
     /// Resets all `failed` jobs back to `queued` so they are retried. Returns the count.
-    pub fn requeue_failed_jobs(&self) -> Result<usize, String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
+    pub fn requeue_failed_jobs(&self) -> AppResult<usize> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         let n = conn
             .execute(
                 "
@@ -664,72 +702,71 @@ impl Db {
                 ",
                 params![Utc::now().to_rfc3339()],
             )
-            .map_err(|e| e.to_string())?;
+            ?;
         Ok(n)
     }
 
-    pub fn add_conflict(&self, local_path: &str, remote_path: &str, reason: &str) -> Result<(), String> {
-        let conn = self.write.lock().map_err(|_| "db write lock poisoned".to_string())?;
-        conn
-            .execute(
-                "
+    pub fn add_conflict(&self, local_path: &str, remote_path: &str, reason: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
                 INSERT INTO sync_conflicts(local_path, remote_path, reason, resolved, created_at)
                 VALUES(?1, ?2, ?3, 0, ?4)
                 ",
-                params![local_path, remote_path, reason, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+            params![local_path, remote_path, reason, Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
-    pub fn list_recent_conflicts(&self, limit: i64) -> Result<Vec<ConflictRow>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "
+    pub fn list_recent_conflicts(&self, limit: i64) -> AppResult<Vec<ConflictRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
                 SELECT id, local_path, remote_path, reason, created_at
                 FROM sync_conflicts
                 ORDER BY id DESC
                 LIMIT ?1
                 ",
-            )
-            .map_err(|e| e.to_string())?;
+        )?;
 
-        let rows = stmt
-            .query_map(params![limit], |row| {
-                Ok(ConflictRow {
-                    id: row.get(0)?,
-                    local_path: row.get(1)?,
-                    remote_path: row.get(2)?,
-                    reason: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ConflictRow {
+                id: row.get(0)?,
+                local_path: row.get(1)?,
+                remote_path: row.get(2)?,
+                reason: row.get(3)?,
+                created_at: row.get(4)?,
             })
-            .map_err(|e| e.to_string())?;
+        })?;
 
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn list_unresolved_conflict_local_paths(&self) -> Result<Vec<String>, String> {
-        let conn = self.read.lock().map_err(|_| "db read lock poisoned".to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "
+    pub fn list_unresolved_conflict_local_paths(&self) -> AppResult<Vec<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
                 SELECT DISTINCT local_path
                 FROM sync_conflicts
                 WHERE resolved = 0
                 ORDER BY local_path
                 ",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
 
-fn migrate(conn: &Connection) -> Result<(), String> {
+fn migrate(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS app_config (
@@ -780,8 +817,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             updated_at TEXT NOT NULL
         );
         ",
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
 
     // Additive migrations for databases created before a column existed.
     add_column_if_missing(conn, "sync_jobs", "last_error", "TEXT")?;
@@ -799,16 +835,12 @@ fn add_column_if_missing(
     table: &str,
     column: &str,
     decl: &str,
-) -> Result<(), String> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(|e| e.to_string())?;
+) -> AppResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut exists = false;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| e.to_string())?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for name in names {
-        if name.map_err(|e| e.to_string())? == column {
+        if name? == column {
             exists = true;
             break;
         }
@@ -817,8 +849,7 @@ fn add_column_if_missing(
         conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
             [],
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
     }
     Ok(())
 }
@@ -863,18 +894,18 @@ fn data_dir_for(
     localappdata: Option<&str>,
     xdg_data_home: Option<&str>,
     home: Option<&str>,
-) -> Result<PathBuf, String> {
+) -> AppResult<PathBuf> {
     match os {
         DataDirOs::Windows => {
             let base = localappdata
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "LOCALAPPDATA env var not found".to_string())?;
+                .ok_or_else(|| AppError::Io("LOCALAPPDATA env var not found".into()))?;
             Ok(PathBuf::from(base).join("DropboxSyncDesktop"))
         }
         DataDirOs::Macos => {
             let home = home
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "HOME env var not found".to_string())?;
+                .ok_or_else(|| AppError::Io("HOME env var not found".into()))?;
             Ok(PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
@@ -886,7 +917,7 @@ fn data_dir_for(
                 None => {
                     let home = home
                         .filter(|s| !s.is_empty())
-                        .ok_or_else(|| "HOME env var not found".to_string())?;
+                        .ok_or_else(|| AppError::Io("HOME env var not found".into()))?;
                     PathBuf::from(home).join(".local").join("share")
                 }
             };
@@ -895,7 +926,7 @@ fn data_dir_for(
     }
 }
 
-fn resolve_app_data_dir() -> Result<PathBuf, String> {
+fn resolve_app_data_dir() -> AppResult<PathBuf> {
     let localappdata = std::env::var("LOCALAPPDATA").ok();
     let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
     let home = std::env::var("HOME").ok();
@@ -908,9 +939,9 @@ fn resolve_app_data_dir() -> Result<PathBuf, String> {
 }
 
 /// Shared app data directory (SQLite DB, overlay_state.json for shell extensions).
-pub fn app_data_dir() -> Result<PathBuf, String> {
+pub fn app_data_dir() -> AppResult<PathBuf> {
     let path = resolve_app_data_dir()?;
-    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&path)?;
     Ok(path)
 }
 
@@ -921,8 +952,13 @@ mod app_data_dir_tests {
 
     #[test]
     fn windows_uses_localappdata() {
-        let got = data_dir_for(DataDirOs::Windows, Some("C:\\Users\\u\\AppData\\Local"), None, None)
-            .expect("windows path");
+        let got = data_dir_for(
+            DataDirOs::Windows,
+            Some("C:\\Users\\u\\AppData\\Local"),
+            None,
+            None,
+        )
+        .expect("windows path");
         assert_eq!(
             got,
             PathBuf::from("C:\\Users\\u\\AppData\\Local").join("DropboxSyncDesktop")
@@ -973,7 +1009,7 @@ mod app_data_dir_tests {
     }
 }
 
-fn db_path() -> Result<PathBuf, String> {
+fn db_path() -> AppResult<PathBuf> {
     let mut path = app_data_dir()?;
     path.push("app.db");
     Ok(path)
@@ -1065,11 +1101,22 @@ mod tests {
 
         assert_eq!(db.get_upload_checkpoint(job.id).expect("get"), None);
 
-        db.save_upload_checkpoint(job.id, "sess-1", 8 * 1024 * 1024, 10 * 1024 * 1024, 1_700_000_000)
-            .expect("save");
+        db.save_upload_checkpoint(
+            job.id,
+            "sess-1",
+            8 * 1024 * 1024,
+            10 * 1024 * 1024,
+            1_700_000_000,
+        )
+        .expect("save");
         assert_eq!(
             db.get_upload_checkpoint(job.id).expect("get"),
-            Some(("sess-1".to_string(), 8 * 1024 * 1024, 10 * 1024 * 1024, 1_700_000_000))
+            Some((
+                "sess-1".to_string(),
+                8 * 1024 * 1024,
+                10 * 1024 * 1024,
+                1_700_000_000
+            ))
         );
 
         db.clear_upload_checkpoint(job.id).expect("clear");
@@ -1092,14 +1139,20 @@ mod tests {
         db.save_upload_checkpoint(job.id, "sess-a", 100, 5_000, 1_700_000_000)
             .expect("save first");
         let first = db.get_upload_checkpoint(job.id).expect("get first");
-        assert_eq!(first, Some(("sess-a".to_string(), 100, 5_000, 1_700_000_000)));
+        assert_eq!(
+            first,
+            Some(("sess-a".to_string(), 100, 5_000, 1_700_000_000))
+        );
 
         // Simulate the file changing underneath the job (different len and mtime):
         // a fresh session checkpoint overwrites the old identity entirely.
         db.save_upload_checkpoint(job.id, "sess-b", 0, 6_000, 1_800_000_000)
             .expect("save second");
         let second = db.get_upload_checkpoint(job.id).expect("get second");
-        assert_eq!(second, Some(("sess-b".to_string(), 0, 6_000, 1_800_000_000)));
+        assert_eq!(
+            second,
+            Some(("sess-b".to_string(), 0, 6_000, 1_800_000_000))
+        );
         assert_ne!(first, second);
     }
 
@@ -1111,7 +1164,10 @@ mod tests {
 
         let mut folders = db.list_known_folders().expect("list");
         folders.sort();
-        assert_eq!(folders, vec!["Cocina/Otra".to_string(), "Cocina/Test".to_string()]);
+        assert_eq!(
+            folders,
+            vec!["Cocina/Otra".to_string(), "Cocina/Test".to_string()]
+        );
 
         db.remove_known_folder("Cocina/Otra").expect("remove");
         let folders = db.list_known_folders().expect("list after remove");
@@ -1126,6 +1182,9 @@ mod tests {
 
         db.reset_sync_state().expect("reset");
 
-        assert!(db.list_known_folders().expect("list after reset").is_empty());
+        assert!(db
+            .list_known_folders()
+            .expect("list after reset")
+            .is_empty());
     }
 }
