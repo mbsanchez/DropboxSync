@@ -113,6 +113,11 @@ function App() {
   const didAutoIndexCloudscRef = useRef(false);
   const schedulerStartedRef = useRef(false);
   const loggedTrayHideRef = useRef(false);
+  // OAuth completion can arrive via the primary Rust event OR the fallback poll,
+  // and both can fire for the same login. This once-only guard lets whichever
+  // path arrives first run the state update + log exactly once; the loser no-ops.
+  // Reset in startOAuth so a fresh (re-)connect attempt can complete again.
+  const oauthCompletedRef = useRef(false);
 
   const pushLog = (line: string) =>
     setActivity((prev) => [
@@ -182,6 +187,8 @@ function App() {
 
   const startOAuth = async () => {
     setConnectError(null);
+    // New login attempt: allow the completion handlers to fire once again.
+    oauthCompletedRef.current = false;
     try {
       const payload = await invoke<{ authUrl: string; state: string }>("start_oauth_flow");
       setAuthUrl(payload.authUrl);
@@ -243,6 +250,8 @@ function App() {
       if (!active) return;
       setAwaitingCallback(false);
       if (event.payload.ok) {
+        if (oauthCompletedRef.current) return;
+        oauthCompletedRef.current = true;
         setConnectError(null);
         setAuthOk(true);
         setStartupLoading(false);
@@ -326,6 +335,8 @@ function App() {
         const requirements = await invoke<StartupRequirements>("get_startup_requirements");
         if (disposed || !requirements.authOk) return;
         setAwaitingCallback(false);
+        if (oauthCompletedRef.current) return;
+        oauthCompletedRef.current = true;
         setAuthOk(true);
         setSyncFolderOk(requirements.syncFolderOk);
         if (requirements.syncFolder) {
