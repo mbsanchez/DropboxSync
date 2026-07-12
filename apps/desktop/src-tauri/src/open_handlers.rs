@@ -44,7 +44,7 @@ pub(crate) fn spawn_drain_sync_queue_if_idle(app_state: AppState) {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("process_sync_queue (cloudsc open): {e}");
+                    tracing::error!(error = %e, "process_sync_queue failed (cloudsc open)");
                     break;
                 }
             }
@@ -83,7 +83,7 @@ pub(crate) fn cloudsc_paths_from_current_exe_args() -> Vec<PathBuf> {
 
 pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<PathBuf>) {
     let Some(state) = app_handle.try_state::<AppState>() else {
-        eprintln!("handle_cloudsc_paths_from_os: AppState not available");
+        tracing::warn!("handle_cloudsc_paths_from_os: AppState not available");
         return;
     };
     let app_state = state.inner().clone();
@@ -95,19 +95,20 @@ pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<Pa
                     .db
                     .enqueue_job("hydrate_cloudsc", Some(rel.as_str()), None)
                 {
-                    eprintln!("enqueue hydrate_cloudsc {rel}: {e}");
+                    tracing::error!(file_path = %rel, error = %e, "enqueue hydrate_cloudsc failed");
                     continue;
                 }
                 if let Err(e) = refresh_queue_depth_internal(&app_state) {
-                    eprintln!("refresh_queue_depth: {e}");
+                    tracing::error!(error = %e, "refresh_queue_depth failed");
                 }
-                eprintln!("queued hydrate_cloudsc for {rel}");
+                tracing::info!(file_path = %rel, "queued hydrate_cloudsc");
                 any_queued = true;
             }
             Err(e) => {
-                eprintln!(
-                    "skip path {} (open/drop cloudsc): {e}",
-                    path.display()
+                tracing::warn!(
+                    file_path = %path.display(),
+                    error = %e,
+                    "skip path (open/drop cloudsc)"
                 );
             }
         }

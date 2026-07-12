@@ -4,6 +4,7 @@ mod cloudsc;
 mod cloudsc_ops;
 mod commands;
 mod dropbox_transfer;
+mod logging;
 mod models;
 mod oauth_listener;
 mod open_handlers;
@@ -32,6 +33,8 @@ use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logging::init_tracing();
+
     let db = Db::new().expect("failed to initialize sqlite db");
     let mut sync_engine = SyncEngine::new();
     if let Ok(Some(folder)) = db.get_sync_folder() {
@@ -58,7 +61,7 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             let paths = crate::open_handlers::cloudsc_paths_from_argv(&argv);
             if !paths.is_empty() {
-                eprintln!("DropboxSyncDesktop: file open on running instance: {paths:?}");
+                tracing::info!(?paths, "file open on running instance");
                 crate::open_handlers::handle_cloudsc_paths_from_os(&app, paths);
             }
             // Do not raise an empty dashboard when the user is fully set up (tray-only workflow).
@@ -85,13 +88,15 @@ pub fn run() {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
                 if skip {
-                    eprintln!("Skipping per-user .cloudsc registration (DROPBOXSYNC_SKIP_WINDOWS_FILE_ASSOC).");
+                    tracing::info!(
+                        "skipping per-user .cloudsc registration (DROPBOXSYNC_SKIP_WINDOWS_FILE_ASSOC)"
+                    );
                 } else {
                     match crate::windows_file_assoc::register_user_cloudsc_association() {
-                        Ok(()) => eprintln!(
-                            "Registered per-user .cloudsc association (HKCU) for portable testing."
+                        Ok(()) => tracing::info!(
+                            "registered per-user .cloudsc association (HKCU) for portable testing"
                         ),
-                        Err(e) => eprintln!("Per-user .cloudsc association failed: {e}"),
+                        Err(e) => tracing::error!(error = %e, "per-user .cloudsc association failed"),
                     }
                 }
             }
@@ -102,7 +107,7 @@ pub fn run() {
             {
                 let paths = crate::open_handlers::cloudsc_paths_from_current_exe_args();
                 if !paths.is_empty() {
-                    eprintln!("DropboxSyncDesktop: startup file args: {paths:?}");
+                    tracing::info!(?paths, "startup file args");
                     crate::open_handlers::handle_cloudsc_paths_from_os(&app.handle().clone(), paths);
                 }
             }
@@ -143,7 +148,7 @@ pub fn run() {
             let tray_ok = match tray_builder.build(app) {
                 Ok(_) => true,
                 Err(err) => {
-                    eprintln!("failed to create tray icon: {err}");
+                    tracing::error!(error = %err, "failed to create tray icon");
                     false
                 }
             };
@@ -161,10 +166,10 @@ pub fn run() {
                 // upload resumes from its checkpoint instead of being silently zombied.
                 match state.db.recover_running_jobs() {
                     Ok(count) if count > 0 => {
-                        eprintln!("DropboxSyncDesktop: recovered {count} stale running job(s) on startup");
+                        tracing::info!(count, "recovered stale running job(s) on startup");
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("DropboxSyncDesktop: failed to recover running jobs: {e}"),
+                    Err(e) => tracing::error!(error = %e, "failed to recover running jobs"),
                 }
 
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());

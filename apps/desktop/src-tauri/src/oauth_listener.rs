@@ -92,9 +92,9 @@ fn emit_oauth_finished(app: &AppHandle, event: DropboxOauthFinishedEvent) {
     ) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("emit_to webview_window(main): {e}");
+            tracing::error!(error = %e, "emit_to webview_window(main) failed");
             if let Err(e2) = app.emit("dropbox-oauth-finished", event) {
-                eprintln!("emit global dropbox-oauth-finished: {e2}");
+                tracing::error!(error = %e2, "emit global dropbox-oauth-finished failed");
             }
         }
     }
@@ -234,7 +234,7 @@ fn run_oauth_listener_loop(
                             &app_state, code, state,
                         ));
                         if let Err(ref e) = result {
-                            eprintln!("Dropbox OAuth token exchange failed: {e}");
+                            tracing::error!(error = %e, "Dropbox OAuth token exchange failed");
                         }
                         let event = DropboxOauthFinishedEvent {
                             ok: result.is_ok(),
