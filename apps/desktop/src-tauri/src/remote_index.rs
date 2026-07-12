@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 
 use crate::auth_session::get_access_token;
-use crate::models::DropboxEntry;
+use crate::models::{DropboxEntry, DropboxListFolderResponse};
 use crate::path_util::normalize_dropbox_path;
 use crate::state::AppState;
 
@@ -73,6 +73,109 @@ pub(crate) fn fetch_remote_file_metadata(
     ))
 }
 
+/// Maps a single `list_folder`/`list_folder/continue` entry to the
+/// `(lowercased path_display, RemoteFileMeta)` pair used to key the batched
+/// remote index, or `None` when the entry isn't an indexable file (folders,
+/// deleted entries, or files missing `content_hash`/`rev`/`path_display`).
+fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMeta)> {
+    if entry.tag != "file" {
+        return None;
+    }
+    let path_display = entry.path_display.as_deref()?;
+    let content_hash = entry.content_hash.clone().unwrap_or_default();
+    let rev = entry.rev.clone().unwrap_or_default();
+    if content_hash.is_empty() || rev.is_empty() {
+        return None;
+    }
+    let modified_ts = entry
+        .server_modified
+        .as_deref()
+        .map(parse_rfc3339_ts_to_unix)
+        .unwrap_or(0);
+    Some((
+        path_display.to_lowercase(),
+        RemoteFileMeta {
+            content_hash,
+            rev,
+            modified_ts,
+        },
+    ))
+}
+
+/// Fetches the metadata of every remote file in one recursive `list_folder`
+/// sweep (paginated via `list_folder/continue`), keyed by lowercased
+/// `path_display`.
+///
+/// This replaces one `get_metadata` HTTP request per local file with a
+/// constant number of `list_folder` requests per sync tick.
+///
+/// SAFETY (mass-delete): the caller treats a path absent from the returned
+/// map as "deleted remotely". A partial listing would therefore spuriously
+/// mark still-present remote files as deleted and enqueue local deletions.
+/// To prevent that, any request or parse failure aborts with `Err` instead
+/// of returning whatever was collected so far.
+pub(crate) fn fetch_all_remote_file_metadata(
+    state: &AppState,
+) -> Result<HashMap<String, RemoteFileMeta>, String> {
+    let token = get_access_token(state)?;
+    let client = &state.http_client;
+
+    let mut remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+
+    let mut entries_resp: DropboxListFolderResponse = {
+        let response = client
+            .post("https://api.dropboxapi.com/2/files/list_folder")
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "path": "",
+                "recursive": true,
+                "include_deleted": false
+            }))
+            .send()
+            .map_err(|e| format!("list_folder request failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            return Err(format!(
+                "list_folder status error for account root: {status}; body: {body}"
+            ));
+        }
+        response
+            .json()
+            .map_err(|e| format!("list_folder parse failed: {e}"))?
+    };
+
+    loop {
+        for entry in &entries_resp.entries {
+            if let Some((path_key, meta)) = remote_meta_from_entry(entry) {
+                remote_by_path.insert(path_key, meta);
+            }
+        }
+
+        if !entries_resp.has_more {
+            break;
+        }
+        let response = client
+            .post("https://api.dropboxapi.com/2/files/list_folder/continue")
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "cursor": entries_resp.cursor }))
+            .send()
+            .map_err(|e| format!("list_folder/continue request failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            return Err(format!(
+                "list_folder/continue status error for account root: {status}; body: {body}"
+            ));
+        }
+        entries_resp = response
+            .json()
+            .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
+    }
+
+    Ok(remote_by_path)
+}
+
 pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     state: &AppState,
 ) -> Result<usize, String> {
@@ -80,6 +183,8 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     if local_files.is_empty() {
         return Ok(0);
     }
+
+    let remote_by_path = fetch_all_remote_file_metadata(state)?;
 
     let existing_jobs = state.db.list_recent_jobs(400)?;
     let pending_targets: HashSet<String> = existing_jobs
@@ -99,7 +204,9 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
         }
 
         let prev_remote = state.db.get_remote_file(&rel)?;
-        let remote_meta = fetch_remote_file_metadata(state, &rel)?;
+        let remote_meta = remote_by_path
+            .get(&normalize_dropbox_path(&rel).to_lowercase())
+            .cloned();
         let Some(remote_meta) = remote_meta else {
             // Remote copy is gone. Only propagate the deletion when we had
             // previously indexed a remote copy (otherwise the file may simply
@@ -148,4 +255,65 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     }
 
     Ok(enqueued)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_entry(
+        path_display: Option<&str>,
+        content_hash: Option<&str>,
+        rev: Option<&str>,
+        server_modified: Option<&str>,
+    ) -> DropboxEntry {
+        DropboxEntry {
+            tag: "file".to_string(),
+            path_display: path_display.map(str::to_string),
+            content_hash: content_hash.map(str::to_string),
+            rev: rev.map(str::to_string),
+            server_modified: server_modified.map(str::to_string),
+            size: None,
+        }
+    }
+
+    #[test]
+    fn file_entry_maps_to_lowercased_key_and_parsed_ts() {
+        let entry = file_entry(
+            Some("/Docs/Report.TXT"),
+            Some("hash123"),
+            Some("rev1"),
+            Some("2024-01-02T03:04:05Z"),
+        );
+
+        let result = remote_meta_from_entry(&entry);
+
+        let (key, meta) = result.expect("file entry with hash+rev should map");
+        assert_eq!(key, "/docs/report.txt");
+        assert_eq!(meta.content_hash, "hash123");
+        assert_eq!(meta.rev, "rev1");
+        assert_eq!(meta.modified_ts, parse_rfc3339_ts_to_unix("2024-01-02T03:04:05Z"));
+    }
+
+    #[test]
+    fn folder_entry_maps_to_none() {
+        let mut entry = file_entry(Some("/Docs"), Some("hash123"), Some("rev1"), None);
+        entry.tag = "folder".to_string();
+
+        assert!(remote_meta_from_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn file_entry_with_empty_content_hash_maps_to_none() {
+        let entry = file_entry(Some("/Docs/Report.txt"), Some(""), Some("rev1"), None);
+
+        assert!(remote_meta_from_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn file_entry_missing_path_display_maps_to_none() {
+        let entry = file_entry(None, Some("hash123"), Some("rev1"), None);
+
+        assert!(remote_meta_from_entry(&entry).is_none());
+    }
 }
