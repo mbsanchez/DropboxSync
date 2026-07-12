@@ -256,25 +256,28 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> Result<bool, Stri
             .source_path
             .as_deref()
             .ok_or_else(|| "upload job missing source_path".to_string())
-            .and_then(|rel| upload_local_file_internal(state, rel, job.id)),
+            .and_then(|rel| upload_local_file_internal(state, rel, job.id).map_err(String::from)),
         "delete" => job
             .target_path
             .as_deref()
             .or(job.source_path.as_deref())
             .ok_or_else(|| "delete job missing target_path/source_path".to_string())
-            .and_then(|rel| delete_remote_file_internal(state, rel)),
+            .and_then(|rel| delete_remote_file_internal(state, rel).map_err(String::from)),
         "local_delete" => job
             .target_path
             .as_deref()
             .or(job.source_path.as_deref())
             .ok_or_else(|| "local_delete job missing target_path/source_path".to_string())
-            .and_then(|rel| delete_local_file_internal(state, rel)),
+            .and_then(|rel| delete_local_file_internal(state, rel).map_err(String::from)),
         "download" => job
             .target_path
             .as_deref()
             .or(job.source_path.as_deref())
             .ok_or_else(|| "download job missing target_path/source_path".to_string())
-            .and_then(|rel| download_remote_file_internal(state, &normalize_dropbox_path(rel))),
+            .and_then(|rel| {
+                download_remote_file_internal(state, &normalize_dropbox_path(rel))
+                    .map_err(String::from)
+            }),
         "hydrate_cloudsc" => job
             .source_path
             .as_deref()

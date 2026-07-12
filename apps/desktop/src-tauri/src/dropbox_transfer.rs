@@ -9,6 +9,7 @@ use reqwest::blocking::{Body, Client};
 use tauri::{Emitter, EventTarget};
 
 use crate::auth_session::get_access_token;
+use crate::error::{AppError, AppResult};
 use crate::models::{
     DropboxListFolderResponse, ListRemoteFolderResponse, RemoteEntry, SyncConflictEvent,
     UploadProgressEvent, UploadSessionStartResponse,
@@ -24,7 +25,7 @@ use crate::storage::db::FileIndexRow;
 /// the same directory as `target` so the replace is a single filesystem
 /// metadata update rather than a cross-volume copy.
 #[cfg(windows)]
-fn atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
+fn atomic_replace(temp: &Path, target: &Path) -> AppResult<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
@@ -53,12 +54,12 @@ fn atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
     };
 
     if ok == 0 {
-        return Err(format!(
+        return Err(AppError::Io(format!(
             "atomic replace failed ({} -> {}): {}",
             temp.display(),
             target.display(),
             io::Error::last_os_error()
-        ));
+        )));
     }
 
     Ok(())
@@ -66,13 +67,13 @@ fn atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
 
 /// Atomically replaces `target` with the contents of `temp` (same-directory rename).
 #[cfg(not(windows))]
-fn atomic_replace(temp: &Path, target: &Path) -> Result<(), String> {
+fn atomic_replace(temp: &Path, target: &Path) -> AppResult<()> {
     fs::rename(temp, target).map_err(|e| {
-        format!(
+        AppError::Io(format!(
             "atomic replace failed ({} -> {}): {e}",
             temp.display(),
             target.display()
-        )
+        ))
     })
 }
 
@@ -91,31 +92,25 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 /// Retries `f` up to `max_attempts` times when it fails with a *transient*
-/// error: our transport-error marker (the message contains "request failed",
-/// set by every `.map_err` around a `.send()` call), a Dropbox rate-limit
-/// (`too_many_write_operations` / `too_many_requests` / HTTP 429), or a
-/// server-side error (HTTP 5xx) — all of which are worth backing off and
-/// retrying rather than failing the whole job outright. Other HTTP status
-/// errors (e.g. plain 4xx) are not retried here since those are either
-/// handled by session-resume logic or should bubble straight up.
+/// error per [`AppError::is_transient`]: a transport-level failure
+/// (`AppError::Network`, set by every `.map_err` around a `.send()` call), a
+/// Dropbox rate-limit (`too_many_write_operations` / `too_many_requests` /
+/// HTTP 429), or a server-side error (HTTP 5xx) — all of which are worth
+/// backing off and retrying rather than failing the whole job outright.
+/// Other HTTP status errors (e.g. plain 4xx) are not retried here since those
+/// are either handled by session-resume logic or should bubble straight up.
 /// Uses a linear backoff (`2s * attempt`) between attempts.
 fn retry_transient<T>(
     label: &str,
     max_attempts: u32,
-    mut f: impl FnMut() -> Result<T, String>,
-) -> Result<T, String> {
+    mut f: impl FnMut() -> AppResult<T>,
+) -> AppResult<T> {
     let mut attempt: u32 = 1;
     loop {
         match f() {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let transient = e.contains("request failed")
-                    || e.contains("too_many_write_operations")
-                    || e.contains("too_many_requests")
-                    || e.contains("status error: 429")
-                    || e.contains("status error: 5")
-                    || e.contains("timed out")
-                    || e.contains("timeout");
+                let transient = e.is_transient();
                 if transient && attempt < max_attempts {
                     let wait_secs = 2u64 * attempt as u64;
                     tracing::warn!(
@@ -146,10 +141,10 @@ fn fetch_and_write_file(
     token: &str,
     path_display: &str,
     target: &Path,
-) -> Result<(), String> {
+) -> AppResult<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create parent directory: {e}"))?;
+            .map_err(|e| AppError::Io(format!("failed to create parent directory: {e}")))?;
     }
 
     let file_name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -175,21 +170,27 @@ fn fetch_and_write_file(
         )
         .timeout(Duration::from_secs(300))
         .send()
-        .map_err(|e| format!("download request failed: {}", describe_reqwest_error(&e)))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "download request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !download_resp.status().is_success() {
         let status = download_resp.status();
         let body = download_resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "download status error for {path_display}: {status}; body: {body}"
-        ));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("download for {path_display}: {body}"),
+        });
     }
 
     let write_result = File::create(&temp)
-        .map_err(|e| format!("failed creating temp file: {e}"))
+        .map_err(|e| AppError::Io(format!("failed creating temp file: {e}")))
         .and_then(|mut tmp_file| {
             io::copy(&mut download_resp, &mut tmp_file)
-                .map_err(|e| format!("failed writing local file: {e}"))
+                .map_err(|e| AppError::Io(format!("failed writing local file: {e}")))
         });
 
     if let Err(e) = write_result {
@@ -208,13 +209,13 @@ fn fetch_and_write_file(
 pub(crate) fn list_remote_folder(
     state: &AppState,
     path: String,
-) -> Result<ListRemoteFolderResponse, String> {
+) -> AppResult<ListRemoteFolderResponse> {
     let token = get_access_token(state)?;
 
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
     let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
@@ -231,17 +232,25 @@ pub(crate) fn list_remote_folder(
             "include_deleted": false
         }))
         .send()
-        .map_err(|e| format!("list_folder request failed: {e}"))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "list_folder request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!("list_folder status error: {status}; body: {body}"));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("list_folder: {body}"),
+        });
     }
 
     let entries_resp: DropboxListFolderResponse = response
         .json()
-        .map_err(|e| format!("list_folder parse failed: {e}"))?;
+        .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?;
 
     let mut entries = Vec::new();
     for entry in entries_resp.entries {
@@ -295,7 +304,7 @@ pub(crate) fn choose_upload_strategy(size_bytes: u64) -> UploadStrategy {
 }
 
 /// Starts a new Dropbox upload session and returns its `session_id`.
-fn start_upload_session(client: &Client, token: &str) -> Result<String, String> {
+fn start_upload_session(client: &Client, token: &str) -> AppResult<String> {
     let resp = client
         .post("https://content.dropboxapi.com/2/files/upload_session/start")
         .bearer_auth(token)
@@ -304,19 +313,25 @@ fn start_upload_session(client: &Client, token: &str) -> Result<String, String> 
         .body(Vec::<u8>::new())
         .timeout(Duration::from_secs(120))
         .send()
-        .map_err(|e| format!("upload_session/start request failed: {}", describe_reqwest_error(&e)))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "upload_session/start request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "upload_session/start status error: {status}; body: {body}"
-        ));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("upload_session/start: {body}"),
+        });
     }
 
     let parsed: UploadSessionStartResponse = resp
         .json()
-        .map_err(|e| format!("upload_session/start parse failed: {e}"))?;
+        .map_err(|e| AppError::Other(format!("upload_session/start parse failed: {e}")))?;
 
     Ok(parsed.session_id)
 }
@@ -328,7 +343,7 @@ fn append_upload_chunk(
     session_id: &str,
     offset: u64,
     chunk: &[u8],
-) -> Result<(), String> {
+) -> AppResult<()> {
     let resp = client
         .post("https://content.dropboxapi.com/2/files/upload_session/append_v2")
         .bearer_auth(token)
@@ -344,14 +359,20 @@ fn append_upload_chunk(
         .body(chunk.to_vec())
         .timeout(Duration::from_secs(120))
         .send()
-        .map_err(|e| format!("upload_session/append_v2 request failed: {}", describe_reqwest_error(&e)))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "upload_session/append_v2 request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "upload_session/append_v2 status error: {status}; body: {body}"
-        ));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("upload_session/append_v2: {body}"),
+        });
     }
 
     Ok(())
@@ -366,7 +387,7 @@ fn finish_upload_session(
     offset: u64,
     dropbox_path: &str,
     last_chunk: &[u8],
-) -> Result<(), String> {
+) -> AppResult<()> {
     let resp = client
         .post("https://content.dropboxapi.com/2/files/upload_session/finish")
         .bearer_auth(token)
@@ -385,14 +406,20 @@ fn finish_upload_session(
         .body(last_chunk.to_vec())
         .timeout(Duration::from_secs(120))
         .send()
-        .map_err(|e| format!("upload_session/finish request failed: {}", describe_reqwest_error(&e)))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "upload_session/finish request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "upload_session/finish status error: {status}; body: {body}"
-        ));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("upload_session/finish: {body}"),
+        });
     }
 
     Ok(())
@@ -435,7 +462,7 @@ fn download_would_conflict(
 /// local edit still produces a new copy, and it survives app restarts since the
 /// copies live on disk. Best-effort: any read/hash error is treated as "not found"
 /// so it can never suppress a real conflict copy.
-fn conflict_copy_with_content_exists(target: &Path, content_hash: &str) -> Result<bool, String> {
+fn conflict_copy_with_content_exists(target: &Path, content_hash: &str) -> AppResult<bool> {
     let (Some(parent), Some(stem)) = (target.parent(), target.file_stem()) else {
         return Ok(false);
     };
@@ -510,26 +537,6 @@ fn emit_sync_conflict(path: &str, conflict_path: &str, reason: &str) {
     }
 }
 
-/// Heuristic: does this error (as produced by `append_upload_chunk` /
-/// `finish_upload_session`'s "status error" formatting) indicate the upload
-/// session itself is no longer usable (expired/closed/offset mismatch), as
-/// opposed to a transient transport failure or an unrelated 4xx/5xx? Used to
-/// decide whether to abandon the current session and start a fresh one.
-///
-/// Deliberately does NOT match a bare "409" — a 409 Conflict can also mean
-/// `too_many_write_operations` (write-lock contention on the destination),
-/// which is a transient condition handled by `retry_transient`, not a dead
-/// session; treating every 409 as session-invalid would trigger a full
-/// re-upload from scratch for what is really just lock contention.
-fn is_session_invalid_error(e: &str) -> bool {
-    e.contains("status error")
-        && (e.contains("lookup_failed")
-            || e.contains("not_found")
-            || e.contains("incorrect_offset")
-            || e.contains("closed")
-            || e.contains("not_closed"))
-}
-
 /// Bundles the mutable session-cursor state (`session_id`/`offset`) that
 /// `restart_session` needs to overwrite, so the function's parameter count
 /// stays within clippy's `too_many_arguments` threshold.
@@ -551,13 +558,13 @@ fn restart_session(
     file: &mut File,
     cursor: &mut SessionCursor,
     file_identity: (u64, i64),
-) -> Result<(), String> {
+) -> AppResult<()> {
     let (file_len, file_mtime) = file_identity;
     let sid = retry_transient("upload_session/start", 4, || {
         start_upload_session(client, token)
     })?;
     file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("failed seeking to restart upload session: {e}"))?;
+        .map_err(|e| AppError::Io(format!("failed seeking to restart upload session: {e}")))?;
     *cursor.session_id = sid;
     *cursor.offset = 0;
     state
@@ -596,7 +603,7 @@ fn upload_via_session(
     len: u64,
     dropbox_path: &str,
     job_id: i64,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let client = &state.http_client;
 
     let file_mtime = file
@@ -610,7 +617,7 @@ fn upload_via_session(
     let (mut session_id, mut offset) = match state.db.get_upload_checkpoint(job_id)? {
         Some((sid, off, ck_len, ck_mtime)) if off <= len && ck_len == len && ck_mtime == file_mtime => {
             file.seek(SeekFrom::Start(off))
-                .map_err(|e| format!("failed seeking to resume upload: {e}"))?;
+                .map_err(|e| AppError::Io(format!("failed seeking to resume upload: {e}")))?;
             (sid, off)
         }
         _ => {
@@ -632,7 +639,7 @@ fn upload_via_session(
         while n < buf.len() {
             let read = file
                 .read(&mut buf[n..])
-                .map_err(|e| format!("failed reading local file for upload: {e}"))?;
+                .map_err(|e| AppError::Io(format!("failed reading local file for upload: {e}")))?;
             if read == 0 {
                 break;
             }
@@ -653,7 +660,7 @@ fn upload_via_session(
                     emit_upload_progress(dropbox_path, offset, len);
                     break;
                 }
-                Err(e) if !restarted && is_session_invalid_error(&e) => {
+                Err(e) if !restarted && e.is_session_invalid() => {
                     restarted = true;
                     restart_session(
                         state,
@@ -685,7 +692,7 @@ fn upload_via_session(
                     emit_upload_progress(dropbox_path, offset, len);
                     break;
                 }
-                Err(e) if !restarted && is_session_invalid_error(&e) => {
+                Err(e) if !restarted && e.is_session_invalid() => {
                     restarted = true;
                     restart_session(
                         state,
@@ -716,7 +723,7 @@ fn upload_via_session(
                         .save_upload_checkpoint(job_id, &session_id, offset, len, file_mtime)?;
                     emit_upload_progress(dropbox_path, offset, len);
                 }
-                Err(e) if !restarted && is_session_invalid_error(&e) => {
+                Err(e) if !restarted && e.is_session_invalid() => {
                     restarted = true;
                     restart_session(
                         state,
@@ -743,7 +750,7 @@ pub(crate) fn upload_local_file_internal(
     state: &AppState,
     relative: &str,
     job_id: i64,
-) -> Result<(), String> {
+) -> AppResult<()> {
     if relative.ends_with(".cloudsc") {
         return Ok(());
     }
@@ -752,11 +759,11 @@ pub(crate) fn upload_local_file_internal(
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let local_path = PathBuf::from(&folder).join(relative);
     if !local_path.exists() {
-        return Err(format!("local file missing for upload: {relative}"));
+        return Err(AppError::Sync(format!("local file missing for upload: {relative}")));
     }
 
     // Skip the upload when Dropbox already holds identical content. This avoids
@@ -777,10 +784,10 @@ pub(crate) fn upload_local_file_internal(
     }
 
     let file = File::open(&local_path)
-        .map_err(|e| format!("failed opening local file for upload: {e}"))?;
+        .map_err(|e| AppError::Io(format!("failed opening local file for upload: {e}")))?;
     let len = file
         .metadata()
-        .map_err(|e| format!("failed reading local file metadata: {e}"))?
+        .map_err(|e| AppError::Io(format!("failed reading local file metadata: {e}")))?
         .len();
 
     let dropbox_path = normalize_dropbox_path(relative);
@@ -807,14 +814,20 @@ pub(crate) fn upload_local_file_internal(
                 // slow link. Files above the threshold take the chunked session path (safe at 120s/chunk).
                 .timeout(Duration::from_secs(300))
                 .send()
-                .map_err(|e| format!("upload request failed: {}", describe_reqwest_error(&e)))?;
+                .map_err(|e| {
+                    AppError::Network(format!(
+                        "upload request failed: {}",
+                        describe_reqwest_error(&e)
+                    ))
+                })?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-                return Err(format!(
-                    "upload status error for {dropbox_path}: {status}; body: {body}"
-                ));
+                return Err(AppError::Dropbox {
+                    status: status.as_u16(),
+                    message: format!("upload for {dropbox_path}: {body}"),
+                });
             }
         }
         UploadStrategy::Session => {
@@ -825,7 +838,7 @@ pub(crate) fn upload_local_file_internal(
     Ok(())
 }
 
-pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> Result<(), String> {
+pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> AppResult<()> {
     if relative.ends_with(".cloudsc") {
         return Ok(());
     }
@@ -840,7 +853,12 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
             "path": dropbox_path
         }))
         .send()
-        .map_err(|e| format!("delete request failed: {e}"))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "delete request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -852,9 +870,10 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
         if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
             return Ok(());
         }
-        return Err(format!(
-            "delete status error for {dropbox_path}: {status}; body: {body}"
-        ));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("delete for {dropbox_path}: {body}"),
+        });
     }
 
     Ok(())
@@ -862,16 +881,16 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> R
 
 /// Removes a local file that was deleted on the remote (remote-wins deletion).
 /// Cleans both index tables so the file is not re-detected on the next tick.
-pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Result<(), String> {
+pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> AppResult<()> {
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let local_path = PathBuf::from(&folder).join(relative);
     if local_path.exists() {
         fs::remove_file(&local_path)
-            .map_err(|e| format!("failed to delete local file {relative}: {e}"))?;
+            .map_err(|e| AppError::Io(format!("failed to delete local file {relative}: {e}")))?;
     }
 
     state.db.remove_local_file(relative)?;
@@ -879,12 +898,12 @@ pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Re
     Ok(())
 }
 
-pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> Result<(), String> {
+pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> AppResult<()> {
     let token = get_access_token(state)?;
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let relative = path_display.trim_start_matches('/').to_string();
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
@@ -933,17 +952,17 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
 pub(crate) fn hydrate_remote_folder_internal(
     state: &AppState,
     folder_path_display: &str,
-) -> Result<usize, String> {
+) -> AppResult<usize> {
     let token = get_access_token(state)?;
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
     let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
 
-    fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
+    fs::create_dir_all(&folder).map_err(|e| AppError::Io(format!("failed to create sync folder: {e}")))?;
 
     let client = &state.http_client;
     let mut downloaded = 0usize;
@@ -957,19 +976,25 @@ pub(crate) fn hydrate_remote_folder_internal(
             "include_deleted": false
         }))
         .send()
-        .map_err(|e| format!("list_folder request failed: {e}"))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "list_folder request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!(
-            "list_folder status error for {folder_path_display}: {status}; body: {body}"
-        ));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("list_folder for {folder_path_display}: {body}"),
+        });
     }
 
     let mut entries_resp: DropboxListFolderResponse = response
         .json()
-        .map_err(|e| format!("list_folder parse failed: {e}"))?;
+        .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?;
 
     loop {
         for entry in &entries_resp.entries {
@@ -1001,18 +1026,26 @@ pub(crate) fn hydrate_remote_folder_internal(
             .bearer_auth(&token)
             .json(&serde_json::json!({ "cursor": entries_resp.cursor.clone() }))
             .send()
-            .map_err(|e| format!("list_folder/continue request failed: {e}"))?
+            .map_err(|e| {
+                AppError::Network(format!(
+                    "list_folder/continue request failed: {}",
+                    describe_reqwest_error(&e)
+                ))
+            })?
             .error_for_status()
-            .map_err(|e| format!("list_folder/continue status error: {e}"))?
+            .map_err(|e| AppError::Dropbox {
+                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
+                message: format!("list_folder/continue: {e}"),
+            })?
             .json()
-            .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
+            .map_err(|e| AppError::Other(format!("list_folder/continue parse failed: {e}")))?;
     }
 
     Ok(downloaded)
 }
 
 #[allow(dead_code)]
-pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, String> {
+pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize> {
     let token = match get_access_token(state) {
         Ok(token) => token,
         Err(_) => return Ok(0),
@@ -1020,8 +1053,8 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
     let folder = state
         .db
         .get_sync_folder()?
-        .ok_or_else(|| "sync folder not configured".to_string())?;
-    fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    fs::create_dir_all(&folder).map_err(|e| AppError::Io(format!("failed to create sync folder: {e}")))?;
 
     let client = &state.http_client;
     let mut downloaded = 0usize;
@@ -1041,15 +1074,23 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
             "include_deleted": false
         }))
         .send()
-        .map_err(|e| format!("list_folder request failed: {e}"))?;
+        .map_err(|e| {
+            AppError::Network(format!(
+                "list_folder request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
     if !list_folder_resp.status().is_success() {
         let status = list_folder_resp.status();
         let body = list_folder_resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        return Err(format!("list_folder status error: {status}; body: {body}"));
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("list_folder: {body}"),
+        });
     }
     let mut response: DropboxListFolderResponse = list_folder_resp
         .json()
-        .map_err(|e| format!("list_folder parse failed: {e}"))?;
+        .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?;
 
     loop {
         for entry in &response.entries {
@@ -1084,17 +1125,23 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> Result<usize, S
             .bearer_auth(&token)
             .json(&serde_json::json!({ "cursor": response.cursor.clone() }))
             .send()
-            .map_err(|e| format!("list_folder/continue request failed: {e}"))?;
+            .map_err(|e| {
+                AppError::Network(format!(
+                    "list_folder/continue request failed: {}",
+                    describe_reqwest_error(&e)
+                ))
+            })?;
         if !continue_resp.status().is_success() {
             let status = continue_resp.status();
             let body = continue_resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-            return Err(format!(
-                "list_folder/continue status error: {status}; body: {body}"
-            ));
+            return Err(AppError::Dropbox {
+                status: status.as_u16(),
+                message: format!("list_folder/continue: {body}"),
+            });
         }
         response = continue_resp
             .json()
-            .map_err(|e| format!("list_folder/continue parse failed: {e}"))?;
+            .map_err(|e| AppError::Other(format!("list_folder/continue parse failed: {e}")))?;
     }
 
     Ok(downloaded)
@@ -1105,9 +1152,9 @@ mod tests {
     use super::{
         atomic_replace, choose_upload_strategy, conflict_copy_with_content_exists,
         download_would_conflict, emit_sync_conflict, emit_upload_progress, is_final_chunk,
-        is_session_invalid_error, retry_transient, UploadStrategy, UPLOAD_CHUNK_SIZE,
-        UPLOAD_SESSION_THRESHOLD_BYTES,
+        retry_transient, UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
+    use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1252,25 +1299,30 @@ mod tests {
         // Only fails once (single ~2s backoff sleep) to keep the test fast while
         // still exercising the retry-then-succeed path.
         let calls = AtomicUsize::new(0);
-        let result: Result<&str, String> = retry_transient("test", 4, || {
+        let result: AppResult<&str> = retry_transient("test", 4, || {
             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
             if n < 2 {
-                Err(format!("upload_session/append_v2 request failed: simulated transport error {n}"))
+                Err(AppError::Network(format!(
+                    "upload_session/append_v2 request failed: simulated transport error {n}"
+                )))
             } else {
                 Ok("done")
             }
         });
 
-        assert_eq!(result, Ok("done"));
+        assert!(matches!(result, Ok("done")));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn retry_transient_does_not_retry_status_errors() {
         let calls = AtomicUsize::new(0);
-        let result: Result<(), String> = retry_transient("test", 4, || {
+        let result: AppResult<()> = retry_transient("test", 4, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err("upload_session/append_v2 status error: 400 Bad Request; body: {}".to_string())
+            Err(AppError::Dropbox {
+                status: 400,
+                message: "upload_session/append_v2: Bad Request; body: {}".to_string(),
+            })
         });
 
         assert!(result.is_err());
@@ -1281,12 +1333,14 @@ mod tests {
     fn retry_transient_gives_up_after_max_attempts() {
         // max_attempts=2 keeps this to a single ~2s backoff sleep before giving up.
         let calls = AtomicUsize::new(0);
-        let result: Result<(), String> = retry_transient("test", 2, || {
+        let result: AppResult<()> = retry_transient("test", 2, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err("upload_session/append_v2 request failed: still broken".to_string())
+            Err(AppError::Network(
+                "upload_session/append_v2 request failed: still broken".to_string(),
+            ))
         });
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(AppError::Network(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1294,25 +1348,31 @@ mod tests {
     fn retry_transient_retries_rate_limit_status_errors() {
         // A 429 (rate limit) must be retried with backoff, unlike a plain 4xx.
         let calls = AtomicUsize::new(0);
-        let result: Result<&str, String> = retry_transient("test", 2, || {
+        let result: AppResult<&str> = retry_transient("test", 2, || {
             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
             if n < 2 {
-                Err("upload_session/append_v2 status error: 429 Too Many Requests; body: {}".to_string())
+                Err(AppError::Dropbox {
+                    status: 429,
+                    message: "upload_session/append_v2: Too Many Requests; body: {}".to_string(),
+                })
             } else {
                 Ok("done")
             }
         });
 
-        assert_eq!(result, Ok("done"));
+        assert!(matches!(result, Ok("done")));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn retry_transient_does_not_retry_plain_400() {
         let calls = AtomicUsize::new(0);
-        let result: Result<(), String> = retry_transient("test", 4, || {
+        let result: AppResult<()> = retry_transient("test", 4, || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err("upload_session/append_v2 status error: 400 Bad Request; body: {}".to_string())
+            Err(AppError::Dropbox {
+                status: 400,
+                message: "upload_session/append_v2: Bad Request; body: {}".to_string(),
+            })
         });
 
         assert!(result.is_err());
@@ -1369,25 +1429,36 @@ mod tests {
 
     #[test]
     fn is_session_invalid_error_detects_known_markers() {
-        assert!(is_session_invalid_error(
-            "upload_session/append_v2 status error: 409 Conflict; body: {\"error\": {\".tag\": \"lookup_failed\"}}"
-        ));
-        assert!(is_session_invalid_error(
-            "upload_session/finish status error: 409 Conflict; body: {\"error_summary\": \"incorrect_offset\"}"
-        ));
-        assert!(is_session_invalid_error(
-            "upload_session/finish status error: 409 Conflict; body: {\"error_summary\": \"not_closed\"}"
-        ));
-        assert!(!is_session_invalid_error(
-            "upload_session/append_v2 request failed: connection reset"
-        ));
-        assert!(!is_session_invalid_error(
-            "upload_session/append_v2 status error: 400 Bad Request; body: {}"
-        ));
+        assert!(AppError::Dropbox {
+            status: 409,
+            message: "upload_session/append_v2: {\"error\": {\".tag\": \"lookup_failed\"}}".to_string()
+        }
+        .is_session_invalid());
+        assert!(AppError::Dropbox {
+            status: 409,
+            message: "upload_session/finish: {\"error_summary\": \"incorrect_offset\"}".to_string()
+        }
+        .is_session_invalid());
+        assert!(AppError::Dropbox {
+            status: 409,
+            message: "upload_session/finish: {\"error_summary\": \"not_closed\"}".to_string()
+        }
+        .is_session_invalid());
+        assert!(!AppError::Network(
+            "upload_session/append_v2 request failed: connection reset".to_string()
+        )
+        .is_session_invalid());
+        assert!(!AppError::Dropbox {
+            status: 400,
+            message: "upload_session/append_v2: Bad Request; body: {}".to_string()
+        }
+        .is_session_invalid());
         // A bare 409 that is actually write-lock contention (not a dead session)
         // must NOT be treated as session-invalid.
-        assert!(!is_session_invalid_error(
-            "upload_session/finish status error: 409 Conflict; body: {\"error_summary\": \"too_many_write_operations/...\"}"
-        ));
+        assert!(!AppError::Dropbox {
+            status: 409,
+            message: "upload_session/finish: {\"error_summary\": \"too_many_write_operations/...\"}".to_string()
+        }
+        .is_session_invalid());
     }
 }
