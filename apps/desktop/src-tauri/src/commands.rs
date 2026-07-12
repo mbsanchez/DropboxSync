@@ -327,7 +327,7 @@ pub fn list_remote_folder(
     state: tauri::State<AppState>,
     path: String,
 ) -> Result<ListRemoteFolderResponse, String> {
-    crate::dropbox_transfer::list_remote_folder(state.inner(), path)
+    crate::dropbox_transfer::list_remote_folder(state.inner(), path).map_err(Into::into)
 }
 
 #[tauri::command]
