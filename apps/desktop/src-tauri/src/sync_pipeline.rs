@@ -386,6 +386,7 @@ mod tests {
             oauth_listener: Arc::new(Mutex::new(None)),
             sync_running: Arc::new(AtomicBool::new(false)),
             token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
         }
     }
 

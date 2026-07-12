@@ -29,6 +29,28 @@ pub(crate) struct AppState {
     /// Serializes concurrent access-token refreshes so only one caller ever hits
     /// Dropbox's token endpoint per staleness window; see `auth_session::refresh_token_guarded`.
     pub token_refresh_lock: Arc<Mutex<()>>,
+    /// Shared blocking HTTP client for every Dropbox API call. `reqwest::blocking::Client`
+    /// is internally `Arc`-backed (and each instance owns its own background tokio
+    /// runtime), so constructing one per call — as every call site used to do — spun up
+    /// dozens of runtimes per sync tick. Built once via `build_http_client` and cloned
+    /// (cheaply) into `AppState`.
+    pub http_client: reqwest::blocking::Client,
+}
+
+/// Builds the single shared blocking HTTP client stored on `AppState`.
+///
+/// Timeouts: a 15s connect timeout catches dead endpoints fast; the 600s total
+/// request timeout matches the previous transfer-only client (`dropbox_transfer.rs`'s
+/// old per-call `http_client()` also used 600s) so large uploads/downloads are
+/// unaffected, while the previously-unbounded metadata/list/delete calls now get a
+/// generous, non-regressing cap.
+pub(crate) fn build_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent(concat!("DropboxSyncDesktop/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("failed to build shared reqwest client")
 }
 
 /// Set once in `setup()` after the Tauri `AppHandle` becomes available; read by

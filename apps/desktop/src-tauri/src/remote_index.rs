@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 
 use chrono::Utc;
-use reqwest::blocking::Client;
 
 use crate::auth_session::get_access_token;
 use crate::models::DropboxEntry;
@@ -26,7 +25,7 @@ pub(crate) fn fetch_remote_file_metadata(
     relative: &str,
 ) -> Result<Option<RemoteFileMeta>, String> {
     let token = get_access_token(state)?;
-    let client = Client::new();
+    let client = &state.http_client;
     let dropbox_path = normalize_dropbox_path(relative);
 
     let response = client
