@@ -62,7 +62,7 @@ pub fn run() {
             let paths = crate::open_handlers::cloudsc_paths_from_argv(&argv);
             if !paths.is_empty() {
                 tracing::info!(?paths, "file open on running instance");
-                crate::open_handlers::handle_cloudsc_paths_from_os(&app, paths);
+                crate::open_handlers::handle_cloudsc_paths_from_os(app, paths);
             }
             // Do not raise an empty dashboard when the user is fully set up (tray-only workflow).
             if let Some(state) = app.try_state::<AppState>() {
@@ -212,6 +212,6 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
-        run_events::handle_run_event(&app_handle, event);
+        run_events::handle_run_event(app_handle, event);
     });
 }

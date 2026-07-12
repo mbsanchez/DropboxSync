@@ -840,15 +840,15 @@ enum DataDirOs {
 fn current_data_dir_os() -> DataDirOs {
     #[cfg(target_os = "windows")]
     {
-        return DataDirOs::Windows;
+        DataDirOs::Windows
     }
     #[cfg(target_os = "macos")]
     {
-        return DataDirOs::Macos;
+        DataDirOs::Macos
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        return DataDirOs::Unix;
+        DataDirOs::Unix
     }
 }
 

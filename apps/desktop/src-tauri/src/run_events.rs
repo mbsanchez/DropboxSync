@@ -57,19 +57,18 @@ pub(crate) fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
                 _ => {}
             }
         }
-        RunEvent::WebviewEvent { event: wv_evt, .. } => {
-            if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = wv_evt {
-                for path in paths.iter() {
-                    let p: &Path = path.as_ref();
-                    tracing::info!(file_path = %p.display(), "file drop (webview)");
-                    if let Err(e) =
-                        app_handle.emit("file-drop", path.to_string_lossy().to_string())
-                    {
-                        tracing::error!(error = %e, "emit file-drop failed");
-                    }
+        RunEvent::WebviewEvent {
+            event: WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }),
+            ..
+        } => {
+            for path in paths.iter() {
+                let p: &Path = path.as_ref();
+                tracing::info!(file_path = %p.display(), "file drop (webview)");
+                if let Err(e) = app_handle.emit("file-drop", path.to_string_lossy().to_string()) {
+                    tracing::error!(error = %e, "emit file-drop failed");
                 }
-                handle_cloudsc_paths_from_os(app_handle, paths);
             }
+            handle_cloudsc_paths_from_os(app_handle, paths);
         }
         _ => {}
     }
