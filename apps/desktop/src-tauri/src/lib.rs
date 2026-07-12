@@ -18,6 +18,7 @@ mod sync_pipeline;
 #[cfg(windows)]
 mod windows_file_assoc;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use state::AppState;
@@ -43,6 +44,8 @@ pub fn run() {
         token_cache: Arc::new(Mutex::new(None)),
         scheduler_started: Arc::new(Mutex::new(false)),
         oauth_listener: Arc::new(Mutex::new(None)),
+        sync_running: Arc::new(AtomicBool::new(false)),
+        token_refresh_lock: Arc::new(Mutex::new(())),
     };
 
     let mut builder = tauri::Builder::default()

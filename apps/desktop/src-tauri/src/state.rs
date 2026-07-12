@@ -22,6 +22,13 @@ pub(crate) struct AppState {
     pub token_cache: Arc<Mutex<Option<crate::storage::secure_store::TokenSession>>>,
     pub scheduler_started: Arc<Mutex<bool>>,
     pub oauth_listener: Arc<Mutex<Option<OauthListenerControl>>>,
+    /// Lock-free single-flight gate for sync entry points (replaces the previous
+    /// mutex-guarded `bool` on `SyncEngine`, which allowed a TOCTOU window between
+    /// checking and setting the flag under two separate lock acquisitions).
+    pub sync_running: Arc<AtomicBool>,
+    /// Serializes concurrent access-token refreshes so only one caller ever hits
+    /// Dropbox's token endpoint per staleness window; see `auth_session::refresh_token_guarded`.
+    pub token_refresh_lock: Arc<Mutex<()>>,
 }
 
 /// Set once in `setup()` after the Tauri `AppHandle` becomes available; read by
@@ -39,3 +46,45 @@ pub(crate) struct AppState {
 /// `AppHandle` value to this module-level `static` also makes it disappear, while
 /// preserving the same "single set-once site" semantics.
 pub(crate) static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Races N threads on a single `Arc<AtomicBool>` gate using the same
+    /// `compare_exchange` pattern used at every sync entry point; exactly one
+    /// thread must observe success.
+    #[test]
+    fn compare_exchange_gate_allows_exactly_one_winner() {
+        const N: usize = 16;
+        let flag = Arc::new(AtomicBool::new(false));
+        let successes = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let flag = Arc::clone(&flag);
+                let successes = Arc::clone(&successes);
+                std::thread::spawn(move || {
+                    if flag
+                        .compare_exchange(
+                            false,
+                            true,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        successes.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(successes.load(Ordering::Acquire), 1);
+    }
+}
