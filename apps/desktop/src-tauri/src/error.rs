@@ -12,19 +12,10 @@ use thiserror::Error;
 
 /// Application-wide typed error. Internal functions return `AppResult<T>`;
 /// the Tauri command boundary converts to `String` for IPC serialization.
-// TODO(DBSYNC-17): remove `allow(dead_code)` once every module producing these
-// variants (auth) is migrated off `Result<_, String>`. `Network`, `Dropbox`,
-// `Storage`, `Sync`, `Io` and `Other` are all constructed by now-migrated
-// modules (dropbox_transfer, cloudsc, path_util, storage::db); `Auth` is
-// still only produced by `auth`/`auth_session`, not yet migrated.
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
     #[error("network error: {0}")]
     Network(String),
-    #[allow(
-        dead_code,
-        reason = "constructed once auth/auth_session (DBSYNC-17 later phase) migrates off Result<_, String>"
-    )]
     #[error("auth error: {0}")]
     Auth(String),
     #[error("dropbox API error (status {status}): {message}")]
@@ -136,6 +127,26 @@ impl AppError {
             || message.contains("closed")
             || message.contains("not_closed")
     }
+
+    /// Does this error indicate a session that cannot be recovered by retrying
+    /// (missing session, no refresh token, or Dropbox explicitly rejecting the
+    /// refresh grant), as opposed to a transient refresh failure that is worth
+    /// retrying later? Used by `auth_session::verify_dropbox_token_internal`
+    /// (and the not-yet-migrated `commands::compute_startup_requirements`) to
+    /// decide whether to surface the user as logged-out.
+    ///
+    /// Uses `Display` (`self.to_string()`) to inspect the message: the `Auth`
+    /// variant's `"auth error: "` prefix does not interfere with any of the
+    /// `contains` markers below.
+    pub(crate) fn is_hard_auth(&self) -> bool {
+        let text = self.to_string();
+        let lower = text.to_ascii_lowercase();
+        text.contains("dropbox token expired and no refresh_token available")
+            || text.contains("missing dropbox token session")
+            // Only treat refresh failures as hard when Dropbox explicitly rejects the grant.
+            || (text.contains("dropbox refresh token exchange failed with status")
+                && (lower.contains("invalid_grant") || lower.contains("invalid_client")))
+    }
 }
 
 #[cfg(test)]
@@ -232,8 +243,10 @@ mod tests {
 
     #[test]
     fn is_session_invalid_false_for_transient_or_unrelated_errors() {
-        assert!(!AppError::Network("upload_session/append_v2 request failed: connection reset".into())
-            .is_session_invalid());
+        assert!(!AppError::Network(
+            "upload_session/append_v2 request failed: connection reset".into()
+        )
+        .is_session_invalid());
         assert!(!AppError::Dropbox {
             status: 400,
             message: "Bad Request".into()
@@ -245,5 +258,39 @@ mod tests {
             message: "upload_session/finish: too_many_write_operations/...".into()
         }
         .is_session_invalid());
+    }
+
+    #[test]
+    fn is_hard_auth_true_for_missing_session_or_refresh_token() {
+        assert!(AppError::Auth("missing dropbox token session".into()).is_hard_auth());
+        assert!(
+            AppError::Auth("dropbox token expired and no refresh_token available".into())
+                .is_hard_auth()
+        );
+    }
+
+    #[test]
+    fn is_hard_auth_true_for_rejected_refresh_grant() {
+        assert!(AppError::Auth(
+            "dropbox refresh token exchange failed with status 400; body: {\"error\": \"invalid_grant\"}"
+                .into()
+        )
+        .is_hard_auth());
+        assert!(AppError::Auth(
+            "dropbox refresh token exchange failed with status 401; body: {\"error\": \"INVALID_CLIENT\"}"
+                .into()
+        )
+        .is_hard_auth());
+    }
+
+    #[test]
+    fn is_hard_auth_false_for_transient_refresh_failures_and_unrelated_errors() {
+        // Refresh failed, but not because Dropbox rejected the grant (e.g. a transient 503).
+        assert!(!AppError::Auth(
+            "dropbox refresh token exchange failed with status 503; body: server busy".into()
+        )
+        .is_hard_auth());
+        assert!(!AppError::Network("connection reset".into()).is_hard_auth());
+        assert!(!AppError::Auth("some other auth hiccup".into()).is_hard_auth());
     }
 }

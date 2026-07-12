@@ -4,20 +4,12 @@ use std::sync::{Arc, Mutex};
 use chrono::{Duration, Utc};
 
 use crate::auth::oauth::refresh_access_token_blocking;
+use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::storage::secure_store::TokenSession;
 
 pub(crate) fn has_stored_credentials(state: &AppState) -> bool {
     state.secure_store.get_session().is_ok() || state.secure_store.get_token().is_ok()
-}
-
-pub(crate) fn is_hard_auth_failure(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    err.contains("dropbox token expired and no refresh_token available")
-        || err.contains("missing dropbox token session")
-        // Only treat refresh failures as hard when Dropbox explicitly rejects the grant.
-        || (err.contains("dropbox refresh token exchange failed with status")
-            && (lower.contains("invalid_grant") || lower.contains("invalid_client")))
 }
 
 /// Returns true when we should exchange the refresh token for a new access token.
@@ -50,8 +42,8 @@ fn refresh_token_guarded(
     token_cache: &Arc<Mutex<Option<TokenSession>>>,
     token_refresh_lock: &Arc<Mutex<()>>,
     force: bool,
-    refresher: impl FnOnce() -> Result<TokenSession, String>,
-) -> Result<TokenSession, String> {
+    refresher: impl FnOnce() -> AppResult<TokenSession>,
+) -> AppResult<TokenSession> {
     // A `Mutex<()>` guards no invariant, so a prior panic while holding it cannot
     // corrupt anything — recover from poison rather than permanently wedging every
     // future refresh with "lock poisoned".
@@ -81,7 +73,7 @@ fn refresh_token_guarded(
 }
 
 /// Clears the in-memory cache and performs a refresh using the session from the keychain.
-pub(crate) fn force_refresh_session(state: &AppState) -> Result<TokenSession, String> {
+pub(crate) fn force_refresh_session(state: &AppState) -> AppResult<TokenSession> {
     if let Ok(mut c) = state.token_cache.lock() {
         *c = None;
     }
@@ -89,10 +81,12 @@ pub(crate) fn force_refresh_session(state: &AppState) -> Result<TokenSession, St
     let session = state
         .secure_store
         .get_session()
-        .map_err(|_| "missing dropbox token session".to_string())?;
+        .map_err(|_| AppError::Auth("missing dropbox token session".to_string()))?;
 
     let Some(refresh_token) = session.refresh_token.clone() else {
-        return Err("dropbox token expired and no refresh_token available".to_string());
+        return Err(AppError::Auth(
+            "dropbox token expired and no refresh_token available".to_string(),
+        ));
     };
 
     refresh_token_guarded(&state.token_cache, &state.token_refresh_lock, true, || {
@@ -116,13 +110,13 @@ pub(crate) fn force_refresh_session(state: &AppState) -> Result<TokenSession, St
         state
             .secure_store
             .store_session(&new_session)
-            .map_err(|e| format!("failed storing refreshed token session: {e}"))?;
+            .map_err(|e| AppError::Auth(format!("failed storing refreshed token session: {e}")))?;
 
         Ok(new_session)
     })
 }
 
-pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
+pub(crate) fn get_access_token(state: &AppState) -> AppResult<String> {
     if let Ok(cache) = state.token_cache.lock() {
         if let Some(session) = cache.as_ref() {
             if !session_needs_refresh(session) {
@@ -137,7 +131,7 @@ pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
             let legacy_token = state
                 .secure_store
                 .get_token()
-                .map_err(|e| format!("missing dropbox token session: {e}"))?;
+                .map_err(|e| AppError::Auth(format!("missing dropbox token session: {e}")))?;
             let migrated = TokenSession {
                 access_token: legacy_token,
                 refresh_token: None,
@@ -156,7 +150,9 @@ pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
     }
 
     let Some(refresh_token) = session.refresh_token.clone() else {
-        return Err("dropbox token expired and no refresh_token available".to_string());
+        return Err(AppError::Auth(
+            "dropbox token expired and no refresh_token available".to_string(),
+        ));
     };
 
     let refreshed_session =
@@ -181,7 +177,9 @@ pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
             state
                 .secure_store
                 .store_session(&new_session)
-                .map_err(|e| format!("failed storing refreshed token session: {e}"))?;
+                .map_err(|e| {
+                    AppError::Auth(format!("failed storing refreshed token session: {e}"))
+                })?;
 
             Ok(new_session)
         })?;
@@ -189,8 +187,11 @@ pub(crate) fn get_access_token(state: &AppState) -> Result<String, String> {
     Ok(refreshed_session.access_token)
 }
 
-pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> Result<bool, String> {
-    fn probe(client: &reqwest::blocking::Client, token: &str) -> Result<reqwest::blocking::Response, ()> {
+pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> AppResult<bool> {
+    fn probe(
+        client: &reqwest::blocking::Client,
+        token: &str,
+    ) -> Result<reqwest::blocking::Response, ()> {
         client
             .post("https://api.dropboxapi.com/2/users/get_current_account")
             .bearer_auth(token)
@@ -224,7 +225,7 @@ pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> Result<bool, St
                 }
             }
             Err(e) => {
-                if is_hard_auth_failure(&e) {
+                if e.is_hard_auth() {
                     Ok(false)
                 } else {
                     Ok(true)
