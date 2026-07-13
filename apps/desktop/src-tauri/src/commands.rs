@@ -259,6 +259,11 @@ pub fn show_setup_window(app: AppHandle) -> Result<(), String> {
 /// DBSYNC-18) in the OS text editor — Notepad on Windows, the default text
 /// editor on macOS, `xdg-open` on Linux. Falls back to opening the data dir if
 /// no log file exists yet.
+///
+/// Note (DBSYNC-47): this opens a **snapshot** — Notepad and most default text
+/// editors do not live-tail, so the view will not grow while open. Re-invoke to
+/// see new entries, or point a tailing viewer at the file. The file itself is
+/// written continuously (see `logging.rs`); sync activity is logged at INFO.
 #[tauri::command]
 pub fn open_logs() -> Result<(), String> {
     let dir = crate::storage::db::app_data_dir().map_err(|e| e.to_string())?;

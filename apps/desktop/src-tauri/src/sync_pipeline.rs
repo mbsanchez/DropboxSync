@@ -281,6 +281,22 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     let max_attempts = 5;
     let attempt = job.attempt_count + 1;
 
+    // Relative path this job acts on (never a secret); used for INFO logging so a
+    // user watching the log sees real sync activity (DBSYNC-47).
+    let job_path = job
+        .source_path
+        .as_deref()
+        .or(job.target_path.as_deref())
+        .unwrap_or("")
+        .to_string();
+    tracing::info!(
+        job_id = job.id,
+        job_type = %job.job_type,
+        path = %job_path,
+        attempt,
+        "sync job started"
+    );
+
     let op_result: AppResult<()> = match job.job_type.as_str() {
         "upload" => job
             .source_path
@@ -323,10 +339,24 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             if let Ok(mut engine) = state.sync_engine.lock() {
                 engine.record_job_processed();
             }
+            tracing::info!(
+                job_id = job.id,
+                job_type = %job.job_type,
+                path = %job_path,
+                "sync job completed"
+            );
         }
         Err(err) => {
             if attempt >= max_attempts {
                 let msg = format!("job {} failed: {err}", job.id);
+                tracing::error!(
+                    job_id = job.id,
+                    job_type = %job.job_type,
+                    path = %job_path,
+                    attempt,
+                    error = %err,
+                    "sync job failed (max attempts reached)"
+                );
                 state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
             } else {
                 let wait_secs = backoff_seconds(attempt);
@@ -334,6 +364,15 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
                 let msg = format!(
                     "job {} retry scheduled in {}s (attempt {}): {err}",
                     job.id, wait_secs, attempt
+                );
+                tracing::warn!(
+                    job_id = job.id,
+                    job_type = %job.job_type,
+                    path = %job_path,
+                    attempt,
+                    wait_secs,
+                    error = %err,
+                    "sync job failed; retry scheduled"
                 );
                 state
                     .db
@@ -350,6 +389,9 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
 
 pub(crate) fn run_sync_tick_internal(state: &AppState) -> AppResult<SyncTickResult> {
     let enqueued_jobs = scan_local_changes_internal(state)?;
+    if enqueued_jobs > 0 {
+        tracing::info!(count = enqueued_jobs, "enqueued local changes for sync");
+    }
 
     // Drain up to `SYNC_BATCH_CAP` due jobs in this tick instead of exactly one,
     // so large backlogs make real progress every 60s. Mirrors the drain loop in
@@ -372,6 +414,16 @@ pub(crate) fn run_sync_tick_internal(state: &AppState) -> AppResult<SyncTickResu
     }
 
     let scanned_files = state.db.list_local_files()?.len();
+    // Only summarise a tick that actually did something, so the idle 60s poll
+    // doesn't spam the log (DBSYNC-47).
+    if enqueued_jobs > 0 || processed_job {
+        tracing::info!(
+            scanned_files,
+            enqueued_jobs,
+            processed_job,
+            "sync tick complete"
+        );
+    }
     Ok(SyncTickResult {
         scanned_files,
         enqueued_jobs,
