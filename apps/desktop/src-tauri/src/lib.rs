@@ -22,15 +22,96 @@ mod windows_file_assoc;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use state::AppState;
 use storage::db::Db;
 use storage::secure_store::SecureStore;
 use sync::engine::SyncEngine;
 use tauri::image::Image;
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, PhysicalPosition, Rect, WebviewWindow};
+
+/// Timestamp of the most recent tray-triggered show/hide of the `main` flyout.
+/// `run_events::handle_run_event` reads this via [`recently_toggled`] to skip the
+/// blur-hide handler right after a tray click, so a click that both focuses the
+/// (already-visible) window and re-triggers the tray toggle doesn't race a
+/// blur-driven hide immediately followed by a click-driven show.
+static LAST_TOGGLE: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn stamp_toggle() {
+    if let Ok(mut guard) = LAST_TOGGLE.lock() {
+        *guard = Some(Instant::now());
+    }
+}
+
+/// True when the `main` flyout was toggled (shown or hidden) from the tray within
+/// the last `within` duration. Used to suppress the blur-hide handler right after a
+/// tray click so it doesn't fight the toggle it just performed.
+pub(crate) fn recently_toggled(within: Duration) -> bool {
+    match LAST_TOGGLE.lock() {
+        Ok(guard) => guard.map(|t| t.elapsed() < within).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Positions the `main` flyout window just above the tray icon, right-aligned to
+/// it — anchored to the primary/tray monitor's bottom-right corner (bottom taskbar
+/// assumption; no multi-monitor/taskbar-edge detection). All math is done in
+/// physical pixels; the result is clamped to the target monitor's bounds so the
+/// flyout never renders off-screen.
+fn position_flyout(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    position: PhysicalPosition<f64>,
+    rect: Rect,
+) {
+    let monitor = app
+        .monitor_from_point(position.x, position.y)
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten());
+
+    let Some(monitor) = monitor else {
+        let _ = window.show();
+        return;
+    };
+
+    let scale = monitor.scale_factor();
+    let mon_pos = monitor.position();
+    let mon_size = monitor.size();
+
+    let rect_pos = rect.position.to_physical::<f64>(scale);
+    let rect_size = rect.size.to_physical::<f64>(scale);
+
+    // `main` window is a fixed LOGICAL 360x600 (tauri.conf.json); convert to physical.
+    let win_w = 360.0 * scale;
+    let win_h = 600.0 * scale;
+    let gap = 8.0 * scale;
+
+    let mut x = rect_pos.x + rect_size.width - win_w;
+    let mut y = rect_pos.y - win_h - gap;
+
+    let min_x = mon_pos.x as f64;
+    let max_x = min_x + mon_size.width as f64 - win_w;
+    let min_y = mon_pos.y as f64;
+    let max_y = min_y + mon_size.height as f64 - win_h;
+
+    x = if max_x >= min_x {
+        x.clamp(min_x, max_x)
+    } else {
+        min_x
+    };
+    y = if max_y >= min_y {
+        y.clamp(min_y, max_y)
+    } else {
+        min_y
+    };
+
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+    let _ = window.show();
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -65,10 +146,12 @@ pub fn run() {
                 tracing::info!(?paths, "file open on running instance");
                 crate::open_handlers::handle_cloudsc_paths_from_os(app, paths);
             }
-            // Do not raise an empty dashboard when the user is fully set up (tray-only workflow).
+            // Do not raise an empty dashboard when the user is fully set up (tray-only
+            // workflow). `main` is a tray-click-only flyout now; onboarding surfaces via
+            // the `setup` window instead.
             if let Some(state) = app.try_state::<AppState>() {
                 if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
-                    if let Some(window) = app.get_webview_window("main") {
+                    if let Some(window) = app.get_webview_window("setup") {
                         let _ = window.show();
                         let _ = window.unminimize();
                         let _ = window.set_focus();
@@ -115,9 +198,11 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
 
-            let open_dashboard = MenuItem::with_id(app, "open_dashboard", "Open Dashboard", true, None::<&str>)?;
+            // "Open Dashboard" is gone: the tray icon itself now toggles the `main`
+            // flyout on a single left click (see `on_tray_icon_event` below); the menu
+            // only needs Exit.
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_dashboard, &quit])?;
+            let menu = Menu::with_items(app, &[&quit])?;
             let tray_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let tray_builder = TrayIconBuilder::with_id("main")
@@ -126,22 +211,30 @@ pub fn run() {
                 .menu(&menu)
                 .tooltip("DropboxSyncDesktop - Idle")
                 .on_tray_icon_event(move |_tray, event| {
-                    if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+                    // Single source of truth for the flyout: a left-click toggles it
+                    // (shows+positions if hidden, hides if visible). No more DoubleClick.
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        position,
+                        rect,
+                        ..
+                    } = event
+                    {
                         if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
+                            let visible = window.is_visible().unwrap_or(false);
+                            if visible {
+                                let _ = window.hide();
+                            } else {
+                                position_flyout(&app_handle, &window, position, rect);
+                                let _ = window.set_focus();
+                            }
+                            stamp_toggle();
                         }
                     }
                 })
                 .on_menu_event(move |app, event| {
-                    if event.id.as_ref() == "open_dashboard" {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
-                    } else if event.id.as_ref() == "quit" {
+                    if event.id.as_ref() == "quit" {
                         app.exit(0);
                     }
                 });
@@ -154,7 +247,10 @@ pub fn run() {
                 }
             };
 
-            // Step 0: start with the main window hidden; the UI shows it when setup is incomplete.
+            // Step 0: both windows start hidden (tauri.conf.json `visible: false`). The
+            // `main` flyout is never shown here — it only appears via the tray click
+            // handler above (and only when the tray was built successfully). When
+            // onboarding (auth/sync folder) is incomplete, show the `setup` window instead.
             if tray_ok {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
@@ -174,6 +270,13 @@ pub fn run() {
                 }
 
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
+
+                if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
+                    if let Some(setup_window) = app.get_webview_window("setup") {
+                        let _ = setup_window.show();
+                        let _ = setup_window.set_focus();
+                    }
+                }
             }
 
             // Single set-once site for `state::APP_HANDLE`, read by
@@ -192,6 +295,7 @@ pub fn run() {
             commands::start_background_scheduler,
             commands::hide_main_window,
             commands::show_main_window,
+            commands::show_setup_window,
             commands::set_sync_folder,
             commands::get_sync_status,
             commands::get_sync_dashboard,

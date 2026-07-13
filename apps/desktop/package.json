@@ -17,6 +17,7 @@
     "tauri:before-build": "node scripts/tauri-before-build.mjs"
   },
   "dependencies": {
+    "@dropbox-sync/shared": "*",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",

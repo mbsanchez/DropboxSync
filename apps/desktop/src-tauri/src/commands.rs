@@ -239,6 +239,19 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Shows the `setup` window (re-auth, folder/filter settings). Unlike `main` — a
+/// tray-click-only flyout toggled from `lib.rs` — `setup` is a normal window the
+/// frontend can request explicitly, e.g. from the flyout's "Settings" action.
+#[tauri::command]
+pub fn show_setup_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("setup") {
+        window.show().map_err(|e| e.to_string())?;
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_sync_status(state: tauri::State<AppState>) -> Result<SyncStatus, String> {
     refresh_queue_depth_internal(state.inner())?;
