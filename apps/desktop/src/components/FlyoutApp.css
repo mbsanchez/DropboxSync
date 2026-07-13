@@ -384,6 +384,89 @@ html, body, #root {
   white-space: nowrap;
 }
 
+/* --- Accueil: current-transfer card (upload/download in progress) --- */
+
+.current-transfer-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--flyout-panel);
+  border: 1px solid var(--flyout-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.current-transfer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.current-transfer-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.current-transfer-bar {
+  position: relative;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--flyout-muted-soft);
+  overflow: hidden;
+}
+
+.current-transfer-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--flyout-accent);
+  transition: width 0.15s ease;
+}
+
+.current-transfer-bar.indeterminate .current-transfer-bar-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 40%;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--flyout-accent) 0,
+    var(--flyout-accent) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+  animation: current-transfer-indeterminate 1.1s linear infinite;
+}
+
+@keyframes current-transfer-indeterminate {
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+.current-transfer-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--flyout-muted);
+}
+
+.current-transfer-run-label {
+  font-size: 10.5px;
+  color: var(--flyout-muted);
+  margin: -2px 0 8px;
+}
+
 /* --- Activité: icon-badge feed rows --- */
 
 .activity-list .activity-row,

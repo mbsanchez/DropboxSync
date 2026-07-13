@@ -75,3 +75,20 @@ export type ActivityEntry = {
   /** Epoch ms captured when the entry was logged, used for relative-time display. */
   timestamp: number;
 };
+
+export type TransferDirection = "upload" | "download";
+
+/** Payload shared by the `upload-progress` / `download-progress` Tauri events. */
+export type TransferProgressEvent = {
+  path: string;
+  transferred: number;
+  total: number;
+};
+
+export type ActiveTransfer = {
+  path: string;
+  transferred: number;
+  total: number;
+  direction: TransferDirection;
+  speedBytesPerSec: number;
+};
