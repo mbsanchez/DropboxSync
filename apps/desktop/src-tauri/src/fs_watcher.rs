@@ -127,9 +127,13 @@ fn on_debounced_batch(
 /// forms compare equal.
 fn normalize_verbatim(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(stripped) => PathBuf::from(stripped),
-        None => p.to_path_buf(),
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` → `\\server\share` (network-share sync root).
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p.to_path_buf()
     }
 }
 

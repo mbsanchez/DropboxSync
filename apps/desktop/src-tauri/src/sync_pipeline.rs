@@ -144,6 +144,35 @@ fn process_known_folder_deletion(
     Ok(1)
 }
 
+/// How a watched path currently resolves on disk. Distinguishes a genuine
+/// absence (`NotFound`) from a transient stat failure (permission, Windows
+/// sharing-violation, AV/network lock) — the latter must NEVER be treated as a
+/// deletion, or a racy stat on a just-written file would enqueue a spurious
+/// remote delete (DBSYNC-29 review; the full scan guards this via `walk_had_error`).
+enum PathKind {
+    File,
+    Dir,
+    Absent,
+    Other,
+}
+
+/// Classify a path. `Err` means a non-`NotFound` IO error — the caller must skip
+/// it (not delete). Uses `symlink_metadata` so a symlink is not followed.
+fn classify_path(path: &Path) -> std::io::Result<PathKind> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => Ok(PathKind::File),
+        Ok(m) if m.is_dir() => Ok(PathKind::Dir),
+        Ok(_) => Ok(PathKind::Other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PathKind::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+/// Grace period before a targeted deletion is committed: re-stat once so a
+/// delete-then-recreate save (some editors briefly unlink the target) is seen as
+/// a modification, not a momentary remote delete + re-add (DBSYNC-29 review).
+const DELETE_CONFIRM_MS: u64 = 150;
+
 /// Targeted, network-free change detection for a specific set of `/`-relative
 /// paths (from the filesystem watcher, DBSYNC-29). Re-evaluates each path against
 /// the index and enqueues the same jobs the full scan would — without walking the
@@ -191,63 +220,109 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     let mut enqueued = 0usize;
     for rel in rels {
         let absolute = tracked_root.join(&rel);
-        if absolute.is_file() {
-            enqueued += process_local_file_change(
-                state,
-                &tracked_root,
-                &rel,
-                &absolute,
-                known_map.get(&rel),
-                &mut pending_targets,
-            )?;
-        } else if absolute.is_dir() {
-            // A moved-in / newly-created directory: record it and enqueue any
-            // pre-existing children (a bounded walk of just this subtree, not the
-            // whole root). Recursive watching also emits child events separately.
-            state.db.upsert_known_folder(&rel)?;
-            for entry in WalkDir::new(&absolute).into_iter().flatten() {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let child_rel = match entry.path().strip_prefix(&tracked_root) {
-                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                    Err(_) => continue,
-                };
-                if child_rel.ends_with(".cloudsc") || should_ignore_local_path(&child_rel) {
-                    continue;
-                }
+        let kind = match classify_path(&absolute) {
+            Ok(k) => k,
+            Err(e) => {
+                // Transient stat failure — NOT a deletion. Skip; the next event or
+                // the 5-min fallback scan reconciles it (DBSYNC-29 review blocker).
+                tracing::warn!(path = %rel, error = %e, "stat failed; not treating as a deletion");
+                continue;
+            }
+        };
+
+        match kind {
+            PathKind::File => {
                 enqueued += process_local_file_change(
                     state,
                     &tracked_root,
-                    &child_rel,
-                    entry.path(),
-                    known_map.get(&child_rel),
+                    &rel,
+                    &absolute,
+                    known_map.get(&rel),
                     &mut pending_targets,
                 )?;
             }
-        } else {
-            // Absent on disk → deletion. Handle both a single file and a removed
-            // directory prefix (delete tracked descendants + the folder rows).
-            if known_map.contains_key(&rel) {
-                enqueued += process_local_file_deletion(state, &tracked_root, &rel)?;
-            }
-            let prefix = format!("{rel}/");
-            for prev in &known {
-                if prev.relative_path == rel {
-                    continue; // already handled above
+            PathKind::Dir => {
+                // A moved-in / newly-created directory: record it and enqueue any
+                // pre-existing children (a bounded walk of just this subtree, not
+                // the whole root). Recursive watching also emits child events.
+                state.db.upsert_known_folder(&rel)?;
+                for entry in WalkDir::new(&absolute).into_iter().flatten() {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let child_rel = match entry.path().strip_prefix(&tracked_root) {
+                        Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                        Err(_) => continue,
+                    };
+                    if child_rel.ends_with(".cloudsc") || should_ignore_local_path(&child_rel) {
+                        continue;
+                    }
+                    enqueued += process_local_file_change(
+                        state,
+                        &tracked_root,
+                        &child_rel,
+                        entry.path(),
+                        known_map.get(&child_rel),
+                        &mut pending_targets,
+                    )?;
                 }
-                if prev.relative_path.starts_with(&prefix)
-                    && !prev.relative_path.ends_with(".cloudsc")
-                    && !should_ignore_local_path(&prev.relative_path)
-                {
-                    enqueued += process_local_file_deletion(state, &tracked_root, &prev.relative_path)?;
-                }
             }
-            for folder_rel in state.db.list_known_folders()? {
-                if folder_rel == rel || folder_rel.starts_with(&prefix) {
-                    enqueued += process_known_folder_deletion(state, &tracked_root, &folder_rel)?;
-                }
+            PathKind::Other => {
+                // Symlink or other special file — not something we sync; skip.
+                continue;
             }
+            PathKind::Absent => {
+                // Confirm the absence is stable before propagating any remote
+                // delete, so a delete-then-recreate atomic save is treated as a
+                // modification (its recreate event/re-stat wins) rather than a
+                // momentary remote delete + re-add.
+                std::thread::sleep(std::time::Duration::from_millis(DELETE_CONFIRM_MS));
+                if !matches!(classify_path(&absolute), Ok(PathKind::Absent)) {
+                    continue;
+                }
+                enqueued += enqueue_targeted_deletions(state, &tracked_root, &rel, &known)?;
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
+
+/// Enqueue remote deletions for an explicitly-absent path: the file itself (if
+/// tracked), every tracked descendant under a removed directory prefix, and any
+/// matching `known_folders` rows. Every delete goes through the DBSYNC-45
+/// dehydration guard in the per-item helpers.
+fn enqueue_targeted_deletions(
+    state: &AppState,
+    tracked_root: &Path,
+    rel: &str,
+    known: &[FileIndexRow],
+) -> AppResult<usize> {
+    let mut enqueued = 0usize;
+
+    // The path itself, if it was a tracked file.
+    if known.iter().any(|k| k.relative_path == rel) {
+        enqueued += process_local_file_deletion(state, tracked_root, rel)?;
+    }
+
+    // Tracked descendants of a removed directory prefix.
+    let prefix = format!("{rel}/");
+    for prev in known {
+        if prev.relative_path == rel {
+            continue; // already handled above
+        }
+        if prev.relative_path.starts_with(&prefix)
+            && !prev.relative_path.ends_with(".cloudsc")
+            && !should_ignore_local_path(&prev.relative_path)
+        {
+            enqueued += process_local_file_deletion(state, tracked_root, &prev.relative_path)?;
+        }
+    }
+
+    // Matching known-folder rows (the removed dir itself + any sub-folders).
+    for folder_rel in state.db.list_known_folders()? {
+        if folder_rel == rel || folder_rel.starts_with(&prefix) {
+            enqueued += process_known_folder_deletion(state, tracked_root, &folder_rel)?;
         }
     }
 
