@@ -45,7 +45,7 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     let mut entries_resp: DropboxListFolderResponse = {
         let response = client
             .post("https://api.dropboxapi.com/2/files/list_folder")
-            .bearer_auth(&token)
+            .bearer_auth(token.as_str())
             .json(&serde_json::json!({
                 "path": remote_folder_path_display,
                 "recursive": false,
@@ -133,7 +133,7 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
         }
         let response = client
             .post("https://api.dropboxapi.com/2/files/list_folder/continue")
-            .bearer_auth(&token)
+            .bearer_auth(token.as_str())
             .json(&serde_json::json!({ "cursor": entries_resp.cursor }))
             .send()
             .map_err(|e| AppError::Network(format!("list_folder/continue request failed: {e}")))?;

@@ -29,11 +29,33 @@ pub const DROPBOX_REDIRECT_URI: &str = match option_env!("DROPBOX_REDIRECT_URI")
     None => "http://localhost:53682/callback",
 };
 
-#[derive(Deserialize)]
+/// OAuth token payload. The bearer credentials are wrapped in `Zeroizing` so
+/// they are wiped from memory on drop (DBSYNC-46). `expires_in` is not secret.
 pub struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: Zeroizing<String>,
+    pub refresh_token: Option<Zeroizing<String>>,
     pub expires_in: Option<i64>,
+}
+
+/// Plain deserialization target for the token endpoint response. `Zeroizing`
+/// has no `Deserialize` impl, so we parse into this and immediately MOVE the
+/// strings into `Zeroizing` (a move reuses the same allocation — the secret
+/// bytes are never copied, and this value's plain lifetime is a single stmt).
+#[derive(Deserialize)]
+struct RawTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+}
+
+impl From<RawTokenResponse> for TokenResponse {
+    fn from(raw: RawTokenResponse) -> Self {
+        TokenResponse {
+            access_token: Zeroizing::new(raw.access_token),
+            refresh_token: raw.refresh_token.map(Zeroizing::new),
+            expires_in: raw.expires_in,
+        }
+    }
 }
 
 fn resolve_app_key() -> AppResult<String> {
@@ -137,12 +159,14 @@ pub async fn complete_oauth(
         )));
     }
 
-    let token = serde_json::from_slice::<TokenResponse>(&body).map_err(|e| {
-        AppError::Auth(format!(
-            "token parse failed: {e}; body: {}",
-            String::from_utf8_lossy(&body)
-        ))
-    })?;
+    let token: TokenResponse = serde_json::from_slice::<RawTokenResponse>(&body)
+        .map_err(|e| {
+            AppError::Auth(format!(
+                "token parse failed: {e}; body: {}",
+                String::from_utf8_lossy(&body)
+            ))
+        })?
+        .into();
 
     Ok(token)
 }
@@ -156,11 +180,13 @@ pub fn refresh_access_token_blocking(
 
     let response = client
         .post("https://api.dropboxapi.com/oauth2/token")
+        // Pass by `&str` so no owned plain-String copy of the refresh token is
+        // made here (DBSYNC-46); `refresh_token` is already a borrowed &str.
         .form(&[
-            ("refresh_token", refresh_token.to_string()),
-            ("grant_type", "refresh_token".to_string()),
-            ("client_id", app_key),
-            ("redirect_uri", redirect_uri),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+            ("client_id", app_key.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
         ])
         .send()
         .map_err(|e| AppError::Network(format!("refresh token request failed: {e}")))?;
@@ -176,6 +202,7 @@ pub fn refresh_access_token_blocking(
     }
 
     response
-        .json::<TokenResponse>()
+        .json::<RawTokenResponse>()
+        .map(TokenResponse::from)
         .map_err(|e| AppError::Auth(format!("refresh token parse failed: {e}")))
 }
