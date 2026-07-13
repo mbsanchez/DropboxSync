@@ -4,6 +4,7 @@ import { useActivityLog } from "../hooks/useActivityLog";
 import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useSyncDashboard } from "../hooks/useSyncDashboard";
 import { useTransferProgress } from "../hooks/useTransferProgress";
+import { usePlaceholderEvents } from "../hooks/usePlaceholderEvents";
 import { formatBytes, formatSpeed } from "../format";
 import type { ActiveTransfer, ActivityEntry, SyncJob } from "../types";
 import "./FlyoutApp.css";
@@ -285,6 +286,7 @@ function FlyoutApp() {
   const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
   const { status, jobs, conflicts, retryFailedJobs } = useSyncDashboard(pushLog);
   const { activeTransfer } = useTransferProgress();
+  usePlaceholderEvents(pushLog);
 
   const [section, setSection] = useState<Section>("home");
   const schedulerStartedRef = useRef(false);

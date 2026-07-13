@@ -989,6 +989,22 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
     state
         .db
         .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
+
+    // DBSYNC-45: record remote provenance for the (re-)hydrated file so that a
+    // later remote deletion propagates as a local delete. Without this row the
+    // deletion branch in `refresh_remote_index` sees `prev_remote = None` and
+    // can't tell "remotely deleted" from "never uploaded", so it does nothing.
+    // The downloaded content hash IS the Dropbox content_hash (DBSYNC-9), which
+    // is exactly what the deletion / should-download checks compare, so the row
+    // is correct even if the best-effort metadata fetch (for rev/mtime) fails.
+    let (rev, remote_mtime) = match crate::remote_index::fetch_remote_file_metadata(state, &relative)
+    {
+        Ok(Some(meta)) => (meta.rev, meta.modified_ts),
+        _ => (String::new(), modified_ts),
+    };
+    if let Err(e) = state.db.upsert_remote_file(&relative, &hash, &rev, remote_mtime) {
+        tracing::warn!(file_path = %relative, error = %e, "failed recording remote provenance after hydrate");
+    }
     Ok(())
 }
 
