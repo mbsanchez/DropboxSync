@@ -4,11 +4,15 @@
   --flyout-border: #d9e3f2;
   --flyout-text: #0f172a;
   --flyout-muted: #64748b;
+  --flyout-muted-soft: rgba(100, 116, 139, 0.12);
   --flyout-accent: #2563eb;
   --flyout-accent-soft: rgba(37, 99, 235, 0.12);
   --flyout-error: #c0392b;
+  --flyout-error-soft: rgba(192, 57, 43, 0.12);
   --flyout-warn: #b45309;
+  --flyout-warn-soft: rgba(180, 83, 9, 0.14);
   --flyout-ok: #16a34a;
+  --flyout-ok-soft: rgba(22, 163, 74, 0.12);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -18,11 +22,15 @@
     --flyout-border: #2a3550;
     --flyout-text: #e5e9f2;
     --flyout-muted: #94a3b8;
+    --flyout-muted-soft: rgba(148, 163, 184, 0.16);
     --flyout-accent: #60a5fa;
     --flyout-accent-soft: rgba(96, 165, 250, 0.18);
     --flyout-error: #f87171;
+    --flyout-error-soft: rgba(248, 113, 113, 0.16);
     --flyout-warn: #fbbf24;
+    --flyout-warn-soft: rgba(251, 191, 36, 0.16);
     --flyout-ok: #4ade80;
+    --flyout-ok-soft: rgba(74, 222, 128, 0.16);
   }
 }
 
@@ -279,4 +287,117 @@ html, body, #root {
 
 .flyout-footer.ok .dot {
   background: var(--flyout-ok);
+}
+
+/* --- Accueil: "Open logs" action --- */
+
+.flyout-logs-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+/* --- Dossiers: minimal panel (path + "open in explorer") --- */
+
+.folder-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--flyout-panel);
+  border: 1px solid var(--flyout-border);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.folder-panel .path {
+  font-size: 11.5px;
+  color: var(--flyout-muted);
+  word-break: break-all;
+}
+
+/* --- Event icon badge (shared by Accueil recent transfers + Activité feed) --- */
+
+.event-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--flyout-muted-soft);
+  color: var(--flyout-muted);
+}
+
+.event-icon.upload {
+  background: var(--flyout-accent-soft);
+  color: var(--flyout-accent);
+}
+
+.event-icon.download {
+  background: var(--flyout-ok-soft);
+  color: var(--flyout-ok);
+}
+
+.event-icon.delete,
+.event-icon.error {
+  background: var(--flyout-error-soft);
+  color: var(--flyout-error);
+}
+
+.event-icon.conflict {
+  background: var(--flyout-warn-soft);
+  color: var(--flyout-warn);
+}
+
+.event-icon.auth {
+  background: var(--flyout-accent-soft);
+  color: var(--flyout-accent);
+}
+
+.event-icon.sync {
+  background: var(--flyout-muted-soft);
+  color: var(--flyout-muted);
+}
+
+/* --- Accueil: recent transfers list --- */
+
+.recent-list .recent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.recent-row-body {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.recent-row-body .row-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Activité: icon-badge feed rows --- */
+
+.activity-list .activity-row,
+.flyout-list.compact .activity-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.activity-row-body {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.activity-row-body .row-main {
+  overflow-wrap: break-word;
 }

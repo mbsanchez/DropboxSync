@@ -24,6 +24,7 @@ export type SyncJob = {
   status: string;
   attemptCount: number;
   nextRetryAt?: string;
+  updatedAt?: string;
   lastError?: string;
 };
 
@@ -71,4 +72,6 @@ export type CloudscPlaceholderInfo = {
 export type ActivityEntry = {
   id: string;
   message: string;
+  /** Epoch ms captured when the entry was logged, used for relative-time display. */
+  timestamp: number;
 };

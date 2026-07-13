@@ -6,11 +6,13 @@ export function useActivityLog() {
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
 
   const pushLog = useCallback((line: string) => {
+    const now = Date.now();
     setActivity((prev) =>
       [
         {
-          id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-          message: `${new Date().toLocaleTimeString()} - ${line}`,
+          id: `${now}-${Math.random().toString(16).slice(2, 8)}`,
+          message: `${new Date(now).toLocaleTimeString()} - ${line}`,
+          timestamp: now,
         },
         ...prev,
       ].slice(0, 40),

@@ -296,6 +296,8 @@ pub fn run() {
             commands::hide_main_window,
             commands::show_main_window,
             commands::show_setup_window,
+            commands::open_logs,
+            commands::open_sync_folder,
             commands::set_sync_folder,
             commands::get_sync_status,
             commands::get_sync_dashboard,

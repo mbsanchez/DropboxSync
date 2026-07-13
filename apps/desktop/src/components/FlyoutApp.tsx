@@ -1,11 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useActivityLog } from "../hooks/useActivityLog";
 import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useSyncDashboard } from "../hooks/useSyncDashboard";
-import { useCloudscPlaceholders } from "../hooks/useCloudscPlaceholders";
-import { useRemoteBrowser, parentDropboxPath } from "../hooks/useRemoteBrowser";
-import type { SyncJob } from "../types";
+import type { ActivityEntry, SyncJob } from "../types";
 import "./FlyoutApp.css";
 
 type Section = "home" | "folders" | "activity";
@@ -15,6 +13,8 @@ const NAV_ITEMS: { id: Section; label: string; glyph: string }[] = [
   { id: "folders", label: "Dossiers", glyph: "☷" },
   { id: "activity", label: "Activité", glyph: "⚙" },
 ];
+
+type EventKind = "upload" | "download" | "delete" | "conflict" | "auth" | "error" | "sync";
 
 function queueActionLabel(jobType: string): string {
   switch (jobType) {
@@ -31,8 +31,162 @@ function queueActionLabel(jobType: string): string {
   }
 }
 
+/** Maps a `SyncJob.jobType` to a badge kind for the recent-transfers icon. */
+function jobEventKind(job: SyncJob): EventKind {
+  if (job.status === "failed") return "error";
+  switch (job.jobType) {
+    case "upload":
+      return "upload";
+    case "download":
+    case "hydrate_cloudsc":
+      return "download";
+    case "delete":
+      return "delete";
+    default:
+      return "sync";
+  }
+}
+
+/** Best-effort classification of a free-text activity-log line into an event
+ * kind, so the Activité feed can show a meaningful icon without any structured
+ * event data from the backend. */
+function classifyActivityMessage(message: string): EventKind {
+  const text = message.toLowerCase();
+  if (text.includes("conflict")) return "conflict";
+  if (text.includes("uploading") || text.includes("upload")) return "upload";
+  if (text.includes("download") || text.includes("hydrat")) return "download";
+  if (text.includes("requeue") || text.includes("retry")) return "sync";
+  if (text.includes("failed") || text.includes("error")) return "error";
+  if (text.includes("dropbox") || text.includes("auth") || text.includes("connect")) return "auth";
+  return "sync";
+}
+
+function basename(path?: string): string {
+  if (!path) return "";
+  const cleaned = path.replace(/[\\/]+$/, "");
+  const parts = cleaned.split(/[\\/]/);
+  return parts[parts.length - 1] || cleaned;
+}
+
+/** Renders a compact "il y a Xmin" style relative time from an epoch-ms
+ * number, an ISO/RFC3339 string, or a Date. */
+function formatRelativeTime(input: number | string | Date | undefined): string {
+  if (input === undefined) return "";
+  const ts = input instanceof Date ? input.getTime() : typeof input === "number" ? input : new Date(input).getTime();
+  if (Number.isNaN(ts)) return "";
+
+  const diffSec = Math.round((Date.now() - ts) / 1000);
+  if (diffSec < 5) return "à l'instant";
+  if (diffSec < 60) return `il y a ${diffSec}s`;
+
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 60) return `il y a ${diffMin} min`;
+
+  const diffH = Math.round(diffMin / 60);
+  if (diffH < 24) return `il y a ${diffH} h`;
+
+  const diffDay = Math.round(diffH / 24);
+  if (diffDay === 1) return "hier";
+  if (diffDay === 2) return "avant-hier";
+  if (diffDay < 7) return `il y a ${diffDay} j`;
+
+  const diffWeek = Math.round(diffDay / 7);
+  if (diffWeek < 5) return `il y a ${diffWeek} sem`;
+
+  const diffMonth = Math.round(diffDay / 30);
+  if (diffMonth < 12) return `il y a ${diffMonth} mois`;
+
+  const diffYear = Math.round(diffDay / 365);
+  return `il y a ${diffYear} an${diffYear > 1 ? "s" : ""}`;
+}
+
+/** Small inline (CSP-safe, no icon-library) SVG glyphs for the event badges. */
+const EVENT_ICON_PATHS: Record<EventKind, ReactElement> = {
+  upload: (
+    <path d="M12 19V5M12 5l-6 6M12 5l6 6" strokeLinecap="round" strokeLinejoin="round" />
+  ),
+  download: (
+    <path d="M12 5v14M12 19l-6-6M12 19l6-6" strokeLinecap="round" strokeLinejoin="round" />
+  ),
+  delete: (
+    <path
+      d="M5 7h14M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0-1 12a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7h12Z"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  ),
+  conflict: (
+    <path
+      d="M12 4 2.5 20h19L12 4Zm0 6v4m0 3h.01"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  ),
+  auth: (
+    <path
+      d="M9.5 12.5a3.5 3.5 0 1 1 3.11-1.89M12.6 10.6 20 3M17 6l2.5 2.5M14.5 8.5 17 11"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  ),
+  error: <path d="M6 6l12 12M18 6 6 18" strokeLinecap="round" strokeLinejoin="round" />,
+  sync: (
+    <path
+      d="M4 12a8 8 0 0 1 13.66-5.66M20 12a8 8 0 0 1-13.66 5.66M4 4v5h5M20 20v-5h-5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  ),
+};
+
+function EventIcon({ kind }: { kind: EventKind }) {
+  return (
+    <span className={`event-icon ${kind}`} aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+        {EVENT_ICON_PATHS[kind]}
+      </svg>
+    </span>
+  );
+}
+
 function openSettings() {
   invoke("show_setup_window").catch(() => {});
+}
+
+type RecentRowProps = { job: SyncJob };
+
+function RecentTransferRow({ job }: RecentRowProps) {
+  const kind = jobEventKind(job);
+  const name = basename(job.targetPath) || queueActionLabel(job.jobType);
+  return (
+    <li className="recent-row">
+      <EventIcon kind={kind} />
+      <div className="recent-row-body">
+        <div className="row-main">{name}</div>
+        <div className={`row-sub ${job.status === "failed" ? "error" : ""}`}>
+          {job.status === "failed" ? job.lastError ?? "Échec" : formatRelativeTime(job.updatedAt)}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+type ActivityRowProps = { entry: ActivityEntry };
+
+function ActivityRow({ entry }: ActivityRowProps) {
+  const kind = classifyActivityMessage(entry.message);
+  // pushLog() prefixes each line with a locale time string ("14:32:05 - ...");
+  // strip it here since the row already renders a relative time separately.
+  const text = entry.message.replace(/^\d{1,2}:\d{2}:\d{2}(?:\s?[AP]M)?\s-\s/, "");
+  return (
+    <li className="activity-row">
+      <EventIcon kind={kind} />
+      <div className="activity-row-body">
+        <div className="row-main">{text}</div>
+        <div className="row-sub">{formatRelativeTime(entry.timestamp)}</div>
+      </div>
+    </li>
+  );
 }
 
 /** Compact Dropbox-style flyout: nav rail + status footer over three read-mostly
@@ -42,18 +196,6 @@ function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
   const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
   const { status, jobs, conflicts, retryFailedJobs } = useSyncDashboard(pushLog);
-  const { cloudscEntries } = useCloudscPlaceholders({
-    pushLog,
-    authOk,
-    syncFolderOk,
-    syncFolder,
-    syncRunning: status.syncRunning,
-  });
-  const { remoteCurrentPath, remoteEntries, remoteLoading, loadRemoteFolder } = useRemoteBrowser({
-    pushLog,
-    ready: authOk && syncFolderOk,
-    syncRunning: status.syncRunning,
-  });
 
   const [section, setSection] = useState<Section>("home");
   const schedulerStartedRef = useRef(false);
@@ -79,6 +221,29 @@ function FlyoutApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authOk, syncFolderOk]);
 
+  const openLogs = async () => {
+    try {
+      await invoke("open_logs");
+    } catch (e) {
+      pushLog(`Failed to open logs: ${String(e)}`);
+    }
+  };
+
+  const openSyncFolder = async () => {
+    try {
+      await invoke("open_sync_folder");
+    } catch (e) {
+      pushLog(`Failed to open sync folder: ${String(e)}`);
+    }
+  };
+
+  const handleNavClick = (item: Section) => {
+    setSection(item);
+    if (item === "folders") {
+      void openSyncFolder();
+    }
+  };
+
   const footerLabel = startupLoading
     ? "Starting..."
     : !authOk || !syncFolderOk
@@ -103,7 +268,7 @@ function FlyoutApp() {
               key={item.id}
               type="button"
               className={`flyout-nav-item${section === item.id ? " active" : ""}`}
-              onClick={() => setSection(item.id)}
+              onClick={() => handleNavClick(item.id)}
               title={item.label}
             >
               <span className="glyph">{item.glyph}</span>
@@ -128,32 +293,20 @@ function FlyoutApp() {
 
         {section === "home" && (
           <section className="flyout-section">
+            <button type="button" className="flyout-btn flyout-logs-btn" onClick={() => void openLogs()}>
+              Ouvrir les journaux
+            </button>
+
             <h2>Recent transfers</h2>
             {hasFailedJobs && (
               <button type="button" className="flyout-btn flyout-retry" onClick={() => void retryFailedJobs()}>
                 Retry failed jobs
               </button>
             )}
-            <ul className="flyout-list">
+            <ul className="flyout-list recent-list">
               {recentJobs.length === 0 && <li className="muted">No recent activity.</li>}
               {recentJobs.map((job) => (
-                <li key={job.id}>
-                  <div className="row-main">
-                    {queueActionLabel(job.jobType)} {job.targetPath ? `— ${job.targetPath}` : ""}
-                  </div>
-                  <div className={`row-sub ${job.status === "failed" ? "error" : ""}`}>
-                    {job.status}
-                    {job.lastError ? `: ${job.lastError}` : ""}
-                  </div>
-                </li>
-              ))}
-            </ul>
-
-            <h2>Activity</h2>
-            <ul className="flyout-list compact">
-              {activity.length === 0 && <li className="muted">No entries yet.</li>}
-              {activity.slice(0, 10).map((entry) => (
-                <li key={entry.id}>{entry.message}</li>
+                <RecentTransferRow key={job.id} job={job} />
               ))}
             </ul>
           </section>
@@ -161,57 +314,13 @@ function FlyoutApp() {
 
         {section === "folders" && (
           <section className="flyout-section">
-            <h2>Remote folder</h2>
-            <div className="flyout-path-bar">
-              <button
-                type="button"
-                className="flyout-btn"
-                disabled={remoteLoading || !remoteCurrentPath}
-                onClick={() => loadRemoteFolder(parentDropboxPath(remoteCurrentPath))}
-              >
-                Up
+            <h2>Dossier synchronisé</h2>
+            <div className="folder-panel">
+              <span className="path">{syncFolder || "Non configuré"}</span>
+              <button type="button" className="flyout-btn" onClick={() => void openSyncFolder()}>
+                Ouvrir dans l'explorateur
               </button>
-              <span className="path">{remoteCurrentPath || "/"}</span>
             </div>
-            <ul className="flyout-list">
-              {remoteEntries.length === 0 && (
-                <li className="muted">{remoteLoading ? "Loading..." : "No entries."}</li>
-              )}
-              {remoteEntries.map((entry) => {
-                const statusLabel = entry.isExcluded ? "Excluded" : entry.isSynced ? "Synced" : "Not downloaded";
-                const isFolder = entry.tag === "folder";
-                return (
-                  <li key={entry.pathDisplay}>
-                    {isFolder ? (
-                      <button
-                        type="button"
-                        className="row-link"
-                        disabled={remoteLoading}
-                        onClick={() => loadRemoteFolder(entry.pathDisplay)}
-                      >
-                        <span className="row-main">[DIR] {entry.pathDisplay}</span>
-                      </button>
-                    ) : (
-                      <div className="row-main">[FILE] {entry.pathDisplay}</div>
-                    )}
-                    <div className="row-sub">{statusLabel}</div>
-                  </li>
-                );
-              })}
-            </ul>
-
-            <h2>.cloudsc placeholders</h2>
-            <ul className="flyout-list compact">
-              {cloudscEntries.length === 0 && <li className="muted">None indexed yet.</li>}
-              {cloudscEntries.map((entry) => (
-                <li key={entry.localPathDisplay}>
-                  <div className="row-main">
-                    {entry.tag === "folder" ? "[DIR]" : "[FILE]"} {entry.localPathDisplay}
-                  </div>
-                  <div className="row-sub">{entry.remotePathDisplay}</div>
-                </li>
-              ))}
-            </ul>
           </section>
         )}
 
@@ -221,18 +330,21 @@ function FlyoutApp() {
             <ul className="flyout-list compact">
               {conflicts.length === 0 && <li className="muted">No conflicts.</li>}
               {conflicts.map((conflict) => (
-                <li key={conflict.id}>
-                  <div className="row-main">{conflict.localPath}</div>
-                  <div className="row-sub error">{conflict.reason}</div>
+                <li key={conflict.id} className="activity-row">
+                  <EventIcon kind="conflict" />
+                  <div className="activity-row-body">
+                    <div className="row-main">{conflict.localPath}</div>
+                    <div className="row-sub error">{conflict.reason}</div>
+                  </div>
                 </li>
               ))}
             </ul>
 
             <h2>Activity log</h2>
-            <ul className="flyout-list">
+            <ul className="flyout-list activity-list">
               {activity.length === 0 && <li className="muted">No entries yet.</li>}
               {activity.map((entry) => (
-                <li key={entry.id}>{entry.message}</li>
+                <ActivityRow key={entry.id} entry={entry} />
               ))}
             </ul>
           </section>
