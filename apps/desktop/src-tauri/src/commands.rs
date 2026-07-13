@@ -239,6 +239,111 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Shows the `setup` window (re-auth, folder/filter settings). Unlike `main` — a
+/// tray-click-only flyout toggled from `lib.rs` — `setup` is a normal window the
+/// frontend can request explicitly, e.g. from the flyout's "Settings" action.
+#[tauri::command]
+pub fn show_setup_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("setup") {
+        window.show().map_err(|e| e.to_string())?;
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+/// Opens the most recent tracing log file (`dropbox-sync.<date>.log`, from
+/// DBSYNC-18) in the OS text editor — Notepad on Windows, the default text
+/// editor on macOS, `xdg-open` on Linux. Falls back to opening the data dir if
+/// no log file exists yet.
+#[tauri::command]
+pub fn open_logs() -> Result<(), String> {
+    let dir = crate::storage::db::app_data_dir().map_err(|e| e.to_string())?;
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("dropbox-sync") && name.ends_with("log") {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                    newest = Some((mtime, entry.path()));
+                }
+            }
+        }
+    }
+    let target = newest.map(|(_, p)| p).unwrap_or(dir);
+    open_in_editor(&target)
+}
+
+/// Opens the configured sync-root folder in the OS file manager (Explorer /
+/// Finder / xdg-open). Used by the flyout's "Dossiers" action.
+#[tauri::command]
+pub fn open_sync_folder(state: tauri::State<AppState>) -> Result<(), String> {
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| "sync folder not configured".to_string())?;
+    open_in_file_manager(std::path::Path::new(&folder))
+}
+
+fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("notepad")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to open logs: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-t")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to open logs: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to open logs: {e}"))?;
+        Ok(())
+    }
+}
+
+fn open_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to open folder: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to open folder: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("failed to open folder: {e}"))?;
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub fn get_sync_status(state: tauri::State<AppState>) -> Result<SyncStatus, String> {
     refresh_queue_depth_internal(state.inner())?;

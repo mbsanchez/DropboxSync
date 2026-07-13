@@ -17,10 +17,23 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "DropboxSyncDesktop",
-        "width": 760,
-        "height": 540,
-        "visible": false
+        "width": 360,
+        "height": 600,
+        "visible": false,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "alwaysOnTop": true
+      },
+      {
+        "label": "setup",
+        "title": "DropboxSync — Setup",
+        "width": 640,
+        "height": 520,
+        "visible": false,
+        "resizable": true
       }
     ],
     "security": {
