@@ -113,6 +113,12 @@ impl Db {
         conn.execute("DELETE FROM sync_jobs", [])?;
         conn.execute("DELETE FROM sync_conflicts", [])?;
         conn.execute("DELETE FROM known_folders", [])?;
+        // Drop the cursor-delta cursor so remote change detection re-seeds
+        // against the new folder (DBSYNC-30); other app_config keys are kept.
+        conn.execute(
+            "DELETE FROM app_config WHERE key = 'remote_delta_cursor'",
+            [],
+        )?;
         Ok(())
     }
 
