@@ -5,6 +5,7 @@ mod cloudsc_ops;
 mod commands;
 mod dropbox_transfer;
 mod error;
+mod fs_watcher;
 mod logging;
 mod models;
 mod oauth_listener;
@@ -283,6 +284,15 @@ pub fn run() {
             // `dropbox_transfer::emit_upload_progress` to emit `upload-progress` events
             // from background sync work. Not duplicated in `start_background_scheduler`.
             let _ = crate::state::APP_HANDLE.set(app.handle().clone());
+
+            // Start the filesystem watcher for near-instant local change
+            // detection (DBSYNC-29); best-effort — the 5-min fallback scan
+            // covers anything it can't watch.
+            if let Some(state) = app.try_state::<crate::state::AppState>() {
+                if let Err(e) = crate::fs_watcher::arm_watcher(&state) {
+                    tracing::warn!(error = %e, "failed to arm filesystem watcher at startup");
+                }
+            }
 
             Ok(())
         })

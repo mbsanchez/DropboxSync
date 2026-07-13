@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{Duration, Utc};
 use walkdir::WalkDir;
@@ -49,6 +49,209 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
 /// rather than deleted by the user. Used to suppress spurious remote deletions.
 fn placeholder_exists(tracked_root: &std::path::Path, rel: &str) -> bool {
     tracked_root.join(format!("{rel}.cloudsc")).exists()
+}
+
+/// Evaluate a single local file against the index and enqueue an upload if it is
+/// new or changed (routing a change that races a still-pending upload to a
+/// conflicted copy). Returns the number of jobs enqueued (0 or 1). Shared by the
+/// full walk (`scan_local_changes_internal`) and the targeted watcher path
+/// (`process_changed_paths`) so both behave identically (DBSYNC-29).
+fn process_local_file_change(
+    state: &AppState,
+    tracked_root: &Path,
+    relative: &str,
+    absolute: &Path,
+    known: Option<&FileIndexRow>,
+    pending_targets: &mut HashSet<String>,
+) -> AppResult<usize> {
+    let (hash, size_bytes, modified_ts) = hash_file(absolute)?;
+
+    match known {
+        None => {
+            state.db.enqueue_job("upload", Some(relative), Some(relative))?;
+            state
+                .db
+                .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
+            pending_targets.insert(relative.to_string());
+            Ok(1)
+        }
+        Some(prev) if prev.hash != hash => {
+            if pending_targets.contains(relative) {
+                let conflicted_path = create_conflicted_copy(absolute)?;
+                let conflicted_rel = conflicted_path
+                    .strip_prefix(tracked_root)
+                    .map_err(|e| AppError::Io(e.to_string()))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                state.db.add_conflict(
+                    relative,
+                    relative,
+                    "concurrent local update while job pending",
+                )?;
+                state
+                    .db
+                    .enqueue_job("upload", Some(&conflicted_rel), Some(&conflicted_rel))?;
+                state
+                    .db
+                    .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
+                if let Ok(mut engine) = state.sync_engine.lock() {
+                    engine.record_conflict();
+                }
+                Ok(1)
+            } else {
+                state.db.enqueue_job("upload", Some(relative), Some(relative))?;
+                state
+                    .db
+                    .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
+                pending_targets.insert(relative.to_string());
+                Ok(1)
+            }
+        }
+        _ => Ok(0),
+    }
+}
+
+/// Propagate a single local FILE deletion to the remote, honoring the DBSYNC-45
+/// dehydration guard (a `<rel>.cloudsc`-backed path was dehydrated, not deleted,
+/// so it is only untracked, never remote-deleted). Returns jobs enqueued (0/1).
+fn process_local_file_deletion(
+    state: &AppState,
+    tracked_root: &Path,
+    prev_rel: &str,
+) -> AppResult<usize> {
+    if placeholder_exists(tracked_root, prev_rel) {
+        state.db.remove_local_file(prev_rel)?;
+        return Ok(0);
+    }
+    state.db.enqueue_job("delete", Some(prev_rel), Some(prev_rel))?;
+    state.db.remove_local_file(prev_rel)?;
+    Ok(1)
+}
+
+/// Propagate a single known-FOLDER deletion (recursive remote `delete_v2`),
+/// honoring the DBSYNC-45 dehydration guard. Returns jobs enqueued (0/1).
+fn process_known_folder_deletion(
+    state: &AppState,
+    tracked_root: &Path,
+    rel: &str,
+) -> AppResult<usize> {
+    if placeholder_exists(tracked_root, rel) {
+        state.db.remove_known_folder(rel)?;
+        return Ok(0);
+    }
+    state.db.enqueue_job("delete", Some(rel), Some(rel))?;
+    state.db.remove_known_folder(rel)?;
+    Ok(1)
+}
+
+/// Targeted, network-free change detection for a specific set of `/`-relative
+/// paths (from the filesystem watcher, DBSYNC-29). Re-evaluates each path against
+/// the index and enqueues the same jobs the full scan would — without walking the
+/// whole tree. The caller drains the queue. Deletions are only inferred from a
+/// path being explicitly absent on disk (never from an incomplete walk), and the
+/// whole-root-missing case is still gated by `is_dir()`, so this can't mass-delete.
+pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppResult<usize> {
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    let tracked_root = PathBuf::from(&folder);
+    // Same catastrophic-mass-deletion guard as the full scan: if the whole root
+    // is missing/unmounted, treat nothing as deleted.
+    if !tracked_root.is_dir() {
+        return Ok(0);
+    }
+
+    let known = state.db.list_local_files()?;
+    let known_map: HashMap<String, FileIndexRow> = known
+        .iter()
+        .map(|f| (f.relative_path.clone(), f.clone()))
+        .collect();
+    let existing_jobs = state.db.list_recent_jobs(200)?;
+    let mut pending_targets: HashSet<String> = existing_jobs
+        .iter()
+        .filter(|j| j.status == "queued" || j.status == "retry_wait" || j.status == "running")
+        .filter_map(|j| j.target_path.clone())
+        .collect();
+
+    // Normalize + dedupe the incoming paths, dropping placeholders/ignored ones.
+    let mut rels: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for p in paths {
+        let rel = p.replace('\\', "/");
+        let rel = rel.trim_start_matches('/').to_string();
+        if rel.is_empty() || rel.ends_with(".cloudsc") || should_ignore_local_path(&rel) {
+            continue;
+        }
+        if seen.insert(rel.clone()) {
+            rels.push(rel);
+        }
+    }
+
+    let mut enqueued = 0usize;
+    for rel in rels {
+        let absolute = tracked_root.join(&rel);
+        if absolute.is_file() {
+            enqueued += process_local_file_change(
+                state,
+                &tracked_root,
+                &rel,
+                &absolute,
+                known_map.get(&rel),
+                &mut pending_targets,
+            )?;
+        } else if absolute.is_dir() {
+            // A moved-in / newly-created directory: record it and enqueue any
+            // pre-existing children (a bounded walk of just this subtree, not the
+            // whole root). Recursive watching also emits child events separately.
+            state.db.upsert_known_folder(&rel)?;
+            for entry in WalkDir::new(&absolute).into_iter().flatten() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let child_rel = match entry.path().strip_prefix(&tracked_root) {
+                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                    Err(_) => continue,
+                };
+                if child_rel.ends_with(".cloudsc") || should_ignore_local_path(&child_rel) {
+                    continue;
+                }
+                enqueued += process_local_file_change(
+                    state,
+                    &tracked_root,
+                    &child_rel,
+                    entry.path(),
+                    known_map.get(&child_rel),
+                    &mut pending_targets,
+                )?;
+            }
+        } else {
+            // Absent on disk → deletion. Handle both a single file and a removed
+            // directory prefix (delete tracked descendants + the folder rows).
+            if known_map.contains_key(&rel) {
+                enqueued += process_local_file_deletion(state, &tracked_root, &rel)?;
+            }
+            let prefix = format!("{rel}/");
+            for prev in &known {
+                if prev.relative_path == rel {
+                    continue; // already handled above
+                }
+                if prev.relative_path.starts_with(&prefix)
+                    && !prev.relative_path.ends_with(".cloudsc")
+                    && !should_ignore_local_path(&prev.relative_path)
+                {
+                    enqueued += process_local_file_deletion(state, &tracked_root, &prev.relative_path)?;
+                }
+            }
+            for folder_rel in state.db.list_known_folders()? {
+                if folder_rel == rel || folder_rel.starts_with(&prefix) {
+                    enqueued += process_known_folder_deletion(state, &tracked_root, &folder_rel)?;
+                }
+            }
+        }
+    }
+
+    Ok(enqueued)
 }
 
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
@@ -119,55 +322,14 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
 
         seen_paths.insert(relative.clone());
 
-        let (hash, size_bytes, modified_ts) = hash_file(&absolute)?;
-
-        match known_map.get(&relative) {
-            None => {
-                state.db.enqueue_job("upload", Some(&relative), Some(&relative))?;
-                state
-                    .db
-                    .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
-                pending_targets.insert(relative.clone());
-                enqueued_jobs += 1;
-            }
-            Some(prev) if prev.hash != hash => {
-                if pending_targets.contains(&relative) {
-                    let conflicted_path = create_conflicted_copy(&absolute)?;
-                    let conflicted_rel = conflicted_path
-                        .strip_prefix(&tracked_root)
-                        .map_err(|e| AppError::Io(e.to_string()))?
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    {
-                        state.db.add_conflict(
-                            &relative,
-                            &relative,
-                            "concurrent local update while job pending",
-                        )?;
-                        state.db.enqueue_job(
-                            "upload",
-                            Some(&conflicted_rel),
-                            Some(&conflicted_rel),
-                        )?;
-                        state
-                            .db
-                            .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
-                    }
-                    if let Ok(mut engine) = state.sync_engine.lock() {
-                        engine.record_conflict();
-                    }
-                    enqueued_jobs += 1;
-                } else {
-                    state.db.enqueue_job("upload", Some(&relative), Some(&relative))?;
-                    state
-                        .db
-                        .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
-                    pending_targets.insert(relative.clone());
-                    enqueued_jobs += 1;
-                }
-            }
-            _ => {}
-        }
+        enqueued_jobs += process_local_file_change(
+            state,
+            &tracked_root,
+            &relative,
+            &absolute,
+            known_map.get(&relative),
+            &mut pending_targets,
+        )?;
     }
 
     // Only propagate FILE deletions when we trust the walk was complete.
@@ -180,21 +342,8 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
                 continue;
             }
             if !seen_paths.contains(&prev.relative_path) {
-                // DATA-LOSS GUARD (DBSYNC-45): a real file replaced by a
-                // `<name>.cloudsc` placeholder was DEHYDRATED, not deleted by the
-                // user. Propagating a remote delete here would destroy the user's
-                // remote copy. Untrack it locally, but never delete remotely.
-                if placeholder_exists(&tracked_root, &prev.relative_path) {
-                    state.db.remove_local_file(&prev.relative_path)?;
-                    continue;
-                }
-                state.db.enqueue_job(
-                    "delete",
-                    Some(&prev.relative_path),
-                    Some(&prev.relative_path),
-                )?;
-                state.db.remove_local_file(&prev.relative_path)?;
-                enqueued_jobs += 1;
+                enqueued_jobs +=
+                    process_local_file_deletion(state, &tracked_root, &prev.relative_path)?;
             }
         }
     }
@@ -242,17 +391,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
     if !walk_had_error {
         for rel in state.db.list_known_folders()? {
             if !seen_dirs.contains(&rel) {
-                // DATA-LOSS GUARD (DBSYNC-45): a hydrated folder replaced by a
-                // `<name>.cloudsc` placeholder was DEHYDRATED, not deleted. A
-                // recursive remote `delete_v2` here would wipe the user's remote
-                // folder. Untrack it locally, but never delete remotely.
-                if placeholder_exists(&tracked_root, &rel) {
-                    state.db.remove_known_folder(&rel)?;
-                    continue;
-                }
-                state.db.enqueue_job("delete", Some(&rel), Some(&rel))?;
-                state.db.remove_known_folder(&rel)?;
-                enqueued_jobs += 1;
+                enqueued_jobs += process_known_folder_deletion(state, &tracked_root, &rel)?;
             }
         }
     }
@@ -269,6 +408,25 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
 
     refresh_queue_depth_internal(state)?;
     Ok(enqueued_jobs + remote_enqueued)
+}
+
+/// Drains the sync queue until it is empty (or an infra error stops it), in
+/// batches. Shared by the `.cloudsc`-open drain and the filesystem watcher
+/// (DBSYNC-29). The `sync_running` single-flight gate is the caller's
+/// responsibility. The 1000-iteration cap is a runaway guard.
+pub(crate) fn drain_sync_queue(state: &AppState) {
+    let mut safety = 0usize;
+    while safety < 1000 {
+        safety += 1;
+        match process_sync_queue_internal(state) {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(e) => {
+                tracing::error!(error = %e, "process_sync_queue failed (drain)");
+                break;
+            }
+        }
+    }
 }
 
 pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
@@ -439,7 +597,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use tempfile::tempdir;
 
-    use super::{run_sync_tick_internal, SYNC_BATCH_CAP};
+    use super::{process_changed_paths, run_sync_tick_internal, SYNC_BATCH_CAP};
     use crate::state::AppState;
     use crate::storage::db::Db;
     use crate::storage::secure_store::SecureStore;
@@ -566,5 +724,128 @@ mod tests {
             1,
             "the future retry_wait job should remain queued/pending, untouched"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Targeted per-path processing (DBSYNC-29)
+    // ---------------------------------------------------------------------------
+
+    fn sync_root(state: &AppState) -> std::path::PathBuf {
+        std::path::PathBuf::from(state.db.get_sync_folder().unwrap().unwrap())
+    }
+
+    fn job_targets(state: &AppState, job_type: &str) -> Vec<String> {
+        state
+            .db
+            .list_recent_jobs(500)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.job_type == job_type)
+            .filter_map(|j| j.target_path)
+            .collect()
+    }
+
+    #[test]
+    fn targeted_created_file_enqueues_upload_and_indexes() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        std::fs::write(sync_root(&state).join("a.txt"), b"hello").unwrap();
+
+        let n = process_changed_paths(&state, &["a.txt".to_string()]).expect("process");
+        assert_eq!(n, 1);
+        assert_eq!(job_targets(&state, "upload"), vec!["a.txt".to_string()]);
+        assert!(state.db.get_local_file("a.txt").unwrap().is_some());
+    }
+
+    #[test]
+    fn targeted_modified_file_enqueues_upload() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        std::fs::write(sync_root(&state).join("m.txt"), b"new-content").unwrap();
+        // Index an out-of-date hash so the on-disk content is a "modification".
+        state.db.upsert_local_file("m.txt", "stale-hash", 3, 0).unwrap();
+
+        let n = process_changed_paths(&state, &["m.txt".to_string()]).expect("process");
+        assert_eq!(n, 1);
+        assert_eq!(job_targets(&state, "upload"), vec!["m.txt".to_string()]);
+    }
+
+    #[test]
+    fn targeted_removed_file_enqueues_delete() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // Indexed but absent on disk → deletion.
+        state.db.upsert_local_file("gone.txt", "h", 3, 0).unwrap();
+
+        let n = process_changed_paths(&state, &["gone.txt".to_string()]).expect("process");
+        assert_eq!(n, 1);
+        assert_eq!(job_targets(&state, "delete"), vec!["gone.txt".to_string()]);
+        assert!(state.db.get_local_file("gone.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn targeted_dehydrated_file_is_not_remote_deleted() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.upsert_local_file("d.txt", "h", 3, 0).unwrap();
+        // A `.cloudsc` placeholder means it was DEHYDRATED, not deleted (DBSYNC-45).
+        std::fs::write(sync_root(&state).join("d.txt.cloudsc"), b"{}").unwrap();
+
+        let n = process_changed_paths(&state, &["d.txt".to_string()]).expect("process");
+        assert_eq!(n, 0);
+        assert!(job_targets(&state, "delete").is_empty());
+        assert!(state.db.get_local_file("d.txt").unwrap().is_none()); // untracked, not deleted
+    }
+
+    #[test]
+    fn targeted_ignored_and_cloudsc_paths_are_skipped() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        let n = process_changed_paths(
+            &state,
+            &[
+                ".DS_Store".to_string(),
+                "x.cloudsc".to_string(),
+                "._resource".to_string(),
+            ],
+        )
+        .expect("process");
+        assert_eq!(n, 0);
+        assert!(state.db.list_recent_jobs(50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn targeted_removed_directory_deletes_children_and_folder() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.upsert_local_file("dir/a.txt", "h", 1, 0).unwrap();
+        state.db.upsert_local_file("dir/b.txt", "h", 1, 0).unwrap();
+        state.db.upsert_known_folder("dir").unwrap();
+        // Nothing on disk under `dir` → the whole folder was removed.
+
+        let n = process_changed_paths(&state, &["dir".to_string()]).expect("process");
+        assert_eq!(n, 3);
+        let deletes = job_targets(&state, "delete");
+        assert!(deletes.contains(&"dir/a.txt".to_string()));
+        assert!(deletes.contains(&"dir/b.txt".to_string()));
+        assert!(deletes.contains(&"dir".to_string()));
+        assert!(state.db.get_local_file("dir/a.txt").unwrap().is_none());
+        assert!(state.db.list_known_folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn targeted_missing_sync_root_bails_out() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state
+            .db
+            .set_sync_folder(&tmp.path().join("does-not-exist").to_string_lossy())
+            .unwrap();
+        state.db.upsert_local_file("a.txt", "h", 1, 0).unwrap();
+
+        let n = process_changed_paths(&state, &["a.txt".to_string()]).expect("process");
+        assert_eq!(n, 0, "a missing root must never be read as a mass deletion");
+        assert!(state.db.list_recent_jobs(50).unwrap().is_empty());
     }
 }
