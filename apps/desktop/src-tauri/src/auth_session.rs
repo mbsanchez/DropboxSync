@@ -256,6 +256,17 @@ pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, label: &str) {
     }
 }
 
+/// Refreshes the tray tooltip to reflect the current sync status. Uses the
+/// globally-stored `AppHandle` (set in `setup()`), so background sync threads —
+/// which don't carry an `AppHandle` — can refresh it right at each
+/// `sync_running` transition instead of waiting for the 60s scheduler poll,
+/// which almost always misses the short "Syncing" window (DBSYNC-48).
+pub(crate) fn refresh_tray_tooltip(state: &AppState) {
+    if let Some(app) = crate::state::APP_HANDLE.get() {
+        update_tray_tooltip(app, &current_tray_status_label(state));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{refresh_token_guarded, TokenSession};

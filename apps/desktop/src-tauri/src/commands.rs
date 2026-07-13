@@ -201,6 +201,9 @@ pub fn start_background_scheduler(
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            // Show "Syncing" for the duration of this tick (DBSYNC-48); the
+            // tooltip is refreshed back to Idle/Error after the store below.
+            update_tray_tooltip(&app, &current_tray_status_label(&app_state));
             // Run the sync tick first so a local folder deletion is detected,
             // its `delete` job enqueued, and drained within this same tick
             // (deleting the folder remotely) before discovery runs. Otherwise
@@ -408,6 +411,8 @@ pub fn trigger_sync_tick(state: tauri::State<AppState>) -> Result<TriggerSyncRes
         return Ok(TriggerSyncResponse { accepted: false });
     }
 
+    // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
+    crate::auth_session::refresh_tray_tooltip(state.inner());
     let app_state = state.inner().clone();
     std::thread::spawn(move || {
         let result = run_sync_tick_internal(&app_state);
@@ -417,6 +422,7 @@ pub fn trigger_sync_tick(state: tauri::State<AppState>) -> Result<TriggerSyncRes
             }
         }
         app_state.sync_running.store(false, Ordering::Release);
+        crate::auth_session::refresh_tray_tooltip(&app_state);
     });
 
     Ok(TriggerSyncResponse { accepted: true })
@@ -458,6 +464,8 @@ pub fn trigger_hydrate_cloudsc_placeholder(
         return Ok(TriggerActionResponse { accepted: false });
     }
 
+    // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
+    crate::auth_session::refresh_tray_tooltip(state.inner());
     let app_state = state.inner().clone();
     std::thread::spawn(move || {
         let result = hydrate_cloudsc_placeholder_internal(&app_state, &placeholder_local_rel_path);
@@ -472,6 +480,7 @@ pub fn trigger_hydrate_cloudsc_placeholder(
             engine.set_last_scan_at(Utc::now().to_rfc3339());
         }
         app_state.sync_running.store(false, Ordering::Release);
+        crate::auth_session::refresh_tray_tooltip(&app_state);
     });
 
     Ok(TriggerActionResponse { accepted: true })
@@ -490,6 +499,8 @@ pub fn trigger_download_remote_file(
         return Ok(TriggerActionResponse { accepted: false });
     }
 
+    // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
+    crate::auth_session::refresh_tray_tooltip(state.inner());
     let app_state = state.inner().clone();
     std::thread::spawn(move || {
         let result = download_remote_file_internal(&app_state, &path_display);
@@ -502,6 +513,7 @@ pub fn trigger_download_remote_file(
             engine.set_last_scan_at(Utc::now().to_rfc3339());
         }
         app_state.sync_running.store(false, Ordering::Release);
+        crate::auth_session::refresh_tray_tooltip(&app_state);
     });
 
     Ok(TriggerActionResponse { accepted: true })
@@ -520,6 +532,8 @@ pub fn trigger_hydrate_remote_folder(
         return Ok(TriggerActionResponse { accepted: false });
     }
 
+    // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
+    crate::auth_session::refresh_tray_tooltip(state.inner());
     let app_state = state.inner().clone();
     std::thread::spawn(move || {
         let result = hydrate_remote_folder_internal(&app_state, &folder_path_display);
@@ -534,6 +548,7 @@ pub fn trigger_hydrate_remote_folder(
             engine.set_last_scan_at(Utc::now().to_rfc3339());
         }
         app_state.sync_running.store(false, Ordering::Release);
+        crate::auth_session::refresh_tray_tooltip(&app_state);
     });
 
     Ok(TriggerActionResponse { accepted: true })
