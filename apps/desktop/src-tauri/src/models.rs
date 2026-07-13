@@ -44,6 +44,15 @@ pub(crate) struct UploadSessionStartResponse {
     pub session_id: String,
 }
 
+/// Response from `/2/files/list_folder/longpoll` (DBSYNC-30).
+#[derive(Deserialize)]
+pub(crate) struct DropboxLongpollResponse {
+    pub changes: bool,
+    /// If present, wait at least this many seconds before longpolling again.
+    #[serde(default)]
+    pub backoff: Option<u64>,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct DropboxEntry {
     #[serde(rename = ".tag")]

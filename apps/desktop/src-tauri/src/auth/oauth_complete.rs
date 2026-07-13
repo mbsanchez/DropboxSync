@@ -70,5 +70,11 @@ pub(crate) async fn complete_oauth_internal(
         engine.clear_oauth_pending();
     }
 
+    // Drop any stale delta cursor so the longpoll loop reseeds against this
+    // (possibly new) account (DBSYNC-30).
+    let _ = app_state
+        .db
+        .set_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY, "");
+
     Ok(())
 }

@@ -13,6 +13,7 @@ mod open_handlers;
 mod overlay_state;
 mod path_util;
 mod remote_index;
+mod remote_longpoll;
 mod run_events;
 mod state;
 mod storage;
@@ -292,6 +293,10 @@ pub fn run() {
                 if let Err(e) = crate::fs_watcher::arm_watcher(&state) {
                     tracing::warn!(error = %e, "failed to arm filesystem watcher at startup");
                 }
+                // Start the Dropbox longpoll loop for near-instant remote change
+                // detection (DBSYNC-30). Idles until logged in; the 5-min sweep
+                // remains the reconciliation fallback.
+                crate::remote_longpoll::start_longpoll(&state);
             }
 
             Ok(())
