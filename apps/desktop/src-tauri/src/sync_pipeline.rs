@@ -98,7 +98,10 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
             .strip_prefix(&tracked_root)
             .map_err(|e| AppError::Io(e.to_string()))?
             .to_string_lossy()
-            .to_string();
+            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
+            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
+            // '/'-stored row and the scan re-uploads it every tick.
+            .replace('\\', "/");
 
         if relative.ends_with(".cloudsc") {
             continue;
@@ -127,7 +130,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
                         .strip_prefix(&tracked_root)
                         .map_err(|e| AppError::Io(e.to_string()))?
                         .to_string_lossy()
-                        .to_string();
+                        .replace('\\', "/");
                     {
                         state.db.add_conflict(
                             &relative,
@@ -202,7 +205,10 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
             .strip_prefix(&tracked_root)
             .map_err(|e| AppError::Io(e.to_string()))?
             .to_string_lossy()
-            .to_string();
+            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
+            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
+            // '/'-stored row and the scan re-uploads it every tick.
+            .replace('\\', "/");
 
         if relative.is_empty() {
             continue; // skip the sync root itself

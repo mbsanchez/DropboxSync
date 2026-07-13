@@ -17,7 +17,10 @@ pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<St
         .strip_prefix(sync_folder)
         .map_err(|e| AppError::Other(format!("failed to compute relative path: {e}")))?
         .to_string_lossy()
-        .to_string())
+        // Canonicalize to '/' (Dropbox convention) so relative-path keys match
+        // across the local index, remote index and placeholder logic on Windows,
+        // where `to_string_lossy` yields '\' separators (DBSYNC-45).
+        .replace('\\', "/"))
 }
 
 pub(crate) fn normalize_dropbox_path(input: &str) -> String {
