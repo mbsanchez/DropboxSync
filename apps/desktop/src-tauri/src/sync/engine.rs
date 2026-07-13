@@ -1,4 +1,5 @@
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,7 +16,11 @@ pub struct SyncStatus {
 
 pub struct SyncEngine {
     pending_oauth_state: Option<String>,
-    pending_pkce_verifier: Option<String>,
+    // PKCE code verifier: wrapped in `Zeroizing` so its bytes are wiped from
+    // memory when the field is cleared or the engine is dropped (DBSYNC-28).
+    // `pending_oauth_state` is the CSRF state token — not secret — so it stays a
+    // plain `String`.
+    pending_pkce_verifier: Option<Zeroizing<String>>,
     tracked_path: Option<String>,
     queue_depth: usize,
     last_error: Option<String>,
@@ -40,14 +45,16 @@ impl SyncEngine {
 
     pub fn set_oauth_context(&mut self, state: String, verifier: String) {
         self.pending_oauth_state = Some(state);
-        self.pending_pkce_verifier = Some(verifier);
+        self.pending_pkce_verifier = Some(Zeroizing::new(verifier));
     }
 
     pub fn pending_oauth_state(&self) -> Option<String> {
         self.pending_oauth_state.clone()
     }
 
-    pub fn pending_pkce_verifier(&self) -> Option<String> {
+    /// Returns a `Zeroizing` copy of the pending PKCE verifier, so the caller's
+    /// copy is also wiped on drop — no plain `String` clone escapes the engine.
+    pub fn pending_pkce_verifier(&self) -> Option<Zeroizing<String>> {
         self.pending_pkce_verifier.clone()
     }
 

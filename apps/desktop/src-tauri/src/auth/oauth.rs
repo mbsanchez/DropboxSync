@@ -4,12 +4,20 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use zeroize::Zeroizing;
+
 use crate::error::{AppError, AppResult};
 
 /// Dropbox App Console → your app → **Settings** → **App key** (OAuth2 `client_id`).
 /// Prefer providing this value via `DROPBOX_APP_KEY` in `.env` for dev/build.
 /// The build command embeds it at compile time via `option_env!`.
-pub const DROPBOX_APP_KEY: &str = match option_env!("DROPBOX_APP_KEY") {
+///
+/// Threat model: this is the **public OAuth `client_id`**, not a secret. It is
+/// meant to be sent to Dropbox and is recoverable from the binary regardless
+/// (PKCE, not a client secret, is what protects the flow). `pub(crate)` here is
+/// visibility hygiene — keeping the surface minimal — not a confidentiality
+/// control; do not treat this value as sensitive.
+pub(crate) const DROPBOX_APP_KEY: &str = match option_env!("DROPBOX_APP_KEY") {
     Some(k) => k,
     None => "",
 };
@@ -89,7 +97,10 @@ pub fn start_oauth() -> AppResult<(String, String, String)> {
     Ok((auth_url, state, verifier))
 }
 
-pub async fn complete_oauth(code: String, verifier: String) -> AppResult<TokenResponse> {
+pub async fn complete_oauth(
+    code: String,
+    verifier: Zeroizing<String>,
+) -> AppResult<TokenResponse> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
     let client = Client::builder()
@@ -98,12 +109,16 @@ pub async fn complete_oauth(code: String, verifier: String) -> AppResult<TokenRe
         .map_err(|e| AppError::Network(format!("failed to build oauth http client: {e}")))?;
     let response = client
         .post("https://api.dropboxapi.com/oauth2/token")
+        // Pass values by `&str` so no additional owned copy of the verifier is
+        // made here; `verifier` (Zeroizing) is wiped when it drops at the end of
+        // this call. (serde_urlencoded's transient body buffer is owned by
+        // reqwest and dropped after send — the best-effort limit here.)
         .form(&[
-            ("code", code),
-            ("grant_type", "authorization_code".to_string()),
-            ("client_id", app_key),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", verifier),
+            ("code", code.as_str()),
+            ("grant_type", "authorization_code"),
+            ("client_id", app_key.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
         ])
         .send()
         .await
