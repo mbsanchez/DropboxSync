@@ -25,7 +25,9 @@ function queueActionLabel(jobType: string): string {
     case "download":
       return "Download (Dropbox -> local)";
     case "delete":
-      return "Delete (Dropbox)";
+      return "Supprimé sur Dropbox";
+    case "local_delete":
+      return "Supprimé (retiré du remote)";
     case "hydrate_cloudsc":
       return "Hydrate (.cloudsc)";
     default:
@@ -43,6 +45,7 @@ function jobEventKind(job: SyncJob): EventKind {
     case "hydrate_cloudsc":
       return "download";
     case "delete":
+    case "local_delete":
       return "delete";
     default:
       return "sync";
@@ -223,6 +226,57 @@ function ActivityRow({ entry }: ActivityRowProps) {
   );
 }
 
+type JobActivityRowProps = { job: SyncJob };
+
+/** Renders a background sync job (upload/download/delete/local_delete/hydrate) as
+ * an Activité row, so events driven by the scheduler (not pushLog) are visible too. */
+function JobActivityRow({ job }: JobActivityRowProps) {
+  const kind = jobEventKind(job);
+  const name = basename(job.targetPath);
+  const main = name ? `${queueActionLabel(job.jobType)} — ${name}` : queueActionLabel(job.jobType);
+  return (
+    <li className="activity-row">
+      <EventIcon kind={kind} />
+      <div className="activity-row-body">
+        <div className="row-main">{main}</div>
+        <div className={`row-sub ${job.status === "failed" ? "error" : ""}`}>
+          {job.status === "failed" ? job.lastError ?? "Échec" : `${job.status} · ${formatRelativeTime(job.updatedAt)}`}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+type ActivityFeedItem =
+  | { kind: "job"; key: string; time: number; job: SyncJob }
+  | { kind: "log"; key: string; time: number; entry: ActivityEntry };
+
+/** Merges background sync `jobs` with the pushLog `activity` entries into a single
+ * time-sorted (descending) feed for the Activité section, so events that only exist
+ * as jobs (e.g. a scheduler-driven `local_delete`) show up alongside logged lines. */
+function buildActivityFeed(jobs: SyncJob[], activity: ActivityEntry[]): ActivityFeedItem[] {
+  const jobItems: ActivityFeedItem[] = jobs
+    .filter((job) => job.updatedAt !== undefined)
+    .map((job) => ({
+      kind: "job",
+      key: `job-${job.id}`,
+      time: new Date(job.updatedAt as string).getTime(),
+      job,
+    }));
+
+  const logItems: ActivityFeedItem[] = activity.map((entry) => ({
+    kind: "log",
+    key: `log-${entry.id}`,
+    time: entry.timestamp,
+    entry,
+  }));
+
+  return [...jobItems, ...logItems]
+    .filter((item) => !Number.isNaN(item.time))
+    .sort((a, b) => b.time - a.time)
+    .slice(0, 40);
+}
+
 /** Compact Dropbox-style flyout: nav rail + status footer over three read-mostly
  * sections. No hydrate/download actions here — hydration happens by double-clicking
  * the `.cloudsc` placeholder in the OS file manager. */
@@ -293,6 +347,7 @@ function FlyoutApp() {
 
   const recentJobs: SyncJob[] = jobs.slice(0, 8);
   const hasFailedJobs = jobs.some((job) => job.status === "failed");
+  const activityFeed = buildActivityFeed(jobs, activity);
 
   // "X of Y files": Y = jobs still pending or completed in the current run
   // (queued/running/retry_wait + done), X = the completed (done) count. Only
@@ -347,14 +402,14 @@ function FlyoutApp() {
               Ouvrir les journaux
             </button>
 
-            <h2>Recent transfers</h2>
+            <h2>Activité récente</h2>
             {hasFailedJobs && (
               <button type="button" className="flyout-btn flyout-retry" onClick={() => void retryFailedJobs()}>
                 Retry failed jobs
               </button>
             )}
             <ul className="flyout-list recent-list">
-              {recentJobs.length === 0 && <li className="muted">No recent activity.</li>}
+              {recentJobs.length === 0 && <li className="muted">Aucune activité récente.</li>}
               {recentJobs.map((job) => (
                 <RecentTransferRow key={job.id} job={job} />
               ))}
@@ -392,10 +447,14 @@ function FlyoutApp() {
 
             <h2>Activity log</h2>
             <ul className="flyout-list activity-list">
-              {activity.length === 0 && <li className="muted">No entries yet.</li>}
-              {activity.map((entry) => (
-                <ActivityRow key={entry.id} entry={entry} />
-              ))}
+              {activityFeed.length === 0 && <li className="muted">No entries yet.</li>}
+              {activityFeed.map((item) =>
+                item.kind === "job" ? (
+                  <JobActivityRow key={item.key} job={item.job} />
+                ) : (
+                  <ActivityRow key={item.key} entry={item.entry} />
+                ),
+              )}
             </ul>
           </section>
         )}
