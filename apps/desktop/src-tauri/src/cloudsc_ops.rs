@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use tauri::{Emitter, EventTarget};
 use walkdir::WalkDir;
 
 use crate::auth_session::get_access_token;
@@ -30,6 +31,11 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
     let client = &state.http_client;
     let mut created = 0usize;
+    // DBSYNC-45: collect placeholder create/prune names to emit ONE
+    // `placeholder-changed` event per index call (no per-file event flood on a
+    // large initial sweep); the frontend logs them into the Activité feed.
+    let mut created_names: Vec<String> = Vec::new();
+    let mut removed_names: Vec<String> = Vec::new();
 
     // Page through the folder with cursor + has_more; a folder with more than one
     // page of entries (Dropbox returns up to ~2000 per page) would otherwise be
@@ -108,6 +114,7 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             };
             write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
             created += 1;
+            created_names.push(child_name.clone());
         }
 
         if !entries_resp.has_more {
@@ -147,13 +154,39 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
         };
         let name = dir_entry.file_name().to_string_lossy().to_string();
         if let Some(target) = name.strip_suffix(".cloudsc") {
-            if !remote_child_names.contains(target) {
-                let _ = fs::remove_file(dir_entry.path());
+            if !remote_child_names.contains(target) && fs::remove_file(dir_entry.path()).is_ok() {
+                removed_names.push(target.to_string());
             }
         }
     }
 
+    emit_placeholder_changed(&created_names, &removed_names);
     Ok(created)
+}
+
+/// Emits a single `placeholder-changed` event summarising the `.cloudsc`
+/// placeholders created/removed during one index sweep, so the flyout Activité
+/// feed can show them (DBSYNC-45). No-ops when nothing changed or no `AppHandle`
+/// is set. Emitting a summary (not per-file) avoids flooding the event bus on a
+/// large initial index.
+fn emit_placeholder_changed(created: &[String], removed: &[String]) {
+    if created.is_empty() && removed.is_empty() {
+        return;
+    }
+    let Some(handle) = crate::state::APP_HANDLE.get() else {
+        return;
+    };
+    let payload = serde_json::json!({ "created": created, "removed": removed });
+    if handle
+        .emit_to(
+            EventTarget::webview_window("main"),
+            "placeholder-changed",
+            payload.clone(),
+        )
+        .is_err()
+    {
+        let _ = handle.emit("placeholder-changed", payload);
+    }
 }
 
 /// Discovers new remote content in every folder that already exists locally as a

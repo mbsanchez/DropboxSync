@@ -44,6 +44,13 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+/// True when a `<rel>.cloudsc` placeholder exists on disk for `rel`, i.e. the
+/// path was DEHYDRATED (real file/folder replaced by its cloud placeholder)
+/// rather than deleted by the user. Used to suppress spurious remote deletions.
+fn placeholder_exists(tracked_root: &std::path::Path, rel: &str) -> bool {
+    tracked_root.join(format!("{rel}.cloudsc")).exists()
+}
+
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
     let folder = state
         .db
@@ -98,7 +105,10 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
             .strip_prefix(&tracked_root)
             .map_err(|e| AppError::Io(e.to_string()))?
             .to_string_lossy()
-            .to_string();
+            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
+            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
+            // '/'-stored row and the scan re-uploads it every tick.
+            .replace('\\', "/");
 
         if relative.ends_with(".cloudsc") {
             continue;
@@ -127,7 +137,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
                         .strip_prefix(&tracked_root)
                         .map_err(|e| AppError::Io(e.to_string()))?
                         .to_string_lossy()
-                        .to_string();
+                        .replace('\\', "/");
                     {
                         state.db.add_conflict(
                             &relative,
@@ -170,6 +180,14 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
                 continue;
             }
             if !seen_paths.contains(&prev.relative_path) {
+                // DATA-LOSS GUARD (DBSYNC-45): a real file replaced by a
+                // `<name>.cloudsc` placeholder was DEHYDRATED, not deleted by the
+                // user. Propagating a remote delete here would destroy the user's
+                // remote copy. Untrack it locally, but never delete remotely.
+                if placeholder_exists(&tracked_root, &prev.relative_path) {
+                    state.db.remove_local_file(&prev.relative_path)?;
+                    continue;
+                }
                 state.db.enqueue_job(
                     "delete",
                     Some(&prev.relative_path),
@@ -202,7 +220,10 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
             .strip_prefix(&tracked_root)
             .map_err(|e| AppError::Io(e.to_string()))?
             .to_string_lossy()
-            .to_string();
+            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
+            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
+            // '/'-stored row and the scan re-uploads it every tick.
+            .replace('\\', "/");
 
         if relative.is_empty() {
             continue; // skip the sync root itself
@@ -221,6 +242,14 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
     if !walk_had_error {
         for rel in state.db.list_known_folders()? {
             if !seen_dirs.contains(&rel) {
+                // DATA-LOSS GUARD (DBSYNC-45): a hydrated folder replaced by a
+                // `<name>.cloudsc` placeholder was DEHYDRATED, not deleted. A
+                // recursive remote `delete_v2` here would wipe the user's remote
+                // folder. Untrack it locally, but never delete remotely.
+                if placeholder_exists(&tracked_root, &rel) {
+                    state.db.remove_known_folder(&rel)?;
+                    continue;
+                }
                 state.db.enqueue_job("delete", Some(&rel), Some(&rel))?;
                 state.db.remove_known_folder(&rel)?;
                 enqueued_jobs += 1;
