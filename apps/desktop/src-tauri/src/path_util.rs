@@ -12,6 +12,26 @@ pub(crate) fn should_ignore_local_path(relative: &str) -> bool {
     p == ".DS_Store" || p.ends_with("/.DS_Store") || p.starts_with("._") || p.contains("/._")
 }
 
+/// True if the path looks like an editor/download temp or lock file that should
+/// not trigger a sync on its own (DBSYNC-29). The real file's own event arrives
+/// separately; watching these just causes churn (and they're often deleted
+/// moments later). Matches the last path component only.
+pub(crate) fn is_editor_temp_path(relative: &str) -> bool {
+    let name = relative
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative)
+        .to_ascii_lowercase();
+    name.ends_with(".tmp")
+        || name.ends_with(".swp")
+        || name.ends_with(".swx")
+        || name.ends_with(".crdownload")
+        || name.ends_with(".part")
+        || name.ends_with('~') // Vim/Emacs/gedit backup
+        || name.starts_with("~$") // MS Office lock/owner file
+        || (name.starts_with(".~lock.") && name.ends_with('#')) // LibreOffice lock
+}
+
 pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
     Ok(absolute
         .strip_prefix(sync_folder)
@@ -424,6 +444,26 @@ mod tests {
         let joined = safe_join(root, "Cocina/Pizza.txt").expect("legit join");
         assert!(joined.starts_with(root));
         assert_eq!(joined, Path::new("/sync/root/Cocina/Pizza.txt"));
+    }
+
+    #[test]
+    fn editor_temp_paths_are_recognized() {
+        use super::is_editor_temp_path;
+        for temp in [
+            "doc.txt.tmp",
+            "sub/.file.swp",
+            "a.swx",
+            "video.crdownload",
+            "big.iso.part",
+            "notes.txt~",
+            "~$report.docx",
+            ".~lock.sheet.ods#",
+        ] {
+            assert!(is_editor_temp_path(temp), "should flag {temp:?}");
+        }
+        for real in ["report.docx", "a/b/c.txt", "photo.jpg", "archive.tar.gz"] {
+            assert!(!is_editor_temp_path(real), "should NOT flag {real:?}");
+        }
     }
 
     #[test]

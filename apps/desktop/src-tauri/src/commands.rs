@@ -100,11 +100,19 @@ pub fn set_sync_folder(state: tauri::State<AppState>, folder: String) -> Result<
     if prev != folder {
         state.db.reset_sync_state()?;
     }
-    let mut engine = state
-        .sync_engine
-        .lock()
-        .map_err(|_| "sync engine lock poisoned".to_string())?;
-    engine.set_tracked_path(folder);
+    {
+        let mut engine = state
+            .sync_engine
+            .lock()
+            .map_err(|_| "sync engine lock poisoned".to_string())?;
+        engine.set_tracked_path(folder);
+    }
+    // Re-arm the filesystem watcher for the (possibly new) sync folder
+    // (DBSYNC-29); arm_watcher drops any previous watcher so the old root is no
+    // longer watched. Best-effort — the periodic fallback still runs.
+    if let Err(e) = crate::fs_watcher::arm_watcher(state.inner()) {
+        tracing::warn!(error = %e, "failed to re-arm filesystem watcher after folder change");
+    }
     Ok(())
 }
 
@@ -218,7 +226,10 @@ pub fn start_background_scheduler(
             app_state.sync_running.store(false, Ordering::Release);
             update_tray_tooltip(&app, &current_tray_status_label(&app_state));
         }
-        std::thread::sleep(StdDuration::from_secs(60));
+        // Safety-net full scan. The filesystem watcher (DBSYNC-29) is now the
+        // primary, near-instant trigger, so this only needs to reconcile missed
+        // events + run the remote-index pass — every 5 min instead of 60s.
+        std::thread::sleep(StdDuration::from_secs(300));
     });
 
     Ok(true)
