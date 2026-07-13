@@ -8,7 +8,7 @@ use crate::models::{DropboxEntry, DropboxListFolderResponse};
 use crate::path_util::normalize_dropbox_path;
 use crate::state::AppState;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RemoteFileMeta {
     pub content_hash: String,
     pub rev: String,
@@ -29,24 +29,6 @@ pub(crate) enum DeltaAction {
     Remove(String),
     /// A folder entry or an unusable entry — nothing to apply.
     Ignore,
-}
-
-impl PartialEq for RemoteFileMeta {
-    fn eq(&self, other: &Self) -> bool {
-        self.content_hash == other.content_hash
-            && self.rev == other.rev
-            && self.modified_ts == other.modified_ts
-    }
-}
-
-impl std::fmt::Debug for RemoteFileMeta {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteFileMeta")
-            .field("content_hash", &self.content_hash)
-            .field("rev", &self.rev)
-            .field("modified_ts", &self.modified_ts)
-            .finish()
-    }
 }
 
 /// Classify a `list_folder`/`continue` delta entry. A `deleted` entry carries no

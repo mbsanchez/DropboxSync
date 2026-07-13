@@ -21,6 +21,10 @@ const LONGPOLL_HTTP_TIMEOUT_SECS: u64 = LONGPOLL_TIMEOUT_SECS + 90 + 15;
 const IDLE_SLEEP_SECS: u64 = 15;
 const MIN_BACKOFF_SECS: u64 = 5;
 const MAX_BACKOFF_SECS: u64 = 60;
+/// When a change is pending but another sync owns the gate, wait this long
+/// before re-longpolling, so we don't spin issuing back-to-back requests
+/// (which would return `changes:true` instantly) until the other sync frees it.
+const GATE_BUSY_SLEEP_SECS: u64 = 3;
 
 /// Single-instance guard — the loop is started once from `lib.rs setup()`.
 static LONGPOLL_STARTED: OnceLock<()> = OnceLock::new();
@@ -79,8 +83,11 @@ fn longpoll_loop(state: &AppState) {
         match do_longpoll(state, &cursor) {
             Ok(resp) => {
                 err_backoff = 0;
-                if resp.changes {
-                    apply_and_drain(state);
+                if resp.changes && !apply_and_drain(state) {
+                    // Another sync owns the gate; the delta wasn't applied and the
+                    // cursor didn't advance. Pause so we don't hot-loop re-longpolling
+                    // the still-pending change until that sync finishes.
+                    std::thread::sleep(Duration::from_secs(GATE_BUSY_SLEEP_SECS));
                 }
                 if let Some(secs) = resp.backoff {
                     std::thread::sleep(Duration::from_secs(secs));
@@ -147,8 +154,10 @@ fn do_longpoll(state: &AppState, cursor: &str) -> AppResult<DropboxLongpollRespo
         .map_err(|e| AppError::Other(format!("longpoll parse failed: {e}")))
 }
 
-/// Apply the remote delta + drain, under the shared single-flight gate.
-fn apply_and_drain(state: &AppState) {
+/// Apply the remote delta + drain, under the shared single-flight gate. Returns
+/// `false` if another sync owned the gate (nothing applied — caller should pause
+/// before re-longpolling the still-pending change).
+fn apply_and_drain(state: &AppState) -> bool {
     if state
         .sync_running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -156,7 +165,7 @@ fn apply_and_drain(state: &AppState) {
     {
         // A scan/tick/watcher already owns the sync; the next longpoll or the
         // 5-min sweep reconciles. No double-drain.
-        return;
+        return false;
     }
     crate::auth_session::refresh_tray_tooltip(state);
     match crate::remote_index::apply_remote_delta(state) {
@@ -167,6 +176,7 @@ fn apply_and_drain(state: &AppState) {
     crate::sync_pipeline::drain_sync_queue(state);
     state.sync_running.store(false, Ordering::Release);
     crate::auth_session::refresh_tray_tooltip(state);
+    true
 }
 
 #[cfg(test)]
