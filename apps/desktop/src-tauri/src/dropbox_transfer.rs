@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -186,12 +186,41 @@ fn fetch_and_write_file(
         });
     }
 
-    let write_result = File::create(&temp)
-        .map_err(|e| AppError::Io(format!("failed creating temp file: {e}")))
-        .and_then(|mut tmp_file| {
-            io::copy(&mut download_resp, &mut tmp_file)
-                .map_err(|e| AppError::Io(format!("failed writing local file: {e}")))
-        });
+    // Stream the body to disk in chunks (instead of io::copy) so we can emit
+    // throttled `download-progress` events for the sync-progress UI (DBSYNC-34).
+    let total = download_resp.content_length().unwrap_or(0);
+    let write_result: AppResult<()> = (|| {
+        let mut tmp_file = File::create(&temp)
+            .map_err(|e| AppError::Io(format!("failed creating temp file: {e}")))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut transferred: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
+        let mut last_emit_bytes: u64 = 0;
+        emit_download_progress(path_display, 0, total);
+        loop {
+            let n = download_resp
+                .read(&mut buf)
+                .map_err(|e| AppError::Io(format!("failed reading download stream: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            tmp_file
+                .write_all(&buf[..n])
+                .map_err(|e| AppError::Io(format!("failed writing local file: {e}")))?;
+            transferred += n as u64;
+            // Throttle: emit at most every ~256 KiB or ~100ms.
+            if transferred - last_emit_bytes >= 256 * 1024
+                || last_emit.elapsed() >= Duration::from_millis(100)
+            {
+                emit_download_progress(path_display, transferred, total);
+                last_emit = std::time::Instant::now();
+                last_emit_bytes = transferred;
+            }
+        }
+        // Final 100% tick (total may be 0/unknown; report the actual byte count).
+        emit_download_progress(path_display, transferred, transferred.max(total));
+        Ok(())
+    })();
 
     if let Err(e) = write_result {
         let _ = fs::remove_file(&temp);
@@ -491,6 +520,20 @@ fn conflict_copy_with_content_exists(target: &Path, content_hash: &str) -> AppRe
 /// on `state::APP_HANDLE` (see its doc comment). No-ops silently when no handle is set
 /// yet, which keeps offline unit tests (which never call `setup()`) window/handle-free.
 fn emit_upload_progress(path: &str, transferred: u64, total: u64) {
+    emit_transfer_progress("upload-progress", path, transferred, total);
+}
+
+/// Emits a `download-progress` event with the same payload shape as
+/// `upload-progress`, so the flyout can show live download progress. The caller
+/// throttles emits (bytes/time) to avoid flooding the event bus.
+fn emit_download_progress(path: &str, transferred: u64, total: u64) {
+    emit_transfer_progress("download-progress", path, transferred, total);
+}
+
+/// Shared emitter for `upload-progress` / `download-progress` events. No-ops
+/// silently when no `AppHandle` is set on `state::APP_HANDLE` yet (keeps offline
+/// unit tests, which never call `setup()`, handle-free).
+fn emit_transfer_progress(event_name: &'static str, path: &str, transferred: u64, total: u64) {
     let Some(handle) = crate::state::APP_HANDLE.get() else {
         return;
     };
@@ -501,12 +544,12 @@ fn emit_upload_progress(path: &str, transferred: u64, total: u64) {
         total,
     };
 
-    match handle.emit_to(EventTarget::webview_window("main"), "upload-progress", event.clone()) {
+    match handle.emit_to(EventTarget::webview_window("main"), event_name, event.clone()) {
         Ok(()) => {}
         Err(e) => {
-            tracing::error!(error = %e, "emit_to webview_window(main) failed");
-            if let Err(e2) = handle.emit("upload-progress", event) {
-                tracing::error!(error = %e2, "emit global upload-progress failed");
+            tracing::error!(error = %e, event = event_name, "emit_to webview_window(main) failed");
+            if let Err(e2) = handle.emit(event_name, event) {
+                tracing::error!(error = %e2, event = event_name, "emit global progress failed");
             }
         }
     }

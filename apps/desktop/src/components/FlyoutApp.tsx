@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { useActivityLog } from "../hooks/useActivityLog";
 import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useSyncDashboard } from "../hooks/useSyncDashboard";
-import type { ActivityEntry, SyncJob } from "../types";
+import { useTransferProgress } from "../hooks/useTransferProgress";
+import { formatBytes, formatSpeed } from "../format";
+import type { ActiveTransfer, ActivityEntry, SyncJob } from "../types";
 import "./FlyoutApp.css";
 
 type Section = "home" | "folders" | "activity";
@@ -153,6 +155,38 @@ function openSettings() {
   invoke("show_setup_window").catch(() => {});
 }
 
+type CurrentTransferCardProps = { transfer: ActiveTransfer };
+
+/** Compact "in-flight" card shown above the recent-transfers list while a
+ * transfer is streaming. Falls back to an indeterminate/striped bar when the
+ * total size is unknown (`total === 0`, e.g. a fresh resumable-upload session). */
+function CurrentTransferCard({ transfer }: CurrentTransferCardProps) {
+  const { path, transferred, total, direction, speedBytesPerSec } = transfer;
+  const knownTotal = total > 0;
+  const pct = knownTotal ? Math.min(100, Math.max(0, (transferred / total) * 100)) : 0;
+
+  return (
+    <div className="current-transfer-card">
+      <div className="current-transfer-head">
+        <EventIcon kind={direction} />
+        <div className="current-transfer-name" title={path}>
+          {basename(path)}
+        </div>
+      </div>
+      <div className={`current-transfer-bar${knownTotal ? "" : " indeterminate"}`}>
+        <div className="current-transfer-bar-fill" style={knownTotal ? { width: `${pct}%` } : undefined} />
+      </div>
+      <div className="current-transfer-meta">
+        <span>
+          {formatBytes(transferred)}
+          {knownTotal ? ` / ${formatBytes(total)}` : ""}
+        </span>
+        <span>{formatSpeed(speedBytesPerSec)}</span>
+      </div>
+    </div>
+  );
+}
+
 type RecentRowProps = { job: SyncJob };
 
 function RecentTransferRow({ job }: RecentRowProps) {
@@ -196,6 +230,7 @@ function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
   const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
   const { status, jobs, conflicts, retryFailedJobs } = useSyncDashboard(pushLog);
+  const { activeTransfer } = useTransferProgress();
 
   const [section, setSection] = useState<Section>("home");
   const schedulerStartedRef = useRef(false);
@@ -259,6 +294,18 @@ function FlyoutApp() {
   const recentJobs: SyncJob[] = jobs.slice(0, 8);
   const hasFailedJobs = jobs.some((job) => job.status === "failed");
 
+  // "X of Y files": Y = jobs still pending or completed in the current run
+  // (queued/running/retry_wait + done), X = the completed (done) count. Only
+  // shown while a sync is actually running/pending, so a completed run's
+  // "done" jobs don't linger in the indicator once the run is over.
+  const pendingJobCount = jobs.filter(
+    (job) => job.status === "queued" || job.status === "running" || job.status === "retry_wait",
+  ).length;
+  const doneJobCount = jobs.filter((job) => job.status === "done").length;
+  const runTotal = pendingJobCount + doneJobCount;
+  const runProgressLabel =
+    (status.syncRunning || pendingJobCount > 0) && runTotal > 0 ? `${doneJobCount} sur ${runTotal} fichiers` : null;
+
   return (
     <div className="flyout">
       <nav className="flyout-nav">
@@ -293,6 +340,9 @@ function FlyoutApp() {
 
         {section === "home" && (
           <section className="flyout-section">
+            {activeTransfer && <CurrentTransferCard transfer={activeTransfer} />}
+            {runProgressLabel && <div className="current-transfer-run-label">{runProgressLabel}</div>}
+
             <button type="button" className="flyout-btn flyout-logs-btn" onClick={() => void openLogs()}>
               Ouvrir les journaux
             </button>
