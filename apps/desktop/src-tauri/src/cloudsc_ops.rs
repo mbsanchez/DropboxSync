@@ -14,7 +14,9 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
 };
-use crate::path_util::{is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under};
+use crate::path_util::{
+    is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
+};
 use crate::state::AppState;
 
 pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
@@ -95,7 +97,16 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                 continue;
             }
 
-            let placeholder_path = local_dir.join(format!("{child_name}.cloudsc"));
+            // `child_name` is the last segment of a remote path_display: refuse a
+            // name that carries embedded separators / traversal before writing it
+            // to local disk (skip the poisoned entry, don't abort the sweep).
+            let placeholder_path = match safe_join(local_dir, &format!("{child_name}.cloudsc")) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(name = %child_name, error = %e, "skipping unsafe placeholder name");
+                    continue;
+                }
+            };
             let target_path = cloudsc_target_path(&placeholder_path);
             // Skip if already represented locally: as a placeholder, or as a real
             // file/dir (a hydrated folder is a real dir, so we never shadow it with
@@ -281,7 +292,9 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
-    let placeholder_path = PathBuf::from(&sync_folder).join(placeholder_local_rel_path);
+    // `placeholder_local_rel_path` is frontend/IPC-supplied — validate it can't
+    // escape the sync root before touching the filesystem.
+    let placeholder_path = safe_join(Path::new(&sync_folder), placeholder_local_rel_path)?;
     if !placeholder_path.exists() {
         return Err(AppError::Sync(format!(
             "placeholder not found: {placeholder_local_rel_path}"

@@ -429,7 +429,17 @@ mod tests {
     #[test]
     fn safe_join_refuses_to_escape_root() {
         let root = Path::new("/sync/root");
-        for bad in ["../outside", "a/../../b", "/abs/path", "..", "x\0y"] {
+        for bad in [
+            "../outside",
+            "a/../../b",
+            "/abs/path",
+            "..",
+            "x\0y",
+            // A remote-derived child name carrying embedded separators (DBSYNC-27
+            // review finding #1: the `.cloudsc` placeholder write sink).
+            "..\\..\\evil.cloudsc",
+            "sub\\..\\..\\evil",
+        ] {
             assert!(
                 safe_join(root, bad).is_err(),
                 "safe_join must refuse {bad:?}"
