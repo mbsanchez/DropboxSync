@@ -27,7 +27,7 @@ pub(crate) fn fetch_remote_file_metadata(
 ) -> AppResult<Option<RemoteFileMeta>> {
     let token = get_access_token(state)?;
     let client = &state.http_client;
-    let dropbox_path = normalize_dropbox_path(relative);
+    let dropbox_path = normalize_dropbox_path(relative)?;
 
     let response = client
         .post("https://api.dropboxapi.com/2/files/get_metadata")
@@ -209,7 +209,7 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
 
         let prev_remote = state.db.get_remote_file(&rel)?;
         let remote_meta = remote_by_path
-            .get(&normalize_dropbox_path(&rel).to_lowercase())
+            .get(&normalize_dropbox_path(&rel)?.to_lowercase())
             .cloned();
         let Some(remote_meta) = remote_meta else {
             // Remote copy is gone. Only propagate the deletion when we had

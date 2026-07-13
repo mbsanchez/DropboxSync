@@ -23,17 +23,72 @@ pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<St
         .replace('\\', "/"))
 }
 
-pub(crate) fn normalize_dropbox_path(input: &str) -> String {
+/// True if `input` contains a path-traversal component (`..`) — checked against
+/// both `/` and `\` separators — or an embedded NUL byte. Such inputs must never
+/// be used to build a Dropbox path or a local filesystem path (DBSYNC-27).
+fn has_traversal(input: &str) -> bool {
+    input.contains('\0') || input.split(['/', '\\']).any(|c| c == "..")
+}
+
+/// True if `input` is an OS-absolute path that has no business appearing as a
+/// path relative to the sync root: a Windows drive prefix (`C:\`, `C:/`) or a
+/// UNC path (`\\server`). A single leading `/` is intentionally NOT treated as
+/// absolute here — it is the legitimate Dropbox root convention.
+fn is_os_absolute(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true; // Windows drive-absolute, e.g. `C:\Users` or `C:/Users`
+    }
+    input.starts_with("\\\\") // UNC path, e.g. `\\server\share`
+}
+
+/// Turn a relative path into a Dropbox API path (`/`-prefixed), rejecting any
+/// input that could escape the intended tree. Returns an error for paths that
+/// contain `..`, NUL bytes, or an OS-absolute prefix instead of silently
+/// building a traversing path (DBSYNC-27). A leading `/` is preserved.
+pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
+    if has_traversal(input) || is_os_absolute(input) {
+        return Err(AppError::Sync(format!("rejected unsafe path: {input:?}")));
+    }
     if input.is_empty() {
-        return "".to_string();
+        return Ok(String::new());
     }
     // Windows relative paths use `\` separators; Dropbox requires `/`.
     let forward = input.replace('\\', "/");
-    if forward.starts_with('/') {
+    Ok(if forward.starts_with('/') {
         forward
     } else {
-        format!("/{}", forward)
+        format!("/{forward}")
+    })
+}
+
+/// Validate that `rel` is a safe path *relative* to the sync root: no `..`, no
+/// NUL byte, and not absolute (no leading `/` or `\`, no drive/UNC prefix).
+/// Used before joining any remote-derived path onto the local sync folder.
+pub(crate) fn validate_relative(rel: &str) -> AppResult<()> {
+    if has_traversal(rel)
+        || is_os_absolute(rel)
+        || rel.starts_with('/')
+        || rel.starts_with('\\')
+    {
+        return Err(AppError::Sync(format!(
+            "rejected unsafe relative path: {rel:?}"
+        )));
     }
+    Ok(())
+}
+
+/// Join an untrusted relative path onto `root`, refusing to escape it. Validates
+/// `rel` with [`validate_relative`], then verifies (lexically, without touching
+/// the filesystem — the target may not exist yet) that the result stays under
+/// `root`. This is the single choke point for every remote→local write sink.
+pub(crate) fn safe_join(root: &Path, rel: &str) -> AppResult<PathBuf> {
+    validate_relative(rel)?;
+    let joined = root.join(rel);
+    if !joined.starts_with(root) {
+        return Err(AppError::Sync(format!("path escapes sync root: {rel:?}")));
+    }
+    Ok(joined)
 }
 
 pub(crate) fn parse_prefix_csv(csv: Option<String>) -> Vec<String> {
@@ -179,7 +234,12 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::NamedTempFile;
 
-    use super::{backoff_seconds, hash_file, DROPBOX_BLOCK_SIZE};
+    use std::path::Path;
+
+    use super::{
+        backoff_seconds, hash_file, normalize_dropbox_path, safe_join, validate_relative,
+        DROPBOX_BLOCK_SIZE,
+    };
 
     // ---------------------------------------------------------------------------
     // Helper: compute the Dropbox content_hash for an in-memory byte slice so
@@ -304,6 +364,87 @@ mod tests {
 
         let (hash, _, _) = hash_file(tmp.path()).expect("hash_file");
         assert_eq!(hash, expected);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Path-traversal hardening (DBSYNC-27)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn normalize_accepts_legit_paths() {
+        assert_eq!(normalize_dropbox_path("").unwrap(), "");
+        assert_eq!(normalize_dropbox_path("Cocina/Pizza").unwrap(), "/Cocina/Pizza");
+        // A leading '/' is the Dropbox root convention and must be preserved.
+        assert_eq!(normalize_dropbox_path("/Cocina").unwrap(), "/Cocina");
+        // Windows separators are canonicalised to '/'.
+        assert_eq!(normalize_dropbox_path("Cocina\\Pizza").unwrap(), "/Cocina/Pizza");
+    }
+
+    #[test]
+    fn normalize_rejects_traversal_payloads() {
+        for bad in [
+            "../etc/passwd",
+            "Cocina/../../secret",
+            "..\\Windows\\System32",
+            "a/../../b",
+            "C:\\Windows",
+            "C:/Windows",
+            "\\\\server\\share",
+            "with\0null",
+        ] {
+            assert!(
+                normalize_dropbox_path(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_relative_rejects_absolute_and_traversal() {
+        assert!(validate_relative("Cocina/Pizza").is_ok());
+        assert!(validate_relative("a/b/c.txt").is_ok());
+
+        for bad in [
+            "..",
+            "../x",
+            "a/../../b",
+            "/etc/passwd",
+            "\\Windows",
+            "C:\\x",
+            "\\\\unc\\x",
+            "x\0y",
+        ] {
+            assert!(validate_relative(bad).is_err(), "expected rejection for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn safe_join_stays_under_root() {
+        let root = Path::new("/sync/root");
+        let joined = safe_join(root, "Cocina/Pizza.txt").expect("legit join");
+        assert!(joined.starts_with(root));
+        assert_eq!(joined, Path::new("/sync/root/Cocina/Pizza.txt"));
+    }
+
+    #[test]
+    fn safe_join_refuses_to_escape_root() {
+        let root = Path::new("/sync/root");
+        for bad in [
+            "../outside",
+            "a/../../b",
+            "/abs/path",
+            "..",
+            "x\0y",
+            // A remote-derived child name carrying embedded separators (DBSYNC-27
+            // review finding #1: the `.cloudsc` placeholder write sink).
+            "..\\..\\evil.cloudsc",
+            "sub\\..\\..\\evil",
+        ] {
+            assert!(
+                safe_join(root, bad).is_err(),
+                "safe_join must refuse {bad:?}"
+            );
+        }
     }
 
     #[test]
