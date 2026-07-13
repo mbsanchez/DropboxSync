@@ -983,6 +983,11 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
             if let Ok(mut engine) = state.sync_engine.lock() {
                 engine.record_conflict();
             }
+            tracing::warn!(
+                path = %relative,
+                conflicted_copy = %conflicted_rel,
+                "sync conflict: local copy preserved before remote overwrite"
+            );
             emit_sync_conflict(&relative, &conflicted_rel, &reason);
         }
     }

@@ -258,6 +258,14 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
         }
     }
 
+    // Summarise a remote-index refresh that enqueued work (DBSYNC-47); a no-op
+    // refresh stays silent so the periodic sweep doesn't spam the log.
+    if enqueued > 0 {
+        tracing::info!(
+            enqueued,
+            "remote index refresh enqueued download/delete jobs"
+        );
+    }
     Ok(enqueued)
 }
 

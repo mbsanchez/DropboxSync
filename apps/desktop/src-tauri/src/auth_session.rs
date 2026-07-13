@@ -91,6 +91,7 @@ pub(crate) fn force_refresh_session(state: &AppState) -> AppResult<TokenSession>
     };
 
     refresh_token_guarded(&state.token_cache, &state.token_refresh_lock, true, || {
+        tracing::info!(forced = true, "refreshing dropbox access token");
         let refreshed = refresh_access_token_blocking(&state.http_client, &refresh_token)?;
 
         let new_refresh_token = refreshed
@@ -158,6 +159,7 @@ pub(crate) fn get_access_token(state: &AppState) -> AppResult<Zeroizing<String>>
 
     let refreshed_session =
         refresh_token_guarded(&state.token_cache, &state.token_refresh_lock, false, || {
+            tracing::info!(forced = false, "refreshing dropbox access token");
             let refreshed = refresh_access_token_blocking(&state.http_client, &refresh_token)?;
 
             let new_refresh_token = refreshed
