@@ -160,12 +160,10 @@ pub async fn complete_oauth(
     }
 
     let token: TokenResponse = serde_json::from_slice::<RawTokenResponse>(&body)
-        .map_err(|e| {
-            AppError::Auth(format!(
-                "token parse failed: {e}; body: {}",
-                String::from_utf8_lossy(&body)
-            ))
-        })?
+        // Do NOT echo the body: on a 2xx response it contains the access/refresh
+        // token, which would leak in cleartext if this error is logged or shown
+        // (DBSYNC-49). The serde error alone identifies the parse failure.
+        .map_err(|e| AppError::Auth(format!("token parse failed: {e}")))?
         .into();
 
     Ok(token)
