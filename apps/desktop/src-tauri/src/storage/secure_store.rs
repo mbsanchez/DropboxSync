@@ -1,5 +1,6 @@
 use keyring::Entry;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use zeroize::Zeroizing;
 
 const SERVICE: &str = "dropbox-sync-desktop";
 
@@ -22,11 +23,27 @@ pub struct SecureStore;
 
 /// Full OAuth session persisted in the OS keychain, including `refresh_token`.
 /// Survives app restarts. The in-memory `AppState::token_cache` is only a runtime copy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// The bearer credentials are `Zeroizing` so the cached in-memory copy is wiped
+/// on drop (DBSYNC-46). Persisted fields are written to the keyring individually
+/// (see `store_session`), so `TokenSession` itself is never (de)serialized —
+/// hence no `Serialize`/`Deserialize` derive; the legacy JSON blob is parsed via
+/// `LegacyTokenSession` below.
+#[derive(Clone, Debug)]
 pub struct TokenSession {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub expires_at: Option<String>, // RFC3339
+    pub access_token: Zeroizing<String>,
+    pub refresh_token: Option<Zeroizing<String>>,
+    pub expires_at: Option<String>, // RFC3339 — not secret
+}
+
+/// Plain parse target for the pre-`TokenSession` single-JSON-blob keyring entry.
+/// Only used in the one-time migration in `get_session`; strings are moved into
+/// `Zeroizing` immediately after parsing.
+#[derive(Deserialize)]
+struct LegacyTokenSession {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<String>,
 }
 
 impl SecureStore {
@@ -71,16 +88,21 @@ impl SecureStore {
                 _ => None,
             };
             return Ok(TokenSession {
-                access_token: access,
-                refresh_token: refresh,
+                access_token: Zeroizing::new(access),
+                refresh_token: refresh.map(Zeroizing::new),
                 expires_at,
             });
         }
 
         let legacy_e = Entry::new(SERVICE, LEGACY_SESSION_KEY)?;
         let json = legacy_e.get_password()?;
-        let session: TokenSession =
+        let legacy: LegacyTokenSession =
             serde_json::from_str(&json).map_err(|_| keyring::Error::NoEntry)?;
+        let session = TokenSession {
+            access_token: Zeroizing::new(legacy.access_token),
+            refresh_token: legacy.refresh_token.map(Zeroizing::new),
+            expires_at: legacy.expires_at,
+        };
         self.store_session(&session)?;
         Ok(session)
     }

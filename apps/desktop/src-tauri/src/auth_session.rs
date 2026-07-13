@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
+use zeroize::Zeroizing;
 
 use crate::auth::oauth::refresh_access_token_blocking;
 use crate::error::{AppError, AppResult};
@@ -116,7 +117,7 @@ pub(crate) fn force_refresh_session(state: &AppState) -> AppResult<TokenSession>
     })
 }
 
-pub(crate) fn get_access_token(state: &AppState) -> AppResult<String> {
+pub(crate) fn get_access_token(state: &AppState) -> AppResult<Zeroizing<String>> {
     if let Ok(cache) = state.token_cache.lock() {
         if let Some(session) = cache.as_ref() {
             if !session_needs_refresh(session) {
@@ -133,7 +134,7 @@ pub(crate) fn get_access_token(state: &AppState) -> AppResult<String> {
                 .get_token()
                 .map_err(|e| AppError::Auth(format!("missing dropbox token session: {e}")))?;
             let migrated = TokenSession {
-                access_token: legacy_token,
+                access_token: Zeroizing::new(legacy_token),
                 refresh_token: None,
                 expires_at: None,
             };
@@ -259,13 +260,14 @@ pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, label: &str) {
 mod tests {
     use super::{refresh_token_guarded, TokenSession};
     use chrono::{Duration, Utc};
+    use zeroize::Zeroizing;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn fresh_session() -> TokenSession {
         TokenSession {
-            access_token: "canned-access-token".to_string(),
-            refresh_token: Some("canned-refresh-token".to_string()),
+            access_token: Zeroizing::new("canned-access-token".to_string()),
+            refresh_token: Some(Zeroizing::new("canned-refresh-token".to_string())),
             // Far in the future so `session_needs_refresh` returns false and the
             // double-check reuses it instead of refreshing again.
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
@@ -308,7 +310,7 @@ mod tests {
         );
         for r in results {
             let session = r.expect("guarded refresh should succeed");
-            assert_eq!(session.access_token, "canned-access-token");
+            assert_eq!(session.access_token.as_str(), "canned-access-token");
         }
     }
 }

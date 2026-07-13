@@ -254,7 +254,7 @@ pub(crate) fn list_remote_folder(
     let client = &state.http_client;
     let response = client
         .post("https://api.dropboxapi.com/2/files/list_folder")
-        .bearer_auth(&token)
+        .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "path": dropbox_path,
             "recursive": false,
@@ -843,7 +843,7 @@ pub(crate) fn upload_local_file_internal(
             let client = &state.http_client;
             let resp = client
                 .post("https://content.dropboxapi.com/2/files/upload")
-                .bearer_auth(&token)
+                .bearer_auth(token.as_str())
                 .header(
                     "Dropbox-API-Arg",
                     serde_json::json!({
@@ -894,7 +894,7 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> A
     let client = &state.http_client;
     let resp = client
         .post("https://api.dropboxapi.com/2/files/delete_v2")
-        .bearer_auth(&token)
+        .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "path": dropbox_path
         }))
@@ -1032,7 +1032,7 @@ pub(crate) fn hydrate_remote_folder_internal(
 
     let response = client
         .post("https://api.dropboxapi.com/2/files/list_folder")
-        .bearer_auth(&token)
+        .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "path": folder_path_display,
             "recursive": true,
@@ -1093,7 +1093,7 @@ pub(crate) fn hydrate_remote_folder_internal(
 
         entries_resp = client
             .post("https://api.dropboxapi.com/2/files/list_folder/continue")
-            .bearer_auth(&token)
+            .bearer_auth(token.as_str())
             .json(&serde_json::json!({ "cursor": entries_resp.cursor.clone() }))
             .send()
             .map_err(|e| {
@@ -1137,7 +1137,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 
     let list_folder_resp = client
         .post("https://api.dropboxapi.com/2/files/list_folder")
-        .bearer_auth(&token)
+        .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "path": "",
             "recursive": true,
@@ -1198,7 +1198,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 
         let continue_resp = client
             .post("https://api.dropboxapi.com/2/files/list_folder/continue")
-            .bearer_auth(&token)
+            .bearer_auth(token.as_str())
             .json(&serde_json::json!({ "cursor": response.cursor.clone() }))
             .send()
             .map_err(|e| {

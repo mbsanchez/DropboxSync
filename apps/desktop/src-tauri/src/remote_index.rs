@@ -31,7 +31,7 @@ pub(crate) fn fetch_remote_file_metadata(
 
     let response = client
         .post("https://api.dropboxapi.com/2/files/get_metadata")
-        .bearer_auth(&token)
+        .bearer_auth(token.as_str())
         .json(&serde_json::json!({
             "path": dropbox_path,
             "include_media_info": false,
@@ -127,7 +127,7 @@ pub(crate) fn fetch_all_remote_file_metadata(
     let mut entries_resp: DropboxListFolderResponse = {
         let response = client
             .post("https://api.dropboxapi.com/2/files/list_folder")
-            .bearer_auth(&token)
+            .bearer_auth(token.as_str())
             .json(&serde_json::json!({
                 "path": "",
                 "recursive": true,
@@ -160,7 +160,7 @@ pub(crate) fn fetch_all_remote_file_metadata(
         }
         let response = client
             .post("https://api.dropboxapi.com/2/files/list_folder/continue")
-            .bearer_auth(&token)
+            .bearer_auth(token.as_str())
             .json(&serde_json::json!({ "cursor": entries_resp.cursor }))
             .send()
             .map_err(|e| AppError::Network(format!("list_folder/continue request failed: {e}")))?;
