@@ -38,6 +38,7 @@ pub(crate) fn spawn_drain_sync_queue_if_idle(app_state: AppState) {
         {
             return;
         }
+        crate::auth_session::refresh_tray_tooltip(&app_state);
         let mut safety = 0usize;
         while safety < 1000 {
             safety += 1;
@@ -51,6 +52,7 @@ pub(crate) fn spawn_drain_sync_queue_if_idle(app_state: AppState) {
             }
         }
         app_state.sync_running.store(false, Ordering::Release);
+        crate::auth_session::refresh_tray_tooltip(&app_state);
     });
 }
 
