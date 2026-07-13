@@ -249,6 +249,9 @@ impl Db {
     }
 
     pub fn get_local_file(&self, relative_path: &str) -> AppResult<Option<FileIndexRow>> {
+        // Canonicalize path separators to '/' so local (OS-native '\' on Windows)
+        // and remote (Dropbox '/') keys match — DBSYNC-45.
+        let relative_path = relative_path.replace('\\', "/");
         let conn = self
             .read
             .lock()
@@ -277,6 +280,7 @@ impl Db {
         size_bytes: i64,
         modified_ts: i64,
     ) -> AppResult<()> {
+        let relative_path = relative_path.replace('\\', "/");
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -300,6 +304,7 @@ impl Db {
     }
 
     pub fn remove_local_file(&self, relative_path: &str) -> AppResult<()> {
+        let relative_path = relative_path.replace('\\', "/");
         let conn = self
             .write
             .lock()
@@ -312,6 +317,7 @@ impl Db {
     }
 
     pub fn get_remote_file(&self, relative_path: &str) -> AppResult<Option<RemoteFileIndexRow>> {
+        let relative_path = relative_path.replace('\\', "/");
         let conn = self
             .read
             .lock()
@@ -343,6 +349,7 @@ impl Db {
         rev: &str,
         modified_ts: i64,
     ) -> AppResult<()> {
+        let relative_path = relative_path.replace('\\', "/");
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -364,6 +371,7 @@ impl Db {
     }
 
     pub fn remove_remote_file(&self, relative_path: &str) -> AppResult<()> {
+        let relative_path = relative_path.replace('\\', "/");
         let conn = self
             .write
             .lock()
@@ -825,6 +833,33 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "sync_jobs", "upload_session_offset", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_len", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_mtime", "INTEGER")?;
+
+    // DBSYNC-45: canonicalize path separators in the index tables to '/'. Rows
+    // written from the local scan used OS-native '\' on Windows while remote/
+    // Dropbox rows used '/', so cross-table lookups (e.g. get_remote_file with a
+    // local key) missed and remote deletions of hydrated files never propagated.
+    // For each table: drop any stale '\'-row whose normalized form already exists
+    // (avoids a PRIMARY KEY collision on the UPDATE; the next sync tick re-upserts
+    // it), then normalize the remaining '\'-rows. Idempotent.
+    // NOTE: a literal '\' inside a SQL string is parsed unreliably by SQLite here,
+    // so the backslash is referenced as char(92) throughout.
+    for table in ["local_file_index", "remote_file_index", "known_folders"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE instr(relative_path, char(92)) > 0 \
+                 AND replace(relative_path, char(92), '/') IN \
+                 (SELECT relative_path FROM {table} WHERE instr(relative_path, char(92)) = 0)"
+            ),
+            [],
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET relative_path = replace(relative_path, char(92), '/') \
+                 WHERE instr(relative_path, char(92)) > 0"
+            ),
+            [],
+        )?;
+    }
     Ok(())
 }
 
