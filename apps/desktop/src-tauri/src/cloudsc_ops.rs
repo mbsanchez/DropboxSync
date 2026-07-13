@@ -218,7 +218,14 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
         }
         let dir = entry.path();
         let rel = relpath_under(&sync_folder, dir)?; // "" for the sync root itself
-        let remote_path = normalize_dropbox_path(&rel); // "" for root, "/Cocina", ...
+        // "" for root, "/Cocina", ...; a malformed path skips this folder only.
+        let remote_path = match normalize_dropbox_path(&rel) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(rel = %rel, error = %e, "skipping folder with unsafe path");
+                continue;
+            }
+        };
         match index_remote_folder_children_as_cloudsc_placeholders_internal(state, &remote_path, dir)
         {
             Ok(n) => created += n,
@@ -315,7 +322,7 @@ mod tests {
     fn root_dir_maps_to_empty_dropbox_path() {
         let root = PathBuf::from("/sync/root");
         let rel = relpath_under(&root, &root).expect("relpath");
-        assert_eq!(normalize_dropbox_path(&rel), "");
+        assert_eq!(normalize_dropbox_path(&rel).unwrap(), "");
     }
 
     #[test]
@@ -324,6 +331,6 @@ mod tests {
         let dir = root.join("Cocina").join("Pizza");
         let rel = relpath_under(&root, &dir).expect("relpath");
         // `normalize_dropbox_path` itself converts OS separators to '/'.
-        assert_eq!(normalize_dropbox_path(&rel), "/Cocina/Pizza");
+        assert_eq!(normalize_dropbox_path(&rel).unwrap(), "/Cocina/Pizza");
     }
 }

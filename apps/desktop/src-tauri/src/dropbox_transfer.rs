@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use reqwest::blocking::{Body, Client};
@@ -16,7 +16,7 @@ use crate::models::{
 };
 use crate::path_util::{
     create_conflicted_copy, hash_file, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
-    relpath_under,
+    relpath_under, safe_join,
 };
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
@@ -249,7 +249,7 @@ pub(crate) fn list_remote_folder(
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
     let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
 
-    let dropbox_path = normalize_dropbox_path(&path);
+    let dropbox_path = normalize_dropbox_path(&path)?;
 
     let client = &state.http_client;
     let response = client
@@ -287,8 +287,11 @@ pub(crate) fn list_remote_folder(
             continue;
         };
         let relative = path_display.trim_start_matches('/').to_string();
-        let local_target = PathBuf::from(&folder).join(&relative);
-        let is_synced = local_target.exists();
+        // A poisoned remote entry that tries to traverse out of the sync root is
+        // never "synced"; refuse the join and treat it as not present locally.
+        let is_synced = safe_join(Path::new(&folder), &relative)
+            .map(|p| p.exists())
+            .unwrap_or(false);
         let is_excluded = !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes);
 
         entries.push(RemoteEntry {
@@ -804,7 +807,7 @@ pub(crate) fn upload_local_file_internal(
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
-    let local_path = PathBuf::from(&folder).join(relative);
+    let local_path = safe_join(Path::new(&folder), relative)?;
     if !local_path.exists() {
         return Err(AppError::Sync(format!("local file missing for upload: {relative}")));
     }
@@ -833,7 +836,7 @@ pub(crate) fn upload_local_file_internal(
         .map_err(|e| AppError::Io(format!("failed reading local file metadata: {e}")))?
         .len();
 
-    let dropbox_path = normalize_dropbox_path(relative);
+    let dropbox_path = normalize_dropbox_path(relative)?;
 
     match choose_upload_strategy(len) {
         UploadStrategy::SingleShot => {
@@ -887,7 +890,7 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> A
     }
 
     let token = get_access_token(state)?;
-    let dropbox_path = normalize_dropbox_path(relative);
+    let dropbox_path = normalize_dropbox_path(relative)?;
     let client = &state.http_client;
     let resp = client
         .post("https://api.dropboxapi.com/2/files/delete_v2")
@@ -930,7 +933,7 @@ pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Ap
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
-    let local_path = PathBuf::from(&folder).join(relative);
+    let local_path = safe_join(Path::new(&folder), relative)?;
     if local_path.exists() {
         fs::remove_file(&local_path)
             .map_err(|e| AppError::Io(format!("failed to delete local file {relative}: {e}")))?;
@@ -955,7 +958,8 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         return Ok(());
     }
 
-    let target = PathBuf::from(&folder).join(&relative);
+    // Refuse a remote path that would escape the sync root before writing.
+    let target = safe_join(Path::new(&folder), &relative)?;
 
     // Remote-wins conflict guard: preserve unsynced local edits before the atomic
     // overwrite below. (There is an inherent, benign TOCTOU window — an edit made
@@ -1068,7 +1072,14 @@ pub(crate) fn hydrate_remote_folder_internal(
                 continue;
             }
 
-            let target = PathBuf::from(&folder).join(&relative);
+            // Skip (don't abort the whole sweep on) a single traversing entry.
+            let target = match safe_join(Path::new(&folder), &relative) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(path = %relative, error = %e, "skipping unsafe remote path");
+                    continue;
+                }
+            };
             fetch_and_write_file(client, &token, path_display, &target)?;
 
             let (hash, size_bytes, modified_ts) = hash_file(&target)?;
@@ -1161,7 +1172,13 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
             };
 
             let relative = path_display.trim_start_matches('/').to_string();
-            let target = PathBuf::from(&folder).join(&relative);
+            let target = match safe_join(Path::new(&folder), &relative) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(path = %relative, error = %e, "skipping unsafe remote path");
+                    continue;
+                }
+            };
 
             if known_map.contains_key(&relative) && target.exists() {
                 continue;

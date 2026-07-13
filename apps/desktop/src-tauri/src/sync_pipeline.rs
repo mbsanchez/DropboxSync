@@ -306,7 +306,9 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             .as_deref()
             .or(job.source_path.as_deref())
             .ok_or_else(|| AppError::Sync("download job missing target_path/source_path".to_string()))
-            .and_then(|rel| download_remote_file_internal(state, &normalize_dropbox_path(rel))),
+            .and_then(|rel| {
+                download_remote_file_internal(state, &normalize_dropbox_path(rel)?)
+            }),
         "hydrate_cloudsc" => job
             .source_path
             .as_deref()
