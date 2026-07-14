@@ -24,6 +24,8 @@ mod sync_pipeline;
 #[cfg(windows)]
 mod windows_file_assoc;
 #[cfg(windows)]
+mod windows_identity;
+#[cfg(windows)]
 mod windows_shell_menu;
 
 use std::sync::atomic::AtomicBool;
@@ -210,6 +212,13 @@ pub fn run() {
                     // is deployed next to the exe (replaces the legacy flyout).
                     crate::windows_shell_menu::sync_shell_menu_registration();
                 }
+
+                // DBSYNC-58: CfAPI shell integration (the Explorer status column,
+                // DBSYNC-57) needs package identity from the sparse package.
+                tracing::info!(
+                    package_identity = crate::windows_identity::has_package_identity(),
+                    "windows package identity"
+                );
             }
 
             // Windows/Linux: double-clicking `.cloudsc` runs `app.exe "path\to\file.cloudsc"`; there is no
