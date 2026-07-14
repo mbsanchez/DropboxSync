@@ -120,6 +120,19 @@ fn refresh_overlay_state_inner(state: &AppState) -> AppResult<()> {
     let tmp = dest.with_extension("json.tmp");
     fs::write(&tmp, json.as_bytes())?;
     fs::rename(&tmp, &dest)?;
+
+    // DBSYNC-41: drive Explorer's built-in cloud "Status" column (CfAPI) from the
+    // same per-file state — no second source of truth. Fails soft on non-NTFS / no
+    // CfAPI. `.cloudsc` sidecars are skipped inside (blank status by design).
+    #[cfg(windows)]
+    {
+        let items: Vec<(&str, bool)> = payload
+            .paths
+            .iter()
+            .map(|(rel, tier)| (rel.as_str(), *tier == OverlayTier::Synced))
+            .collect();
+        crate::cloud_filter::sync_placeholder_states(payload.sync_folder.as_deref(), &items);
+    }
     Ok(())
 }
 
