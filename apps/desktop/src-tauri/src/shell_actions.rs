@@ -64,13 +64,14 @@ pub(crate) fn dispatch_action(state: &AppState, action: &str, abs_path: &Path) -
             tracing::info!(action = "hydrate", file_path = %rel, "shell action queued");
             Ok(true)
         }
-        // Real backends land in their own tickets; validate the wiring now so the
-        // context-menu round-trip is provable before the op exists.
+        // DBSYNC-33: replace the local copy with a `.cloudsc` placeholder,
+        // freeing space. The op removes the index row + writes the placeholder
+        // before deleting, so the local delete never propagates to Dropbox.
         "free_up_space" | "dehydrate" => {
-            let _rel = validate_under_root(state, abs_path)?;
-            Err(AppError::Sync(
-                "free_up_space not yet implemented (DBSYNC-33)".to_string(),
-            ))
+            let rel = validate_under_root(state, abs_path)?;
+            let n = crate::cloudsc_ops::dehydrate_path_internal(state, &rel)?;
+            tracing::info!(action = "free_up_space", path = %rel, count = n, "shell action done");
+            Ok(false) // immediate; nothing to drain
         }
         "copy_link" => {
             let _rel = validate_under_root(state, abs_path)?;
