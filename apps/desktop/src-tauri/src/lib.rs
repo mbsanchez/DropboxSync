@@ -15,6 +15,7 @@ mod path_util;
 mod remote_index;
 mod remote_longpoll;
 mod run_events;
+mod shell_actions;
 mod state;
 mod storage;
 mod sync;
@@ -143,10 +144,18 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            let paths = crate::open_handlers::cloudsc_paths_from_argv(&argv);
-            if !paths.is_empty() {
-                tracing::info!(?paths, "file open on running instance");
-                crate::open_handlers::handle_cloudsc_paths_from_os(app, paths);
+            // A shell-action verb (`--action/--path`) and a `.cloudsc` open are
+            // mutually exclusive invocations — handle the action first and skip
+            // the open path so a `--path <file>.cloudsc` can't double-dispatch.
+            if let Some((action, path)) = crate::shell_actions::parse_action_args(&argv) {
+                tracing::info!(action = %action, path = %path.display(), "shell action on running instance");
+                crate::shell_actions::handle_action_from_os(app, &action, &path);
+            } else {
+                let paths = crate::open_handlers::cloudsc_paths_from_argv(&argv);
+                if !paths.is_empty() {
+                    tracing::info!(?paths, "file open on running instance");
+                    crate::open_handlers::handle_cloudsc_paths_from_os(app, paths);
+                }
             }
             // Do not raise an empty dashboard when the user is fully set up (tray-only
             // workflow). `main` is a tray-click-only flyout now; onboarding surfaces via
@@ -191,10 +200,18 @@ pub fn run() {
             // `RunEvent::Opened` (macOS/iOS only). Handle argv on first launch here.
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
-                let paths = crate::open_handlers::cloudsc_paths_from_current_exe_args();
-                if !paths.is_empty() {
-                    tracing::info!(?paths, "startup file args");
-                    crate::open_handlers::handle_cloudsc_paths_from_os(&app.handle().clone(), paths);
+                // Action verb takes precedence over `.cloudsc` open (mutually
+                // exclusive; prevents a `--path <file>.cloudsc` double-dispatch).
+                let argv: Vec<String> = std::env::args().collect();
+                if let Some((action, path)) = crate::shell_actions::parse_action_args(&argv) {
+                    tracing::info!(action = %action, path = %path.display(), "startup shell action");
+                    crate::shell_actions::handle_action_from_os(&app.handle().clone(), &action, &path);
+                } else {
+                    let paths = crate::open_handlers::cloudsc_paths_from_current_exe_args();
+                    if !paths.is_empty() {
+                        tracing::info!(?paths, "startup file args");
+                        crate::open_handlers::handle_cloudsc_paths_from_os(&app.handle().clone(), paths);
+                    }
                 }
             }
 

@@ -22,6 +22,18 @@ pub enum OverlayTier {
     Syncing,
 }
 
+/// Versioned shell **status contract** (DBSYNC-51): the single source of per-path
+/// sync state read by every native surface — macOS Finder Sync badges, Linux
+/// file-manager emblems, and the Windows status column. Written atomically to
+/// `overlay_state.json` under [`db::app_data_dir`].
+///
+/// Schema (`version = 1`):
+/// - `version`: contract version; bump on a breaking change.
+/// - `updated_at`: RFC3339 timestamp of this snapshot.
+/// - `sync_folder`: absolute sync-root path (so extensions can resolve keys).
+/// - `paths`: map of `/`-relative path (under `sync_folder`) → [`OverlayTier`]
+///   (`synced` | `syncing` | `out_of_sync`). A path absent from the map is
+///   `unknown` (not tracked / outside the root).
 #[derive(Serialize)]
 struct OverlayStateFile {
     version: u32,
