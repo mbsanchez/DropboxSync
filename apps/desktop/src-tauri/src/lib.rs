@@ -15,6 +15,7 @@ mod path_util;
 mod remote_index;
 mod remote_longpoll;
 mod run_events;
+mod sharing;
 mod shell_actions;
 mod state;
 mod storage;
@@ -142,6 +143,16 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .manage(app_state)
         .plugin(tauri_plugin_opener::init());
+
+    // The notification plugin pulls WinRT `windows`-crate imports that make the
+    // lib *test* binary fail to load on Windows (STATUS_ENTRYPOINT_NOT_FOUND — a
+    // known Tauri/windows-rs cargo-test issue; the real app binary is unaffected).
+    // Gating it out of `cfg(test)` lets the linker drop those imports from the
+    // test binary while the shipped app keeps native notifications (DBSYNC-52).
+    #[cfg(not(test))]
+    {
+        builder = builder.plugin(tauri_plugin_notification::init());
+    }
 
     #[cfg(desktop)]
     {

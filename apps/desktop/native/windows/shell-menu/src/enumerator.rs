@@ -13,7 +13,11 @@ use windows::Win32::UI::Shell::{
 use crate::command::{CommandKind, DropboxSyncCommand};
 use crate::OBJECT_COUNT;
 
-const CHILDREN: [CommandKind; 2] = [CommandKind::FreeUpSpace, CommandKind::Hydrate];
+const CHILDREN: [CommandKind; 3] = [
+    CommandKind::FreeUpSpace,
+    CommandKind::Hydrate,
+    CommandKind::CopyLink,
+];
 
 #[implement(IEnumExplorerCommand)]
 pub struct SubCommands {
