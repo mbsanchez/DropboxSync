@@ -22,6 +22,8 @@ pub enum CommandKind {
     FreeUpSpace,
     /// "Synchroniser sur le disque" — hydrate a `.cloudsc` placeholder.
     Hydrate,
+    /// "Copier le lien Dropbox" — copy a shared link for any synced item.
+    CopyLink,
 }
 
 #[implement(IExplorerCommand)]
@@ -51,6 +53,7 @@ impl IExplorerCommand_Impl for DropboxSyncCommand_Impl {
                 CommandKind::Parent => "DropboxSync", // brand — untranslated
                 CommandKind::FreeUpSpace => labels::label_free_up_space(&lang),
                 CommandKind::Hydrate => labels::label_sync_to_disk(&lang),
+                CommandKind::CopyLink => labels::label_copy_link(&lang),
             };
             util::alloc_wide(title)
         })
@@ -78,8 +81,13 @@ impl IExplorerCommand_Impl for DropboxSyncCommand_Impl {
         util::guard(Ok(ECS_HIDDEN.0 as u32), move || {
             let paths = util::collect_paths(items.as_ref());
             let targets = scope::classify(&paths);
+            let under_root = targets.any_free_up_space || targets.any_hydrate;
             let visible = match kind {
-                CommandKind::Parent => targets.any_free_up_space || targets.any_hydrate,
+                CommandKind::Parent => under_root,
+                // Copy-link targets the single-value clipboard, so only offer it for
+                // a single selected item (a multi-select would race N links onto the
+                // clipboard and fire N notifications).
+                CommandKind::CopyLink => under_root && paths.len() == 1,
                 CommandKind::FreeUpSpace => targets.any_free_up_space,
                 CommandKind::Hydrate => targets.any_hydrate,
             };
@@ -94,17 +102,21 @@ impl IExplorerCommand_Impl for DropboxSyncCommand_Impl {
     fn Invoke(&self, items: Ref<'_, IShellItemArray>, _bind_ctx: Ref<'_, IBindCtx>) -> Result<()> {
         let kind = self.kind;
         util::guard(Ok(()), move || {
-            let (action, want): (&str, Target) = match kind {
-                CommandKind::FreeUpSpace => ("free_up_space", Target::FreeUpSpace),
-                CommandKind::Hydrate => ("hydrate", Target::Hydrate),
-                CommandKind::Parent => return Ok(()),
-            };
-            // Only act on the items that actually qualify for this child, so a
-            // mixed selection never dehydrates a `.cloudsc` or hydrates a plain file.
+            // Launch the app once per qualifying item. A mixed selection never
+            // dehydrates a `.cloudsc` or hydrates a plain file; copy-link acts on
+            // any item under the sync root (file/folder, hydrated or `.cloudsc`).
             for path in util::collect_paths(items.as_ref()) {
-                if scope::target_for(&path) == want {
-                    util::launch_app(action, &path);
+                let target = scope::target_for(&path);
+                if target == Target::None {
+                    continue;
                 }
+                let action = match kind {
+                    CommandKind::CopyLink => "copy_link",
+                    CommandKind::FreeUpSpace if target == Target::FreeUpSpace => "free_up_space",
+                    CommandKind::Hydrate if target == Target::Hydrate => "hydrate",
+                    _ => continue, // Parent, or a child that doesn't match this item
+                };
+                util::launch_app(action, &path);
             }
             Ok(())
         })

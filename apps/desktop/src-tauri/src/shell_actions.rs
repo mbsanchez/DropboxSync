@@ -73,11 +73,29 @@ pub(crate) fn dispatch_action(state: &AppState, action: &str, abs_path: &Path) -
             tracing::info!(action = "free_up_space", path = %rel, count = n, "shell action done");
             Ok(false) // immediate; nothing to drain
         }
+        // DBSYNC-52: generate a Dropbox shared link for the item and copy it to the
+        // clipboard. A `.cloudsc` placeholder shares its REMOTE file (`name`), not
+        // `name.cloudsc`. Errors are surfaced non-fatally (logged + a notification).
         "copy_link" => {
-            let _rel = validate_under_root(state, abs_path)?;
-            Err(AppError::Sync(
-                "copy_link not yet implemented (DBSYNC-52)".to_string(),
-            ))
+            let rel = validate_under_root(state, abs_path)?;
+            let remote_rel = crate::sharing::remote_rel_from_item(&rel).to_string();
+            // Generate the link AND copy it as one fallible step, so a clipboard
+            // failure (another app holding the clipboard open) surfaces the same
+            // error notification as a link-generation failure — never silent.
+            let result = crate::sharing::create_or_get_shared_link(state, &remote_rel)
+                .and_then(|url| crate::sharing::copy_to_clipboard(&url));
+            match result {
+                Ok(()) => {
+                    tracing::info!(action = "copy_link", path = %remote_rel, "share link copied to clipboard");
+                    crate::sharing::notify("DropboxSync", "Link copied to clipboard");
+                    Ok(false)
+                }
+                Err(e) => {
+                    tracing::warn!(action = "copy_link", path = %remote_rel, error = %e, "copy link failed");
+                    crate::sharing::notify("DropboxSync", "Couldn't copy the Dropbox link");
+                    Err(e)
+                }
+            }
         }
         other => Err(AppError::Sync(format!("unknown shell action: {other}"))),
     }

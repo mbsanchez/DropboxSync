@@ -42,6 +42,18 @@ pub fn label_free_up_space(lang: &str) -> &'static str {
     }
 }
 
+/// "Copy a Dropbox shared link for this item to the clipboard."
+pub fn label_copy_link(lang: &str) -> &'static str {
+    match lang {
+        "fr" => "Copier le lien Dropbox",
+        "es" => "Copiar enlace de Dropbox",
+        "de" => "Dropbox-Link kopieren",
+        "it" => "Copia link di Dropbox",
+        "pt" => "Copiar link do Dropbox",
+        _ => "Copy Dropbox link",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +66,8 @@ mod tests {
         assert_eq!(label_free_up_space("xx"), "Free up space");
         assert_eq!(label_sync_to_disk("fr"), "Synchroniser sur le disque");
         assert_eq!(label_sync_to_disk("zz"), "Sync to disk");
+        assert_eq!(label_copy_link("fr"), "Copier le lien Dropbox");
+        assert_eq!(label_copy_link("es"), "Copiar enlace de Dropbox");
+        assert_eq!(label_copy_link("xx"), "Copy Dropbox link");
     }
 }
