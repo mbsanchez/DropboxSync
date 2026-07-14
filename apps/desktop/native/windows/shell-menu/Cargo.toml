@@ -1,0 +1,31 @@
+[package]
+name = "dropbox_sync_shell_menu"
+version = "0.1.0"
+edition = "2021"
+description = "DropboxSync Windows Explorer context-menu (IExplorerCommand COM server)"
+publish = false
+
+[lib]
+# In-proc COM server: builds dropbox_sync_shell_menu.dll
+crate-type = ["cdylib"]
+
+[dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+# The `#[implement]` macro expands to `::windows_core::…` paths, so the crate
+# must be present under that name as a direct dependency.
+windows-core = "0.61"
+winreg = "0.55"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true

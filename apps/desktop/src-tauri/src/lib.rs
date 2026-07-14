@@ -22,6 +22,8 @@ mod sync;
 mod sync_pipeline;
 #[cfg(windows)]
 mod windows_file_assoc;
+#[cfg(windows)]
+mod windows_shell_menu;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -193,6 +195,9 @@ pub fn run() {
                         ),
                         Err(e) => tracing::error!(error = %e, "per-user .cloudsc association failed"),
                     }
+                    // DBSYNC-33 Slice 2: hook up the COM context menu when its DLL
+                    // is deployed next to the exe (replaces the legacy flyout).
+                    crate::windows_shell_menu::sync_shell_menu_registration();
                 }
             }
 
