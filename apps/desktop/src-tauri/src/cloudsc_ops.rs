@@ -16,6 +16,7 @@ use crate::models::{
 };
 use crate::path_util::{
     is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
+    should_ignore_local_path,
 };
 use crate::state::AppState;
 
@@ -323,6 +324,102 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
     }
 }
 
+/// Free up space (DBSYNC-33): replace a fully-synced local file — or every synced
+/// file under a folder — with a `.cloudsc` placeholder and delete the local copy.
+///
+/// The local delete must NEVER be propagated as a Dropbox delete. Two independent
+/// guards ensure that: the `local_file_index` row is removed and the `.cloudsc`
+/// is written BEFORE the file is deleted, so (a) the scan/watcher never sees a
+/// *tracked-file* deletion and (b) the DBSYNC-45 `placeholder_exists` guard
+/// suppresses any remote delete. A file with unsynced local changes is refused
+/// (single file) or skipped (folder) so no data is lost.
+pub(crate) fn dehydrate_path_internal(state: &AppState, rel: &str) -> AppResult<usize> {
+    let sync_folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    let root = PathBuf::from(&sync_folder);
+    let abs = safe_join(&root, rel)?;
+
+    let mut created: Vec<String> = Vec::new();
+    if abs.is_dir() {
+        // Recurse: dehydrate every synced file under the folder (keep the tree).
+        for entry in WalkDir::new(&abs).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let file_rel = match entry.path().strip_prefix(&root) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if file_rel.ends_with(".cloudsc") || should_ignore_local_path(&file_rel) {
+                continue;
+            }
+            match dehydrate_one_file(state, &root, &file_rel) {
+                Ok(true) => created.push(file_rel),
+                Ok(false) => {} // not fully synced — left untouched
+                Err(e) => tracing::warn!(path = %file_rel, error = %e, "dehydrate skipped a file"),
+            }
+        }
+    } else if abs.is_file() {
+        if dehydrate_one_file(state, &root, rel)? {
+            created.push(rel.to_string());
+        } else {
+            return Err(AppError::Sync(format!(
+                "cannot free up space: '{rel}' is not fully synced"
+            )));
+        }
+    } else {
+        return Err(AppError::Sync(format!("path not found: {rel}")));
+    }
+
+    let count = created.len();
+    if count > 0 {
+        emit_placeholder_changed(&created, &[]);
+        crate::overlay_state::refresh_overlay_state_internal(state);
+        tracing::info!(count, "dehydrated (freed up space)");
+    }
+    Ok(count)
+}
+
+/// Dehydrate a single file iff it is fully synced (local + remote present and
+/// content matches). Returns `Ok(true)` if dehydrated, `Ok(false)` if not synced
+/// (skipped, untouched). The ORDER of the three mutations is load-bearing.
+fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<bool> {
+    let Some(local) = state.db.get_local_file(rel)? else {
+        return Ok(false);
+    };
+    let Some(remote) = state.db.get_remote_file(rel)? else {
+        return Ok(false);
+    };
+    if local.hash != remote.content_hash {
+        return Ok(false); // unsynced local edit — never lose it
+    }
+
+    let abs = safe_join(root, rel)?;
+    let placeholder_path = {
+        let mut s = abs.clone().into_os_string();
+        s.push(".cloudsc");
+        PathBuf::from(s)
+    };
+    let meta = CloudscMeta {
+        version: 1,
+        tag: "file".to_string(),
+        remote_path_display: normalize_dropbox_path(rel)?,
+    };
+
+    // 1) Write the placeholder first — this activates the DBSYNC-45 dehydration
+    //    guard so a concurrent scan/watcher tick can't remote-delete this path.
+    write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
+    // 2) Untrack the file BEFORE deleting it, so the scan/watcher never sees a
+    //    tracked-file deletion to propagate.
+    state.db.remove_local_file(rel)?;
+    // 3) Delete the local file (frees the disk space).
+    fs::remove_file(&abs)
+        .map_err(|e| AppError::Io(format!("failed removing local file for dehydrate: {e}")))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +442,97 @@ mod tests {
         let rel = relpath_under(&root, &dir).expect("relpath");
         // `normalize_dropbox_path` itself converts OS separators to '/'.
         assert_eq!(normalize_dropbox_path(&rel).unwrap(), "/Cocina/Pizza");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Dehydrate / free up space (DBSYNC-33)
+    // ---------------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    fn build_state(sync_folder: &Path) -> AppState {
+        std::fs::create_dir_all(sync_folder).expect("create sync folder");
+        let dbdir = tempfile::tempdir().expect("db tempdir");
+        let db_path = dbdir.path().join("app.db");
+        std::mem::forget(dbdir);
+        let db = crate::storage::db::Db::new_at(&db_path).expect("db");
+        db.set_sync_folder(&sync_folder.to_string_lossy())
+            .expect("set folder");
+        AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: Arc::new(db),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        }
+    }
+
+    #[test]
+    fn dehydrate_synced_file_creates_placeholder_and_frees_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        std::fs::write(sync.join("a.txt"), b"hello").unwrap();
+        state.db.upsert_local_file("a.txt", "H", 5, 0).unwrap();
+        state.db.upsert_remote_file("a.txt", "H", "rev", 0).unwrap();
+
+        let n = dehydrate_path_internal(&state, "a.txt").unwrap();
+        assert_eq!(n, 1);
+        assert!(!sync.join("a.txt").exists(), "local file should be freed");
+        assert!(sync.join("a.txt.cloudsc").exists(), "placeholder written");
+        assert!(
+            state.db.get_local_file("a.txt").unwrap().is_none(),
+            "index row untracked"
+        );
+    }
+
+    #[test]
+    fn dehydrate_refuses_unsynced_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        std::fs::write(sync.join("b.txt"), b"local edit").unwrap();
+        state.db.upsert_local_file("b.txt", "LOCALHASH", 10, 0).unwrap();
+        // Remote hash differs → the local copy has unsynced changes.
+        state.db.upsert_remote_file("b.txt", "REMOTEHASH", "rev", 0).unwrap();
+
+        let err = dehydrate_path_internal(&state, "b.txt").unwrap_err();
+        assert!(format!("{err}").contains("not fully synced"), "got: {err}");
+        assert!(sync.join("b.txt").exists(), "unsynced file must be kept");
+        assert!(!sync.join("b.txt.cloudsc").exists());
+        assert!(state.db.get_local_file("b.txt").unwrap().is_some());
+    }
+
+    #[test]
+    fn dehydrate_does_not_trigger_remote_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        std::fs::write(sync.join("c.txt"), b"data").unwrap();
+        state.db.upsert_local_file("c.txt", "H", 4, 0).unwrap();
+        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+
+        dehydrate_path_internal(&state, "c.txt").unwrap();
+
+        // The watcher/scan now re-evaluates the (absent) file. It must NOT enqueue
+        // a remote delete (DBSYNC-33 constraint / DBSYNC-45 guard).
+        crate::sync_pipeline::process_changed_paths(&state, &["c.txt".to_string()]).unwrap();
+        let deletes: Vec<String> = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.job_type == "delete")
+            .filter_map(|j| j.target_path)
+            .collect();
+        assert!(
+            deletes.is_empty(),
+            "dehydration must never enqueue a remote delete, got {deletes:?}"
+        );
     }
 }
