@@ -967,6 +967,7 @@ dependencies = [
  "url",
  "urlencoding",
  "walkdir",
+ "windows",
  "windows-sys 0.59.0",
  "winreg",
  "zeroize",
