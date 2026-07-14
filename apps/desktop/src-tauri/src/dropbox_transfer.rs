@@ -15,8 +15,8 @@ use crate::models::{
     UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
-    create_conflicted_copy, hash_file, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
-    relpath_under, safe_join,
+    create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed,
+    normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
 };
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
@@ -801,16 +801,45 @@ pub(crate) fn upload_local_file_internal(
         return Ok(());
     }
 
-    let token = get_access_token(state)?;
     let folder = state
         .db
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
     let local_path = safe_join(Path::new(&folder), relative)?;
-    if !local_path.exists() {
-        return Err(AppError::Sync(format!("local file missing for upload: {relative}")));
+    // Distinguish a genuine absence (NotFound) from a transient stat failure
+    // (permission, Windows sharing-violation, an editor's atomic save mid-rename).
+    // Only a confirmed NotFound is treated as "gone"; anything else is returned as
+    // an error so the job retries — we must NEVER conclude "deleted" from a racy
+    // check (DBSYNC-55; mirrors `sync_pipeline::classify_path`).
+    match std::fs::symlink_metadata(&local_path) {
+        Ok(_) => {} // present — fall through to the upload
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The source vanished before we could upload it — an editor temp file
+            // (`~$doc.docx`) deleted on close, or a file removed right after it was
+            // created. Failing the job surfaces as a stuck "Error" the user can't
+            // clear, so no-op instead. Forget the row only when there is nothing on
+            // Dropbox to reconcile (a temp/ignored path, or a file never uploaded).
+            // If it HAD a remote copy, leave the index row and DO NOT enqueue a
+            // delete here: the guarded deletion-detection path (classify_path +
+            // re-stat) decides whether this was a real deletion to propagate — an
+            // unguarded delete from here could wrongly wipe a live remote file
+            // during an atomic save.
+            tracing::info!(file_path = %relative, "upload cancelled: local file no longer exists");
+            let had_remote = state.db.get_remote_file(relative)?.is_some();
+            if !had_remote || is_ignored_local_path(relative) {
+                state.db.remove_local_file(relative)?;
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(AppError::Io(format!(
+                "failed to stat local file for upload: {e}"
+            )));
+        }
     }
+
+    let token = get_access_token(state)?;
 
     // Skip the upload when Dropbox already holds identical content. This avoids
     // re-uploading files that originated from Dropbox (e.g. after a sync-state

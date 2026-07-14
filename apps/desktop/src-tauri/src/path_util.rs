@@ -32,6 +32,15 @@ pub(crate) fn is_editor_temp_path(relative: &str) -> bool {
         || (name.starts_with(".~lock.") && name.ends_with('#')) // LibreOffice lock
 }
 
+/// Single "never sync this local path" predicate for the whole pipeline: OS junk
+/// ([`should_ignore_local_path`]) plus editor/download temp & lock files
+/// ([`is_editor_temp_path`]). Editor temps must be excluded from the full scan too
+/// — not just the fs watcher — or an `~$doc.docx` the scan sees gets enqueued and
+/// tracked, then fails the upload when the editor deletes it (DBSYNC-55).
+pub(crate) fn is_ignored_local_path(relative: &str) -> bool {
+    should_ignore_local_path(relative) || is_editor_temp_path(relative)
+}
+
 pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
     Ok(absolute
         .strip_prefix(sync_folder)
@@ -257,9 +266,34 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        backoff_seconds, hash_file, normalize_dropbox_path, safe_join, validate_relative,
-        DROPBOX_BLOCK_SIZE,
+        backoff_seconds, hash_file, is_ignored_local_path, normalize_dropbox_path, safe_join,
+        validate_relative, DROPBOX_BLOCK_SIZE,
     };
+
+    #[test]
+    fn ignored_local_path_covers_os_junk_and_editor_temps() {
+        // Editor/office temp & lock files (the DBSYNC-55 fix — must be excluded
+        // from the full scan, not just the fs watcher).
+        for p in [
+            "~$report.docx",
+            "sub/~$sheet.xlsx",
+            "doc.txt.tmp",
+            "~WRD0001.tmp",
+            "a.swp",
+            "video.crdownload",
+            "dl.part",
+            "notes.txt~",
+        ] {
+            assert!(is_ignored_local_path(p), "should ignore {p:?}");
+        }
+        // OS junk still ignored.
+        assert!(is_ignored_local_path(".DS_Store"));
+        assert!(is_ignored_local_path("dir/._resource"));
+        // Real user files are NOT ignored.
+        for p in ["report.docx", "dir/photo.jpg", "notes.txt"] {
+            assert!(!is_ignored_local_path(p), "should not ignore {p:?}");
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // Helper: compute the Dropbox content_hash for an in-memory byte slice so
