@@ -171,4 +171,57 @@ mod tests {
         // A `.cloudsc` double-click passes just the file path, no --action.
         assert_eq!(parse_action_args(&v(&["exe", "C:/sync/a.cloudsc"])), None);
     }
+
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use super::{dispatch_action, validate_under_root};
+    use crate::state::AppState;
+
+    fn build_state_with_sync_folder(folder: &std::path::Path) -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("app.db");
+        std::mem::forget(dir); // keep the DB file alive for the test body
+        let db = crate::storage::db::Db::new_at(&db_path).expect("db");
+        db.set_sync_folder(&folder.to_string_lossy()).expect("set folder");
+        AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: Arc::new(db),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        }
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_action() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_sync_folder(tmp.path());
+        let err = dispatch_action(&state, "bogus_verb", tmp.path()).unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown shell action"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_under_root_accepts_inside_rejects_outside() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let inside = root.path().join("in.txt");
+        std::fs::write(&inside, b"y").unwrap();
+        let out_file = outside.path().join("x.txt");
+        std::fs::write(&out_file, b"x").unwrap();
+
+        let state = build_state_with_sync_folder(root.path());
+        assert_eq!(validate_under_root(&state, &inside).unwrap(), "in.txt");
+        assert!(
+            validate_under_root(&state, &out_file).is_err(),
+            "a path outside the sync root must be rejected"
+        );
+    }
 }
