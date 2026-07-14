@@ -293,6 +293,16 @@ pub fn run() {
                     Err(e) => tracing::error!(error = %e, "failed to recover running jobs"),
                 }
 
+                // Clear phantom "Error" state from editor-temp files a previous
+                // build tracked/failed (DBSYNC-55).
+                match crate::sync_pipeline::cleanup_stale_upload_state(state.inner()) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "cleaned stale editor-temp sync state on startup");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "failed to clean stale upload state"),
+                }
+
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
 
                 if crate::commands::should_show_main_window_for_onboarding(state.inner()) {

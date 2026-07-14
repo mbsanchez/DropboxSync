@@ -12,8 +12,8 @@ use crate::dropbox_transfer::{
 use crate::error::{AppError, AppResult};
 use crate::models::SyncTickResult;
 use crate::path_util::{
-    backoff_seconds, create_conflicted_copy, hash_file, normalize_dropbox_path,
-    should_ignore_local_path,
+    backoff_seconds, create_conflicted_copy, hash_file, is_editor_temp_path, is_ignored_local_path,
+    normalize_dropbox_path, safe_join,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
 use crate::overlay_state;
@@ -209,7 +209,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     for p in paths {
         let rel = p.replace('\\', "/");
         let rel = rel.trim_start_matches('/').to_string();
-        if rel.is_empty() || rel.ends_with(".cloudsc") || should_ignore_local_path(&rel) {
+        if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
             continue;
         }
         if seen.insert(rel.clone()) {
@@ -254,7 +254,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
                         Ok(r) => r.to_string_lossy().replace('\\', "/"),
                         Err(_) => continue,
                     };
-                    if child_rel.ends_with(".cloudsc") || should_ignore_local_path(&child_rel) {
+                    if child_rel.ends_with(".cloudsc") || is_ignored_local_path(&child_rel) {
                         continue;
                     }
                     enqueued += process_local_file_change(
@@ -313,7 +313,7 @@ fn enqueue_targeted_deletions(
         }
         if prev.relative_path.starts_with(&prefix)
             && !prev.relative_path.ends_with(".cloudsc")
-            && !should_ignore_local_path(&prev.relative_path)
+            && !is_ignored_local_path(&prev.relative_path)
         {
             enqueued += process_local_file_deletion(state, tracked_root, &prev.relative_path)?;
         }
@@ -391,7 +391,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         if relative.ends_with(".cloudsc") {
             continue;
         }
-        if should_ignore_local_path(&relative) {
+        if is_ignored_local_path(&relative) {
             continue;
         }
 
@@ -413,7 +413,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
             if prev.relative_path.ends_with(".cloudsc") {
                 continue;
             }
-            if should_ignore_local_path(&prev.relative_path) {
+            if is_ignored_local_path(&prev.relative_path) {
                 continue;
             }
             if !seen_paths.contains(&prev.relative_path) {
@@ -452,7 +452,7 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         if relative.is_empty() {
             continue; // skip the sync root itself
         }
-        if should_ignore_local_path(&relative) {
+        if is_ignored_local_path(&relative) {
             continue;
         }
 
@@ -465,6 +465,13 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
     // of deletions.
     if !walk_had_error {
         for rel in state.db.list_known_folders()? {
+            // Never propagate a "deletion" for an ignored/temp-named folder: it is
+            // skipped by the walk above (so never in `seen_dirs`), and a stale row
+            // from an older build would otherwise trigger a RECURSIVE remote delete
+            // of a folder that still exists (DBSYNC-55).
+            if is_ignored_local_path(&rel) {
+                continue;
+            }
             if !seen_dirs.contains(&rel) {
                 enqueued_jobs += process_known_folder_deletion(state, &tracked_root, &rel)?;
             }
@@ -620,6 +627,61 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     Ok(true)
 }
 
+/// Startup cleanup (DBSYNC-55): forget editor-temp files a previous build tracked,
+/// and resolve failed `upload` jobs whose source is a temp file or no longer
+/// exists, so a phantom "Error" clears without a manual reset. Returns the number
+/// of rows/jobs cleaned.
+pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
+    let mut cleaned = 0usize;
+
+    // 1) Drop tracked editor-temp index rows + known-folder rows — they should
+    //    never have been tracked (and a stale temp-named folder row could trigger a
+    //    recursive remote delete).
+    for row in state.db.list_local_files()? {
+        if is_ignored_local_path(&row.relative_path) {
+            state.db.remove_local_file(&row.relative_path)?;
+            cleaned += 1;
+        }
+    }
+    for folder_rel in state.db.list_known_folders()? {
+        if is_ignored_local_path(&folder_rel) {
+            state.db.remove_known_folder(&folder_rel)?;
+            cleaned += 1;
+        }
+    }
+
+    // 2) Resolve failed upload jobs whose source is a temp file or is gone on disk
+    //    (a genuine failure with an existing, non-temp source is left alone to retry).
+    //    Only trust "missing" when the sync root is actually mounted — otherwise an
+    //    unmounted removable/network drive would look like "everything deleted" and
+    //    we'd wrongly resolve real failures (whose optimistic index rows would then
+    //    never re-detect the un-uploaded edit).
+    let folder = state.db.get_sync_folder()?;
+    let root_mounted = folder
+        .as_deref()
+        .map(|f| Path::new(f).is_dir())
+        .unwrap_or(false);
+    for job in state.db.list_recent_jobs(10_000)? {
+        if job.job_type != "upload" || job.status != "failed" {
+            continue;
+        }
+        let Some(src) = job.source_path.as_deref() else {
+            continue;
+        };
+        let missing = root_mounted
+            && folder
+                .as_deref()
+                .and_then(|f| safe_join(Path::new(f), src).ok())
+                .map(|p| !p.exists())
+                .unwrap_or(false);
+        if is_editor_temp_path(src) || missing {
+            state.db.mark_job_completed(job.id)?;
+            cleaned += 1;
+        }
+    }
+    Ok(cleaned)
+}
+
 pub(crate) fn run_sync_tick_internal(state: &AppState) -> AppResult<SyncTickResult> {
     let enqueued_jobs = scan_local_changes_internal(state)?;
     if enqueued_jobs > 0 {
@@ -672,7 +734,9 @@ mod tests {
     use chrono::{Duration, Utc};
     use tempfile::tempdir;
 
-    use super::{process_changed_paths, run_sync_tick_internal, SYNC_BATCH_CAP};
+    use super::{
+        cleanup_stale_upload_state, process_changed_paths, run_sync_tick_internal, SYNC_BATCH_CAP,
+    };
     use crate::state::AppState;
     use crate::storage::db::Db;
     use crate::storage::secure_store::SecureStore;
@@ -922,5 +986,130 @@ mod tests {
         let n = process_changed_paths(&state, &["a.txt".to_string()]).expect("process");
         assert_eq!(n, 0, "a missing root must never be read as a mass deletion");
         assert!(state.db.list_recent_jobs(50).unwrap().is_empty());
+    }
+
+    // ---- DBSYNC-55: editor-temp / vanished-source handling ----
+
+    fn delete_jobs(state: &AppState) -> Vec<String> {
+        state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.job_type == "delete")
+            .filter_map(|j| j.target_path)
+            .collect()
+    }
+
+    #[test]
+    fn upload_of_a_vanished_source_is_a_noop_not_a_failure() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // Tracked but never on remote (e.g. an editor temp) and gone from disk.
+        state.db.upsert_local_file("~$doc.docx", "h", 1, 0).unwrap();
+
+        // No token / network needed: the missing-file branch returns before auth.
+        crate::dropbox_transfer::upload_local_file_internal(&state, "~$doc.docx", 1)
+            .expect("vanished upload must not error");
+
+        assert!(
+            state.db.get_local_file("~$doc.docx").unwrap().is_none(),
+            "the vanished file is forgotten"
+        );
+        assert!(
+            delete_jobs(&state).is_empty(),
+            "nothing on remote → no delete propagated"
+        );
+    }
+
+    #[test]
+    fn upload_of_a_vanished_synced_file_defers_to_the_guarded_deletion_path() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // A real synced file (present on remote) whose upload source is absent.
+        state.db.upsert_local_file("report.docx", "h2", 1, 0).unwrap();
+        state.db.upsert_remote_file("report.docx", "h1", "rev", 0).unwrap();
+
+        crate::dropbox_transfer::upload_local_file_internal(&state, "report.docx", 1)
+            .expect("must not error");
+
+        // MUST NOT enqueue a remote delete from this racy check (that could wipe a
+        // live file during an atomic save). The index row is left so the guarded
+        // deletion-detection path (classify_path NotFound-only + re-stat) decides.
+        assert!(
+            delete_jobs(&state).is_empty(),
+            "no remote delete may be enqueued from the upload path"
+        );
+        assert!(
+            state.db.get_local_file("report.docx").unwrap().is_some(),
+            "the index row is kept for the guarded deletion path"
+        );
+    }
+
+    #[test]
+    fn scan_never_recursively_deletes_a_temp_named_folder() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // A stale known-folder row from an older build whose leaf matches a temp
+        // pattern, no longer present in the (empty) sync dir → must NOT be deleted.
+        state.db.upsert_known_folder("backup.tmp").unwrap();
+
+        run_sync_tick_internal(&state).expect("tick");
+
+        let deletes: Vec<String> = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.job_type == "delete")
+            .filter_map(|j| j.target_path)
+            .collect();
+        assert!(
+            deletes.is_empty(),
+            "a temp-named folder must never trigger a recursive remote delete, got {deletes:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_clears_editor_temp_rows_and_phantom_failed_jobs() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let sync = tmp.path().join("synced");
+
+        // A tracked editor-temp row that should never have existed.
+        state.db.upsert_local_file("~$doc.docx", "h", 1, 0).unwrap();
+        // Three failed upload jobs: a temp file, a missing regular file, and a real
+        // one that still exists on disk (a genuine failure — must be left alone).
+        std::fs::write(sync.join("real.txt"), b"x").unwrap();
+        for src in ["~$doc.docx", "gone.txt", "real.txt"] {
+            state.db.enqueue_job("upload", Some(src), Some(src)).unwrap();
+            let id = state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.source_path.as_deref() == Some(src))
+                .unwrap()
+                .id;
+            state.db.mark_job_failed(id, 5, Some("boom")).unwrap();
+        }
+
+        let cleaned = cleanup_stale_upload_state(&state).expect("cleanup");
+        assert_eq!(cleaned, 3, "temp row + temp job + missing-source job");
+
+        assert!(state.db.get_local_file("~$doc.docx").unwrap().is_none());
+        let failed: Vec<String> = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.status == "failed")
+            .filter_map(|j| j.source_path)
+            .collect();
+        assert_eq!(
+            failed,
+            vec!["real.txt".to_string()],
+            "a genuine failure with an existing, non-temp source is kept"
+        );
     }
 }
