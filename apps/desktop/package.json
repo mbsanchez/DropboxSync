@@ -14,6 +14,7 @@
     "dev:mac": "npm run bundle:dev && open src-tauri/target/release/bundle/macos/DropboxSyncDesktop.app",
     "dev:win": "npm run bundle:win && node scripts/run-windows-release.mjs",
     "build:finder-sync": "bash native/macos/FinderSyncExtension/build-appex.sh",
+    "build:shell-menu": "node scripts/build-shell-menu.mjs",
     "tauri:before-build": "node scripts/tauri-before-build.mjs"
   },
   "dependencies": {

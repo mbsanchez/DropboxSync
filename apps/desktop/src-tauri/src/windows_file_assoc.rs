@@ -10,7 +10,7 @@ use winreg::enums::*;
 use winreg::RegKey;
 
 /// ProgID for HKCU classes; distinct from any machine-wide installer ProgID.
-const PROG_ID: &str = "DropboxSyncDesktop.CloudscPortable.1";
+pub(crate) const PROG_ID: &str = "DropboxSyncDesktop.CloudscPortable.1";
 
 /// Registers `.cloudsc` to launch the current executable with `"%1"`.
 pub fn register_user_cloudsc_association() -> io::Result<()> {
@@ -50,7 +50,7 @@ fn register_user_cloudsc_association_for_exe(exe: &Path) -> io::Result<()> {
 
 /// Sub-menu ProgID that holds the cascading "DropboxSync" children (referenced by
 /// the parent verb's `ExtendedSubCommandsKey`).
-const CLOUDSC_MENU_PROG_ID: &str = "DropboxSyncDesktop.CloudscMenu";
+pub(crate) const CLOUDSC_MENU_PROG_ID: &str = "DropboxSyncDesktop.CloudscMenu";
 
 /// DBSYNC-51 (Slice 2): a cascading **"DropboxSync"** context-menu on `.cloudsc`
 /// whose children invoke the running app over the shell-action channel
