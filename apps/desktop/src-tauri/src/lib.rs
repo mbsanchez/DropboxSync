@@ -1,5 +1,7 @@
 mod auth;
 mod auth_session;
+#[cfg(windows)]
+mod cloud_filter;
 mod cloudsc;
 mod cloudsc_ops;
 mod commands;
