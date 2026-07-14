@@ -15,7 +15,7 @@ use crate::models::{
     CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
 };
 use crate::path_util::{
-    is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
+    hash_file, is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
     should_ignore_local_path,
 };
 use crate::state::AppState;
@@ -386,17 +386,24 @@ pub(crate) fn dehydrate_path_internal(state: &AppState, rel: &str) -> AppResult<
 /// content matches). Returns `Ok(true)` if dehydrated, `Ok(false)` if not synced
 /// (skipped, untouched). The ORDER of the three mutations is load-bearing.
 fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<bool> {
-    let Some(local) = state.db.get_local_file(rel)? else {
+    // Must be a tracked file with a known remote copy.
+    if state.db.get_local_file(rel)?.is_none() {
         return Ok(false);
-    };
+    }
     let Some(remote) = state.db.get_remote_file(rel)? else {
         return Ok(false);
     };
-    if local.hash != remote.content_hash {
-        return Ok(false); // unsynced local edit — never lose it
-    }
 
     let abs = safe_join(root, rel)?;
+    // AUTHORITATIVE freshness check: hash the ACTUAL on-disk bytes now, not the
+    // (possibly stale) index row. A file edited but not yet re-indexed by the
+    // watcher/scan must NOT be dehydrated — deleting it would permanently lose
+    // the edit (index-freshness TOCTOU). Only proceed if disk == last-synced remote.
+    let (on_disk_hash, _size, _mtime) = hash_file(&abs)?;
+    if on_disk_hash != remote.content_hash {
+        return Ok(false); // unsynced (or index-stale) local edit — keep the file
+    }
+
     let placeholder_path = {
         let mut s = abs.clone().into_os_string();
         s.push(".cloudsc");
@@ -478,8 +485,9 @@ mod tests {
         let sync = tmp.path().join("synced");
         let state = build_state(&sync);
         std::fs::write(sync.join("a.txt"), b"hello").unwrap();
-        state.db.upsert_local_file("a.txt", "H", 5, 0).unwrap();
-        state.db.upsert_remote_file("a.txt", "H", "rev", 0).unwrap();
+        let (h, _, _) = hash_file(&sync.join("a.txt")).unwrap();
+        state.db.upsert_local_file("a.txt", &h, 5, 0).unwrap();
+        state.db.upsert_remote_file("a.txt", &h, "rev", 0).unwrap();
 
         let n = dehydrate_path_internal(&state, "a.txt").unwrap();
         assert_eq!(n, 1);
@@ -509,13 +517,32 @@ mod tests {
     }
 
     #[test]
+    fn dehydrate_refuses_when_disk_differs_from_remote_despite_stale_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        // The index CLAIMS synced (local hash == remote hash), but the on-disk
+        // bytes were edited after the last index (watcher hasn't caught up). The
+        // authoritative re-hash must catch this and refuse — never lose the edit.
+        std::fs::write(sync.join("d.txt"), b"edited after the last index update").unwrap();
+        state.db.upsert_local_file("d.txt", "STALE_SYNCED", 5, 0).unwrap();
+        state.db.upsert_remote_file("d.txt", "STALE_SYNCED", "rev", 0).unwrap();
+
+        let err = dehydrate_path_internal(&state, "d.txt").unwrap_err();
+        assert!(format!("{err}").contains("not fully synced"), "got: {err}");
+        assert!(sync.join("d.txt").exists(), "the edited file must be kept");
+        assert!(!sync.join("d.txt.cloudsc").exists());
+    }
+
+    #[test]
     fn dehydrate_does_not_trigger_remote_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let sync = tmp.path().join("synced");
         let state = build_state(&sync);
         std::fs::write(sync.join("c.txt"), b"data").unwrap();
-        state.db.upsert_local_file("c.txt", "H", 4, 0).unwrap();
-        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        let (h, _, _) = hash_file(&sync.join("c.txt")).unwrap();
+        state.db.upsert_local_file("c.txt", &h, 4, 0).unwrap();
+        state.db.upsert_remote_file("c.txt", &h, "rev", 0).unwrap();
 
         dehydrate_path_internal(&state, "c.txt").unwrap();
 
