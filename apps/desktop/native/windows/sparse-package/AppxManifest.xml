@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparse (external-location) package that grants the unpackaged DropboxSync exe a
+  package IDENTITY, so the app can call WinRT StorageProviderSyncRootManager.Register
+  (Cloud Files API sync root / Explorer status column, DBSYNC-57) without hitting
+  APPMODEL_ERROR_NO_PACKAGE. Per-user, no admin at install (the code-signing cert
+  must be trusted once — see build-and-install.ps1).
+
+  `Publisher` MUST match the signing certificate subject exactly. `Executable` is
+  found in the external location passed to Add-AppxPackage -ExternalLocation (the
+  app's install dir; for dev, target/release with dropbox_sync_desktop.exe).
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 rescap">
+
+  <Identity
+    Name="DropboxSyncDesktop"
+    Publisher="CN=DropboxSync Dev"
+    Version="1.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>DropboxSync</DisplayName>
+    <PublisherDisplayName>DropboxSync</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application
+      Id="DropboxSyncDesktop"
+      Executable="dropbox_sync_desktop.exe"
+      uap10:TrustLevel="mediumIL"
+      uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements
+        DisplayName="DropboxSync"
+        Description="Self-hosted Dropbox-like desktop sync client"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+</Package>
