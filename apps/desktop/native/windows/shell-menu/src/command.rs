@@ -57,8 +57,11 @@ impl IExplorerCommand_Impl for DropboxSyncCommand_Impl {
     }
 
     fn GetIcon(&self, _items: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
-        // No custom icon (optional in the contract); a follow-up may add branding.
-        Err(E_NOTIMPL.into())
+        // The app's own icon (`<exe>,0`) on the parent and both children.
+        util::guard(Err(E_NOTIMPL.into()), || match util::app_icon_spec() {
+            Some(spec) => util::alloc_wide(&spec),
+            None => Err(E_NOTIMPL.into()),
+        })
     }
 
     fn GetToolTip(&self, _items: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
