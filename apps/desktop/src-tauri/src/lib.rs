@@ -15,6 +15,7 @@ mod path_util;
 mod remote_index;
 mod remote_longpoll;
 mod run_events;
+mod shell_actions;
 mod state;
 mod storage;
 mod sync;
@@ -148,6 +149,11 @@ pub fn run() {
                 tracing::info!(?paths, "file open on running instance");
                 crate::open_handlers::handle_cloudsc_paths_from_os(app, paths);
             }
+            // DBSYNC-51: shell action verb (`--action/--path`) on the running instance.
+            if let Some((action, path)) = crate::shell_actions::parse_action_args(&argv) {
+                tracing::info!(action = %action, path = %path.display(), "shell action on running instance");
+                crate::shell_actions::handle_action_from_os(app, &action, &path);
+            }
             // Do not raise an empty dashboard when the user is fully set up (tray-only
             // workflow). `main` is a tray-click-only flyout now; onboarding surfaces via
             // the `setup` window instead.
@@ -195,6 +201,12 @@ pub fn run() {
                 if !paths.is_empty() {
                     tracing::info!(?paths, "startup file args");
                     crate::open_handlers::handle_cloudsc_paths_from_os(&app.handle().clone(), paths);
+                }
+                // DBSYNC-51: a `--action/--path` verb invoked at cold start.
+                let argv: Vec<String> = std::env::args().collect();
+                if let Some((action, path)) = crate::shell_actions::parse_action_args(&argv) {
+                    tracing::info!(action = %action, path = %path.display(), "startup shell action");
+                    crate::shell_actions::handle_action_from_os(&app.handle().clone(), &action, &path);
                 }
             }
 
