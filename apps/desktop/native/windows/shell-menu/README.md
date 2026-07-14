@@ -16,7 +16,10 @@ DBSYNC-33; the actions themselves are handled by the running app
 ## How it works
 
 - One CLSID `{FBF4F890-5407-47BF-BE25-F5B2595FA839}` registered per-user (HKCU,
-  no admin) on `*` (all files, incl. `.cloudsc`) and `Directory` (folders).
+  no admin) on `AllFilesystemObjects` (files, folders and drives) as an
+  `IExplorerCommand` verb with a `command`/`DelegateExecute` subkey +
+  `MultiSelectModel` — required for the verb to surface on Windows 11 (a bare
+  `ExplorerCommandHandler` is culled and never appears).
 - Per-item visibility is decided in `IExplorerCommand::GetState` by reading the
   app's `overlay_state.json` (`%LOCALAPPDATA%\DropboxSyncDesktop\`) for the sync
   root and checking the item's extension. The sync root is cached and only

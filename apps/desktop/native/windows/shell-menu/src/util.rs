@@ -92,6 +92,13 @@ pub fn current_module_path() -> PathBuf {
     }
 }
 
+/// Icon spec (`"<exe>,0"`) for the menu items — the app's own embedded icon.
+/// `None` if the exe can't be resolved.
+pub fn app_icon_spec() -> Option<String> {
+    let exe = crate::registry::resolve_app_exe(&current_module_path())?;
+    Some(format!("{},0", exe.to_string_lossy()))
+}
+
 /// Launch the app with the shell-action args. The exe is resolved from the value
 /// the app wrote at registration; falls back to an exe sitting next to the DLL.
 ///

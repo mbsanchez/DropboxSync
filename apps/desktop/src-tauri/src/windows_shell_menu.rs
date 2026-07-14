@@ -26,8 +26,10 @@ const CLSID_STR: &str = "{FBF4F890-5407-47BF-BE25-F5B2595FA839}";
 const DLL_NAME: &str = "dropbox_sync_shell_menu.dll";
 /// `shell\<verb>` subkey carrying `ExplorerCommandHandler`.
 const VERB: &str = "DropboxSync";
-/// Classes the handler attaches to: all files (incl. `.cloudsc`) and folders.
-const TARGET_CLASSES: [&str; 2] = ["*", "Directory"];
+/// Class the verb attaches to: all files, folders and drives. On Win11 the verb
+/// only surfaces with a `command` subkey + `MultiSelectModel` (a bare
+/// `ExplorerCommandHandler` is culled by the shell).
+const TARGET_CLASS: &str = "AllFilesystemObjects";
 /// App-written config the DLL reads to find the exe to launch.
 const SHELLEXT_KEY: &str = r"Software\DropboxSyncDesktop\ShellExt";
 
@@ -50,8 +52,8 @@ pub fn sync_shell_menu_registration() {
 
     match register_com_handler(&dll, &exe) {
         Ok(()) => {
-            // COM handler now serves `.cloudsc` via `*`; drop the legacy flyout
-            // so those files don't get a duplicate "DropboxSync" menu.
+            // COM handler now serves `.cloudsc` via AllFilesystemObjects; drop the
+            // legacy flyout so those files don't get a duplicate "DropboxSync" menu.
             remove_legacy_flyout();
             tracing::info!(dll = %dll.display(), "registered COM shell context menu (HKCU)");
         }
@@ -75,12 +77,19 @@ fn register_com_handler(dll: &Path, exe: &Path) -> io::Result<()> {
     inproc.set_value("", &dll.to_string_lossy().as_ref())?;
     inproc.set_value("ThreadingModel", &"Apartment")?;
 
-    // 2) Handler hookup on each target class.
-    for class in TARGET_CLASSES {
-        let (k, _) = hkcu.create_subkey(format!(r"Software\Classes\{class}\shell\{VERB}"))?;
-        k.set_value("MUIVerb", &"DropboxSync")?;
-        k.set_value("ExplorerCommandHandler", &CLSID_STR)?;
-    }
+    // 2) The context-menu verb on AllFilesystemObjects, with the app's icon.
+    let icon = format!("{},0", exe.to_string_lossy());
+    let (k, _) = hkcu.create_subkey(format!(r"Software\Classes\{TARGET_CLASS}\shell\{VERB}"))?;
+    k.set_value("MUIVerb", &"DropboxSync")?;
+    k.set_value("MultiSelectModel", &"Player")?;
+    k.set_value("Icon", &icon)?;
+    k.set_value("ExplorerCommandHandler", &CLSID_STR)?;
+    // `command` subkey is required for the verb to appear on Win11; the parent
+    // never executes directly (it has subcommands), so DelegateExecute is inert.
+    let (cmd, _) =
+        hkcu.create_subkey(format!(r"Software\Classes\{TARGET_CLASS}\shell\{VERB}\command"))?;
+    cmd.set_value("", &"")?;
+    cmd.set_value("DelegateExecute", &CLSID_STR)?;
 
     // 3) Record the exe the DLL should launch, and the DLL path.
     let (cfg, _) = hkcu.create_subkey(SHELLEXT_KEY)?;
