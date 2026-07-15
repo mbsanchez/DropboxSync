@@ -24,11 +24,12 @@ use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, Tra
 use crate::command::{CommandKind, DropboxSyncCommand};
 use crate::{LOCK_COUNT, OBJECT_COUNT};
 
-/// Verb CLSIDs — each MUST match a `desktop3:Verb Clsid` + `com:Class Id` in the
-/// sparse-package manifest. NEVER change once shipped.
-pub const CLSID_FREE_UP_SPACE: GUID = GUID::from_u128(0x7C3A1E44_9B2D_4F6A_A1E7_2D9C8B5F0A31);
-pub const CLSID_HYDRATE: GUID = GUID::from_u128(0x7C3A1E44_9B2D_4F6A_A1E7_2D9C8B5F0A32);
-pub const CLSID_COPY_LINK: GUID = GUID::from_u128(0x7C3A1E44_9B2D_4F6A_A1E7_2D9C8B5F0A33);
+/// The single CloudFiles verb CLSID — a "DropboxSync" PARENT flyout that holds the
+/// three child verbs (Libérer / Synchroniser / Copier le lien) via `EnumSubCommands`.
+/// One top-level verb (vs three) means the shell shows OUR flyout with OUR icon
+/// (`GetIcon`), not the icon-less auto-grouped app-attribution flyout. MUST match a
+/// `desktop3:Verb Clsid` + `com:Class Id` in the manifest. NEVER change once shipped.
+pub const CLSID_MENU_PARENT: GUID = GUID::from_u128(0x7C3A1E44_9B2D_4F6A_A1E7_2D9C8B5F0A31);
 
 /// The four Shell handler CLSIDs the CloudFiles schema requires before
 /// `CloudFilesContextMenus`. We serve them so the extension is "complete", but our
@@ -91,13 +92,9 @@ impl IClassFactory_Impl for LeafFactory_Impl {
 /// Register all verb + handler class factories and pump the STA message loop. The
 /// process stays alive as a reusable COM server.
 pub fn run_cloudfiles_exe_server() -> Result<()> {
-    // (CLSID, kind) for the three branded verbs. Handlers reuse FreeUpSpace (their
-    // kind is irrelevant — they are skipped via E_NOINTERFACE).
-    let mut registrations: Vec<(GUID, CommandKind)> = vec![
-        (CLSID_FREE_UP_SPACE, CommandKind::FreeUpSpace),
-        (CLSID_HYDRATE, CommandKind::Hydrate),
-        (CLSID_COPY_LINK, CommandKind::CopyLink),
-    ];
+    // One "DropboxSync" parent verb (its EnumSubCommands yields the three children) +
+    // the four inert handlers (kind irrelevant — skipped via E_NOINTERFACE).
+    let mut registrations: Vec<(GUID, CommandKind)> = vec![(CLSID_MENU_PARENT, CommandKind::Parent)];
     for h in CLSID_HANDLERS {
         registrations.push((h, CommandKind::FreeUpSpace));
     }
