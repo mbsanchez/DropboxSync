@@ -6,7 +6,7 @@ import { useSyncDashboard } from "../hooks/useSyncDashboard";
 import { useTransferProgress } from "../hooks/useTransferProgress";
 import { usePlaceholderEvents } from "../hooks/usePlaceholderEvents";
 import { formatBytes, formatSpeed } from "../format";
-import type { ActiveTransfer, ActivityEntry, SyncJob } from "../types";
+import type { ActiveTransfer, ActivityEntry, SyncConflict, SyncJob } from "../types";
 import "./FlyoutApp.css";
 
 type Section = "home" | "folders" | "activity";
@@ -284,9 +284,24 @@ function buildActivityFeed(jobs: SyncJob[], activity: ActivityEntry[]): Activity
 function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
   const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
-  const { status, jobs, conflicts, retryFailedJobs } = useSyncDashboard(pushLog);
+  const { status, jobs, conflicts, retryFailedJobs, resolveConflict } = useSyncDashboard(pushLog);
   const { activeTransfer } = useTransferProgress();
   usePlaceholderEvents(pushLog);
+
+  // DBSYNC-35: apply a conflict decision. "Utiliser distant" on a remote-deleted
+  // conflict discards the local file for good, so it gets a double-confirm.
+  const onResolveConflict = (
+    conflict: SyncConflict,
+    action: "keep_local" | "use_remote" | "keep_both",
+  ) => {
+    if (action === "use_remote" && conflict.remoteDeleted) {
+      const ok = window.confirm(
+        `Le distant a été supprimé. « Utiliser distant » supprimera définitivement le fichier local « ${conflict.localPath} ». Continuer ?`,
+      );
+      if (!ok) return;
+    }
+    void resolveConflict(conflict.id, action);
+  };
 
   const [section, setSection] = useState<Section>("home");
   const schedulerStartedRef = useRef(false);
@@ -457,11 +472,36 @@ function FlyoutApp() {
             <ul className="flyout-list compact">
               {conflicts.length === 0 && <li className="muted">No conflicts.</li>}
               {conflicts.map((conflict) => (
-                <li key={conflict.id} className="activity-row">
+                <li key={conflict.id} className="activity-row conflict-row">
                   <EventIcon kind="conflict" />
                   <div className="activity-row-body">
                     <div className="row-main">{conflict.localPath}</div>
                     <div className="row-sub error">{conflict.reason}</div>
+                    <div className="conflict-actions">
+                      <button
+                        type="button"
+                        className="conflict-btn"
+                        onClick={() => onResolveConflict(conflict, "keep_local")}
+                      >
+                        Garder local
+                      </button>
+                      <button
+                        type="button"
+                        className={`conflict-btn${conflict.remoteDeleted ? " danger" : ""}`}
+                        onClick={() => onResolveConflict(conflict, "use_remote")}
+                      >
+                        {conflict.remoteDeleted ? "Supprimer local" : "Utiliser distant"}
+                      </button>
+                      {!conflict.remoteDeleted && (
+                        <button
+                          type="button"
+                          className="conflict-btn"
+                          onClick={() => onResolveConflict(conflict, "keep_both")}
+                        >
+                          Garder les deux
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </li>
               ))}

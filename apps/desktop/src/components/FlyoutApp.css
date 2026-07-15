@@ -257,6 +257,40 @@ html, body, #root {
   color: var(--flyout-error);
 }
 
+/* DBSYNC-35: conflict resolution actions */
+.conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.conflict-btn {
+  background: var(--flyout-panel);
+  color: var(--flyout-text);
+  border: 1px solid var(--flyout-border);
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.conflict-btn:hover {
+  border-color: var(--flyout-accent);
+  color: var(--flyout-accent);
+}
+
+.conflict-btn.danger {
+  color: var(--flyout-error);
+  border-color: var(--flyout-error-soft);
+}
+
+.conflict-btn.danger:hover {
+  border-color: var(--flyout-error);
+  color: var(--flyout-error);
+}
+
 .flyout-footer {
   flex: 0 0 auto;
   display: flex;

@@ -124,6 +124,16 @@ pub(crate) fn notify(title: &str, body: &str) {
 #[cfg(test)]
 pub(crate) fn notify(_title: &str, _body: &str) {}
 
+/// OS notification for a newly detected sync conflict (DBSYNC-35). Delegates to
+/// `notify`, so it is fire-and-forget and a no-op in tests / before the app handle
+/// exists. Conflict creation is de-duplicated at each call site, so this never spams.
+pub(crate) fn notify_conflict(rel: &str) {
+    notify(
+        "DropboxSync",
+        &format!("Sync conflict on {rel} — open the app to resolve it"),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::remote_rel_from_item;

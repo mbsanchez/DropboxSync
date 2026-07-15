@@ -40,6 +40,22 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
     }
   }, [pushLog, refreshDashboard]);
 
+  // DBSYNC-35: apply the user's conflict decision (keep_local / use_remote / keep_both).
+  // Optimistically drop the row so it disappears immediately, then reconcile from the DB.
+  const resolveConflict = useCallback(
+    async (id: number, action: "keep_local" | "use_remote" | "keep_both") => {
+      setConflicts((prev) => prev.filter((c) => c.id !== id));
+      try {
+        await invoke("resolve_conflict", { id, action });
+        pushLog(`Conflict ${id} resolved (${action}).`);
+      } catch (error) {
+        pushLog(`Resolve conflict error: ${String(error)}`);
+      }
+      await refreshDashboard();
+    },
+    [pushLog, refreshDashboard],
+  );
+
   useEffect(() => {
     void refreshDashboard();
   }, [refreshDashboard]);
@@ -123,5 +139,5 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
     prevSyncRunningRef.current = status.syncRunning;
   }, [status.syncRunning, status.lastError, status.lastScanAt, refreshDashboard, pushLog]);
 
-  return { status, jobs, conflicts, refreshDashboard, retryFailedJobs };
+  return { status, jobs, conflicts, refreshDashboard, retryFailedJobs, resolveConflict };
 }

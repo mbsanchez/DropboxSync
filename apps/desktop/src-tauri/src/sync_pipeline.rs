@@ -119,6 +119,8 @@ fn process_local_file_change(
                     relative,
                     relative,
                     "concurrent local update while job pending",
+                    Some(&conflicted_rel),
+                    false,
                 )?;
                 state
                     .db
@@ -129,6 +131,7 @@ fn process_local_file_change(
                 if let Ok(mut engine) = state.sync_engine.lock() {
                     engine.record_conflict();
                 }
+                crate::sharing::notify_conflict(relative);
                 Ok(1)
             } else {
                 state.db.enqueue_job("upload", Some(relative), Some(relative))?;
@@ -758,6 +761,130 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
     Ok(cleaned)
 }
 
+/// User's choice for resolving a conflict (DBSYNC-35). Parsed from the IPC string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConflictAction {
+    KeepLocal,
+    UseRemote,
+    KeepBoth,
+}
+
+impl ConflictAction {
+    pub(crate) fn parse(s: &str) -> AppResult<Self> {
+        match s {
+            "keep_local" => Ok(Self::KeepLocal),
+            "use_remote" => Ok(Self::UseRemote),
+            "keep_both" => Ok(Self::KeepBoth),
+            other => Err(AppError::Sync(format!("unknown conflict action: {other}"))),
+        }
+    }
+}
+
+/// Resolve one conflict per the user's choice (DBSYNC-35). Acts on the copies the
+/// auto-resolver already produced, so no version is ever the only casualty — except
+/// `UseRemote` in the remote-deleted scenario, which the UI double-confirms.
+///
+/// Data-safety: local deletions untrack the index row BEFORE removing the file
+/// (mirrors dehydrate) so a racing scan never reads the removal as a tracked-file
+/// deletion and propagates a spurious Dropbox delete. Remote mutations go through
+/// the job queue (retries + the dehydration-suppression guard). A double click is a
+/// no-op — `get_unresolved_conflict` returns `None` once the row is resolved.
+pub(crate) fn resolve_conflict_internal(
+    state: &AppState,
+    id: i64,
+    action: ConflictAction,
+) -> AppResult<()> {
+    let Some(conflict) = state.db.get_unresolved_conflict(id)? else {
+        return Ok(());
+    };
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    let root = Path::new(&folder);
+    let primary_rel = conflict.local_path.as_str();
+    let copy_rel = conflict.conflicted_copy_path.as_deref();
+
+    match (action, copy_rel, conflict.remote_deleted) {
+        // ── Keep Local ──────────────────────────────────────────────────────────
+        // Promote the preserved local edit (the conflicted copy) over the primary and
+        // push it to Dropbox, then drop the now-redundant copy from the remote.
+        (ConflictAction::KeepLocal, Some(copy_rel), _) => {
+            let copy_abs = safe_join(root, copy_rel)?;
+            let primary_abs = safe_join(root, primary_rel)?;
+            if copy_abs.exists() {
+                std::fs::rename(&copy_abs, &primary_abs)
+                    .map_err(|e| AppError::Io(format!("failed promoting conflicted copy: {e}")))?;
+                state.db.remove_local_file(copy_rel)?;
+            }
+            state
+                .db
+                .enqueue_job("upload", Some(primary_rel), Some(primary_rel))?;
+            if state.db.get_remote_file(copy_rel)?.is_some() {
+                state.db.enqueue_job("delete", Some(copy_rel), Some(copy_rel))?;
+            }
+        }
+        // No copy (remote-deleted scenario): the local primary IS the version to keep
+        // — re-upload it to restore the remote.
+        (ConflictAction::KeepLocal, None, _) => {
+            state
+                .db
+                .enqueue_job("upload", Some(primary_rel), Some(primary_rel))?;
+        }
+
+        // ── Use Remote ──────────────────────────────────────────────────────────
+        // Copy exists → the primary already holds the remote content; discard the
+        // preserved local edit (delete the copy locally, and remotely if uploaded).
+        (ConflictAction::UseRemote, Some(copy_rel), _) => {
+            let copy_abs = safe_join(root, copy_rel)?;
+            state.db.remove_local_file(copy_rel)?; // untrack before delete
+            if copy_abs.exists() {
+                std::fs::remove_file(&copy_abs)
+                    .map_err(|e| AppError::Io(format!("failed removing conflicted copy: {e}")))?;
+            }
+            if state.db.get_remote_file(copy_rel)?.is_some() {
+                state.db.enqueue_job("delete", Some(copy_rel), Some(copy_rel))?;
+            }
+        }
+        // Remote was deleted and there is no copy: "follow remote" means discarding the
+        // diverged local file. The UI double-confirms this destructive choice.
+        (ConflictAction::UseRemote, None, true) => {
+            let primary_abs = safe_join(root, primary_rel)?;
+            state.db.remove_local_file(primary_rel)?; // untrack before delete
+            state.db.remove_remote_file(primary_rel)?;
+            if primary_abs.exists() {
+                std::fs::remove_file(&primary_abs)
+                    .map_err(|e| AppError::Io(format!("failed removing local file: {e}")))?;
+            }
+        }
+        // Remote present, no copy: the primary already equals the remote — nothing to
+        // discard.
+        (ConflictAction::UseRemote, None, false) => {}
+
+        // ── Keep Both ───────────────────────────────────────────────────────────
+        // Copy exists: both versions live on disk; upload the copy so both reach
+        // Dropbox promptly (the scan would eventually do this anyway).
+        (ConflictAction::KeepBoth, Some(copy_rel), _) => {
+            if safe_join(root, copy_rel)?.exists() {
+                state.db.enqueue_job("upload", Some(copy_rel), Some(copy_rel))?;
+            }
+        }
+        // Remote deleted, no copy: there is no second version to keep — restore the
+        // remote from the local primary (degenerates to Keep Local).
+        (ConflictAction::KeepBoth, None, true) => {
+            state
+                .db
+                .enqueue_job("upload", Some(primary_rel), Some(primary_rel))?;
+        }
+        (ConflictAction::KeepBoth, None, false) => {}
+    }
+
+    state.db.mark_conflict_resolved(id)?;
+    // Recompute error/overlay state so the resolved path stops being flagged.
+    refresh_queue_depth_internal(state)?;
+    Ok(())
+}
+
 pub(crate) fn run_sync_tick_internal(state: &AppState) -> AppResult<SyncTickResult> {
     let enqueued_jobs = scan_local_changes_internal(state)?;
     if enqueued_jobs > 0 {
@@ -811,7 +938,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        cleanup_stale_upload_state, process_changed_paths, run_sync_tick_internal, SYNC_BATCH_CAP,
+        cleanup_stale_upload_state, process_changed_paths, resolve_conflict_internal,
+        run_sync_tick_internal, ConflictAction, SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
     use crate::storage::db::Db;
@@ -1205,5 +1333,166 @@ mod tests {
             vec!["real.txt".to_string()],
             "a genuine failure with an existing, non-temp source is kept"
         );
+    }
+
+    // ── DBSYNC-35: conflict resolution ──────────────────────────────────────
+
+    /// Writes `content` to `<sync_folder>/<rel>` and returns the absolute path.
+    fn write_synced(state: &AppState, rel: &str, content: &str) -> std::path::PathBuf {
+        let folder = state.db.get_sync_folder().unwrap().unwrap();
+        let abs = std::path::Path::new(&folder).join(rel);
+        if let Some(p) = abs.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&abs, content).unwrap();
+        abs
+    }
+
+    fn first_conflict_id(state: &AppState) -> i64 {
+        state.db.list_recent_conflicts(1).unwrap()[0].id
+    }
+
+    fn unresolved_count(state: &AppState) -> usize {
+        state.db.list_recent_conflicts(100).unwrap().len()
+    }
+
+    const COPY_REL: &str = "doc (conflicted copy 20260101000000).txt";
+
+    #[test]
+    fn keep_local_promotes_copy_over_primary_and_uploads() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        let primary = write_synced(&state, "doc.txt", "REMOTE");
+        let copy = write_synced(&state, COPY_REL, "LOCAL_EDIT");
+        state
+            .db
+            .add_conflict("doc.txt", "doc.txt", "r", Some(COPY_REL), false)
+            .unwrap();
+
+        resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::KeepLocal)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&primary).unwrap(),
+            "LOCAL_EDIT",
+            "the local edit must win at the primary path"
+        );
+        assert!(!copy.exists(), "the conflicted copy is consumed by the promotion");
+        assert_eq!(job_targets(&state, "upload"), vec!["doc.txt".to_string()]);
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "copy was never on the remote → no remote delete"
+        );
+        assert_eq!(unresolved_count(&state), 0, "conflict must be marked resolved");
+    }
+
+    #[test]
+    fn keep_local_deletes_remote_copy_when_it_was_uploaded() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        write_synced(&state, "doc.txt", "REMOTE");
+        write_synced(&state, COPY_REL, "LOCAL_EDIT");
+        state.db.upsert_remote_file(COPY_REL, "h", "rev1", 1).unwrap();
+        state
+            .db
+            .add_conflict("doc.txt", "doc.txt", "r", Some(COPY_REL), false)
+            .unwrap();
+
+        resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::KeepLocal)
+            .unwrap();
+
+        assert_eq!(
+            job_targets(&state, "delete"),
+            vec![COPY_REL.to_string()],
+            "a copy that reached Dropbox must be cleaned up remotely"
+        );
+    }
+
+    #[test]
+    fn use_remote_discards_local_copy_keeps_primary() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let primary = write_synced(&state, "doc.txt", "REMOTE");
+        let copy = write_synced(&state, COPY_REL, "LOCAL_EDIT");
+        state
+            .db
+            .add_conflict("doc.txt", "doc.txt", "r", Some(COPY_REL), false)
+            .unwrap();
+
+        resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::UseRemote)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&primary).unwrap(),
+            "REMOTE",
+            "the remote-content primary is preserved untouched"
+        );
+        assert!(!copy.exists(), "the discarded local copy is deleted");
+        assert_eq!(unresolved_count(&state), 0);
+    }
+
+    #[test]
+    fn use_remote_when_remote_deleted_discards_local_primary() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let primary = write_synced(&state, "doc.txt", "LOCAL_ONLY");
+        // Simulate the file having been tracked locally before the remote delete.
+        state.db.upsert_local_file("doc.txt", "h", 10, 1).unwrap();
+        state
+            .db
+            .add_conflict("doc.txt", "doc.txt", "r", None, true)
+            .unwrap();
+
+        resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::UseRemote)
+            .unwrap();
+
+        assert!(!primary.exists(), "following the deleted remote removes the local file");
+        assert!(
+            state.db.get_local_file("doc.txt").unwrap().is_none(),
+            "the local index row must be untracked so the scan sees no tracked-file deletion"
+        );
+        assert_eq!(unresolved_count(&state), 0);
+    }
+
+    #[test]
+    fn keep_both_keeps_files_and_uploads_the_copy() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let primary = write_synced(&state, "doc.txt", "REMOTE");
+        let copy = write_synced(&state, COPY_REL, "LOCAL_EDIT");
+        state
+            .db
+            .add_conflict("doc.txt", "doc.txt", "r", Some(COPY_REL), false)
+            .unwrap();
+
+        resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::KeepBoth)
+            .unwrap();
+
+        assert!(primary.exists() && copy.exists(), "both versions are kept on disk");
+        assert_eq!(
+            job_targets(&state, "upload"),
+            vec![COPY_REL.to_string()],
+            "the preserved copy is pushed to Dropbox so both versions sync"
+        );
+        assert_eq!(unresolved_count(&state), 0);
+    }
+
+    #[test]
+    fn resolving_twice_is_a_safe_no_op() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        write_synced(&state, "doc.txt", "LOCAL_ONLY");
+        state
+            .db
+            .add_conflict("doc.txt", "doc.txt", "r", None, false)
+            .unwrap();
+        let id = first_conflict_id(&state);
+
+        resolve_conflict_internal(&state, id, ConflictAction::KeepLocal).unwrap();
+        // Second call finds no unresolved row → returns Ok without touching anything.
+        resolve_conflict_internal(&state, id, ConflictAction::UseRemote).unwrap();
+
+        assert_eq!(unresolved_count(&state), 0);
     }
 }

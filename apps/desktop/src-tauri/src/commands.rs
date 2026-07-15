@@ -400,6 +400,20 @@ pub fn retry_failed_jobs(state: tauri::State<AppState>) -> Result<usize, String>
     Ok(requeued)
 }
 
+/// Resolve a sync conflict with the user's choice (DBSYNC-35): `keep_local`,
+/// `use_remote`, or `keep_both`. See `resolve_conflict_internal` for the per-scenario
+/// semantics and data-safety guarantees.
+#[tauri::command]
+pub fn resolve_conflict(
+    state: tauri::State<AppState>,
+    id: i64,
+    action: String,
+) -> Result<(), String> {
+    let action = crate::sync_pipeline::ConflictAction::parse(&action)?;
+    crate::sync_pipeline::resolve_conflict_internal(state.inner(), id, action)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn scan_local_changes(state: tauri::State<AppState>) -> Result<usize, String> {
     scan_local_changes_internal(state.inner()).map_err(String::from)
