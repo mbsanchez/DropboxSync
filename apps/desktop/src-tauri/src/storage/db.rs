@@ -400,11 +400,20 @@ impl Db {
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        // DBSYNC-31: ON CONFLICT against the partial-unique index — if an ACTIVE job for
+        // this (job_type, target_path) already exists, collapse into it (refresh, don't
+        // duplicate) instead of piling up a second row. We deliberately do NOT reset its
+        // status/attempt_count — a `running` or backing-off `retry_wait` job keeps its
+        // lifecycle; the existing job re-reads the current file state when it runs. Rows
+        // with a NULL target_path (e.g. hydrate_cloudsc) aren't covered by the partial
+        // index (NULLs are distinct) and insert normally, matching prior behaviour.
         conn
             .execute(
                 "
                 INSERT INTO sync_jobs(job_type, source_path, target_path, status, attempt_count, next_retry_at, created_at, updated_at)
                 VALUES(?1, ?2, ?3, 'queued', 0, NULL, ?4, ?4)
+                ON CONFLICT(job_type, target_path) WHERE status IN ('queued','retry_wait','running')
+                DO UPDATE SET source_path=excluded.source_path, updated_at=excluded.updated_at
                 ",
                 params![job_type, source_path, target_path, now],
             )
@@ -423,6 +432,33 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Distinct `target_path` + `source_path` of every ACTIVE job (`queued`,
+    /// `retry_wait`, `running`). DBSYNC-31: replaces the `list_recent_jobs(N)`-based
+    /// dedup, which silently missed jobs once the table exceeded N rows. Backed by the
+    /// `idx_sync_jobs_status_retry` index. Used to avoid enqueuing duplicate work and to
+    /// route a change that races a still-pending job to a conflicted copy.
+    pub fn active_job_paths(&self) -> AppResult<std::collections::HashSet<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT target_path FROM sync_jobs
+              WHERE status IN ('queued','retry_wait','running') AND target_path IS NOT NULL AND target_path <> ''
+            UNION
+            SELECT source_path FROM sync_jobs
+              WHERE status IN ('queued','retry_wait','running') AND source_path IS NOT NULL AND source_path <> ''
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
     }
 
     pub fn list_recent_jobs(&self, limit: i64) -> AppResult<Vec<SyncJobRow>> {
@@ -791,10 +827,10 @@ fn migrate(conn: &Connection) -> AppResult<()> {
 
         CREATE TABLE IF NOT EXISTS sync_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_type TEXT NOT NULL,
+            job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
             source_path TEXT,
             target_path TEXT,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
             attempt_count INTEGER NOT NULL DEFAULT 0,
             next_retry_at TEXT,
             created_at TEXT NOT NULL,
@@ -866,6 +902,97 @@ fn migrate(conn: &Connection) -> AppResult<()> {
             [],
         )?;
     }
+
+    // DBSYNC-31 (AC4): CHECK constraints on sync_jobs(job_type, status). SQLite can't
+    // ALTER ... ADD CONSTRAINT, so rebuild the table once. Fresh DBs already get the
+    // CHECKs from the CREATE TABLE above; a pre-existing table (whose stored SQL has no
+    // CHECK) is rebuilt here. Guarded + idempotent. Any row with an out-of-set value
+    // (shouldn't exist — both columns are code-controlled) is dropped rather than
+    // aborting the copy. Runs BEFORE the index creation below so the indexes land on the
+    // rebuilt table. Job rows are transient (re-derived by the scan), so this is safe.
+    let sync_jobs_has_check = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_jobs'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|sql| sql.contains("CHECK"))
+        .unwrap_or(true);
+    if !sync_jobs_has_check {
+        conn.execute_batch(
+            "
+            CREATE TABLE sync_jobs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
+                source_path TEXT,
+                target_path TEXT,
+                status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_error TEXT,
+                upload_session_id TEXT,
+                upload_session_offset INTEGER,
+                upload_session_file_len INTEGER,
+                upload_session_file_mtime INTEGER
+            );
+            INSERT INTO sync_jobs_new
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at,
+                       created_at, updated_at, last_error, upload_session_id, upload_session_offset,
+                       upload_session_file_len, upload_session_file_mtime
+                FROM sync_jobs
+                WHERE status IN ('queued','running','retry_wait','done','failed')
+                  AND job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc');
+            DROP TABLE sync_jobs;
+            ALTER TABLE sync_jobs_new RENAME TO sync_jobs;
+            ",
+        )?;
+    }
+
+    // DBSYNC-31: indexes for the hot job/conflict queries (previously full scans) and a
+    // partial-unique guard so a path can never have two ACTIVE jobs of the same type.
+    //
+    // `sync_jobs(status, next_retry_at)` serves the drain query (WHERE status='queued'
+    // OR (status='retry_wait' AND next_retry_at<=?)) and the active-job lookups.
+    // `sync_conflicts(resolved)` serves the unresolved-conflict query.
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_sync_jobs_status_retry ON sync_jobs(status, next_retry_at);
+        CREATE INDEX IF NOT EXISTS idx_sync_conflicts_resolved ON sync_conflicts(resolved);
+        ",
+    )?;
+
+    // Dedup existing ACTIVE jobs before adding the unique index (a pre-existing
+    // duplicate would make CREATE UNIQUE INDEX fail). Keep the lowest id per
+    // (job_type, target_path); NULL target_path jobs (e.g. hydrate_cloudsc) are left
+    // untouched — NULLs are distinct in a SQLite unique index, so they never conflict.
+    conn.execute(
+        "
+        DELETE FROM sync_jobs
+        WHERE status IN ('queued','retry_wait','running')
+          AND target_path IS NOT NULL
+          AND id NOT IN (
+              SELECT MIN(id) FROM sync_jobs
+              WHERE status IN ('queued','retry_wait','running') AND target_path IS NOT NULL
+              GROUP BY job_type, target_path
+          )
+        ",
+        [],
+    )?;
+
+    // Only ONE active job per (job_type, target_path); DONE/failed history is exempt
+    // (partial index), so `enqueue_job`'s ON CONFLICT collapses re-enqueues of the same
+    // pending work instead of piling up duplicates.
+    conn.execute(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_jobs_active_unique
+          ON sync_jobs(job_type, target_path)
+          WHERE status IN ('queued','retry_wait','running')
+        ",
+        [],
+    )?;
+
     Ok(())
 }
 
@@ -1091,6 +1218,56 @@ mod tests {
         assert_eq!(active, 1);
         assert_eq!(files[0].relative_path, "a.txt");
         assert_eq!(jobs[0].status, "queued");
+    }
+
+    #[test]
+    fn enqueue_dedups_active_jobs_but_not_history() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        // DBSYNC-31: two enqueues of the same (job_type, target_path) collapse into ONE
+        // active job (partial-unique index + ON CONFLICT), instead of two rows.
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        assert_eq!(db.count_active_jobs().unwrap(), 1, "duplicate active upload collapsed");
+
+        // A different job_type for the same path is a distinct active job.
+        db.enqueue_job("delete", Some("a.txt"), Some("a.txt")).unwrap();
+        assert_eq!(db.count_active_jobs().unwrap(), 2);
+
+        // active_job_paths reports the path (used for dedup / conflict routing).
+        assert!(db.active_job_paths().unwrap().contains("a.txt"));
+
+        // DONE jobs are exempt from the partial index: completing the upload lets a fresh
+        // upload for the same path be enqueued (history is preserved, not overwritten).
+        let upload_id = db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload")
+            .unwrap()
+            .id;
+        db.mark_job_completed(upload_id).unwrap();
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        let uploads = db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.job_type == "upload")
+            .count();
+        assert_eq!(uploads, 2, "a new active upload coexists with the completed one");
+    }
+
+    #[test]
+    fn check_constraint_rejects_invalid_job_type() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        // DBSYNC-31 AC4: the CHECK constraint rejects an unknown job_type at the DB layer.
+        assert!(
+            db.enqueue_job("bogus_type", Some("a.txt"), Some("a.txt")).is_err(),
+            "an out-of-set job_type must be rejected"
+        );
+        // A valid job_type still enqueues.
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        assert_eq!(db.count_active_jobs().unwrap(), 1);
     }
 
     #[test]

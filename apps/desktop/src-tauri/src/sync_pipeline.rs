@@ -244,12 +244,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         .iter()
         .map(|f| (f.relative_path.clone(), f.clone()))
         .collect();
-    let existing_jobs = state.db.list_recent_jobs(200)?;
-    let mut pending_targets: HashSet<String> = existing_jobs
-        .iter()
-        .filter(|j| j.status == "queued" || j.status == "retry_wait" || j.status == "running")
-        .filter_map(|j| j.target_path.clone())
-        .collect();
+    // DBSYNC-31: indexed active-job query instead of scanning list_recent_jobs(200)
+    // (which silently missed pending jobs once the table grew past the limit).
+    let mut pending_targets: HashSet<String> = state.db.active_job_paths()?;
 
     // Normalize + dedupe the incoming paths, dropping placeholders/ignored ones.
     let mut rels: Vec<String> = Vec::new();
@@ -383,12 +380,8 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
     let known = state.db.list_local_files()?;
-    let existing_jobs = state.db.list_recent_jobs(200)?;
-    let pending_targets: HashSet<String> = existing_jobs
-        .iter()
-        .filter(|j| j.status == "queued" || j.status == "retry_wait" || j.status == "running")
-        .filter_map(|j| j.target_path.clone())
-        .collect();
+    // DBSYNC-31: indexed active-job query instead of scanning list_recent_jobs(200).
+    let pending_targets: HashSet<String> = state.db.active_job_paths()?;
 
     let tracked_root = PathBuf::from(&folder);
 
