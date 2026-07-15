@@ -6,8 +6,14 @@ description = "DropboxSync Windows Explorer context-menu (IExplorerCommand COM s
 publish = false
 
 [lib]
-# In-proc COM server: builds dropbox_sync_shell_menu.dll
-crate-type = ["cdylib"]
+# In-proc COM server (dropbox_sync_shell_menu.dll) + rlib so the ExeServer bin can
+# reuse the IExplorerCommand implementation (DBSYNC-62).
+crate-type = ["cdylib", "rlib"]
+
+# DBSYNC-62: out-of-process CloudFilesContextMenus COM ExeServer.
+[[bin]]
+name = "dropbox_sync_cloudmenu"
+path = "src/exeserver_main.rs"
 
 [dependencies]
 windows = { version = "0.61", features = [
@@ -16,6 +22,7 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # The `#[implement]` macro expands to `::windows_core::…` paths, so the crate
 # must be present under that name as a direct dependency.

@@ -763,7 +763,11 @@ fn registered_folder() -> Option<String> {
 
 /// Bump when the sync-root registration policy changes (e.g. enabling dehydration)
 /// so an existing install re-registers once to apply it. NEVER lower it.
-const REG_POLICY_VERSION: u32 = 2;
+/// v3 (DBSYNC-62): re-register with package identity so WinRT populates the sync
+/// root's `AUMID`, linking it to the package that declares the branded
+/// CloudFilesContextMenus verbs (a pre-identity registration lacked it). The
+/// re-register's placeholder eviction is suppressed by the DBSYNC-63 grace guard.
+const REG_POLICY_VERSION: u32 = 3;
 const POLICY_VERSION_KEY: &str = "Software\\DropboxSyncDesktop\\SyncRoot";
 
 /// The registration policy version this machine last registered with (HKCU, our

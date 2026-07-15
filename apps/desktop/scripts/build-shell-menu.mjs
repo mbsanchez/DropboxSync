@@ -48,6 +48,24 @@ try {
 }
 
 console.log(`Copied ${dllName} -> ${destDll}`);
+
+// DBSYNC-62: also stage the out-of-proc CloudFilesContextMenus COM ExeServer, which
+// the sparse-package manifest declares (com:ExeServer Executable). It must sit at the
+// external location alongside the app exe so packaged COM activation can find it.
+const cmdExe = "dropbox_sync_cloudmenu.exe";
+const builtExe = path.join(crateDir, "target", "release", cmdExe);
+if (fs.existsSync(builtExe)) {
+  try {
+    fs.copyFileSync(builtExe, path.join(destDir, cmdExe));
+    console.log(`Copied ${cmdExe} -> ${path.join(destDir, cmdExe)}`);
+  } catch (err) {
+    console.error(`Failed to copy ${cmdExe}: ${err.message}`);
+    process.exit(1);
+  }
+} else {
+  console.error(`Build produced no ExeServer at ${builtExe}`);
+  process.exit(1);
+}
 console.log(
   "Start the app (npm run dev:win) to register it, then restart Explorer to load the menu.",
 );
