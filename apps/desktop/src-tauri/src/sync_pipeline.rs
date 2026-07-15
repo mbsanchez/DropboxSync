@@ -729,6 +729,32 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
             cleaned += 1;
         }
     }
+
+    // 3) Resolve failed `hydrate_cloudsc` jobs whose `.cloudsc` placeholder (in
+    //    `source_path`) no longer exists — the file was already hydrated, or (after
+    //    the DBSYNC-59 transition) converted to a native CfAPI placeholder, so the
+    //    old `.cloudsc` is gone and this job can only ever re-fail. Left un-resolved
+    //    it keeps `latest_failed_error` set and pins the tray to Error (DBSYNC-32).
+    //    Same `root_mounted` guard: never treat a placeholder as "gone" on an
+    //    unmounted drive. No filesystem/remote mutation — only the job row changes.
+    for job in state.db.list_recent_jobs(10_000)? {
+        if job.job_type != "hydrate_cloudsc" || job.status != "failed" {
+            continue;
+        }
+        let Some(src) = job.source_path.as_deref() else {
+            continue;
+        };
+        let missing = root_mounted
+            && folder
+                .as_deref()
+                .and_then(|f| safe_join(Path::new(f), src).ok())
+                .map(|p| !p.exists())
+                .unwrap_or(false);
+        if missing {
+            state.db.mark_job_completed(job.id)?;
+            cleaned += 1;
+        }
+    }
     Ok(cleaned)
 }
 

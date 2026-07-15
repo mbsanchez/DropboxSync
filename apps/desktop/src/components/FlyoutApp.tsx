@@ -328,6 +328,17 @@ function FlyoutApp() {
     }
   };
 
+  // DBSYNC-32: "Sync Now" — kick off an immediate sync tick (non-blocking; the
+  // backend CAS-guards against overlapping runs and refreshes the tray state).
+  const syncNow = async () => {
+    try {
+      const accepted = await invoke<{ accepted: boolean }>("trigger_sync_tick");
+      pushLog(accepted?.accepted ? "Sync requested." : "Sync already running.");
+    } catch (e) {
+      pushLog(`Failed to trigger sync: ${String(e)}`);
+    }
+  };
+
   const handleNavClick = (item: Section) => {
     setSection(item);
     if (item === "folders") {
@@ -380,6 +391,15 @@ function FlyoutApp() {
             </button>
           ))}
         </div>
+        <button
+          type="button"
+          className="flyout-settings"
+          onClick={() => void syncNow()}
+          disabled={status.syncRunning}
+          title="Synchroniser maintenant"
+        >
+          <span className="glyph">{"🔄"}</span>
+        </button>
         <button type="button" className="flyout-settings" onClick={openSettings} title="Settings / Reconnect">
           <span className="glyph">{"⚙️"}</span>
         </button>

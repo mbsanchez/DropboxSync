@@ -252,9 +252,27 @@ pub(crate) fn current_tray_status_label(state: &AppState) -> String {
     "Idle".to_string()
 }
 
+/// Reflect the current sync state in BOTH the tray tooltip and the tray ICON
+/// (DBSYNC-32). Idle keeps the template-tinted brand icon; Syncing/Error swap to the
+/// colored cloud status icons (`icon_as_template(false)` so macOS doesn't flatten
+/// their colour to a menu-bar silhouette). Called at every `sync_running`/error
+/// transition via [`refresh_tray_tooltip`], so the icon tracks state live.
 pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, label: &str) {
-    if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_tooltip(Some(format!("DropboxSyncDesktop - {label}")));
+    let Some(tray) = app.tray_by_id("main") else {
+        return;
+    };
+    let _ = tray.set_tooltip(Some(format!("DropboxSyncDesktop - {label}")));
+
+    // Same blue brand icon in every state — only the inner glyph changes (check /
+    // sync-arrows / exclamation). `icon_as_template(false)` keeps the blue on macOS.
+    let bytes: &[u8] = match label {
+        "Syncing" => include_bytes!("icons/tray-sync.png"),
+        "Error" => include_bytes!("icons/tray-error.png"),
+        _ => include_bytes!("icons/tray-idle.png"),
+    };
+    if let Ok(img) = tauri::image::Image::from_bytes(bytes) {
+        let _ = tray.set_icon(Some(img));
+        let _ = tray.set_icon_as_template(false);
     }
 }
 
