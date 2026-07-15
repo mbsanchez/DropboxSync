@@ -827,10 +827,10 @@ fn migrate(conn: &Connection) -> AppResult<()> {
 
         CREATE TABLE IF NOT EXISTS sync_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_type TEXT NOT NULL,
+            job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
             source_path TEXT,
             target_path TEXT,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
             attempt_count INTEGER NOT NULL DEFAULT 0,
             next_retry_at TEXT,
             created_at TEXT NOT NULL,
@@ -900,6 +900,53 @@ fn migrate(conn: &Connection) -> AppResult<()> {
                  WHERE instr(relative_path, char(92)) > 0"
             ),
             [],
+        )?;
+    }
+
+    // DBSYNC-31 (AC4): CHECK constraints on sync_jobs(job_type, status). SQLite can't
+    // ALTER ... ADD CONSTRAINT, so rebuild the table once. Fresh DBs already get the
+    // CHECKs from the CREATE TABLE above; a pre-existing table (whose stored SQL has no
+    // CHECK) is rebuilt here. Guarded + idempotent. Any row with an out-of-set value
+    // (shouldn't exist — both columns are code-controlled) is dropped rather than
+    // aborting the copy. Runs BEFORE the index creation below so the indexes land on the
+    // rebuilt table. Job rows are transient (re-derived by the scan), so this is safe.
+    let sync_jobs_has_check = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_jobs'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|sql| sql.contains("CHECK"))
+        .unwrap_or(true);
+    if !sync_jobs_has_check {
+        conn.execute_batch(
+            "
+            CREATE TABLE sync_jobs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
+                source_path TEXT,
+                target_path TEXT,
+                status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_error TEXT,
+                upload_session_id TEXT,
+                upload_session_offset INTEGER,
+                upload_session_file_len INTEGER,
+                upload_session_file_mtime INTEGER
+            );
+            INSERT INTO sync_jobs_new
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at,
+                       created_at, updated_at, last_error, upload_session_id, upload_session_offset,
+                       upload_session_file_len, upload_session_file_mtime
+                FROM sync_jobs
+                WHERE status IN ('queued','running','retry_wait','done','failed')
+                  AND job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc');
+            DROP TABLE sync_jobs;
+            ALTER TABLE sync_jobs_new RENAME TO sync_jobs;
+            ",
         )?;
     }
 
@@ -1208,6 +1255,19 @@ mod tests {
             .filter(|j| j.job_type == "upload")
             .count();
         assert_eq!(uploads, 2, "a new active upload coexists with the completed one");
+    }
+
+    #[test]
+    fn check_constraint_rejects_invalid_job_type() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        // DBSYNC-31 AC4: the CHECK constraint rejects an unknown job_type at the DB layer.
+        assert!(
+            db.enqueue_job("bogus_type", Some("a.txt"), Some("a.txt")).is_err(),
+            "an out-of-set job_type must be rejected"
+        );
+        // A valid job_type still enqueues.
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        assert_eq!(db.count_active_jobs().unwrap(), 1);
     }
 
     #[test]
