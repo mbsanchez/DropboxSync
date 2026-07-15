@@ -15,12 +15,14 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
   IgnorableNamespaces="uap uap10 rescap">
 
   <Identity
     Name="DropboxSyncDesktop"
     Publisher="CN=DropboxSync Dev"
-    Version="1.0.0.0"
+    Version="1.1.0.0"
     ProcessorArchitecture="x64" />
 
   <Properties>
@@ -50,6 +52,35 @@
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png" />
+      <!-- DBSYNC-62: branded cloud context-menu verb in the Win11 compact menu, now
+           that the sync root is AUMID-linked to this package. -->
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer Executable="dropbox_sync_cloudmenu.exe" DisplayName="DropboxSync">
+              <com:Class Id="7C3A1E44-9B2D-4F6A-A1E7-2D9C8B5F0A31" />
+              <com:Class Id="20000000-0000-0000-0000-000000000001" />
+              <com:Class Id="20000000-0000-0000-0000-000000000002" />
+              <com:Class Id="20000000-0000-0000-0000-000000000003" />
+              <com:Class Id="20000000-0000-0000-0000-000000000004" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+        <desktop3:Extension Category="windows.cloudFiles">
+          <desktop3:CloudFiles IconResource="Assets\Square44x44Logo.png">
+            <!-- The SDK schema requires these four handlers before CloudFilesContextMenus.
+                 Served by cloudmenu.exe but only implementing IExplorerCommand, so the
+                 shell's QI for the handler interface fails and it skips them (harmless). -->
+            <desktop3:CustomStateHandler Clsid="20000000-0000-0000-0000-000000000001"/>
+            <desktop3:ThumbnailProviderHandler Clsid="20000000-0000-0000-0000-000000000002"/>
+            <desktop3:ExtendedPropertyHandler Clsid="20000000-0000-0000-0000-000000000003"/>
+            <desktop3:BannersHandler Clsid="20000000-0000-0000-0000-000000000004"/>
+            <desktop3:CloudFilesContextMenus>
+              <desktop3:Verb Id="DropboxSyncMenu" Clsid="7C3A1E44-9B2D-4F6A-A1E7-2D9C8B5F0A31" />
+            </desktop3:CloudFilesContextMenus>
+          </desktop3:CloudFiles>
+        </desktop3:Extension>
+      </Extensions>
     </Application>
   </Applications>
 

@@ -27,6 +27,7 @@ use windows::Win32::System::Com::IClassFactory;
 
 mod command;
 mod enumerator;
+pub mod exeserver; // DBSYNC-62: out-of-proc CloudFilesContextMenus ExeServer
 mod factory;
 mod labels;
 mod registry;
