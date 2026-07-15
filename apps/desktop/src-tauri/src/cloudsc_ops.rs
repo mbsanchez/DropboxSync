@@ -283,6 +283,92 @@ fn create_remote_only_placeholder(
     true
 }
 
+/// Near-instant materialization of a newly-appeared remote FILE as a native CfAPI
+/// dehydrated placeholder (Windows, when active), driven by the longpoll delta so it
+/// shows locally within seconds instead of waiting for the 5-min indexer (DBSYNC-59).
+/// No-op unless: placeholders are active, selective sync includes the path, the file
+/// isn't already represented locally (real file / placeholder / `.cloudsc`), and the
+/// parent is a real local directory (a not-yet-materialized folder surfaces the file
+/// when it is indexed/expanded). `reconcile_remote_present` has already recorded the
+/// remote row; this adds the placeholder + local row.
+#[cfg(windows)]
+pub(crate) fn materialize_remote_only_file_if_absent(
+    state: &AppState,
+    rel: &str,
+    path_display: &str,
+    content_hash: &str,
+    rev: &str,
+    size: i64,
+    modified_ts: i64,
+) {
+    if content_hash.is_empty() || rev.is_empty() {
+        return;
+    }
+    let Ok(Some(folder)) = state.db.get_sync_folder() else {
+        return;
+    };
+    if !crate::cloud_filter::placeholders_active(&folder) {
+        return;
+    }
+    let include = parse_prefix_csv(state.db.get_include_prefixes_csv().unwrap_or_default());
+    let exclude = parse_prefix_csv(state.db.get_exclude_prefixes_csv().unwrap_or_default());
+    if !is_path_allowed(rel, &include, &exclude) {
+        return;
+    }
+    let root = Path::new(&folder);
+    let Ok(abs) = safe_join(root, rel) else {
+        return;
+    };
+    // Already represented locally (real file, placeholder, or `.cloudsc`) → nothing to do.
+    if abs.exists() || with_cloudsc_suffix(&abs).exists() {
+        return;
+    }
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return;
+    };
+    if !parent.is_dir() {
+        return; // parent folder not materialized yet — the indexer handles it
+    }
+    let name = name.to_string_lossy().to_string();
+    if create_remote_only_placeholder(
+        state,
+        parent,
+        &name,
+        rel,
+        path_display,
+        content_hash,
+        rev,
+        size,
+        modified_ts,
+    ) {
+        emit_placeholder_changed(&[name], &[]);
+    }
+}
+
+/// Near-instant local prune for a remotely-deleted FILE (Windows), driven by the
+/// longpoll delta. A native CfAPI placeholder is removed by `reconcile_remote_absent`
+/// (its `local_delete` job); this additionally removes a legacy `<rel>.cloudsc`
+/// sidecar so it disappears within seconds instead of waiting for the 5-min prune
+/// (DBSYNC-59). No-op if no `.cloudsc` sidecar exists.
+#[cfg(windows)]
+pub(crate) fn prune_cloudsc_sidecar_for(state: &AppState, rel: &str) {
+    let Ok(Some(folder)) = state.db.get_sync_folder() else {
+        return;
+    };
+    let root = Path::new(&folder);
+    let Ok(abs) = safe_join(root, rel) else {
+        return;
+    };
+    let cloudsc = with_cloudsc_suffix(&abs);
+    if cloudsc.exists() && fs::remove_file(&cloudsc).is_ok() {
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel.to_string());
+        emit_placeholder_changed(&[], &[name]);
+    }
+}
+
 /// Emits a single `placeholder-changed` event summarising the `.cloudsc`
 /// placeholders created/removed during one index sweep, so the flyout Activité
 /// feed can show them (DBSYNC-45). No-ops when nothing changed or no `AppHandle`

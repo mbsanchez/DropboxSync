@@ -441,11 +441,32 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
                 DeltaAction::Upsert(rel, meta) => {
                     if !rel.ends_with(".cloudsc") && !pending_targets.contains(&rel) {
                         enqueued += reconcile_remote_present(state, &rel, &meta)?;
+                        // DBSYNC-59: surface a newly-appeared remote file as a native
+                        // placeholder within seconds (targeted — just this file) instead
+                        // of waiting for the 5-min indexer.
+                        #[cfg(windows)]
+                        {
+                            let path_display = entry.path_display.clone().unwrap_or_default();
+                            crate::cloudsc_ops::materialize_remote_only_file_if_absent(
+                                state,
+                                &rel,
+                                &path_display,
+                                &meta.content_hash,
+                                &meta.rev,
+                                entry.size.unwrap_or(0),
+                                meta.modified_ts,
+                            );
+                        }
                     }
                 }
                 DeltaAction::Remove(rel) => {
                     if !rel.ends_with(".cloudsc") && !pending_targets.contains(&rel) {
                         enqueued += reconcile_remote_absent(state, &rel)?;
+                        // DBSYNC-59: purge a legacy `.cloudsc` sidecar for the removed
+                        // file now (CfAPI placeholders are removed by the local_delete
+                        // job above) instead of waiting for the 5-min prune.
+                        #[cfg(windows)]
+                        crate::cloudsc_ops::prune_cloudsc_sidecar_for(state, &rel);
                     }
                 }
                 DeltaAction::Ignore => {}
