@@ -132,6 +132,11 @@ fn refresh_overlay_state_inner(state: &AppState) -> AppResult<()> {
             .map(|(rel, tier)| (rel.as_str(), *tier == OverlayTier::Synced))
             .collect();
         crate::cloud_filter::sync_placeholder_states(payload.sync_folder.as_deref(), &items);
+        // DBSYNC-59: give real directories a placeholder identity too, so their status
+        // column shows the aggregate (cloud when all children are online-only) instead
+        // of a perpetual "syncing" glyph. Files are placeholders; folders were plain dirs.
+        let folder_rels = state.db.list_known_folders().unwrap_or_default();
+        crate::cloud_filter::sync_folder_states(payload.sync_folder.as_deref(), &folder_rels);
     }
     Ok(())
 }

@@ -56,10 +56,18 @@ pub(crate) fn dispatch_action(state: &AppState, action: &str, abs_path: &Path) -
         // Foundation smoke verb: reuse the proven `.cloudsc`-open path (which
         // validates the path is under the root and is a placeholder).
         "hydrate" => {
-            // DBSYNC-59 Slice 2: a native CfAPI dehydrated placeholder is a real file
-            // (not a `.cloudsc` sidecar). It hydrates in place via the platform + our
+            // DBSYNC-59 Slice 2: native CfAPI content is a real file/folder (not a
+            // `.cloudsc` sidecar). It hydrates in place via the platform + our
             // FETCH_DATA handler — no queue job — so handle it before the `.cloudsc`
-            // resolver (which would reject a non-`.cloudsc` path).
+            // resolver (which would reject a non-`.cloudsc` path). A folder hydrates
+            // all of its dehydrated children.
+            #[cfg(windows)]
+            if abs_path.is_dir() {
+                let rel = validate_under_root(state, abs_path)?;
+                let n = crate::cloud_filter::hydrate_folder(abs_path);
+                tracing::info!(action = "hydrate", path = %rel, count = n, "cfapi folder hydrated in place");
+                return Ok(false);
+            }
             #[cfg(windows)]
             if crate::path_util::is_dehydrated_placeholder(abs_path) {
                 let rel = validate_under_root(state, abs_path)?;

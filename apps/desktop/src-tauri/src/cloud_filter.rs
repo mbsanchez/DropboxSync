@@ -69,6 +69,10 @@ const PROVIDER_ID: GUID = GUID::from_u128(0xEA067F54_0C87_4DC2_9F90_3A632C2AAF9C
 static REGISTERED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// `rel → last-applied in-sync bool`, so we only touch a file when it changes.
 static APPLIED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+/// Directories already converted to in-sync placeholders this session (DBSYNC-59):
+/// converting once is enough — under PopulationPolicy=AlwaysFull the shell then
+/// tracks the folder's aggregate status from its children automatically.
+static APPLIED_FOLDERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -120,6 +124,72 @@ pub(crate) fn sync_placeholder_states(sync_folder: Option<&str>, items: &[(&str,
         if apply_file_state(&abs, *is_synced, first) {
             applied.insert((*rel).to_string(), *is_synced);
         }
+    }
+}
+
+/// Give each real directory under the sync root a CfAPI placeholder identity so
+/// Explorer's status column shows its aggregate state (e.g. the cloud icon when all
+/// children are online-only) instead of a perpetual "syncing" glyph (DBSYNC-59). A
+/// plain directory in a sync root has no state for the shell to render; our files are
+/// placeholders (created via `CfCreatePlaceholders`) but folders are created as plain
+/// dirs, which is why only folders showed "syncing". Converting once per session is
+/// enough — under PopulationPolicy=AlwaysFull the shell then tracks the aggregate from
+/// the children. `folder_rels` are `/`-relative paths under the sync root. No-ops
+/// without package identity / registration. Never pins (that would hydrate children).
+pub(crate) fn sync_folder_states(sync_folder: Option<&str>, folder_rels: &[String]) {
+    let Some(folder) = sync_folder else {
+        return;
+    };
+    if !crate::windows_identity::has_package_identity() || !ensure_registered(folder) {
+        return;
+    }
+    let root = Path::new(folder);
+    let applied = APPLIED_FOLDERS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut applied) = applied.lock() else {
+        return;
+    };
+    for rel in folder_rels {
+        if rel.is_empty() || applied.contains(rel) {
+            continue;
+        }
+        let abs = root.join(rel);
+        if !abs.is_dir() {
+            continue;
+        }
+        if apply_folder_state(&abs) {
+            applied.insert(rel.clone());
+        }
+    }
+}
+
+/// Convert a directory to an in-sync placeholder (no pin) so the shell renders its
+/// aggregate status. Under PopulationPolicy=AlwaysFull this never hides children.
+/// Fails soft.
+fn apply_folder_state(abs: &Path) -> bool {
+    let path = to_wide(&abs.to_string_lossy());
+    unsafe {
+        let handle = match CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(dir = %abs.display(), error = %e, "apply_folder_state: open failed");
+                return false;
+            }
+        };
+        // Convert to a placeholder (ignore "already a placeholder") + mark in-sync.
+        // NEVER pin: pinning a directory would force-hydrate every child.
+        let conv = CfConvertToPlaceholder(handle, None, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None);
+        let sync = CfSetInSyncState(handle, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None);
+        let _ = CloseHandle(handle);
+        tracing::debug!(dir = %abs.display(), convert = ?conv, set_in_sync = ?sync, "cfapi apply_folder_state");
+        true
     }
 }
 
@@ -499,6 +569,25 @@ pub(crate) fn create_dehydrated_placeholder(
     };
     tracing::info!(parent = %parent.display(), name, size, remote = %remote_path, result = ?r, entry = ?info.Result, "cfapi create dehydrated placeholder");
     r.is_ok() && info.Result.is_ok()
+}
+
+/// Hydrate every dehydrated (online-only) file under directory `abs` — our
+/// "Synchroniser sur le disque" on a cloud-only folder (DBSYNC-59). Walks the subtree
+/// and pulls each dehydrated placeholder on device via [`hydrate_placeholder`]
+/// (which also reconciles its column state). Non-dehydrated files are left untouched.
+/// Returns the number of files hydrated.
+pub(crate) fn hydrate_folder(abs: &Path) -> usize {
+    let mut n = 0usize;
+    for entry in walkdir::WalkDir::new(abs).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Stat only — is_dehydrated_placeholder uses symlink_metadata, no open/recall.
+        if crate::path_util::is_dehydrated_placeholder(entry.path()) && hydrate_placeholder(entry.path()) {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Post-hydration reconcile for the status column. The platform can leave a

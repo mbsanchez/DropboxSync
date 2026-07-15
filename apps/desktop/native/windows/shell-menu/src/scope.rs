@@ -52,11 +52,62 @@ pub fn target_for(path: &Path) -> Target {
     if !is_under(&root, path) {
         return Target::None;
     }
-    if has_cloudsc_ext(path) || is_dehydrated_placeholder(path) {
+    if has_cloudsc_ext(path) {
+        return Target::Hydrate;
+    }
+    if path.is_dir() {
+        // A folder's verb reflects its aggregate content (DBSYNC-59): if it still holds
+        // any resident (on-device) file there is something to free (FreeUpSpace); if
+        // every file is cloud-only it is already online-only → offer Hydrate. Matches
+        // the folder's own cloud/available status glyph.
+        return if dir_has_resident_file(path) {
+            Target::FreeUpSpace
+        } else {
+            Target::Hydrate
+        };
+    }
+    if is_dehydrated_placeholder(path) {
         Target::Hydrate
     } else {
         Target::FreeUpSpace
     }
+}
+
+/// Does `root` contain at least one RESIDENT (on-device) file — a regular file that is
+/// neither a dehydrated placeholder nor a `.cloudsc` sidecar? If so the folder has
+/// something to free; if every file is cloud-only (or it is empty) it is already
+/// online-only. Bounded so the UI-thread menu build stays cheap: at most `MAX` entries
+/// are examined (early-exit on the first resident file); hitting the cap without one
+/// defaults to "all cloud-only", matching the folder's cloud icon. Uses `read_dir` +
+/// `symlink_metadata` (stats only — never opens a file, so it can't trigger a recall).
+fn dir_has_resident_file(root: &Path) -> bool {
+    const MAX: usize = 4096;
+    let mut stack = vec![root.to_path_buf()];
+    let mut examined = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            examined += 1;
+            if examined > MAX {
+                return false;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                let p = entry.path();
+                if has_cloudsc_ext(&p) {
+                    continue; // cloud-only sidecar
+                }
+                if !is_dehydrated_placeholder(&p) {
+                    return true; // an on-device file → something to free
+                }
+            }
+        }
+    }
+    false
 }
 
 fn has_cloudsc_ext(path: &Path) -> bool {
