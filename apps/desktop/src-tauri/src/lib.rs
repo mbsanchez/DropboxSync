@@ -249,11 +249,13 @@ pub fn run() {
             // only needs Exit.
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
-            let tray_image = Image::from_bytes(include_bytes!("../icons/32x32.png"))
+            // DBSYNC-32: start on the idle brand icon; update_tray_tooltip swaps the glyph
+            // (sync/error) live. Not a template — we keep the brand blue in every state.
+            let tray_image = Image::from_bytes(include_bytes!("icons/tray-idle.png"))
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let tray_builder = TrayIconBuilder::with_id("main")
                 .icon(tray_image)
-                .icon_as_template(true)
+                .icon_as_template(false)
                 .menu(&menu)
                 .tooltip("DropboxSyncDesktop - Idle")
                 .on_tray_icon_event(move |_tray, event| {

@@ -490,9 +490,18 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
     // escape the sync root before touching the filesystem.
     let placeholder_path = safe_join(Path::new(&sync_folder), placeholder_local_rel_path)?;
     if !placeholder_path.exists() {
-        return Err(AppError::Sync(format!(
-            "placeholder not found: {placeholder_local_rel_path}"
-        )));
+        // Idempotent no-op: a missing `.cloudsc` means there is nothing to hydrate.
+        // This happens legitimately when the file was already hydrated, or — after the
+        // DBSYNC-59 transition — when it was converted to a native CfAPI placeholder,
+        // so the old `.cloudsc` no longer exists. Failing here would strand a stale
+        // `hydrate_cloudsc` job in `failed` forever (retry always re-fails), which
+        // keeps `latest_failed_error` set and pins the tray to the Error state
+        // (DBSYNC-32). Nothing is downloaded or deleted, so this is data-safe.
+        tracing::info!(
+            placeholder = %placeholder_local_rel_path,
+            "hydrate_cloudsc: placeholder already gone, treating as no-op"
+        );
+        return Ok(0);
     }
 
     let meta = read_cloudsc_placeholder_file(&placeholder_path)?;
