@@ -18,7 +18,8 @@ use serde::Deserialize;
 pub enum Target {
     /// Regular file/folder under the sync root → "Désynchroniser".
     FreeUpSpace,
-    /// `.cloudsc` placeholder under the sync root → "Synchroniser sur le disque".
+    /// Cloud-only item under the sync root → "Synchroniser sur le disque": either a
+    /// `.cloudsc` sidecar or a native CfAPI dehydrated placeholder (DBSYNC-59).
     Hydrate,
     /// Outside the sync root, or no root configured → menu hidden.
     None,
@@ -52,16 +53,80 @@ pub fn target_for(path: &Path) -> Target {
         return Target::None;
     }
     if has_cloudsc_ext(path) {
+        return Target::Hydrate;
+    }
+    if path.is_dir() {
+        // A folder's verb reflects its aggregate content (DBSYNC-59): if it still holds
+        // any resident (on-device) file there is something to free (FreeUpSpace); if
+        // every file is cloud-only it is already online-only → offer Hydrate. Matches
+        // the folder's own cloud/available status glyph.
+        return if dir_has_resident_file(path) {
+            Target::FreeUpSpace
+        } else {
+            Target::Hydrate
+        };
+    }
+    if is_dehydrated_placeholder(path) {
         Target::Hydrate
     } else {
         Target::FreeUpSpace
     }
 }
 
+/// Does `root` contain at least one RESIDENT (on-device) file — a regular file that is
+/// neither a dehydrated placeholder nor a `.cloudsc` sidecar? If so the folder has
+/// something to free; if every file is cloud-only (or it is empty) it is already
+/// online-only. Bounded so the UI-thread menu build stays cheap: at most `MAX` entries
+/// are examined (early-exit on the first resident file); hitting the cap without one
+/// defaults to "all cloud-only", matching the folder's cloud icon. Uses `read_dir` +
+/// `symlink_metadata` (stats only — never opens a file, so it can't trigger a recall).
+fn dir_has_resident_file(root: &Path) -> bool {
+    const MAX: usize = 4096;
+    let mut stack = vec![root.to_path_buf()];
+    let mut examined = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            examined += 1;
+            if examined > MAX {
+                return false;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                let p = entry.path();
+                if has_cloudsc_ext(&p) {
+                    continue; // cloud-only sidecar
+                }
+                if !is_dehydrated_placeholder(&p) {
+                    return true; // an on-device file → something to free
+                }
+            }
+        }
+    }
+    false
+}
+
 fn has_cloudsc_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("cloudsc"))
+        .unwrap_or(false)
+}
+
+/// True if `path` is a native CfAPI dehydrated (online-only) placeholder — a real
+/// file whose data isn't resident locally (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS).
+/// Such a file is cloud-only, exactly like a `.cloudsc` sidecar, so the menu offers
+/// to bring it back on device (DBSYNC-59). Uses `symlink_metadata` (a cheap stat, no
+/// open) so classifying it never triggers a recall/download.
+fn is_dehydrated_placeholder(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0)
         .unwrap_or(false)
 }
 
@@ -183,5 +248,17 @@ mod tests {
         assert!(has_cloudsc_ext(Path::new("a.CLOUDSC")));
         assert!(!has_cloudsc_ext(Path::new("a.txt")));
         assert!(!has_cloudsc_ext(Path::new("cloudsc")));
+    }
+
+    #[test]
+    fn dehydrated_placeholder_false_for_plain_and_missing() {
+        // A resident file has no RECALL_ON_DATA_ACCESS attribute; a missing path is
+        // not a placeholder. (Creating a real CfAPI placeholder needs a sync root, so
+        // the positive case is covered by manual/integration testing.)
+        let f = std::env::temp_dir().join("dbsync_scope_plain.tmp");
+        std::fs::write(&f, b"resident").unwrap();
+        assert!(!is_dehydrated_placeholder(&f));
+        assert!(!is_dehydrated_placeholder(Path::new("no_such_file_zzz.bin")));
+        let _ = std::fs::remove_file(&f);
     }
 }

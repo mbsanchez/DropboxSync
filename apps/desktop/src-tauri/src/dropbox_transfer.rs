@@ -136,6 +136,17 @@ fn retry_transient<T>(
 /// to a same-directory temp file, which is then atomically renamed onto
 /// `target` so a crash or interruption mid-download never leaves `target`
 /// truncated or corrupted.
+/// Download a remote file's full bytes to an arbitrary local `target` path, for
+/// CfAPI on-demand hydration (DBSYNC-59): the fetch-data callback streams the
+/// bytes back to the platform via `CfExecute`. Reuses the tested whole-file
+/// download; deliberately does NOT touch the DB index, the sync-root target path,
+/// or the conflict guard (that is `download_remote_file_internal`'s job).
+#[cfg(windows)]
+pub(crate) fn download_to_path(state: &AppState, path_display: &str, target: &Path) -> AppResult<()> {
+    let token = get_access_token(state)?;
+    fetch_and_write_file(&state.http_client, &token, path_display, target)
+}
+
 fn fetch_and_write_file(
     client: &Client,
     token: &str,

@@ -40,6 +40,16 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     let mut created_names: Vec<String> = Vec::new();
     let mut removed_names: Vec<String> = Vec::new();
 
+    // DBSYNC-59 Slice 2: when native CfAPI placeholders are active, a remote-only
+    // FILE is materialized as a real dehydrated placeholder (cloud icon) instead of a
+    // `.cloudsc` sidecar. Computed once (cheap after first call). Folders keep
+    // `.cloudsc` for now (folder-collapse is a separate slice).
+    #[cfg(windows)]
+    let cfapi_active = match state.db.get_sync_folder() {
+        Ok(Some(f)) => crate::cloud_filter::placeholders_active(&f),
+        _ => false,
+    };
+
     // Page through the folder with cursor + has_more; a folder with more than one
     // page of entries (Dropbox returns up to ~2000 per page) would otherwise be
     // silently truncated to its first page.
@@ -80,6 +90,14 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     loop {
         for entry in entries_resp.entries {
             let tag = entry.tag;
+            #[cfg(windows)]
+            let content_hash = entry.content_hash;
+            #[cfg(windows)]
+            let rev = entry.rev;
+            #[cfg(windows)]
+            let size = entry.size;
+            #[cfg(windows)]
+            let server_modified = entry.server_modified;
             let path_display = match entry.path_display {
                 Some(p) => p,
                 None => continue,
@@ -117,6 +135,51 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             }
             if target_path.exists() {
                 continue;
+            }
+
+            // DBSYNC-59 Slice 2: with native CfAPI placeholders active, represent
+            // cloud-only content the native way (like Dropbox/OneDrive) instead of a
+            // `.cloudsc` sidecar: a FILE becomes a real dehydrated placeholder (cloud
+            // icon), a FOLDER becomes a real directory whose children are indexed as
+            // placeholders on the next sweep. The non-Windows / inactive / missing-
+            // metadata paths keep `.cloudsc`.
+            #[cfg(windows)]
+            if cfapi_active {
+                if tag == "file" {
+                    if let (Some(ch), Some(rv), Some(sz)) =
+                        (content_hash.as_deref(), rev.as_deref(), size)
+                    {
+                        if !ch.is_empty() && !rv.is_empty() {
+                            let mts = server_modified
+                                .as_deref()
+                                .map(crate::remote_index::parse_rfc3339_ts_to_unix)
+                                .unwrap_or(0);
+                            if create_remote_only_placeholder(
+                                state, local_dir, &child_name, &relative, &path_display, ch, rv,
+                                sz, mts,
+                            ) {
+                                created += 1;
+                                created_names.push(child_name.clone());
+                            }
+                            continue; // represented natively — no `.cloudsc`
+                        }
+                    }
+                    // Missing content_hash/rev/size → fall through to `.cloudsc`.
+                } else if tag == "folder" {
+                    // A cloud-only folder is a real directory (its children surface as
+                    // placeholders next sweep), never a `<name>.cloudsc`.
+                    match fs::create_dir_all(&target_path) {
+                        Ok(()) => {
+                            let _ = state.db.upsert_known_folder(&relative);
+                            created += 1;
+                            created_names.push(child_name.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!(name = %child_name, error = %e, "remote-only folder: create dir failed");
+                        }
+                    }
+                    continue; // represented natively — no `.cloudsc`
+                }
             }
 
             let meta = CloudscMeta {
@@ -174,6 +237,136 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
     emit_placeholder_changed(&created_names, &removed_names);
     Ok(created)
+}
+
+/// Materialize a remote-only FILE as a native CfAPI dehydrated placeholder (Windows,
+/// when active) instead of a `.cloudsc` sidecar (DBSYNC-59 Slice 2). Creates the
+/// placeholder at `local_dir\child_name` (cloud icon; hydrates on open via
+/// FETCH_DATA) and records it in the index as fully-synced cloud-only content —
+/// local and remote rows both carry the Dropbox `content_hash`, so:
+/// - the overlay shows it synced and the remote reconciler enqueues NO eager
+///   download (local hash == remote hash);
+/// - a native hydration-on-open is a clean no-op (downloaded bytes hash-match);
+/// - a remote delete removes it via `reconcile_remote_absent` (local_delete);
+/// - a user delete of the placeholder propagates as a real Dropbox delete (it is a
+///   real cloud-only file, exactly like Dropbox/OneDrive online-only files).
+///
+/// Returns whether the placeholder was created. If the placeholder is created but an
+/// index upsert fails, it is logged (rare DB error) — the file is still represented.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn create_remote_only_placeholder(
+    state: &AppState,
+    local_dir: &Path,
+    child_name: &str,
+    rel: &str,
+    path_display: &str,
+    content_hash: &str,
+    rev: &str,
+    size: i64,
+    modified_ts: i64,
+) -> bool {
+    if !crate::cloud_filter::create_dehydrated_placeholder(
+        local_dir,
+        child_name,
+        path_display,
+        size,
+    ) {
+        return false;
+    }
+    if let Err(e) = state.db.upsert_local_file(rel, content_hash, size, modified_ts) {
+        tracing::warn!(rel, error = %e, "remote-only placeholder: local index upsert failed");
+    }
+    if let Err(e) = state.db.upsert_remote_file(rel, content_hash, rev, modified_ts) {
+        tracing::warn!(rel, error = %e, "remote-only placeholder: remote index upsert failed");
+    }
+    true
+}
+
+/// Near-instant materialization of a newly-appeared remote FILE as a native CfAPI
+/// dehydrated placeholder (Windows, when active), driven by the longpoll delta so it
+/// shows locally within seconds instead of waiting for the 5-min indexer (DBSYNC-59).
+/// No-op unless: placeholders are active, selective sync includes the path, the file
+/// isn't already represented locally (real file / placeholder / `.cloudsc`), and the
+/// parent is a real local directory (a not-yet-materialized folder surfaces the file
+/// when it is indexed/expanded). `reconcile_remote_present` has already recorded the
+/// remote row; this adds the placeholder + local row.
+#[cfg(windows)]
+pub(crate) fn materialize_remote_only_file_if_absent(
+    state: &AppState,
+    rel: &str,
+    path_display: &str,
+    content_hash: &str,
+    rev: &str,
+    size: i64,
+    modified_ts: i64,
+) {
+    if content_hash.is_empty() || rev.is_empty() {
+        return;
+    }
+    let Ok(Some(folder)) = state.db.get_sync_folder() else {
+        return;
+    };
+    if !crate::cloud_filter::placeholders_active(&folder) {
+        return;
+    }
+    let include = parse_prefix_csv(state.db.get_include_prefixes_csv().unwrap_or_default());
+    let exclude = parse_prefix_csv(state.db.get_exclude_prefixes_csv().unwrap_or_default());
+    if !is_path_allowed(rel, &include, &exclude) {
+        return;
+    }
+    let root = Path::new(&folder);
+    let Ok(abs) = safe_join(root, rel) else {
+        return;
+    };
+    // Already represented locally (real file, placeholder, or `.cloudsc`) → nothing to do.
+    if abs.exists() || with_cloudsc_suffix(&abs).exists() {
+        return;
+    }
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return;
+    };
+    if !parent.is_dir() {
+        return; // parent folder not materialized yet — the indexer handles it
+    }
+    let name = name.to_string_lossy().to_string();
+    if create_remote_only_placeholder(
+        state,
+        parent,
+        &name,
+        rel,
+        path_display,
+        content_hash,
+        rev,
+        size,
+        modified_ts,
+    ) {
+        emit_placeholder_changed(&[name], &[]);
+    }
+}
+
+/// Near-instant local prune for a remotely-deleted FILE (Windows), driven by the
+/// longpoll delta. A native CfAPI placeholder is removed by `reconcile_remote_absent`
+/// (its `local_delete` job); this additionally removes a legacy `<rel>.cloudsc`
+/// sidecar so it disappears within seconds instead of waiting for the 5-min prune
+/// (DBSYNC-59). No-op if no `.cloudsc` sidecar exists.
+#[cfg(windows)]
+pub(crate) fn prune_cloudsc_sidecar_for(state: &AppState, rel: &str) {
+    let Ok(Some(folder)) = state.db.get_sync_folder() else {
+        return;
+    };
+    let root = Path::new(&folder);
+    let Ok(abs) = safe_join(root, rel) else {
+        return;
+    };
+    let cloudsc = with_cloudsc_suffix(&abs);
+    if cloudsc.exists() && fs::remove_file(&cloudsc).is_ok() {
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel.to_string());
+        emit_placeholder_changed(&[], &[name]);
+    }
 }
 
 /// Emits a single `placeholder-changed` event summarising the `.cloudsc`
@@ -343,13 +536,37 @@ pub(crate) fn dehydrate_path_internal(state: &AppState, rel: &str) -> AppResult<
 
     let mut created: Vec<String> = Vec::new();
     if abs.is_dir() {
-        // Collapse the whole folder into a single `<folder>.cloudsc` — the exact
-        // inverse of folder hydration (which lazily re-expands one level). Rejects
-        // the whole folder (touching nothing) if any file is unsynced; degrades to
-        // per-file placeholders if a file is locked (DBSYNC-54).
-        let mut placeholders = dehydrate_folder_collapse(state, &root, rel)?;
-        created.append(&mut placeholders);
+        // DBSYNC-59 Slice 2: with native CfAPI placeholders active, free space the
+        // native way — recursively dehydrate the folder's files into real placeholders
+        // (cloud icon), keeping the directory structure (like Dropbox/OneDrive), rather
+        // than collapsing to a single `<folder>.cloudsc`.
+        #[cfg(windows)]
+        let used_cfapi = if crate::cloud_filter::placeholders_active(&root.to_string_lossy()) {
+            let mut freed = dehydrate_folder_cfapi(state, &root, rel)?;
+            created.append(&mut freed);
+            true
+        } else {
+            false
+        };
+        #[cfg(not(windows))]
+        let used_cfapi = false;
+
+        if !used_cfapi {
+            // Collapse the whole folder into a single `<folder>.cloudsc` — the exact
+            // inverse of folder hydration (which lazily re-expands one level). Rejects
+            // the whole folder (touching nothing) if any file is unsynced; degrades to
+            // per-file placeholders if a file is locked (DBSYNC-54).
+            let mut placeholders = dehydrate_folder_collapse(state, &root, rel)?;
+            created.append(&mut placeholders);
+        }
     } else if abs.is_file() {
+        // Already a native CfAPI dehydrated placeholder → cloud-only already; nothing
+        // to free. Return before `dehydrate_one_file`, whose `is_file_fully_synced`
+        // re-hash would OPEN it and trigger a recall/hydration (DBSYNC-59).
+        #[cfg(windows)]
+        if crate::path_util::is_dehydrated_placeholder(&abs) {
+            return Ok(0);
+        }
         if dehydrate_one_file(state, &root, rel)? {
             created.push(rel.to_string());
         } else {
@@ -422,6 +639,18 @@ fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<boo
         return Ok(false); // unsynced (or index-stale) local edit — keep the file
     }
 
+    // DBSYNC-59 Slice 2: when native CfAPI placeholders are active (packaged Windows
+    // with a live hydration connection), free space by replacing the file with a real
+    // dehydrated placeholder at the SAME path — it gets the native cloud icon and
+    // hydrates on open — instead of a `.cloudsc` sidecar. Elsewhere, fall back to
+    // `.cloudsc`.
+    #[cfg(windows)]
+    {
+        if crate::cloud_filter::placeholders_active(&root.to_string_lossy()) {
+            return dehydrate_one_file_cfapi(state, root, rel);
+        }
+    }
+
     let abs = safe_join(root, rel)?;
     let row = state
         .db
@@ -444,6 +673,113 @@ fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<boo
         )));
     }
     Ok(true)
+}
+
+/// Free a single fully-synced file by replacing it with a native CfAPI dehydrated
+/// placeholder at the SAME path (DBSYNC-59 Slice 2). The caller has already verified
+/// `rel` is fully synced, so the bytes are safely on Dropbox.
+///
+/// Ordering is load-bearing for the DBSYNC-33/45 "a dehydration is never a Dropbox
+/// delete" guarantee. The index row is UNTRACKED before the file is removed, so a
+/// concurrent scan/watcher tick that catches the brief remove→create window sees no
+/// *tracked-file* deletion (the deletion loop iterates the index). The placeholder
+/// then lands at the same path — a real file that reaches `seen_paths` and is skipped
+/// by [`is_dehydrated_placeholder`], so it is never re-hashed, re-uploaded, or
+/// delete-detected. Finally the row is RE-TRACKED with the original sha256 so a later
+/// native hydration-on-open (which does NOT pass through our index-updating download)
+/// is a clean no-op: the hydrated bytes equal the remote, so no re-upload.
+#[cfg(windows)]
+fn dehydrate_one_file_cfapi(state: &AppState, root: &Path, rel: &str) -> AppResult<bool> {
+    let abs = safe_join(root, rel)?;
+    let row = state
+        .db
+        .get_local_file(rel)?
+        .ok_or_else(|| AppError::Sync(format!("missing index row for {rel}")))?;
+    let remote_path = normalize_dropbox_path(rel)?;
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Err(AppError::Sync(format!("invalid path for dehydrate: {rel}")));
+    };
+    let name = name.to_string_lossy().to_string();
+
+    // 1) Untrack BEFORE deleting so the remove→create window can't remote-delete.
+    state.db.remove_local_file(rel)?;
+    // 2) Free the path (CfCreatePlaceholders requires the target not to exist).
+    if let Err(e) = fs::remove_file(&abs) {
+        // Couldn't free it (locked / in use) — restore the fully-synced state.
+        state
+            .db
+            .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
+        return Err(AppError::Io(format!(
+            "failed removing local file for dehydrate: {e}"
+        )));
+    }
+    // 3) Create the dehydrated placeholder.
+    if crate::cloud_filter::create_dehydrated_placeholder(parent, &name, &remote_path, row.size_bytes)
+    {
+        // 4) Re-track with the ORIGINAL sha256 → native hydration is a clean no-op.
+        state
+            .db
+            .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
+        Ok(true)
+    } else {
+        // Placeholder creation failed. The bytes are safe on Dropbox (fully synced);
+        // leave the path untracked so the next remote sweep re-represents it as
+        // cloud-only. Never re-track a now-absent file.
+        Err(AppError::Io(format!(
+            "failed creating dehydrated placeholder for {rel}"
+        )))
+    }
+}
+
+/// Free space on a folder the native CfAPI way (DBSYNC-59 Slice 2): recursively turn
+/// each fully-synced file under `folder_rel` into a dehydrated placeholder (cloud
+/// icon), keeping the real directory structure — the Dropbox/OneDrive model, not the
+/// `.cloudsc` single-entry collapse. Unsynced files (unsaved local edits) and already-
+/// dehydrated files are skipped, never lost. Fails CLOSED on a walk error (never act
+/// on a partial enumeration). The full subtree is enumerated BEFORE any mutation so a
+/// remove+recreate never perturbs the in-flight walk. Returns the freed rels.
+#[cfg(windows)]
+fn dehydrate_folder_cfapi(state: &AppState, root: &Path, folder_rel: &str) -> AppResult<Vec<String>> {
+    if folder_rel.is_empty() {
+        return Err(AppError::Sync(
+            "cannot free up space on the sync root itself".to_string(),
+        ));
+    }
+    let abs = safe_join(root, folder_rel)?;
+
+    let mut files: Vec<String> = Vec::new();
+    for entry in WalkDir::new(&abs) {
+        let entry = entry.map_err(|e| {
+            AppError::Io(format!(
+                "cannot free up space: could not fully read folder '{folder_rel}' ({e}); nothing changed"
+            ))
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_rel = match entry.path().strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if file_rel.ends_with(".cloudsc") || should_ignore_local_path(&file_rel) {
+            continue;
+        }
+        // Already cloud-only — never re-hash it (that would hydrate it).
+        if crate::path_util::is_dehydrated_placeholder(entry.path()) {
+            continue;
+        }
+        files.push(file_rel);
+    }
+
+    let mut freed = Vec::new();
+    for file_rel in files {
+        // dehydrate_one_file routes to the CfAPI path (active here); Ok(false) means an
+        // unsynced file to keep (never lost).
+        if dehydrate_one_file(state, root, &file_rel)? {
+            freed.push(file_rel);
+        }
+    }
+    Ok(freed)
 }
 
 /// Collapse a fully-synced folder into a single `<folder>.cloudsc` (`tag:
