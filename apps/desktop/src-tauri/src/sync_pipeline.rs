@@ -61,6 +61,12 @@ fn placeholder_exists(tracked_root: &std::path::Path, rel: &str) -> bool {
 /// placeholder. Best-effort: if the sync folder can't be read we do NOT suppress, so
 /// a genuine user deletion still propagates.
 fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
+    // DBSYNC-62 backstop at execution time: never run a remote delete while within the
+    // sync-root registration grace window (placeholder eviction, not a user delete).
+    #[cfg(windows)]
+    if crate::cloud_filter::in_post_registration_grace() {
+        return true;
+    }
     let Ok(Some(folder)) = state.db.get_sync_folder() else {
         return false;
     };
@@ -145,6 +151,15 @@ fn process_local_file_deletion(
     tracked_root: &Path,
     prev_rel: &str,
 ) -> AppResult<usize> {
+    // DBSYNC-62: within the sync-root (re)registration grace window, a locally-vanished
+    // tracked file is almost certainly a placeholder the shell EVICTED (Unregister), not
+    // a user delete — never propagate it. Keep the index row; the indexer re-materializes
+    // the placeholder. (Zero effect in normal operation, which never re-registers.)
+    #[cfg(windows)]
+    if crate::cloud_filter::in_post_registration_grace() {
+        tracing::warn!(rel = %prev_rel, "remote delete suppressed: sync-root registration grace (placeholder eviction, not a user delete)");
+        return Ok(0);
+    }
     if placeholder_exists(tracked_root, prev_rel) {
         state.db.remove_local_file(prev_rel)?;
         return Ok(0);
@@ -161,6 +176,13 @@ fn process_known_folder_deletion(
     tracked_root: &Path,
     rel: &str,
 ) -> AppResult<usize> {
+    // DBSYNC-62: suppress folder deletes during the registration grace window too — a
+    // sync-root Unregister can strip a whole placeholder subtree at once.
+    #[cfg(windows)]
+    if crate::cloud_filter::in_post_registration_grace() {
+        tracing::warn!(rel, "remote folder delete suppressed: sync-root registration grace (eviction, not a user delete)");
+        return Ok(0);
+    }
     if placeholder_exists(tracked_root, rel) {
         state.db.remove_known_folder(rel)?;
         return Ok(0);

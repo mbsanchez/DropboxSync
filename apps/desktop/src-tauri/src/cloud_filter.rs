@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Security::Cryptography::CryptographicBuffer;
@@ -73,6 +74,42 @@ static APPLIED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 /// converting once is enough — under PopulationPolicy=AlwaysFull the shell then
 /// tracks the folder's aggregate status from its children automatically.
 static APPLIED_FOLDERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Timestamp of the last sync-root (un)registration. Registering a sync root does an
+/// `Unregister` + `Register`, and `Unregister` **evicts the dehydrated placeholders
+/// from disk** — the files vanish locally. Without a guard the sync engine reads that
+/// mass disappearance as user deletes and propagates them to Dropbox (the DBSYNC-62
+/// data-loss incident). Deletion propagation is therefore suppressed for a grace
+/// window after any real (re)registration (see `in_post_registration_grace`), during
+/// which the indexer re-materializes the evicted placeholders. This has zero effect on
+/// normal launches, which REUSE the existing registration and never (re)register.
+static LAST_REGISTRATION_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// Grace window after a (re)registration during which remote-delete propagation is
+/// suppressed. Comfortably longer than the 5-min reconciliation sweep so the indexer
+/// re-creates the evicted placeholders before deletes could resume.
+const POST_REGISTRATION_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// Record that a sync-root (un)registration just happened (starts the grace window).
+fn mark_registration_activity() {
+    if let Ok(mut g) = LAST_REGISTRATION_AT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *g = Some(Instant::now());
+    }
+}
+
+/// True while within [`POST_REGISTRATION_GRACE`] of the last (un)registration — the
+/// shell may still be evicting placeholders, so a locally-vanished tracked file must
+/// NOT be propagated as a Dropbox delete. Checked by the sync pipeline's delete paths.
+pub(crate) fn in_post_registration_grace() -> bool {
+    LAST_REGISTRATION_AT
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|g| *g))
+        .map(|t| t.elapsed() < POST_REGISTRATION_GRACE)
+        .unwrap_or(false)
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -792,6 +829,10 @@ macro_rules! step {
 }
 
 fn register_winrt(folder: &str) -> windows::core::Result<()> {
+    // Start the delete-suppression grace window NOW: the Unregister below evicts the
+    // dehydrated placeholders from disk, and that mass disappearance must never be read
+    // as user deletes (DBSYNC-62).
+    mark_registration_activity();
     let id = sync_root_id();
     tracing::info!(sync_root_id = %id, folder, "cfapi register: begin");
     let info = step!("new", StorageProviderSyncRootInfo::new());
@@ -842,6 +883,9 @@ fn register_winrt(folder: &str) -> windows::core::Result<()> {
 }
 
 fn unregister() -> windows::core::Result<()> {
+    // Unregister evicts placeholders from disk — open the grace window so the resulting
+    // disappearances aren't propagated as Dropbox deletes (DBSYNC-62).
+    mark_registration_activity();
     StorageProviderSyncRootManager::Unregister(&HSTRING::from(sync_root_id()))
 }
 
