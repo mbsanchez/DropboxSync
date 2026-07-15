@@ -41,6 +41,29 @@ pub(crate) fn is_ignored_local_path(relative: &str) -> bool {
     should_ignore_local_path(relative) || is_editor_temp_path(relative)
 }
 
+/// True if `abs` is a Windows CfAPI dehydrated (online-only) placeholder — a real
+/// file whose data is NOT resident locally
+/// ([`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`]). Reading or hashing it would trigger
+/// an on-demand download (hydration), so the sync pipeline must treat it as
+/// cloud-only in-sync and NEVER hash it (DBSYNC-59). Uses `symlink_metadata`, which
+/// only stats — it does not open the file — so it never causes a recall. Always
+/// `false` off Windows.
+pub(crate) fn is_dehydrated_placeholder(abs: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        std::fs::symlink_metadata(abs)
+            .map(|m| m.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = abs;
+        false
+    }
+}
+
 pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
     Ok(absolute
         .strip_prefix(sync_folder)
@@ -266,9 +289,22 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        backoff_seconds, hash_file, is_ignored_local_path, normalize_dropbox_path, safe_join,
-        validate_relative, DROPBOX_BLOCK_SIZE,
+        backoff_seconds, hash_file, is_dehydrated_placeholder, is_ignored_local_path,
+        normalize_dropbox_path, safe_join, validate_relative, DROPBOX_BLOCK_SIZE,
     };
+
+    #[test]
+    fn dehydrated_placeholder_is_false_for_plain_and_missing_files() {
+        // A normal (fully-resident) file has no RECALL_ON_DATA_ACCESS attribute, so it
+        // is never treated as a dehydrated placeholder — the sync pipeline must hash
+        // it normally. A non-existent path is likewise not a placeholder.
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"resident bytes").unwrap();
+        assert!(!is_dehydrated_placeholder(f.path()));
+        assert!(!is_dehydrated_placeholder(Path::new(
+            "does-not-exist-xyz.bin"
+        )));
+    }
 
     #[test]
     fn ignored_local_path_covers_os_junk_and_editor_temps() {

@@ -350,6 +350,13 @@ pub(crate) fn dehydrate_path_internal(state: &AppState, rel: &str) -> AppResult<
         let mut placeholders = dehydrate_folder_collapse(state, &root, rel)?;
         created.append(&mut placeholders);
     } else if abs.is_file() {
+        // Already a native CfAPI dehydrated placeholder → cloud-only already; nothing
+        // to free. Return before `dehydrate_one_file`, whose `is_file_fully_synced`
+        // re-hash would OPEN it and trigger a recall/hydration (DBSYNC-59).
+        #[cfg(windows)]
+        if crate::path_util::is_dehydrated_placeholder(&abs) {
+            return Ok(0);
+        }
         if dehydrate_one_file(state, &root, rel)? {
             created.push(rel.to_string());
         } else {
@@ -422,6 +429,18 @@ fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<boo
         return Ok(false); // unsynced (or index-stale) local edit — keep the file
     }
 
+    // DBSYNC-59 Slice 2: when native CfAPI placeholders are active (packaged Windows
+    // with a live hydration connection), free space by replacing the file with a real
+    // dehydrated placeholder at the SAME path — it gets the native cloud icon and
+    // hydrates on open — instead of a `.cloudsc` sidecar. Elsewhere, fall back to
+    // `.cloudsc`.
+    #[cfg(windows)]
+    {
+        if crate::cloud_filter::placeholders_active(&root.to_string_lossy()) {
+            return dehydrate_one_file_cfapi(state, root, rel);
+        }
+    }
+
     let abs = safe_join(root, rel)?;
     let row = state
         .db
@@ -444,6 +463,62 @@ fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<boo
         )));
     }
     Ok(true)
+}
+
+/// Free a single fully-synced file by replacing it with a native CfAPI dehydrated
+/// placeholder at the SAME path (DBSYNC-59 Slice 2). The caller has already verified
+/// `rel` is fully synced, so the bytes are safely on Dropbox.
+///
+/// Ordering is load-bearing for the DBSYNC-33/45 "a dehydration is never a Dropbox
+/// delete" guarantee. The index row is UNTRACKED before the file is removed, so a
+/// concurrent scan/watcher tick that catches the brief remove→create window sees no
+/// *tracked-file* deletion (the deletion loop iterates the index). The placeholder
+/// then lands at the same path — a real file that reaches `seen_paths` and is skipped
+/// by [`is_dehydrated_placeholder`], so it is never re-hashed, re-uploaded, or
+/// delete-detected. Finally the row is RE-TRACKED with the original sha256 so a later
+/// native hydration-on-open (which does NOT pass through our index-updating download)
+/// is a clean no-op: the hydrated bytes equal the remote, so no re-upload.
+#[cfg(windows)]
+fn dehydrate_one_file_cfapi(state: &AppState, root: &Path, rel: &str) -> AppResult<bool> {
+    let abs = safe_join(root, rel)?;
+    let row = state
+        .db
+        .get_local_file(rel)?
+        .ok_or_else(|| AppError::Sync(format!("missing index row for {rel}")))?;
+    let remote_path = normalize_dropbox_path(rel)?;
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Err(AppError::Sync(format!("invalid path for dehydrate: {rel}")));
+    };
+    let name = name.to_string_lossy().to_string();
+
+    // 1) Untrack BEFORE deleting so the remove→create window can't remote-delete.
+    state.db.remove_local_file(rel)?;
+    // 2) Free the path (CfCreatePlaceholders requires the target not to exist).
+    if let Err(e) = fs::remove_file(&abs) {
+        // Couldn't free it (locked / in use) — restore the fully-synced state.
+        state
+            .db
+            .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
+        return Err(AppError::Io(format!(
+            "failed removing local file for dehydrate: {e}"
+        )));
+    }
+    // 3) Create the dehydrated placeholder.
+    if crate::cloud_filter::create_dehydrated_placeholder(parent, &name, &remote_path, row.size_bytes)
+    {
+        // 4) Re-track with the ORIGINAL sha256 → native hydration is a clean no-op.
+        state
+            .db
+            .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
+        Ok(true)
+    } else {
+        // Placeholder creation failed. The bytes are safe on Dropbox (fully synced);
+        // leave the path untracked so the next remote sweep re-represents it as
+        // cloud-only. Never re-track a now-absent file.
+        Err(AppError::Io(format!(
+            "failed creating dehydrated placeholder for {rel}"
+        )))
+    }
 }
 
 /// Collapse a fully-synced folder into a single `<folder>.cloudsc` (`tag:

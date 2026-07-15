@@ -24,31 +24,43 @@
 //! step no-ops and the app is otherwise unaffected.
 #![cfg(windows)]
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Storage::Provider::{
-    StorageProviderHydrationPolicy, StorageProviderPopulationPolicy, StorageProviderSyncRootInfo,
-    StorageProviderSyncRootManager,
+    StorageProviderHydrationPolicy, StorageProviderHydrationPolicyModifier,
+    StorageProviderPopulationPolicy, StorageProviderSyncRootInfo, StorageProviderSyncRootManager,
 };
 use windows::Storage::StorageFolder;
-use windows::Win32::Foundation::{CloseHandle, E_ABORT, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, E_ABORT, HANDLE, HLOCAL, LocalFree, NTSTATUS};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Storage::CloudFilters::{
-    CfConvertToPlaceholder, CfRevertPlaceholder, CfSetInSyncState, CfSetPinState,
-    CF_CONVERT_FLAG_MARK_IN_SYNC, CF_IN_SYNC_STATE_IN_SYNC, CF_IN_SYNC_STATE_NOT_IN_SYNC,
-    CF_PIN_STATE_PINNED, CF_REVERT_FLAG_NONE, CF_SET_IN_SYNC_FLAG_NONE, CF_SET_PIN_FLAG_NONE,
+    CfConnectSyncRoot, CfConvertToPlaceholder, CfCreatePlaceholders, CfExecute,
+    CfHydratePlaceholder, CfRevertPlaceholder, CfSetInSyncState, CfSetPinState, CF_CALLBACK_INFO,
+    CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE,
+    CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, CF_CALLBACK_TYPE_FETCH_DATA, CF_CONNECTION_KEY,
+    CF_CONNECT_FLAGS, CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
+    CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CREATE_FLAG_NONE, CF_FS_METADATA, CF_HYDRATE_FLAG_NONE,
+    CF_IN_SYNC_STATE_IN_SYNC, CF_IN_SYNC_STATE_NOT_IN_SYNC, CF_OPERATION_INFO,
+    CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_0,
+    CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TYPE_TRANSFER_DATA,
+    CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO, CF_PIN_STATE_PINNED,
+    CF_REVERT_FLAG_NONE, CF_SET_IN_SYNC_FLAG_NONE, CF_SET_PIN_FLAG_NONE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_ARCHIVE, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+use crate::error::{AppError, AppResult};
 
 /// Stable provider id. NEVER change once shipped.
 const PROVIDER_ID: GUID = GUID::from_u128(0xEA067F54_0C87_4DC2_9F90_3A632C2AAF9C);
@@ -97,6 +109,14 @@ pub(crate) fn sync_placeholder_states(sync_folder: Option<&str>, items: &[(&str,
         if !abs.is_file() {
             continue;
         }
+        // A native CfAPI dehydrated placeholder (cloud-only, e.g. after "free up
+        // space") is a real file. NEVER run apply_file_state on it: pinning it would
+        // make the platform hydrate (re-download) it, defeating the freed space, and
+        // its cloud-only status is owned by its native dehydrated state, not the
+        // column driver (DBSYNC-59 Slice 2).
+        if crate::path_util::is_dehydrated_placeholder(&abs) {
+            continue;
+        }
         if apply_file_state(&abs, *is_synced, first) {
             applied.insert((*rel).to_string(), *is_synced);
         }
@@ -122,24 +142,31 @@ fn ensure_registered(folder: &str) -> bool {
         }
         *cur = None;
     }
-    // Already registered in a previous run? Do NOT re-register: the WinRT
-    // `Register` re-creates the navigation-pane node that the elevated
-    // `enable-status-column` step strips to make the column show. Re-adding it
-    // every launch would break the column again. The persisted registration +
-    // the folder's sync-root reparse point are enough for placeholder ops.
-    if registered_folder().is_some_and(|f| same_folder(&f, folder)) {
+    // Already registered in a previous run WITH the current policy version? Do NOT
+    // re-register: the WinRT `Register` re-creates the navigation-pane node that the
+    // elevated `enable-status-column` step strips to make the column show. Re-adding
+    // it every launch would break the column again. The persisted registration + the
+    // folder's sync-root reparse point are enough for placeholder ops. A bumped
+    // `REG_POLICY_VERSION` (a policy change like enabling dehydration) forces one
+    // re-register — after which the elevated strip must run again.
+    if registered_folder().is_some_and(|f| same_folder(&f, folder))
+        && stored_policy_version() >= REG_POLICY_VERSION
+    {
         tracing::info!(folder, "CfAPI sync root already registered (reusing)");
         *cur = Some(folder.to_string());
+        connect_provider(folder);
         return true;
     }
     let folder_owned = folder.to_string();
     match run_on_mta(move || register_winrt(&folder_owned)) {
         Ok(()) => {
+            set_stored_policy_version(REG_POLICY_VERSION);
             tracing::info!(
                 folder,
-                "registered CfAPI sync root — run `enable-status-column` (elevated) to show the column"
+                "registered CfAPI sync root (policy v{REG_POLICY_VERSION}) — run `enable-status-column` (elevated) to show the column"
             );
             *cur = Some(folder.to_string());
+            connect_provider(folder);
             true
         }
         Err(e) => {
@@ -147,6 +174,438 @@ fn ensure_registered(folder: &str) -> bool {
             false
         }
     }
+}
+
+/// Live `CfConnectSyncRoot` connection key (`CF_CONNECTION_KEY.0`) for the process
+/// lifetime, so the platform can call our `FETCH_DATA` handler to hydrate on open.
+/// The connection does NOT persist across process restarts — reconnect each run.
+static CONNECTION: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
+/// `TransferKey`s the platform asked us to cancel; checked between transfer chunks.
+static CANCELLED: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+
+/// Connect the (registered) sync root once per process so on-demand hydration
+/// works. Fails soft — a registered-but-disconnected root just can't hydrate
+/// dehydrated files on open (the status column is unaffected).
+fn connect_provider(folder: &str) {
+    let slot = CONNECTION.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = slot.lock() else {
+        return;
+    };
+    if guard.is_some() {
+        return; // already connected this session
+    }
+    // Terminated callback table: FETCH_DATA (hydrate on open) + CANCEL + END.
+    let table = [
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_FETCH_DATA,
+            Callback: Some(on_fetch_data),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+            Callback: Some(on_cancel_fetch_data),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE(-1),
+            Callback: None,
+        },
+    ];
+    let path = HSTRING::from(folder);
+    let flags = CF_CONNECT_FLAGS(
+        CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO.0 | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH.0,
+    );
+    match unsafe { CfConnectSyncRoot(PCWSTR(path.as_ptr()), table.as_ptr(), None, flags) } {
+        Ok(key) => {
+            *guard = Some(key.0);
+            tracing::info!(folder, "cfapi provider connected (on-demand hydration)");
+        }
+        Err(e) => {
+            tracing::warn!(folder, error = %e, "CfConnectSyncRoot failed; on-demand hydration disabled");
+        }
+    }
+}
+
+const STATUS_SUCCESS: NTSTATUS = NTSTATUS(0);
+const STATUS_UNSUCCESSFUL: NTSTATUS = NTSTATUS(0xC000_0001u32 as i32);
+/// Transfer chunk size — a multiple of the sector size (4 KiB) as CfAPI requires
+/// for every non-final `TRANSFER_DATA`.
+const FETCH_CHUNK: usize = 4 * 1024 * 1024;
+
+fn mark_cancelled(transfer_key: i64) {
+    if let Ok(mut s) = CANCELLED.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+        s.insert(transfer_key);
+    }
+}
+fn is_cancelled(transfer_key: i64) -> bool {
+    CANCELLED
+        .get()
+        .and_then(|m| m.lock().ok().map(|s| s.contains(&transfer_key)))
+        .unwrap_or(false)
+}
+fn clear_cancel(transfer_key: i64) {
+    if let Some(m) = CANCELLED.get() {
+        if let Ok(mut s) = m.lock() {
+            s.remove(&transfer_key);
+        }
+    }
+}
+
+/// Reach the owned `AppState` from a platform callback thread (no `AppHandle` arg).
+fn app_state() -> Option<crate::state::AppState> {
+    use tauri::Manager;
+    let handle = crate::state::APP_HANDLE.get()?;
+    Some(handle.try_state::<crate::state::AppState>()?.inner().clone())
+}
+
+/// Reconstruct the placeholder's absolute path from the callback info
+/// (`VolumeDosName` = `C:` + `NormalizedPath` = `\Users\…\file`).
+unsafe fn full_local_path(info: &CF_CALLBACK_INFO) -> Option<PathBuf> {
+    let vol = info.VolumeDosName.to_string().ok()?;
+    let norm = info.NormalizedPath.to_string().ok()?;
+    if norm.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(format!("{vol}{norm}")))
+}
+
+/// `FETCH_DATA`: the platform needs `[offset, offset+length)` of a dehydrated
+/// placeholder. Download the file from Dropbox and stream the range back via
+/// `CfExecute`. On any failure, report failure so the open unblocks (errors)
+/// rather than hanging. Panic-firewalled — a panic across this ABI aborts.
+unsafe extern "system" fn on_fetch_data(
+    info: *const CF_CALLBACK_INFO,
+    params: *const CF_CALLBACK_PARAMETERS,
+) {
+    if info.is_null() || params.is_null() {
+        return;
+    }
+    let info = &*info;
+    let params = &*params;
+    let conn = info.ConnectionKey;
+    let transfer = info.TransferKey;
+    let fetch = &params.Anonymous.FetchData;
+    let offset = fetch.RequiredFileOffset;
+    let length = fetch.RequiredLength;
+    let abs = full_local_path(info);
+
+    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &abs {
+        Some(p) => serve_fetch(conn, transfer, p, offset, length),
+        None => Err(AppError::Other("could not resolve placeholder path".into())),
+    }))
+    .unwrap_or_else(|_| Err(AppError::Other("fetch handler panicked".into())));
+
+    clear_cancel(transfer);
+    match served {
+        Ok(()) => {
+            tracing::info!(offset, length, "cfapi fetch-data served");
+            // Native (double-click) hydration: settle the status column off its
+            // "syncing" glyph once hydration finishes. Deferred to a background thread
+            // — never re-enter CfAPI (open + CfSetInSyncState) from inside the
+            // FETCH_DATA callback — with a small delay so the platform finalizes the
+            // hydration first.
+            if let Some(p) = abs.clone() {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    reconcile_after_hydration(&p);
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cfapi fetch-data failed; failing the open");
+            let _ = cf_transfer(conn, transfer, std::ptr::null(), offset, length, STATUS_UNSUCCESSFUL);
+        }
+    }
+}
+
+/// `CANCEL_FETCH_DATA`: flag the transfer so an in-flight `serve_fetch` stops.
+unsafe extern "system" fn on_cancel_fetch_data(
+    info: *const CF_CALLBACK_INFO,
+    _params: *const CF_CALLBACK_PARAMETERS,
+) {
+    if info.is_null() {
+        return;
+    }
+    mark_cancelled((*info).TransferKey);
+    tracing::debug!("cfapi fetch-data cancelled by platform");
+}
+
+/// Download the whole file to a temp, then stream the requested range to the
+/// platform. (HydrationPolicy=Full → the platform asks for the whole file on
+/// first access, so whole-file download is the normal path; ranged download is a
+/// future optimisation.)
+fn serve_fetch(
+    conn: CF_CONNECTION_KEY,
+    transfer: i64,
+    abs: &Path,
+    offset: i64,
+    length: i64,
+) -> AppResult<()> {
+    let state = app_state().ok_or_else(|| AppError::Other("app state unavailable".into()))?;
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| AppError::Other("no sync folder configured".into()))?;
+    let rel = crate::path_util::relpath_under(Path::new(&folder), abs)?;
+    let remote = crate::path_util::normalize_dropbox_path(&rel)?;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "dbsync-hydrate-{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let result = (|| -> AppResult<()> {
+        crate::dropbox_transfer::download_to_path(&state, &remote, &tmp)?;
+        let mut f = std::fs::File::open(&tmp)?;
+        stream_range(conn, transfer, &mut f, offset, length)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Stream `[offset, offset+length)` from `f` to the platform in aligned chunks.
+fn stream_range(
+    conn: CF_CONNECTION_KEY,
+    transfer: i64,
+    f: &mut std::fs::File,
+    offset: i64,
+    length: i64,
+) -> AppResult<()> {
+    f.seek(SeekFrom::Start(offset as u64))?;
+    let mut buf = vec![0u8; FETCH_CHUNK];
+    let mut pos = offset;
+    let mut remaining = length;
+    while remaining > 0 {
+        if is_cancelled(transfer) {
+            return Err(AppError::Other("fetch cancelled".into()));
+        }
+        let want = remaining.min(FETCH_CHUNK as i64) as usize;
+        let mut filled = 0;
+        while filled < want {
+            let n = f.read(&mut buf[filled..want])?;
+            if n == 0 {
+                break; // EOF
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        unsafe {
+            cf_transfer(conn, transfer, buf.as_ptr() as *const _, pos, filled as i64, STATUS_SUCCESS)
+                .map_err(|e| AppError::Other(format!("CfExecute(TRANSFER_DATA): {e}")))?;
+        }
+        pos += filled as i64;
+        remaining -= filled as i64;
+        if filled < want {
+            break; // reached EOF (final, possibly unaligned, chunk — allowed)
+        }
+    }
+    Ok(())
+}
+
+/// One `CfExecute(CF_OPERATION_TYPE_TRANSFER_DATA)`. `status = STATUS_UNSUCCESSFUL`
+/// + null buffer reports a failed fetch for the range.
+unsafe fn cf_transfer(
+    conn: CF_CONNECTION_KEY,
+    transfer: i64,
+    buffer: *const core::ffi::c_void,
+    offset: i64,
+    length: i64,
+    status: NTSTATUS,
+) -> windows::core::Result<()> {
+    let op_info = CF_OPERATION_INFO {
+        StructSize: std::mem::size_of::<CF_OPERATION_INFO>() as u32,
+        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
+        ConnectionKey: conn,
+        TransferKey: transfer,
+        CorrelationVector: std::ptr::null(),
+        SyncStatus: std::ptr::null(),
+        RequestKey: 0,
+    };
+    let mut params = CF_OPERATION_PARAMETERS {
+        ParamSize: (core::mem::offset_of!(CF_OPERATION_PARAMETERS, Anonymous)
+            + std::mem::size_of::<CF_OPERATION_PARAMETERS_0_0>()) as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            TransferData: CF_OPERATION_PARAMETERS_0_0 {
+                Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                CompletionStatus: status,
+                Buffer: buffer,
+                Offset: offset,
+                Length: length,
+            },
+        },
+    };
+    CfExecute(&op_info, &mut params)
+}
+
+/// True when native CfAPI dehydrated placeholders are usable for `folder` right
+/// now: Windows + package identity + the sync root registered AND a live hydration
+/// connection. When false, callers fall back to the `.cloudsc` sidecar model
+/// (macOS, non-packaged Windows, or a failed registration/connection) so cloud-only
+/// content keeps working everywhere. A live connection is required because a
+/// dehydrated placeholder with no `FETCH_DATA` handler connected can't be opened.
+pub(crate) fn placeholders_active(folder: &str) -> bool {
+    crate::windows_identity::has_package_identity() && ensure_registered(folder) && is_connected()
+}
+
+/// Whether the process currently holds a live `CfConnectSyncRoot` connection.
+fn is_connected() -> bool {
+    CONNECTION
+        .get()
+        .and_then(|m| m.lock().ok().map(|g| g.is_some()))
+        .unwrap_or(false)
+}
+
+/// Create a real dehydrated (online-only) CfAPI placeholder named `name` inside the
+/// real directory `parent`, backed by Dropbox path `remote_path` with remote byte
+/// size `size`. It shows the cloud icon and hydrates on open via our `FETCH_DATA`
+/// handler (`FileIdentity` carries `remote_path`; the handler also re-derives it
+/// from the local path). Marked in-sync so no upload is triggered. The caller MUST
+/// ensure `parent\name` does not already exist (`CfCreatePlaceholders` fails
+/// otherwise). Returns whether the placeholder was created.
+pub(crate) fn create_dehydrated_placeholder(
+    parent: &Path,
+    name: &str,
+    remote_path: &str,
+    size: i64,
+) -> bool {
+    let name_w = to_wide(name);
+    let base_w = to_wide(&parent.to_string_lossy());
+    let ident: Vec<u16> = remote_path.encode_utf16().collect();
+    let mut info = CF_PLACEHOLDER_CREATE_INFO {
+        RelativeFileName: PCWSTR(name_w.as_ptr()),
+        FsMetadata: CF_FS_METADATA {
+            BasicInfo: FILE_BASIC_INFO {
+                CreationTime: 0,
+                LastAccessTime: 0,
+                LastWriteTime: 0,
+                ChangeTime: 0,
+                FileAttributes: FILE_ATTRIBUTE_ARCHIVE.0,
+            },
+            FileSize: size,
+        },
+        FileIdentity: ident.as_ptr() as *const _,
+        FileIdentityLength: (ident.len() * 2) as u32,
+        Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+        Result: windows::core::HRESULT(0),
+        CreateUsn: 0,
+    };
+    let r = unsafe {
+        CfCreatePlaceholders(
+            PCWSTR(base_w.as_ptr()),
+            std::slice::from_mut(&mut info),
+            CF_CREATE_FLAG_NONE,
+            None,
+        )
+    };
+    tracing::info!(parent = %parent.display(), name, size, remote = %remote_path, result = ?r, entry = ?info.Result, "cfapi create dehydrated placeholder");
+    r.is_ok() && info.Result.is_ok()
+}
+
+/// Post-hydration reconcile for the status column. The platform can leave a
+/// just-hydrated placeholder marked NOT_IN_SYNC, and our `APPLIED` cache then makes
+/// `sync_placeholder_states` skip re-applying it (it already believes the file is in
+/// the desired synced state) — so the "Statut" column sticks on a "syncing" glyph
+/// forever even though the file is fully hydrated and matches the cloud. Fix: drop
+/// the cache entry (so a later overlay refresh re-applies pin/sync per policy) and
+/// re-confirm IN_SYNC now so the column settles immediately. Right after hydration
+/// the local bytes equal the remote, so IN_SYNC is correct. Fails soft.
+fn reconcile_after_hydration(abs: &Path) {
+    if let Some(state) = app_state() {
+        if let Ok(Some(folder)) = state.db.get_sync_folder() {
+            if let Ok(rel) = crate::path_util::relpath_under(Path::new(&folder), abs) {
+                if let Some(applied) = APPLIED.get() {
+                    if let Ok(mut m) = applied.lock() {
+                        m.remove(&rel);
+                    }
+                }
+            }
+        }
+    }
+    let path = to_wide(&abs.to_string_lossy());
+    unsafe {
+        if let Ok(handle) = CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        ) {
+            let r = CfSetInSyncState(handle, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None);
+            let _ = CloseHandle(handle);
+            tracing::debug!(file = %abs.display(), result = ?r, "cfapi reconcile after hydration (mark in-sync)");
+        }
+    }
+}
+
+/// Force full hydration of a native CfAPI dehydrated placeholder at `abs` (our
+/// "Synchroniser sur le disque" menu on a cloud-only file). Opens a backup-semantics
+/// handle and calls `CfHydratePlaceholder` for the whole file (offset 0, length -1),
+/// which pulls every byte through our `FETCH_DATA` handler. Returns whether it
+/// succeeded. Fails soft. Requires a live provider connection (see `is_connected`).
+pub(crate) fn hydrate_placeholder(abs: &Path) -> bool {
+    let path = to_wide(&abs.to_string_lossy());
+    unsafe {
+        let handle = match CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(path = %abs.display(), error = %e, "hydrate_placeholder: open failed");
+                return false;
+            }
+        };
+        let r = CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAG_NONE, None);
+        let _ = CloseHandle(handle);
+        tracing::info!(file = %abs.display(), result = ?r, "cfapi hydrate placeholder");
+        if r.is_ok() {
+            // Settle the status column: re-confirm IN_SYNC after hydration (see
+            // reconcile_after_hydration). Safe here — we're on the app action thread,
+            // and CfHydratePlaceholder returned synchronously.
+            reconcile_after_hydration(abs);
+        }
+        r.is_ok()
+    }
+}
+
+/// DEV / validation only (DBSYNC-59 Slice 1): turn a synced file into a real
+/// dehydrated (online-only) placeholder so opening it triggers our `FETCH_DATA`
+/// handler. A provider cannot force-dehydrate an existing file
+/// (`CfDehydratePlaceholder` → DEHYDRATION_DISALLOWED), so we create the placeholder
+/// fresh: remove the local file then create it dehydrated, so the fs-watcher debounce
+/// coalesces it and no delete propagates to Dropbox. Returns whether it was created.
+pub(crate) fn dehydrate_for_test(abs: &Path) -> bool {
+    let Some(state) = app_state() else {
+        return false;
+    };
+    let Ok(Some(folder)) = state.db.get_sync_folder() else {
+        return false;
+    };
+    let (Ok(rel), Ok(size)) = (
+        crate::path_util::relpath_under(Path::new(&folder), abs),
+        std::fs::metadata(abs).map(|m| m.len() as i64),
+    ) else {
+        return false;
+    };
+    let Ok(remote) = crate::path_util::normalize_dropbox_path(&rel) else {
+        return false;
+    };
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return false;
+    };
+
+    if let Err(e) = std::fs::remove_file(abs) {
+        tracing::warn!(path = %abs.display(), error = %e, "dehydrate_for_test: remove failed");
+        return false;
+    }
+    create_dehydrated_placeholder(parent, &name.to_string_lossy(), &remote, size)
 }
 
 /// Case-insensitive, separator-normalized path equality. Windows paths are
@@ -174,6 +633,31 @@ fn registered_folder() -> Option<String> {
     );
     let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(path).ok()?;
     key.get_value::<String, _>(&sid).ok()
+}
+
+/// Bump when the sync-root registration policy changes (e.g. enabling dehydration)
+/// so an existing install re-registers once to apply it. NEVER lower it.
+const REG_POLICY_VERSION: u32 = 2;
+const POLICY_VERSION_KEY: &str = "Software\\DropboxSyncDesktop\\SyncRoot";
+
+/// The registration policy version this machine last registered with (HKCU, our
+/// own key — read-only, no elevation). `0` if never set / older build.
+fn stored_policy_version() -> u32 {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(POLICY_VERSION_KEY)
+        .ok()
+        .and_then(|k| k.get_value::<u32, _>("PolicyVersion").ok())
+        .unwrap_or(0)
+}
+
+fn set_stored_policy_version(v: u32) {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(POLICY_VERSION_KEY) {
+        let _ = k.set_value("PolicyVersion", &v);
+    }
 }
 
 /// Run a WinRT closure on a dedicated MTA thread (async `.get()` must not run on
@@ -231,6 +715,14 @@ fn register_winrt(folder: &str) -> windows::core::Result<()> {
         step!("SetIconResource", info.SetIconResource(&HSTRING::from(icon)));
     }
     step!("SetHydrationPolicy", info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full));
+    // Let the platform dehydrate unpinned in-sync files (and let us call
+    // CfDehydratePlaceholder directly) — required for on-demand / the cloud icon
+    // (DBSYNC-59). Only affects UNPINNED files, so DBSYNC-41's pinned files (and the
+    // status column) are unchanged.
+    step!(
+        "SetHydrationPolicyModifier",
+        info.SetHydrationPolicyModifier(StorageProviderHydrationPolicyModifier::AutoDehydrationAllowed)
+    );
     step!("SetPopulationPolicy", info.SetPopulationPolicy(StorageProviderPopulationPolicy::AlwaysFull));
     step!("SetProviderId", info.SetProviderId(PROVIDER_ID));
     step!("SetVersion", info.SetVersion(&HSTRING::from("1.0.0.0")));
@@ -238,9 +730,24 @@ fn register_winrt(folder: &str) -> windows::core::Result<()> {
     let ctx = step!("CreateContext", CryptographicBuffer::CreateFromByteArray(b"DropboxSync"));
     step!("SetContext", info.SetContext(&ctx));
     // Clear any stale/partial registration for this id first, so a leftover entry
-    // from a crash or a previous build can't make Register fail (0x80070490).
-    let _ = StorageProviderSyncRootManager::Unregister(&HSTRING::from(&id));
-    step!("Register", StorageProviderSyncRootManager::Register(&info));
+    // (e.g. one whose nav-pane node was stripped by `enable-status-column`, or a
+    // crash remnant) can't make Register fail with 0x80070490 (ERROR_NOT_FOUND).
+    // That failure is sticky against a stripped entry on the first try; a fresh
+    // Unregister + Register retry clears it (observed empirically).
+    let id_h = HSTRING::from(&id);
+    let mut result = {
+        let _ = StorageProviderSyncRootManager::Unregister(&id_h);
+        StorageProviderSyncRootManager::Register(&info)
+    };
+    for attempt in 1..=3 {
+        if result.is_ok() {
+            break;
+        }
+        tracing::warn!(attempt, error = ?result, "cfapi Register failed; retrying after Unregister");
+        let _ = StorageProviderSyncRootManager::Unregister(&id_h);
+        result = StorageProviderSyncRootManager::Register(&info);
+    }
+    step!("Register", result);
     tracing::info!("cfapi register: ok");
     Ok(())
 }

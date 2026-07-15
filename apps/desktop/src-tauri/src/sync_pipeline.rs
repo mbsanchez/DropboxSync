@@ -51,6 +51,23 @@ fn placeholder_exists(tracked_root: &std::path::Path, rel: &str) -> bool {
     tracked_root.join(format!("{rel}.cloudsc")).exists()
 }
 
+/// Execution-time guard for a queued remote `delete`: suppress it when the local
+/// path is now represented as CLOUD-ONLY — a `.cloudsc` sidecar OR a native CfAPI
+/// dehydrated placeholder at the path itself. That means the path was DEHYDRATED to
+/// free space, not deleted by the user, so deleting it on Dropbox would be data loss
+/// (DBSYNC-33/45/59). Re-checking at drain time (not only at enqueue) closes the
+/// brief `remove_file`→`CfCreatePlaceholders` window in the CfAPI dehydrate path,
+/// where the enqueue-time `placeholder_exists` guard can miss the not-yet-created
+/// placeholder. Best-effort: if the sync folder can't be read we do NOT suppress, so
+/// a genuine user deletion still propagates.
+fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
+    let Ok(Some(folder)) = state.db.get_sync_folder() else {
+        return false;
+    };
+    let root = std::path::Path::new(&folder);
+    placeholder_exists(root, rel) || crate::path_util::is_dehydrated_placeholder(&root.join(rel))
+}
+
 /// Evaluate a single local file against the index and enqueue an upload if it is
 /// new or changed (routing a change that races a still-pending upload to a
 /// conflicted copy). Returns the number of jobs enqueued (0 or 1). Shared by the
@@ -64,6 +81,15 @@ fn process_local_file_change(
     known: Option<&FileIndexRow>,
     pending_targets: &mut HashSet<String>,
 ) -> AppResult<usize> {
+    // DBSYNC-59: a Windows CfAPI dehydrated placeholder is cloud-only content that
+    // just happens to be a real file on disk. Hashing it would open it and trigger
+    // an on-demand download (hydration) — turning every scan tick into a full
+    // re-download of every online-only file, and re-uploading unchanged bytes.
+    // Treat it as present + in-sync: never hash, never enqueue, never delete. It
+    // still reaches `seen_paths` in the caller, so genuine-delete detection is safe.
+    if crate::path_util::is_dehydrated_placeholder(absolute) {
+        return Ok(0);
+    }
     let (hash, size_bytes, modified_ts) = hash_file(absolute)?;
 
     match known {
@@ -548,7 +574,16 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             .as_deref()
             .or(job.source_path.as_deref())
             .ok_or_else(|| AppError::Sync("delete job missing target_path/source_path".to_string()))
-            .and_then(|rel| delete_remote_file_internal(state, rel)),
+            .and_then(|rel| {
+                // Dehydration is never a Dropbox delete: if the path is now a cloud-only
+                // placeholder, drop this job instead of deleting the remote file.
+                if delete_suppressed_by_dehydration(state, rel) {
+                    tracing::info!(rel, "remote delete suppressed: path is a cloud-only placeholder (dehydration, not a deletion)");
+                    Ok(())
+                } else {
+                    delete_remote_file_internal(state, rel)
+                }
+            }),
         "local_delete" => job
             .target_path
             .as_deref()
@@ -986,6 +1021,24 @@ mod tests {
         let n = process_changed_paths(&state, &["a.txt".to_string()]).expect("process");
         assert_eq!(n, 0, "a missing root must never be read as a mass deletion");
         assert!(state.db.list_recent_jobs(50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_is_suppressed_when_path_is_a_cloud_only_placeholder() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let sync = tmp.path().join("synced");
+        // A queued remote delete whose path now has a `.cloudsc` sidecar is a
+        // dehydration (free up space), not a user deletion → suppress at drain time.
+        // (The native CfAPI placeholder branch needs a real sync root, so it is
+        // exercised by manual/integration testing; here we cover the `.cloudsc` case
+        // and the genuine-deletion case that must still propagate.)
+        std::fs::write(sync.join("foo.txt.cloudsc"), b"{}").unwrap();
+        assert!(super::delete_suppressed_by_dehydration(&state, "foo.txt"));
+        assert!(
+            !super::delete_suppressed_by_dehydration(&state, "gone.txt"),
+            "a genuinely deleted file (no placeholder) must still be deleted on remote"
+        );
     }
 
     // ---- DBSYNC-55: editor-temp / vanished-source handling ----

@@ -56,6 +56,17 @@ pub(crate) fn dispatch_action(state: &AppState, action: &str, abs_path: &Path) -
         // Foundation smoke verb: reuse the proven `.cloudsc`-open path (which
         // validates the path is under the root and is a placeholder).
         "hydrate" => {
+            // DBSYNC-59 Slice 2: a native CfAPI dehydrated placeholder is a real file
+            // (not a `.cloudsc` sidecar). It hydrates in place via the platform + our
+            // FETCH_DATA handler — no queue job — so handle it before the `.cloudsc`
+            // resolver (which would reject a non-`.cloudsc` path).
+            #[cfg(windows)]
+            if crate::path_util::is_dehydrated_placeholder(abs_path) {
+                let rel = validate_under_root(state, abs_path)?;
+                let ok = crate::cloud_filter::hydrate_placeholder(abs_path);
+                tracing::info!(action = "hydrate", path = %rel, ok, "cfapi placeholder hydrated in place");
+                return Ok(false);
+            }
             let rel = resolve_cloudsc_rel_path(state, abs_path)?;
             state
                 .db
@@ -96,6 +107,16 @@ pub(crate) fn dispatch_action(state: &AppState, action: &str, abs_path: &Path) -
                     Err(e)
                 }
             }
+        }
+        // DEV / validation (DBSYNC-59 Slice 1, Windows-only): dehydrate a hydrated
+        // CfAPI placeholder so on-demand hydration can be exercised end-to-end.
+        // Not a user-facing verb; the real "free up space" → CfAPI mapping is Slice 2.
+        #[cfg(windows)]
+        "cfapi_dehydrate" => {
+            let rel = validate_under_root(state, abs_path)?;
+            let ok = crate::cloud_filter::dehydrate_for_test(abs_path);
+            tracing::info!(action = "cfapi_dehydrate", path = %rel, ok, "shell action done");
+            Ok(false)
         }
         other => Err(AppError::Sync(format!("unknown shell action: {other}"))),
     }
