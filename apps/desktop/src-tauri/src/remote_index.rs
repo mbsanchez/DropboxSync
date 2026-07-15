@@ -276,13 +276,8 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
 /// The set of relative paths with an in-flight job, so we don't enqueue a
 /// duplicate download/delete for a file already being processed.
 fn pending_job_targets(state: &AppState) -> AppResult<HashSet<String>> {
-    Ok(state
-        .db
-        .list_recent_jobs(400)?
-        .iter()
-        .filter(|j| j.status == "queued" || j.status == "retry_wait" || j.status == "running")
-        .filter_map(|j| j.target_path.clone().or(j.source_path.clone()))
-        .collect())
+    // DBSYNC-31: single indexed SQL query instead of scanning list_recent_jobs(400).
+    state.db.active_job_paths()
 }
 
 /// Reconcile a path that is PRESENT on the remote: record its metadata and, when

@@ -43,24 +43,8 @@ struct OverlayStateFile {
 }
 
 fn active_job_paths(db: &db::Db) -> AppResult<HashSet<String>> {
-    let jobs = db.list_recent_jobs(10_000)?;
-    let mut set = HashSet::new();
-    for j in jobs {
-        if j.status != "queued" && j.status != "retry_wait" && j.status != "running" {
-            continue;
-        }
-        if let Some(p) = j.target_path.as_ref() {
-            if !p.is_empty() {
-                set.insert(p.clone());
-            }
-        }
-        if let Some(p) = j.source_path.as_ref() {
-            if !p.is_empty() {
-                set.insert(p.clone());
-            }
-        }
-    }
-    Ok(set)
+    // DBSYNC-31: single indexed SQL query instead of scanning list_recent_jobs(10_000).
+    db.active_job_paths()
 }
 
 fn unresolved_conflict_paths(db: &db::Db) -> AppResult<HashSet<String>> {
