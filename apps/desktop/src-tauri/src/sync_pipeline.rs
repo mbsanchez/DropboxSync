@@ -378,6 +378,61 @@ fn enqueue_targeted_deletions(
     Ok(enqueued)
 }
 
+/// Mass-deletion circuit breaker thresholds (DBSYNC-64). A single scan pass that
+/// would propagate at least `MASS_DELETE_ABSOLUTE` deletions, OR at least
+/// `MASS_DELETE_FRACTION_PERCENT`% of the tracked set (guarded by a small floor so a
+/// tiny repo isn't over-eager), is treated as a likely bug / CfAPI eviction / drive
+/// hiccup rather than an intentional bulk delete — and is BLOCKED pending an explicit
+/// user override. No sync client should ever nuke hundreds of files (local OR remote)
+/// from a single reconcile without a sanity check.
+const MASS_DELETE_ABSOLUTE: usize = 200;
+const MASS_DELETE_FRACTION_FLOOR: usize = 25;
+const MASS_DELETE_FRACTION_PERCENT: usize = 10;
+
+/// One-shot app_config flag the user sets (via `confirm_pending_deletions`) to let
+/// the next mass deletion through.
+const MASS_DELETE_OVERRIDE_KEY: &str = "mass_delete_override_once";
+
+/// True if this many deletion candidates out of `tracked` tracked entries looks like
+/// a catastrophe rather than an intentional bulk delete.
+pub(crate) fn is_mass_deletion(candidates: usize, tracked: usize) -> bool {
+    if candidates >= MASS_DELETE_ABSOLUTE {
+        return true;
+    }
+    candidates >= MASS_DELETE_FRACTION_FLOOR
+        && candidates.saturating_mul(100) >= tracked.saturating_mul(MASS_DELETE_FRACTION_PERCENT)
+}
+
+/// Returns true (and CONSUMES the one-shot flag) if the user has explicitly
+/// authorized the next mass deletion to proceed.
+fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
+    if state.db.get_app_config(MASS_DELETE_OVERRIDE_KEY)?.as_deref() == Some("1") {
+        state.db.set_app_config(MASS_DELETE_OVERRIDE_KEY, "0")?;
+        tracing::warn!("mass-deletion override consumed: allowing this deletion batch");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Block a suspicious mass deletion: propagate NONE of it, log loudly, notify, and
+/// surface a sticky error so the UI shows sync is paused (DBSYNC-64).
+fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
+    let msg = format!(
+        "Sync paused: {candidates} deletions in one pass ({tracked} tracked) look like a bug \
+         or missing files, not an intentional delete — nothing was deleted. Review, then \
+         confirm to proceed."
+    );
+    tracing::error!(
+        candidates,
+        tracked,
+        "MASS-DELETION BLOCKED by circuit breaker; no deletions propagated (DBSYNC-64)"
+    );
+    if let Ok(mut engine) = state.sync_engine.lock() {
+        engine.set_last_error(msg.clone());
+    }
+    crate::sharing::notify("DropboxSync - sync paused", &msg);
+}
+
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
     let folder = state
         .db
@@ -452,22 +507,6 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         )?;
     }
 
-    // Only propagate FILE deletions when we trust the walk was complete.
-    if !walk_had_error {
-        for prev in known {
-            if prev.relative_path.ends_with(".cloudsc") {
-                continue;
-            }
-            if is_ignored_local_path(&prev.relative_path) {
-                continue;
-            }
-            if !seen_paths.contains(&prev.relative_path) {
-                enqueued_jobs +=
-                    process_local_file_deletion(state, &tracked_root, &prev.relative_path)?;
-            }
-        }
-    }
-
     // Track real (materialized) directories so a folder deletion — which has no
     // file content to diff — can still be detected: any previously-known folder
     // that is no longer present on disk must have been deleted locally, so its
@@ -505,20 +544,47 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         state.db.upsert_known_folder(&relative)?;
     }
 
-    // Only propagate FOLDER deletions (recursive remote delete) when the dir
-    // walk was fully readable — a partial walk must never be treated as a batch
-    // of deletions.
+    // ── Deletion propagation + mass-deletion circuit breaker (DBSYNC-64) ────────
+    // Only propagate deletions when BOTH walks were fully readable — a partial walk
+    // must never be treated as a batch of deletions. Collect the FILE and FOLDER
+    // deletion candidates FIRST (don't enqueue yet); if a single pass would delete a
+    // suspicious number of them, a bug / CfAPI eviction / drive hiccup likely made
+    // real files look absent — block the whole batch (nothing enqueued), alert, and
+    // require an explicit user override, instead of nuking the user's Dropbox.
+    //
+    // Ignored/temp-named folders are excluded: they're skipped by the walk (never in
+    // `seen_dirs`), and a stale row from an older build would otherwise trigger a
+    // RECURSIVE remote delete of a folder that still exists (DBSYNC-55).
     if !walk_had_error {
-        for rel in state.db.list_known_folders()? {
-            // Never propagate a "deletion" for an ignored/temp-named folder: it is
-            // skipped by the walk above (so never in `seen_dirs`), and a stale row
-            // from an older build would otherwise trigger a RECURSIVE remote delete
-            // of a folder that still exists (DBSYNC-55).
-            if is_ignored_local_path(&rel) {
-                continue;
+        let file_deletions: Vec<String> = known
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .filter(|rel| {
+                !rel.ends_with(".cloudsc")
+                    && !is_ignored_local_path(rel)
+                    && !seen_paths.contains(rel)
+            })
+            .collect();
+        let folder_deletions: Vec<String> = state
+            .db
+            .list_known_folders()?
+            .into_iter()
+            .filter(|rel| !is_ignored_local_path(rel) && !seen_dirs.contains(rel))
+            .collect();
+
+        let candidate_count = file_deletions.len() + folder_deletions.len();
+        let tracked_count = known.len() + seen_dirs.len();
+
+        if is_mass_deletion(candidate_count, tracked_count)
+            && !consume_mass_delete_override(state)?
+        {
+            block_mass_deletion(state, candidate_count, tracked_count);
+        } else {
+            for rel in &file_deletions {
+                enqueued_jobs += process_local_file_deletion(state, &tracked_root, rel)?;
             }
-            if !seen_dirs.contains(&rel) {
-                enqueued_jobs += process_known_folder_deletion(state, &tracked_root, &rel)?;
+            for rel in &folder_deletions {
+                enqueued_jobs += process_known_folder_deletion(state, &tracked_root, rel)?;
             }
         }
     }
@@ -943,8 +1009,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        cleanup_stale_upload_state, process_changed_paths, resolve_conflict_internal,
-        run_sync_tick_internal, ConflictAction, SYNC_BATCH_CAP,
+        cleanup_stale_upload_state, is_mass_deletion, process_changed_paths,
+        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_internal,
+        ConflictAction, SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
     use crate::storage::db::Db;
@@ -1499,5 +1566,67 @@ mod tests {
         resolve_conflict_internal(&state, id, ConflictAction::UseRemote).unwrap();
 
         assert_eq!(unresolved_count(&state), 0);
+    }
+
+    // ── DBSYNC-64: mass-deletion circuit breaker ─────────────────────────────
+
+    #[test]
+    fn is_mass_deletion_thresholds() {
+        assert!(is_mass_deletion(200, 100_000), "absolute limit trips regardless of fraction");
+        assert!(is_mass_deletion(30, 100), ">= floor and >= 10% of tracked");
+        assert!(!is_mass_deletion(24, 100), "below the absolute floor");
+        assert!(!is_mass_deletion(30, 1000), "3% is under the 10% fraction");
+        assert!(!is_mass_deletion(0, 0), "nothing to delete");
+    }
+
+    #[test]
+    fn scan_blocks_mass_deletion_until_overridden() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // 30 tracked files that no longer exist on disk → 30 deletion candidates.
+        for i in 0..30 {
+            state
+                .db
+                .upsert_local_file(&format!("f{i}.txt"), "h", 1, 1)
+                .unwrap();
+        }
+
+        // First scan: the batch is a mass deletion → BLOCKED. Nothing propagated,
+        // index rows kept, a sticky error surfaced. (The scan's later remote-refresh
+        // step errors here with no token, but the deletion decision runs BEFORE it,
+        // so its side effects are already committed — ignore the Result and assert
+        // those.)
+        let _ = scan_local_changes_internal(&state);
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "a mass deletion must be blocked — no remote deletes enqueued"
+        );
+        assert_eq!(
+            state.db.list_local_files().unwrap().len(),
+            30,
+            "blocked deletion must NOT drop the index rows"
+        );
+        assert!(
+            state
+                .sync_engine
+                .lock()
+                .unwrap()
+                .current_status(false)
+                .last_error
+                .is_some(),
+            "a blocked mass deletion must surface a sticky error"
+        );
+
+        // User reviews and confirms → the next scan propagates the deletions.
+        state
+            .db
+            .set_app_config("mass_delete_override_once", "1")
+            .unwrap();
+        let _ = scan_local_changes_internal(&state);
+        assert_eq!(
+            job_targets(&state, "delete").len(),
+            30,
+            "an explicit override lets the reviewed batch through"
+        );
     }
 }

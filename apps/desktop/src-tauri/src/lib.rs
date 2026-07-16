@@ -394,6 +394,7 @@ pub fn run() {
             commands::get_sync_dashboard,
             commands::retry_failed_jobs,
             commands::resolve_conflict,
+            commands::confirm_pending_deletions,
             commands::scan_local_changes,
             commands::process_sync_queue,
             commands::sync_tick,
