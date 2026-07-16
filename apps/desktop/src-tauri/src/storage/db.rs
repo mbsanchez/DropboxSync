@@ -44,6 +44,13 @@ pub struct ConflictRow {
     pub local_path: String,
     pub remote_path: String,
     pub reason: String,
+    /// Sibling copy holding the *local* content the auto-resolve preserved
+    /// (`<name> (conflicted copy <ts>).<ext>`), relative to the sync root. `None`
+    /// for the remote-deleted scenario, where only the local primary survives.
+    pub conflicted_copy_path: Option<String>,
+    /// True when the conflict is "remote deleted while local diverged" — there is
+    /// no remote content to fall back to, so `Use Remote` means discarding local.
+    pub remote_deleted: bool,
     pub created_at: String,
 }
 
@@ -756,21 +763,39 @@ impl Db {
         Ok(n)
     }
 
-    pub fn add_conflict(&self, local_path: &str, remote_path: &str, reason: &str) -> AppResult<()> {
+    pub fn add_conflict(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        reason: &str,
+        conflicted_copy_path: Option<&str>,
+        remote_deleted: bool,
+    ) -> AppResult<()> {
         let conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn.execute(
             "
-                INSERT INTO sync_conflicts(local_path, remote_path, reason, resolved, created_at)
-                VALUES(?1, ?2, ?3, 0, ?4)
+                INSERT INTO sync_conflicts
+                    (local_path, remote_path, reason, conflicted_copy_path, remote_deleted, resolved, created_at)
+                VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6)
                 ",
-            params![local_path, remote_path, reason, Utc::now().to_rfc3339()],
+            params![
+                local_path,
+                remote_path,
+                reason,
+                conflicted_copy_path,
+                remote_deleted as i64,
+                Utc::now().to_rfc3339()
+            ],
         )?;
         Ok(())
     }
 
+    /// Only UNRESOLVED conflicts — this backs the actionable list in the UI. Once a
+    /// conflict is resolved (`mark_conflict_resolved`) it drops off here and the
+    /// overlay stops flagging its path (`list_unresolved_conflict_local_paths`).
     pub fn list_recent_conflicts(&self, limit: i64) -> AppResult<Vec<ConflictRow>> {
         let conn = self
             .read
@@ -778,8 +803,10 @@ impl Db {
             .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn.prepare(
             "
-                SELECT id, local_path, remote_path, reason, created_at
+                SELECT id, local_path, remote_path, reason, conflicted_copy_path,
+                       remote_deleted, created_at
                 FROM sync_conflicts
+                WHERE resolved = 0
                 ORDER BY id DESC
                 LIMIT ?1
                 ",
@@ -791,11 +818,56 @@ impl Db {
                 local_path: row.get(1)?,
                 remote_path: row.get(2)?,
                 reason: row.get(3)?,
-                created_at: row.get(4)?,
+                conflicted_copy_path: row.get(4)?,
+                remote_deleted: row.get::<_, i64>(5)? != 0,
+                created_at: row.get(6)?,
             })
         })?;
 
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fetch a single unresolved conflict by id (for the resolver). Returns `None`
+    /// if it doesn't exist or was already resolved — so a double-click resolves once.
+    pub fn get_unresolved_conflict(&self, id: i64) -> AppResult<Option<ConflictRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
+                SELECT id, local_path, remote_path, reason, conflicted_copy_path,
+                       remote_deleted, created_at
+                FROM sync_conflicts
+                WHERE id = ?1 AND resolved = 0
+                ",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(ConflictRow {
+                id: row.get(0)?,
+                local_path: row.get(1)?,
+                remote_path: row.get(2)?,
+                reason: row.get(3)?,
+                conflicted_copy_path: row.get(4)?,
+                remote_deleted: row.get::<_, i64>(5)? != 0,
+                created_at: row.get(6)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Marks a conflict row resolved. Idempotent (a no-op if already resolved).
+    pub fn mark_conflict_resolved(&self, id: i64) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE sync_conflicts SET resolved = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     pub fn list_unresolved_conflict_local_paths(&self) -> AppResult<Vec<String>> {
@@ -842,6 +914,8 @@ fn migrate(conn: &Connection) -> AppResult<()> {
             local_path TEXT NOT NULL,
             remote_path TEXT NOT NULL,
             reason TEXT NOT NULL,
+            conflicted_copy_path TEXT,
+            remote_deleted INTEGER NOT NULL DEFAULT 0,
             resolved INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
@@ -875,6 +949,17 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "sync_jobs", "upload_session_offset", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_len", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_mtime", "INTEGER")?;
+
+    // DBSYNC-35: structured fields for conflict resolution — the sibling copy holding
+    // the preserved local content, and a flag for the remote-deleted scenario. Both
+    // have constant defaults, so ADD COLUMN is safe on existing rows.
+    add_column_if_missing(conn, "sync_conflicts", "conflicted_copy_path", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "sync_conflicts",
+        "remote_deleted",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     // DBSYNC-45: canonicalize path separators in the index tables to '/'. Rows
     // written from the local scan used OS-native '\' on Windows while remote/

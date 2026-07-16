@@ -31,7 +31,14 @@ export type SyncJob = {
 export type SyncConflict = {
   id: number;
   localPath: string;
+  remotePath: string;
   reason: string;
+  /** Sibling copy preserving the local content, relative to the sync root.
+   *  Absent for the remote-deleted scenario (only the local primary survives). */
+  conflictedCopyPath?: string | null;
+  /** True when the remote was deleted while local diverged — "Use Remote" then
+   *  means discarding the local file (guarded by a confirm in the UI). */
+  remoteDeleted: boolean;
   createdAt: string;
 };
 

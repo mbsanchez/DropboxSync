@@ -1019,7 +1019,9 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
             let reason = format!(
                 "remote download would overwrite unsynced local changes; local copy preserved as {conflicted_rel}"
             );
-            state.db.add_conflict(&relative, &relative, &reason)?;
+            state
+                .db
+                .add_conflict(&relative, &relative, &reason, Some(&conflicted_rel), false)?;
             if let Ok(mut engine) = state.sync_engine.lock() {
                 engine.record_conflict();
             }
@@ -1029,6 +1031,7 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
                 "sync conflict: local copy preserved before remote overwrite"
             );
             emit_sync_conflict(&relative, &conflicted_rel, &reason);
+            crate::sharing::notify_conflict(&relative);
         }
     }
 

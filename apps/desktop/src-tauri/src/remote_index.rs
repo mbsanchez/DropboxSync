@@ -337,13 +337,18 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
         Ok(1)
     } else {
         // Local was modified while the remote was deleted: keep it, flag conflict.
-        state
-            .db
-            .add_conflict(rel, rel, "remote deleted while local had unsynced changes")?;
+        state.db.add_conflict(
+            rel,
+            rel,
+            "remote deleted while local had unsynced changes",
+            None,
+            true,
+        )?;
         state.db.remove_remote_file(rel)?;
         if let Ok(mut engine) = state.sync_engine.lock() {
             engine.record_conflict();
         }
+        crate::sharing::notify_conflict(rel);
         Ok(0)
     }
 }
