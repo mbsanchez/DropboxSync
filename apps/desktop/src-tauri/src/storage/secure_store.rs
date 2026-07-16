@@ -106,6 +106,20 @@ impl SecureStore {
         self.store_session(&session)?;
         Ok(session)
     }
+
+    /// Deletes every credential `has_stored_credentials` (see `auth_session.rs`) can
+    /// find: the chunked session keys, the expiry marker, the legacy single-blob
+    /// session, and the legacy single-token entry used by [`get_token`](Self::get_token).
+    /// Best-effort per key (a missing entry is not an error) — never logs token
+    /// values, only that a clear was attempted.
+    pub fn clear_session(&self) -> Result<(), keyring::Error> {
+        let _ = clear_chunked_key(SESSION_ACCESS);
+        let _ = clear_chunked_key(SESSION_REFRESH);
+        let _ = Entry::new(SERVICE, SESSION_EXPIRES).and_then(|e| e.delete_credential());
+        let _ = Entry::new(SERVICE, LEGACY_SESSION_KEY).and_then(|e| e.delete_credential());
+        let _ = Entry::new(SERVICE, "dropbox-access-token").and_then(|e| e.delete_credential());
+        Ok(())
+    }
 }
 
 fn utf16_payload_bytes(s: &str) -> usize {

@@ -173,6 +173,18 @@ impl Db {
         Ok(())
     }
 
+    /// Removes the `sync_folder` app_config key (DBSYNC-36 disconnect). Local
+    /// preferences (selective-sync prefixes, ignore globs) are deliberately left
+    /// untouched — only `reset_sync_state` + this together represent "sign out".
+    pub fn clear_sync_folder(&self) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute("DELETE FROM app_config WHERE key = 'sync_folder'", [])?;
+        Ok(())
+    }
+
     pub fn get_sync_folder(&self) -> AppResult<Option<String>> {
         let conn = self
             .read
@@ -1499,6 +1511,25 @@ mod tests {
             .list_known_folders()
             .expect("list after reset")
             .is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_sync_folder_but_keeps_local_prefs() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.set_sync_folder("/tmp/folder").expect("set folder");
+        db.set_include_prefixes_csv("Fotos,Videos/2024")
+            .expect("set include prefixes");
+
+        // Mirror the `disconnect_dropbox` command's DB-side clears.
+        db.reset_sync_state().expect("reset");
+        db.clear_sync_folder().expect("clear sync folder");
+
+        assert_eq!(db.get_sync_folder().expect("get after clear"), None);
+        assert_eq!(
+            db.get_include_prefixes_csv().expect("get prefixes after clear"),
+            Some("Fotos,Videos/2024".to_string()),
+            "local prefs must survive disconnect"
+        );
     }
 
     #[test]

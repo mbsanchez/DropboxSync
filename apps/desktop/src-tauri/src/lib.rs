@@ -407,7 +407,8 @@ pub fn run() {
             commands::get_selective_sync_filters,
             commands::set_selective_sync_filters,
             commands::get_ignore_globs,
-            commands::set_ignore_globs
+            commands::set_ignore_globs,
+            commands::disconnect_dropbox
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

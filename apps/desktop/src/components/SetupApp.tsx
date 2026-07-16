@@ -6,6 +6,7 @@ import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useAuthFlow } from "../hooks/useAuthFlow";
 import { useSelectiveSync } from "../hooks/useSelectiveSync";
 import { useIgnoreGlobs } from "../hooks/useIgnoreGlobs";
+import { useDisconnect } from "../hooks/useDisconnect";
 import "../App.css";
 
 /**
@@ -39,6 +40,7 @@ function SetupApp() {
   const { includeCsv, setIncludeCsv, excludeCsv, setExcludeCsv, saveSelectiveSync } =
     useSelectiveSync(pushLog);
   const { ignoreGlobsCsv, setIgnoreGlobsCsv, saveIgnoreGlobs } = useIgnoreGlobs(pushLog);
+  const { disconnecting, disconnect } = useDisconnect(pushLog, refreshStartupRequirements);
 
   const [showFolderSetup, setShowFolderSetup] = useState(false);
 
@@ -78,6 +80,14 @@ function SetupApp() {
     } catch (e) {
       pushLog(`Failed to save sync folder: ${String(e)}`);
     }
+  };
+
+  const handleDisconnect = () => {
+    const ok = window.confirm(
+      "Disconnect Dropbox? This signs you out and clears local sync state. Your files on Dropbox are not affected.",
+    );
+    if (!ok) return;
+    void disconnect();
   };
 
   const pickFolder = async () => {
@@ -167,6 +177,9 @@ function SetupApp() {
                 Cancel OAuth
               </button>
             )}
+            <button type="button" disabled={disconnecting} onClick={handleDisconnect}>
+              {disconnecting ? "Disconnecting..." : "Disconnect"}
+            </button>
           </div>
           {authUrl && (
             <p>

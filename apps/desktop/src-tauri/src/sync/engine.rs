@@ -68,6 +68,14 @@ impl SyncEngine {
         self.tracked_path = Some(path);
     }
 
+    /// Clears the in-memory tracked path (DBSYNC-36 disconnect). Sets `None`
+    /// rather than `Some(String::new())` so `SyncStatus.tracked_path` — and any
+    /// caller checking it — unambiguously reports "no sync folder", matching
+    /// `Db::get_sync_folder`'s `None` after `clear_sync_folder`.
+    pub fn clear_tracked_path(&mut self) {
+        self.tracked_path = None;
+    }
+
     pub fn set_queue_depth(&mut self, queue_depth: usize) {
         self.queue_depth = queue_depth;
     }
