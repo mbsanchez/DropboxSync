@@ -253,50 +253,14 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     }
 
     let (remote_by_path, _cursor) = fetch_all_remote_file_metadata(state)?;
-
     let pending_targets = pending_job_targets(state)?;
 
-    let mut enqueued = 0usize;
-
-    // PRESENT files: reconcile immediately, same as before — never gated by the
-    // breaker (it only guards inferred deletions).
-    for local in &local_files {
-        let rel = &local.relative_path;
-        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
-            continue;
-        }
-        if let Some(remote_meta) = remote_by_path.get(&normalize_dropbox_path(rel)?.to_lowercase())
-        {
-            enqueued += reconcile_remote_present(state, rel, remote_meta)?;
-        }
-    }
-
-    // ABSENT files + mass-deletion circuit breaker, remote→local direction
-    // (DBSYNC-64 extension). A full sweep INFERS "deleted remotely" from a path's
-    // absence in this snapshot; unlike the cursor-delta's explicit `.tag=="deleted"`
-    // entries (apply_remote_delta, always authoritative and never gated here), a
-    // wrong/incomplete snapshot would misclassify still-present files as absent and
-    // mass-delete local copies. So: compute how many of the absent files would
-    // actually enqueue a `local_delete` (an unmodified local copy — a diverged one
-    // becomes a conflict, never a delete, so it doesn't count), and block the whole
-    // absent batch this pass if that looks like a catastrophe rather than an
-    // intentional bulk delete. PRESENT files above are unaffected either way.
-    let (absent, delete_candidates) =
-        remote_sweep_delete_candidates(state, &local_files, &remote_by_path, &pending_targets)?;
-    let tracked = local_files.len();
-
-    let overridden =
-        delete_candidates > 0 && crate::sync_pipeline::consume_mass_delete_override(state)?;
-
-    if crate::sync_pipeline::is_mass_deletion(delete_candidates, tracked) && !overridden {
-        crate::sync_pipeline::block_mass_deletion(state, delete_candidates, tracked);
-    } else {
-        // Not a mass deletion this pass (or the user overrode it) → sync isn't paused.
-        crate::sync_pipeline::clear_mass_delete_blocked(state);
-        for rel in &absent {
-            enqueued += reconcile_remote_absent(state, rel)?;
-        }
-    }
+    let enqueued = reconcile_remote_snapshot_with_breaker(
+        state,
+        &local_files,
+        &remote_by_path,
+        &pending_targets,
+    )?;
 
     // Summarise a remote-index refresh that enqueued work (DBSYNC-47); a no-op
     // refresh stays silent so the periodic sweep doesn't spam the log.
@@ -309,12 +273,80 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     Ok(enqueued)
 }
 
-/// Pure decision helper for the full-sweep half of the DBSYNC-64 mass-deletion
-/// circuit breaker (remote→local direction): given the local index and a fetched
-/// remote snapshot, returns the relative paths ABSENT from the remote (candidates
-/// for `reconcile_remote_absent`) alongside how many of them would actually
-/// enqueue a `local_delete` — i.e. the local copy still matches the last-synced
-/// remote content (`get_remote_file(rel).content_hash == local.hash`), exactly the
+/// Reconciles a fetched remote snapshot against the local index, gating inferred
+/// deletions behind the DBSYNC-64 mass-deletion circuit breaker (remote→local
+/// direction). PRESENT files are reconciled immediately and are NEVER gated (the
+/// breaker only guards inferred deletions). For ABSENT files: a full snapshot
+/// INFERS "deleted remotely" from a path's absence, unlike the cursor-delta's
+/// explicit `.tag=="deleted"` entries (`apply_remote_delta`, always authoritative
+/// and never gated) — so a wrong/incomplete snapshot could misclassify
+/// still-present files as absent and mass-delete local copies. This computes how
+/// many absent files would actually enqueue a `local_delete` (an unmodified local
+/// copy — a diverged one becomes a conflict, never a delete, so it doesn't count)
+/// and blocks the WHOLE absent batch this pass if that looks like a catastrophe
+/// rather than an intentional bulk delete.
+///
+/// Shared by BOTH remote-snapshot callers that reconcile against the full local
+/// index — the periodic full sweep
+/// (`refresh_remote_index_and_enqueue_downloads_internal`) and
+/// `seed_remote_delta_cursor` — so the cursor-reset re-snapshot path (which runs
+/// with the full local index still intact) gets the exact same guard as the
+/// periodic sweep (DBSYNC-64 CTO fix). Returns jobs enqueued.
+fn reconcile_remote_snapshot_with_breaker(
+    state: &AppState,
+    local_files: &[FileIndexRow],
+    remote_by_path: &HashMap<String, RemoteFileMeta>,
+    pending_targets: &HashSet<String>,
+) -> AppResult<usize> {
+    let mut enqueued = 0usize;
+
+    // PRESENT files: reconcile immediately, never gated by the breaker.
+    for local in local_files {
+        let rel = &local.relative_path;
+        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
+            continue;
+        }
+        if let Some(remote_meta) = remote_by_path.get(&normalize_dropbox_path(rel)?.to_lowercase())
+        {
+            enqueued += reconcile_remote_present(state, rel, remote_meta)?;
+        }
+    }
+
+    // ABSENT files + mass-deletion circuit breaker.
+    let (absent, delete_candidates) =
+        remote_sweep_delete_candidates(state, local_files, remote_by_path, pending_targets)?;
+    let tracked = local_files.len();
+
+    let overridden =
+        delete_candidates > 0 && crate::sync_pipeline::consume_mass_delete_override(state)?;
+
+    if crate::sync_pipeline::is_mass_deletion(delete_candidates, tracked) && !overridden {
+        crate::sync_pipeline::block_mass_deletion(
+            state,
+            delete_candidates,
+            tracked,
+            crate::sync_pipeline::MassDeleteSource::RemoteSweep,
+        );
+    } else {
+        // Not a mass deletion this pass (or the user overrode it) → sync isn't paused.
+        crate::sync_pipeline::clear_mass_delete_blocked(
+            state,
+            crate::sync_pipeline::MassDeleteSource::RemoteSweep,
+        );
+        for rel in &absent {
+            enqueued += reconcile_remote_absent(state, rel)?;
+        }
+    }
+
+    Ok(enqueued)
+}
+
+/// Pure decision helper for the DBSYNC-64 mass-deletion circuit breaker
+/// (remote→local direction): given the local index and a fetched remote snapshot,
+/// returns the relative paths ABSENT from the remote (candidates for
+/// `reconcile_remote_absent`) alongside how many of them would actually enqueue a
+/// `local_delete` — i.e. the local copy still matches the last-synced remote
+/// content (`get_remote_file(rel).content_hash == local.hash`), exactly the
 /// condition `reconcile_remote_absent` itself uses. A diverged local file becomes a
 /// conflict instead of a delete, so it is intentionally NOT counted as a
 /// mass-delete candidate. No network I/O — takes the already-fetched snapshot, so
@@ -337,11 +369,12 @@ fn remote_sweep_delete_candidates(
             continue; // present — handled by the caller's other loop.
         }
 
+        // `local` is already the `FileIndexRow` for `rel` from `list_local_files`,
+        // so its `.hash` is the current local content — no need to re-fetch it via
+        // `get_local_file` (DBSYNC-64 review nit).
         if let Some(prev) = state.db.get_remote_file(rel)? {
-            if let Some(local_row) = state.db.get_local_file(rel)? {
-                if local_row.hash == prev.content_hash {
-                    delete_candidates += 1;
-                }
+            if local.hash == prev.content_hash {
+                delete_candidates += 1;
             }
         }
         absent.push(rel.clone());
@@ -434,26 +467,28 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
 /// and persist the resulting cursor as the seed for cursor-delta longpoll. The
 /// cursor MUST come from this same sweep so it points at exactly the state the
 /// index now reflects (not a later `get_latest_cursor`). Returns the cursor.
+///
+/// DBSYNC-64 (CTO fix): this reconciles against the SAME kind of absence-inferred
+/// snapshot as the periodic full sweep, and it is reachable with a FULL local
+/// index intact — not just on first login/after `reset_sync_state` (which wipes
+/// `local_file_index` first, so an empty index makes the breaker a no-op there),
+/// but also via the Dropbox cursor-RESET path: `apply_remote_delta` catches a
+/// `reset` error, clears only the cursor, and calls this function while
+/// `local_file_index` is untouched. A wrong/short snapshot on that path would
+/// otherwise mass-delete local files ungated — so this goes through the exact
+/// same `reconcile_remote_snapshot_with_breaker` gate as the periodic sweep.
 pub(crate) fn seed_remote_delta_cursor(state: &AppState) -> AppResult<String> {
     let (remote_by_path, cursor) = fetch_all_remote_file_metadata(state)?;
 
     let local_files = state.db.list_local_files()?;
     if !local_files.is_empty() {
         let pending_targets = pending_job_targets(state)?;
-        for local in local_files {
-            let rel = local.relative_path;
-            if rel.ends_with(".cloudsc") || pending_targets.contains(&rel) {
-                continue;
-            }
-            match remote_by_path.get(&normalize_dropbox_path(&rel)?.to_lowercase()) {
-                Some(meta) => {
-                    reconcile_remote_present(state, &rel, meta)?;
-                }
-                None => {
-                    reconcile_remote_absent(state, &rel)?;
-                }
-            }
-        }
+        reconcile_remote_snapshot_with_breaker(
+            state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+        )?;
     }
 
     state
@@ -878,6 +913,89 @@ mod tests {
             "neither absent file matches the diverged/never-indexed exclusion rules"
         );
         assert!(!is_mass_deletion(delete_candidates, local_files.len()));
+    }
+
+    #[test]
+    fn reconcile_remote_snapshot_with_breaker_blocks_then_proceeds_on_override() {
+        // Regression coverage for the CTO fix: `seed_remote_delta_cursor` (reached
+        // via the cursor-reset path with a FULL local index intact, per
+        // `apply_remote_delta`'s "reset" branch) and the periodic full sweep both
+        // funnel through this exact function — so this test exercises the shared
+        // gate both callers now get, without needing to mock the network calls
+        // inside either caller.
+        let state = build_state();
+        for i in 0..30 {
+            let rel = format!("g{i}.txt");
+            state.db.upsert_remote_file(&rel, "H", "rev", 0).unwrap();
+            state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
+        }
+        let local_files = state.db.list_local_files().unwrap();
+        assert_eq!(local_files.len(), 30);
+
+        let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        let pending_targets: HashSet<String> = HashSet::new();
+
+        // First pass: 30/30 absent+matching → BLOCKED. Nothing enqueued/deleted,
+        // and the REMOTE-direction pause flag (not the scan one) is set.
+        let enqueued = reconcile_remote_snapshot_with_breaker(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+        )
+        .unwrap();
+        assert_eq!(enqueued, 0, "a blocked mass deletion enqueues nothing");
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "a mass deletion must be blocked — no local_delete jobs enqueued"
+        );
+        assert_eq!(
+            state.db.list_local_files().unwrap().len(),
+            30,
+            "blocked deletion must NOT drop the index rows"
+        );
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_remote")
+                .unwrap()
+                .is_some_and(|s| !s.is_empty()),
+            "a blocked remote-sweep mass deletion must persist the REMOTE durable pause flag"
+        );
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_scan")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "the remote sweep must never touch the local-scan pause flag"
+        );
+
+        // User confirms → the override lets this batch of 30 through, and clears
+        // the remote pause flag.
+        state
+            .db
+            .set_app_config("mass_delete_override_once", "1")
+            .unwrap();
+        let enqueued = reconcile_remote_snapshot_with_breaker(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+        )
+        .unwrap();
+        assert_eq!(enqueued, 30, "an explicit override lets the reviewed batch through");
+        assert_eq!(job_targets(&state, "local_delete").len(), 30);
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_remote")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "overriding the batch must clear the remote pause flag"
+        );
     }
 
     #[test]
