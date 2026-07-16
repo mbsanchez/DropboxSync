@@ -7,6 +7,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{DropboxEntry, DropboxListFolderResponse};
 use crate::path_util::normalize_dropbox_path;
 use crate::state::AppState;
+use crate::storage::db::FileIndexRow;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RemoteFileMeta {
@@ -203,6 +204,12 @@ pub(crate) fn fetch_all_remote_file_metadata(
             .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?
     };
 
+    // Pagination completeness (mass-delete safety, see doc comment above): this loop
+    // only exits via `break` after a page with `has_more == false`. Every
+    // `list_folder/continue` call above is guarded by `?` on both the HTTP request and
+    // the JSON parse, so a failure on any page propagates as `Err` and unwinds out of
+    // this function — the caller never receives a map that silently stops short of the
+    // full snapshot.
     loop {
         for entry in &entries_resp.entries {
             if let Some((path_key, meta)) = remote_meta_from_entry(entry) {
@@ -250,15 +257,44 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     let pending_targets = pending_job_targets(state)?;
 
     let mut enqueued = 0usize;
-    for local in local_files {
-        let rel = local.relative_path;
-        if rel.ends_with(".cloudsc") || pending_targets.contains(&rel) {
+
+    // PRESENT files: reconcile immediately, same as before — never gated by the
+    // breaker (it only guards inferred deletions).
+    for local in &local_files {
+        let rel = &local.relative_path;
+        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
             continue;
         }
+        if let Some(remote_meta) = remote_by_path.get(&normalize_dropbox_path(rel)?.to_lowercase())
+        {
+            enqueued += reconcile_remote_present(state, rel, remote_meta)?;
+        }
+    }
 
-        match remote_by_path.get(&normalize_dropbox_path(&rel)?.to_lowercase()) {
-            Some(remote_meta) => enqueued += reconcile_remote_present(state, &rel, remote_meta)?,
-            None => enqueued += reconcile_remote_absent(state, &rel)?,
+    // ABSENT files + mass-deletion circuit breaker, remote→local direction
+    // (DBSYNC-64 extension). A full sweep INFERS "deleted remotely" from a path's
+    // absence in this snapshot; unlike the cursor-delta's explicit `.tag=="deleted"`
+    // entries (apply_remote_delta, always authoritative and never gated here), a
+    // wrong/incomplete snapshot would misclassify still-present files as absent and
+    // mass-delete local copies. So: compute how many of the absent files would
+    // actually enqueue a `local_delete` (an unmodified local copy — a diverged one
+    // becomes a conflict, never a delete, so it doesn't count), and block the whole
+    // absent batch this pass if that looks like a catastrophe rather than an
+    // intentional bulk delete. PRESENT files above are unaffected either way.
+    let (absent, delete_candidates) =
+        remote_sweep_delete_candidates(state, &local_files, &remote_by_path, &pending_targets)?;
+    let tracked = local_files.len();
+
+    let overridden =
+        delete_candidates > 0 && crate::sync_pipeline::consume_mass_delete_override(state)?;
+
+    if crate::sync_pipeline::is_mass_deletion(delete_candidates, tracked) && !overridden {
+        crate::sync_pipeline::block_mass_deletion(state, delete_candidates, tracked);
+    } else {
+        // Not a mass deletion this pass (or the user overrode it) → sync isn't paused.
+        crate::sync_pipeline::clear_mass_delete_blocked(state);
+        for rel in &absent {
+            enqueued += reconcile_remote_absent(state, rel)?;
         }
     }
 
@@ -271,6 +307,47 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
         );
     }
     Ok(enqueued)
+}
+
+/// Pure decision helper for the full-sweep half of the DBSYNC-64 mass-deletion
+/// circuit breaker (remote→local direction): given the local index and a fetched
+/// remote snapshot, returns the relative paths ABSENT from the remote (candidates
+/// for `reconcile_remote_absent`) alongside how many of them would actually
+/// enqueue a `local_delete` — i.e. the local copy still matches the last-synced
+/// remote content (`get_remote_file(rel).content_hash == local.hash`), exactly the
+/// condition `reconcile_remote_absent` itself uses. A diverged local file becomes a
+/// conflict instead of a delete, so it is intentionally NOT counted as a
+/// mass-delete candidate. No network I/O — takes the already-fetched snapshot, so
+/// it's unit-testable independent of `fetch_all_remote_file_metadata`.
+fn remote_sweep_delete_candidates(
+    state: &AppState,
+    local_files: &[FileIndexRow],
+    remote_by_path: &HashMap<String, RemoteFileMeta>,
+    pending_targets: &HashSet<String>,
+) -> AppResult<(Vec<String>, usize)> {
+    let mut absent = Vec::new();
+    let mut delete_candidates = 0usize;
+
+    for local in local_files {
+        let rel = &local.relative_path;
+        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
+            continue;
+        }
+        if remote_by_path.contains_key(&normalize_dropbox_path(rel)?.to_lowercase()) {
+            continue; // present — handled by the caller's other loop.
+        }
+
+        if let Some(prev) = state.db.get_remote_file(rel)? {
+            if let Some(local_row) = state.db.get_local_file(rel)? {
+                if local_row.hash == prev.content_hash {
+                    delete_candidates += 1;
+                }
+            }
+        }
+        absent.push(rel.clone());
+    }
+
+    Ok((absent, delete_candidates))
 }
 
 /// The set of relative paths with an in-flight job, so we don't enqueue a
@@ -491,6 +568,7 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_pipeline::{consume_mass_delete_override, is_mass_deletion};
 
     fn file_entry(
         path_display: Option<&str>,
@@ -704,6 +782,102 @@ mod tests {
         let n = reconcile_remote_present(&state, "f.txt", &meta).unwrap();
         assert_eq!(n, 0);
         assert!(job_targets(&state, "download").is_empty());
+    }
+
+    // ── DBSYNC-64: mass-deletion circuit breaker, remote→local (sweep) ─────────
+
+    #[test]
+    fn remote_sweep_delete_candidates_flags_matching_absent_files_as_mass_delete() {
+        let state = build_state();
+        // 30 tracked files, each with a local copy matching the last-synced remote
+        // hash, and NONE present in this sweep's remote snapshot → all 30 are
+        // `local_delete` candidates.
+        for i in 0..30 {
+            let rel = format!("f{i}.txt");
+            state.db.upsert_remote_file(&rel, "H", "rev", 0).unwrap();
+            state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
+        }
+        let local_files = state.db.list_local_files().unwrap();
+        assert_eq!(local_files.len(), 30);
+
+        let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        let pending_targets: HashSet<String> = HashSet::new();
+
+        let (absent, delete_candidates) =
+            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
+                .unwrap();
+
+        assert_eq!(absent.len(), 30, "every tracked file is absent from the snapshot");
+        assert_eq!(delete_candidates, 30, "every absent file matches its last-synced hash");
+        assert!(
+            is_mass_deletion(delete_candidates, local_files.len()),
+            "30/30 candidates must trip the breaker"
+        );
+
+        // Not overridden yet.
+        assert!(!consume_mass_delete_override(&state).unwrap());
+
+        // User confirms → the one-shot override lets the batch proceed, then is
+        // consumed (a second check reads false again).
+        state
+            .db
+            .set_app_config("mass_delete_override_once", "1")
+            .unwrap();
+        assert!(consume_mass_delete_override(&state).unwrap());
+        assert!(!consume_mass_delete_override(&state).unwrap());
+    }
+
+    #[test]
+    fn remote_sweep_delete_candidates_excludes_diverged_files_and_present_files() {
+        let state = build_state();
+
+        // Diverged local copy: absent from remote, but local hash no longer matches
+        // the last-synced remote hash → NOT a delete candidate (becomes a conflict
+        // via reconcile_remote_absent, never counted toward the breaker).
+        state.db.upsert_remote_file("diverged.txt", "H", "rev", 0).unwrap();
+        state.db.upsert_local_file("diverged.txt", "DIFFERENT", 3, 0).unwrap();
+
+        // Never indexed remotely: absent from the snapshot, but there's no prior
+        // remote row, so it can't be a remote-wins delete either.
+        state.db.upsert_local_file("never_indexed.txt", "H", 3, 0).unwrap();
+
+        // Present in this sweep's snapshot: excluded from `absent` entirely.
+        state.db.upsert_remote_file("present.txt", "H", "rev", 0).unwrap();
+        state.db.upsert_local_file("present.txt", "H", 3, 0).unwrap();
+
+        // Pending job: skipped like `.cloudsc` files, even though it would
+        // otherwise be a clean delete candidate.
+        state.db.upsert_remote_file("pending.txt", "H", "rev", 0).unwrap();
+        state.db.upsert_local_file("pending.txt", "H", 3, 0).unwrap();
+
+        let local_files = state.db.list_local_files().unwrap();
+        let mut remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        remote_by_path.insert(
+            "/present.txt".to_string(),
+            RemoteFileMeta {
+                content_hash: "H".to_string(),
+                rev: "rev".to_string(),
+                modified_ts: 0,
+            },
+        );
+        let mut pending_targets: HashSet<String> = HashSet::new();
+        pending_targets.insert("pending.txt".to_string());
+
+        let (absent, delete_candidates) =
+            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
+                .unwrap();
+
+        let mut absent_sorted = absent.clone();
+        absent_sorted.sort();
+        assert_eq!(
+            absent_sorted,
+            vec!["diverged.txt".to_string(), "never_indexed.txt".to_string()]
+        );
+        assert_eq!(
+            delete_candidates, 0,
+            "neither absent file matches the diverged/never-indexed exclusion rules"
+        );
+        assert!(!is_mass_deletion(delete_candidates, local_files.len()));
     }
 
     #[test]

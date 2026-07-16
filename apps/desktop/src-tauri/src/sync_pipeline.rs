@@ -418,7 +418,11 @@ pub(crate) fn is_mass_deletion(candidates: usize, tracked: usize) -> bool {
 
 /// Returns true (and CONSUMES the one-shot flag) if the user has explicitly
 /// authorized the next mass deletion to proceed.
-fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
+///
+/// `pub(crate)`: shared with the remote sweep (`remote_index.rs`, DBSYNC-64
+/// remote→local extension) so both directions consume the same one-shot flag
+/// instead of each keeping their own.
+pub(crate) fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
     if state.db.get_app_config(MASS_DELETE_OVERRIDE_KEY)?.as_deref() == Some("1") {
         state.db.set_app_config(MASS_DELETE_OVERRIDE_KEY, "0")?;
         tracing::warn!("mass-deletion override consumed: allowing this deletion batch");
@@ -430,7 +434,11 @@ fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
 /// Block a suspicious mass deletion: propagate NONE of it, log loudly, notify, and
 /// persist a DURABLE "sync paused" flag so the UI keeps showing it every tick until
 /// the block clears (DBSYNC-64).
-fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
+///
+/// `pub(crate)`: shared with the remote sweep (`remote_index.rs`) — the durable
+/// pause flag applies regardless of which direction (local scan or remote sweep)
+/// tripped the breaker.
+pub(crate) fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
     let msg = format!(
         "Sync paused: {candidates} deletions in one pass ({tracked} tracked) look like a bug \
          or missing files, not an intentional delete — nothing was deleted. Review, then \
@@ -453,7 +461,9 @@ fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
 
 /// Clear the durable mass-deletion pause flag — the situation resolved (no mass
 /// deletion this pass, or the user overrode it), so sync is no longer paused.
-fn clear_mass_delete_blocked(state: &AppState) {
+///
+/// `pub(crate)`: shared with the remote sweep (`remote_index.rs`).
+pub(crate) fn clear_mass_delete_blocked(state: &AppState) {
     if state
         .db
         .get_app_config(MASS_DELETE_BLOCKED_KEY)
