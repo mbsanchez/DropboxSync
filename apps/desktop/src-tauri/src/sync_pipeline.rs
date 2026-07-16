@@ -12,7 +12,8 @@ use crate::dropbox_transfer::{
 use crate::error::{AppError, AppResult};
 use crate::models::SyncTickResult;
 use crate::path_util::{
-    backoff_seconds, create_conflicted_copy, hash_file, is_editor_temp_path, is_ignored_local_path,
+    backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
+    is_editor_temp_path, is_ignored_local_path,
     normalize_dropbox_path, safe_join,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
@@ -689,15 +690,19 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
 
     // 1) Drop tracked editor-temp index rows + known-folder rows — they should
     //    never have been tracked (and a stale temp-named folder row could trigger a
-    //    recursive remote delete).
+    //    recursive remote delete). Use the BUILT-IN ignore predicate (OS junk +
+    //    editor temps), NOT the combined one: a user-defined ignore glob (DBSYNC-36)
+    //    can match a real, already-synced file, and this cleanup must never strip
+    //    such a file's index row (that would make it look "new" and re-download/
+    //    churn). This also decouples the cleanup from user-glob load ordering.
     for row in state.db.list_local_files()? {
-        if is_ignored_local_path(&row.relative_path) {
+        if is_builtin_ignored_local_path(&row.relative_path) {
             state.db.remove_local_file(&row.relative_path)?;
             cleaned += 1;
         }
     }
     for folder_rel in state.db.list_known_folders()? {
-        if is_ignored_local_path(&folder_rel) {
+        if is_builtin_ignored_local_path(&folder_rel) {
             state.db.remove_known_folder(&folder_rel)?;
             cleaned += 1;
         }

@@ -114,17 +114,26 @@ pub(crate) fn parse_ignore_globs_csv(csv: Option<String>) -> Vec<String> {
     }
 }
 
-/// Single "never sync this local path" predicate for the whole pipeline: OS junk
+/// The BUILT-IN "never sync this path" predicate: OS junk
 /// ([`should_ignore_local_path`]) plus editor/download temp & lock files
-/// ([`is_editor_temp_path`]) plus user-defined ignore globs
-/// ([`set_user_ignore_globs`], DBSYNC-36). Editor temps must be excluded from the
-/// full scan too — not just the fs watcher — or an `~$doc.docx` the scan sees gets
-/// enqueued and tracked, then fails the upload when the editor deletes it
+/// ([`is_editor_temp_path`]), WITHOUT the user's own ignore globs (DBSYNC-36). Use
+/// this — not [`is_ignored_local_path`] — at any site whose meaning is "a path that
+/// should never have been tracked" (e.g. startup `cleanup_stale_upload_state`), so a
+/// user ignoring a real, already-synced file can never make that site drop the
+/// file's index row (which would make it look "new" and re-download/churn). Keeps
+/// such sites decoupled from user-glob load ordering.
+pub(crate) fn is_builtin_ignored_local_path(relative: &str) -> bool {
+    should_ignore_local_path(relative) || is_editor_temp_path(relative)
+}
+
+/// Single "never sync this local path" predicate for the whole pipeline: the
+/// built-in ignores ([`is_builtin_ignored_local_path`]) plus user-defined ignore
+/// globs ([`set_user_ignore_globs`], DBSYNC-36). Editor temps must be excluded from
+/// the full scan too — not just the fs watcher — or an `~$doc.docx` the scan sees
+/// gets enqueued and tracked, then fails the upload when the editor deletes it
 /// (DBSYNC-55).
 pub(crate) fn is_ignored_local_path(relative: &str) -> bool {
-    should_ignore_local_path(relative)
-        || is_editor_temp_path(relative)
-        || user_ignore_globs_match(relative)
+    is_builtin_ignored_local_path(relative) || user_ignore_globs_match(relative)
 }
 
 /// True if `abs` is a Windows CfAPI dehydrated (online-only) placeholder — a real
@@ -375,9 +384,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        backoff_seconds, hash_file, is_dehydrated_placeholder, is_ignored_local_path,
-        matches_ignore_globs, normalize_dropbox_path, safe_join, set_user_ignore_globs,
-        should_ignore_local_path, validate_relative, DROPBOX_BLOCK_SIZE,
+        backoff_seconds, hash_file, is_builtin_ignored_local_path, is_dehydrated_placeholder,
+        is_ignored_local_path, matches_ignore_globs, normalize_dropbox_path, safe_join,
+        set_user_ignore_globs, should_ignore_local_path, validate_relative, DROPBOX_BLOCK_SIZE,
     };
 
     #[test]
@@ -457,6 +466,22 @@ mod tests {
         assert!(is_ignored_local_path("a.log"));
         set_user_ignore_globs(Vec::new());
         assert!(!is_ignored_local_path("a.log"));
+    }
+
+    #[test]
+    fn builtin_ignore_predicate_excludes_user_globs() {
+        // The startup cleanup uses the BUILT-IN predicate so a user ignoring a real,
+        // already-synced file never makes cleanup drop that file's index row. Even
+        // while `*.log` is an active user glob, `is_builtin_ignored_local_path` must
+        // NOT match `a.log` (only the combined predicate does). Built-in junk still
+        // matches. Reset the process-wide static when done (parallel tests).
+        set_user_ignore_globs(vec!["*.log".to_string()]);
+        assert!(!is_builtin_ignored_local_path("a.log"));
+        assert!(is_ignored_local_path("a.log"));
+        set_user_ignore_globs(Vec::new());
+        assert!(is_builtin_ignored_local_path("Thumbs.db"));
+        assert!(is_builtin_ignored_local_path("~$doc.docx"));
+        assert!(!is_builtin_ignored_local_path("a.log"));
     }
 
     // ---------------------------------------------------------------------------
