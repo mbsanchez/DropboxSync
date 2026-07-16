@@ -759,23 +759,29 @@ fn dehydrate_file_atomic(
         Ok(true)
     } else {
         // Placeholder creation failed — restore the original file so nothing is
-        // ever lost (DBSYNC-64).
-        if let Err(e) = fs::rename(&aside, abs) {
-            tracing::error!(
-                rel,
-                aside = %aside.display(),
-                error = %e,
-                "CRITICAL: dehydrate placeholder creation failed AND restoring the \
-                 original file failed; the file's bytes are still safe at the \
-                 .dbsync-dehydrate.tmp aside path and must be recovered manually"
-            );
+        // ever lost (DBSYNC-64). Only re-track when the restore actually put the file
+        // back at `abs`: if the restore rename ALSO fails, `abs` is absent (bytes are
+        // at `aside`), and re-tracking a now-absent path would make the next scan read
+        // it as a single-file deletion and propagate a spurious remote delete of the
+        // still-intact Dropbox copy. Leave it untracked in that critical case.
+        match fs::rename(&aside, abs) {
+            Ok(()) => {
+                state
+                    .db
+                    .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
+            }
+            Err(e) => {
+                tracing::error!(
+                    rel,
+                    aside = %aside.display(),
+                    error = %e,
+                    "CRITICAL: dehydrate placeholder creation failed AND restoring the \
+                     original file failed; the file's bytes are still safe at the \
+                     .dbsync-dehydrate.tmp aside path and must be recovered manually. \
+                     Left untracked so the scan does not remote-delete the good cloud copy."
+                );
+            }
         }
-        // Either way the bytes are still on disk (at `abs` or, in the critical
-        // case above, at `aside`) — re-track so the row reflects a still-synced,
-        // still-present file rather than stranding it as untracked.
-        state
-            .db
-            .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
         Err(AppError::Io(format!(
             "failed creating dehydrated placeholder for {rel}; local file restored"
         )))
