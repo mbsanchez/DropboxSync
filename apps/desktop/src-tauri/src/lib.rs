@@ -29,6 +29,8 @@ mod windows_file_assoc;
 mod windows_identity;
 #[cfg(windows)]
 mod windows_shell_menu;
+#[cfg(windows)]
+mod windows_startup;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -409,7 +411,9 @@ pub fn run() {
             commands::set_selective_sync_filters,
             commands::get_ignore_globs,
             commands::set_ignore_globs,
-            commands::disconnect_dropbox
+            commands::disconnect_dropbox,
+            commands::get_startup_at_login,
+            commands::set_startup_at_login
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

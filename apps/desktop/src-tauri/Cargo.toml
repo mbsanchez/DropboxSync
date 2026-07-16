@@ -49,6 +49,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_Packaging_Appx",
 ] }
 windows = { version = "0.61", features = [
+    "ApplicationModel",
     "Foundation",
     "Security_Cryptography",
     "Storage",

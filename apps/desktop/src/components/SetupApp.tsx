@@ -7,6 +7,7 @@ import { useAuthFlow } from "../hooks/useAuthFlow";
 import { useSelectiveSync } from "../hooks/useSelectiveSync";
 import { useIgnoreGlobs } from "../hooks/useIgnoreGlobs";
 import { useDisconnect } from "../hooks/useDisconnect";
+import { useStartupAtLogin } from "../hooks/useStartupAtLogin";
 import "../App.css";
 
 /**
@@ -41,6 +42,12 @@ function SetupApp() {
     useSelectiveSync(pushLog);
   const { ignoreGlobsCsv, setIgnoreGlobsCsv, saveIgnoreGlobs } = useIgnoreGlobs(pushLog);
   const { disconnecting, disconnect } = useDisconnect(pushLog, refreshStartupRequirements);
+  const {
+    supported: startupAtLoginSupported,
+    enabled: startupAtLoginEnabled,
+    busy: startupAtLoginBusy,
+    toggle: toggleStartupAtLogin,
+  } = useStartupAtLogin(pushLog);
 
   const [showFolderSetup, setShowFolderSetup] = useState(false);
 
@@ -241,6 +248,24 @@ function SetupApp() {
             />
             <button onClick={() => void saveIgnoreGlobs()}>Save ignored files</button>
           </div>
+
+          {startupAtLoginSupported && (
+            <>
+              <h3>Start at login</h3>
+              <p style={{ fontSize: "0.85rem", color: "#64748b", marginTop: -4, marginBottom: 8 }}>
+                Start DropboxSync automatically when you sign in to Windows.
+              </p>
+              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={startupAtLoginEnabled}
+                  disabled={startupAtLoginBusy}
+                  onChange={() => void toggleStartupAtLogin()}
+                />
+                Start at login
+              </label>
+            </>
+          )}
         </section>
       )}
     </main>
