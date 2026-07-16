@@ -464,6 +464,18 @@ pub fn resolve_conflict(
     Ok(())
 }
 
+/// User override for the mass-deletion circuit breaker (DBSYNC-64): authorize the
+/// NEXT scan to propagate the deletions it blocked. One-shot — the flag is consumed
+/// by the next scan pass. Only call this after the user has reviewed the blocked
+/// deletion and confirmed it is an intentional bulk delete.
+#[tauri::command]
+pub fn confirm_pending_deletions(state: tauri::State<AppState>) -> Result<(), String> {
+    state
+        .db
+        .set_app_config("mass_delete_override_once", "1")?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn scan_local_changes(state: tauri::State<AppState>) -> Result<usize, String> {
     scan_local_changes_internal(state.inner()).map_err(String::from)
