@@ -34,10 +34,21 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
     // job — so surface it here (with precedence over a transient job error) instead
     // of a bare `engine.set_last_error`, which this very function would then clear on
     // the next tick (the block enqueues no failed rows).
-    let paused = state
+    //
+    // Per-direction keys (CTO fix): the local scan and the remote sweep each have
+    // their OWN durable pause flag so a benign pass in one direction can't clobber
+    // the other's still-active pause message within the same tick (the remote sweep
+    // runs right after the local scan in `scan_local_changes_internal`). Surface
+    // whichever is set; the scan's message takes precedence if somehow both are.
+    let scan_paused = state
         .db
-        .get_app_config(MASS_DELETE_BLOCKED_KEY)?
+        .get_app_config(MASS_DELETE_BLOCKED_SCAN_KEY)?
         .filter(|s| !s.is_empty());
+    let remote_paused = state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_REMOTE_KEY)?
+        .filter(|s| !s.is_empty());
+    let paused = scan_paused.or(remote_paused);
 
     let mut engine = state
         .sync_engine
@@ -398,13 +409,55 @@ const MASS_DELETE_FRACTION_FLOOR: usize = 25;
 const MASS_DELETE_FRACTION_PERCENT: usize = 10;
 
 /// One-shot app_config flag the user sets (via `confirm_pending_deletions`) to let
-/// the next mass deletion through.
+/// the next mass deletion through. Intentionally SHARED across both directions
+/// (known trade-off: confirming one also authorizes the other's next pass) rather
+/// than split per-direction — the local scan and remote sweep run back-to-back in
+/// the same tick, and splitting this one would just mean confirming twice.
 const MASS_DELETE_OVERRIDE_KEY: &str = "mass_delete_override_once";
 
-/// Durable app_config flag holding the "sync paused: mass deletion blocked" message.
+/// Durable app_config flag holding the "sync paused: mass deletion blocked" message
+/// for a LOCAL-SCAN-tripped breaker (DBSYNC-64: `scan_local_changes_internal`).
 /// Persisted (not a transient engine field) so `refresh_queue_depth_internal` keeps
 /// surfacing it every tick until the block clears. Empty string = not paused.
-const MASS_DELETE_BLOCKED_KEY: &str = "mass_delete_blocked";
+///
+/// Split from the remote-sweep key (CTO fix) because the local scan and the remote
+/// sweep both run within one `scan_local_changes_internal` call — a single shared
+/// key meant a benign remote sweep's `clear_mass_delete_blocked` would silently
+/// erase the local scan's still-active pause message from moments earlier.
+const MASS_DELETE_BLOCKED_SCAN_KEY: &str = "mass_delete_blocked_scan";
+
+/// Same as `MASS_DELETE_BLOCKED_SCAN_KEY`, but for the REMOTE-SWEEP direction:
+/// `remote_index.rs`'s full sweep (`refresh_remote_index_and_enqueue_downloads_internal`)
+/// and `seed_remote_delta_cursor` (reached via the cursor-reset path with a full
+/// local index still intact).
+const MASS_DELETE_BLOCKED_REMOTE_KEY: &str = "mass_delete_blocked_remote";
+
+/// Which direction tripped the mass-deletion circuit breaker (DBSYNC-64), so
+/// `block_mass_deletion`/`clear_mass_delete_blocked` write/clear the right durable
+/// flag instead of a single shared one both directions could clobber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MassDeleteSource {
+    /// `scan_local_changes_internal`'s local→remote deletion detection.
+    LocalScan,
+    /// `remote_index.rs`'s remote→local sweep (full snapshot + cursor reseed).
+    RemoteSweep,
+}
+
+impl MassDeleteSource {
+    fn blocked_key(self) -> &'static str {
+        match self {
+            MassDeleteSource::LocalScan => MASS_DELETE_BLOCKED_SCAN_KEY,
+            MassDeleteSource::RemoteSweep => MASS_DELETE_BLOCKED_REMOTE_KEY,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MassDeleteSource::LocalScan => "local scan",
+            MassDeleteSource::RemoteSweep => "remote sweep",
+        }
+    }
+}
 
 /// True if this many deletion candidates out of `tracked` tracked entries looks like
 /// a catastrophe rather than an intentional bulk delete.
@@ -418,7 +471,11 @@ pub(crate) fn is_mass_deletion(candidates: usize, tracked: usize) -> bool {
 
 /// Returns true (and CONSUMES the one-shot flag) if the user has explicitly
 /// authorized the next mass deletion to proceed.
-fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
+///
+/// `pub(crate)`: shared with the remote sweep (`remote_index.rs`, DBSYNC-64
+/// remote→local extension) so both directions consume the same one-shot flag
+/// instead of each keeping their own.
+pub(crate) fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
     if state.db.get_app_config(MASS_DELETE_OVERRIDE_KEY)?.as_deref() == Some("1") {
         state.db.set_app_config(MASS_DELETE_OVERRIDE_KEY, "0")?;
         tracing::warn!("mass-deletion override consumed: allowing this deletion batch");
@@ -430,19 +487,30 @@ fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
 /// Block a suspicious mass deletion: propagate NONE of it, log loudly, notify, and
 /// persist a DURABLE "sync paused" flag so the UI keeps showing it every tick until
 /// the block clears (DBSYNC-64).
-fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
+///
+/// `pub(crate)`: shared with the remote sweep (`remote_index.rs`) — `source`
+/// selects which direction's durable pause flag gets written so the two
+/// directions can't clobber each other's message.
+pub(crate) fn block_mass_deletion(
+    state: &AppState,
+    candidates: usize,
+    tracked: usize,
+    source: MassDeleteSource,
+) {
     let msg = format!(
-        "Sync paused: {candidates} deletions in one pass ({tracked} tracked) look like a bug \
-         or missing files, not an intentional delete — nothing was deleted. Review, then \
-         confirm to proceed."
+        "Sync paused: {candidates} deletions in one pass ({tracked} tracked, {}) look like a \
+         bug or missing files, not an intentional delete — nothing was deleted. Review, then \
+         confirm to proceed.",
+        source.label()
     );
     tracing::error!(
         candidates,
         tracked,
+        source = source.label(),
         "MASS-DELETION BLOCKED by circuit breaker; no deletions propagated (DBSYNC-64)"
     );
     // Durable so `refresh_queue_depth_internal` re-surfaces it instead of clearing it.
-    if let Err(e) = state.db.set_app_config(MASS_DELETE_BLOCKED_KEY, &msg) {
+    if let Err(e) = state.db.set_app_config(source.blocked_key(), &msg) {
         tracing::error!(error = %e, "failed to persist mass-deletion pause flag");
     }
     if let Ok(mut engine) = state.sync_engine.lock() {
@@ -451,17 +519,22 @@ fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
     crate::sharing::notify("DropboxSync - sync paused", &msg);
 }
 
-/// Clear the durable mass-deletion pause flag — the situation resolved (no mass
-/// deletion this pass, or the user overrode it), so sync is no longer paused.
-fn clear_mass_delete_blocked(state: &AppState) {
+/// Clear the durable mass-deletion pause flag for `source` — that direction's
+/// situation resolved (no mass deletion this pass, or the user overrode it), so
+/// sync is no longer paused ON THAT ACCOUNT. The other direction's flag (if set)
+/// is left untouched — it's the other direction's job to clear its own.
+///
+/// `pub(crate)`: shared with the remote sweep (`remote_index.rs`).
+pub(crate) fn clear_mass_delete_blocked(state: &AppState, source: MassDeleteSource) {
+    let key = source.blocked_key();
     if state
         .db
-        .get_app_config(MASS_DELETE_BLOCKED_KEY)
+        .get_app_config(key)
         .ok()
         .flatten()
         .is_some_and(|s| !s.is_empty())
     {
-        let _ = state.db.set_app_config(MASS_DELETE_BLOCKED_KEY, "");
+        let _ = state.db.set_app_config(key, "");
     }
 }
 
@@ -613,10 +686,15 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         let overridden = candidate_count > 0 && consume_mass_delete_override(state)?;
 
         if is_mass_deletion(candidate_count, tracked_count) && !overridden {
-            block_mass_deletion(state, candidate_count, tracked_count);
+            block_mass_deletion(
+                state,
+                candidate_count,
+                tracked_count,
+                MassDeleteSource::LocalScan,
+            );
         } else {
             // Not a mass deletion (or the user confirmed) → sync is not paused.
-            clear_mass_delete_blocked(state);
+            clear_mass_delete_blocked(state, MassDeleteSource::LocalScan);
             for rel in &file_deletions {
                 enqueued_jobs += process_local_file_deletion(state, &tracked_root, rel)?;
             }
@@ -1046,9 +1124,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        cleanup_stale_upload_state, is_mass_deletion, process_changed_paths,
-        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_internal,
-        ConflictAction, SYNC_BATCH_CAP,
+        block_mass_deletion, cleanup_stale_upload_state, clear_mass_delete_blocked,
+        is_mass_deletion, process_changed_paths, resolve_conflict_internal,
+        run_sync_tick_internal, scan_local_changes_internal, ConflictAction, MassDeleteSource,
+        SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
     use crate::storage::db::Db;
@@ -1648,7 +1727,7 @@ mod tests {
         assert!(
             state
                 .db
-                .get_app_config("mass_delete_blocked")
+                .get_app_config("mass_delete_blocked_scan")
                 .unwrap()
                 .is_some_and(|s| !s.is_empty()),
             "a blocked mass deletion must persist a durable pause flag"
@@ -1669,11 +1748,78 @@ mod tests {
         assert!(
             state
                 .db
-                .get_app_config("mass_delete_blocked")
+                .get_app_config("mass_delete_blocked_scan")
                 .unwrap()
                 .unwrap_or_default()
                 .is_empty(),
             "overriding the batch must clear the pause flag"
+        );
+    }
+
+    #[test]
+    fn per_direction_pause_flags_do_not_clobber_each_other() {
+        // CTO fix: the local scan and the remote sweep must each own a SEPARATE
+        // durable pause flag — clearing one direction's flag must never erase the
+        // other direction's still-active pause message from earlier in the tick.
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        block_mass_deletion(&state, 40, 100, MassDeleteSource::LocalScan);
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_scan")
+                .unwrap()
+                .is_some_and(|s| !s.is_empty()),
+            "local scan block must set the scan key"
+        );
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_remote")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "local scan block must NOT touch the remote key"
+        );
+
+        // A benign remote sweep pass clears ONLY its own key.
+        clear_mass_delete_blocked(&state, MassDeleteSource::RemoteSweep);
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_scan")
+                .unwrap()
+                .is_some_and(|s| !s.is_empty()),
+            "a remote-sweep clear must NOT erase the local scan's pause message"
+        );
+
+        // Now the remote sweep also blocks — both flags are set independently.
+        block_mass_deletion(&state, 50, 100, MassDeleteSource::RemoteSweep);
+        assert!(state
+            .db
+            .get_app_config("mass_delete_blocked_remote")
+            .unwrap()
+            .is_some_and(|s| !s.is_empty()));
+
+        // Clearing the scan side leaves the remote pause intact, and vice versa.
+        clear_mass_delete_blocked(&state, MassDeleteSource::LocalScan);
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_scan")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "scan clear removes the scan flag"
+        );
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_remote")
+                .unwrap()
+                .is_some_and(|s| !s.is_empty()),
+            "scan clear must leave the remote pause flag untouched"
         );
     }
 }
