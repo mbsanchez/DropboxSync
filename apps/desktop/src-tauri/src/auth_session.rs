@@ -240,6 +240,37 @@ pub(crate) fn verify_dropbox_token_internal(state: &AppState) -> AppResult<bool>
     Ok(true)
 }
 
+/// Best-effort revoke of the current Dropbox access token (DBSYNC-36 disconnect).
+/// MUST be called before the local session is cleared — it needs the still-valid
+/// token to identify which grant to revoke. Never panics, never logs the token
+/// value; a failure (no stored session, network error, non-2xx) only produces a
+/// warning log since local sign-out proceeds either way.
+pub(crate) fn revoke_dropbox_token_best_effort(state: &AppState) {
+    let session = match state.secure_store.get_session() {
+        Ok(s) => s,
+        Err(_) => return, // nothing to revoke
+    };
+
+    let result = state
+        .http_client
+        .post("https://api.dropboxapi.com/2/auth/token/revoke")
+        .bearer_auth(session.access_token.as_str())
+        .json(&serde_json::json!({}))
+        .send();
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("dropbox access token revoked");
+        }
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "dropbox token revoke returned non-success");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "dropbox token revoke request failed");
+        }
+    }
+}
+
 pub(crate) fn current_tray_status_label(state: &AppState) -> String {
     if state.sync_running.load(Ordering::Acquire) {
         return "Syncing".to_string();

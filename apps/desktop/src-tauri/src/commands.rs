@@ -8,8 +8,8 @@ use tauri::{AppHandle, Manager};
 use crate::auth::oauth::start_oauth;
 use crate::auth::oauth_complete::complete_oauth_internal;
 use crate::auth_session::{
-    current_tray_status_label, has_stored_credentials, update_tray_tooltip,
-    verify_dropbox_token_internal,
+    current_tray_status_label, has_stored_credentials, revoke_dropbox_token_best_effort,
+    update_tray_tooltip, verify_dropbox_token_internal,
 };
 use crate::cloudsc_ops::{
     hydrate_cloudsc_placeholder_internal,
@@ -134,6 +134,42 @@ pub fn set_sync_folder(state: tauri::State<AppState>, folder: String) -> Result<
 pub fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
     let picked = rfd::FileDialog::new().pick_folder();
     Ok(picked.map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Disconnects Dropbox and returns the app to a pre-onboarding state (DBSYNC-36).
+/// Order matters: the token is revoked with Dropbox BEFORE any local credential is
+/// cleared (revoke needs a still-valid token), then the in-memory cache, then the
+/// keyring, then the DB/engine state. The cache→keyring→DB window is not fully
+/// atomic — a concurrent sync tick could reload the cache from the still-present
+/// keyring in between — but that self-heals: the reloaded token is already revoked,
+/// so its next use 401s and `force_refresh` finds an empty keyring and fails clean.
+/// A keyring clear failure is logged and does NOT abort the rest of disconnect —
+/// leaving the DB/engine connected while only the cache is cleared would be a worse,
+/// more confusing half-state than a leftover (already-revoked) keyring entry.
+#[tauri::command]
+pub fn disconnect_dropbox(state: tauri::State<AppState>) -> Result<(), String> {
+    revoke_dropbox_token_best_effort(state.inner());
+
+    if let Ok(mut cache) = state.token_cache.lock() {
+        *cache = None;
+    }
+
+    if let Err(e) = state.secure_store.clear_session() {
+        tracing::warn!(error = %e, "failed to fully clear dropbox session from keyring");
+    }
+
+    state.db.reset_sync_state()?;
+    state.db.clear_sync_folder()?;
+
+    {
+        let mut engine = state
+            .sync_engine
+            .lock()
+            .map_err(|_| "sync engine lock poisoned".to_string())?;
+        engine.clear_tracked_path();
+    }
+
+    Ok(())
 }
 
 /// Same logic as [`get_startup_requirements`] for use from Rust (e.g. window visibility).

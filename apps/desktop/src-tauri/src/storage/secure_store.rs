@@ -106,6 +106,35 @@ impl SecureStore {
         self.store_session(&session)?;
         Ok(session)
     }
+
+    /// Deletes every credential `has_stored_credentials` (see `auth_session.rs`) can
+    /// find: the chunked session keys, the expiry marker, the legacy single-blob
+    /// session, and the legacy single-token entry used by [`get_token`](Self::get_token).
+    ///
+    /// A MISSING entry is success (`NoEntry`), but a genuine keyring failure on a
+    /// primary key is surfaced: every delete is attempted (so we clear as much as
+    /// possible), and the FIRST real error is returned. Callers can then warn — a
+    /// silent partial clear would leave a session that resurrects on restart, which
+    /// is exactly what disconnect must prevent. Never logs token values.
+    pub fn clear_session(&self) -> Result<(), keyring::Error> {
+        let mut first_err: Option<keyring::Error> = None;
+        let mut record = |result: Result<(), keyring::Error>| {
+            if let Err(e) = result {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        };
+        record(clear_chunked_key(SESSION_ACCESS));
+        record(clear_chunked_key(SESSION_REFRESH));
+        record(delete_credential_if_present(SESSION_EXPIRES));
+        record(delete_credential_if_present(LEGACY_SESSION_KEY));
+        record(delete_credential_if_present("dropbox-access-token"));
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 fn utf16_payload_bytes(s: &str) -> usize {
@@ -140,6 +169,16 @@ fn chunk_part_key(base: &str, i: usize) -> String {
 }
 
 /// Deletes `base.start_idx`, `base.start_idx+1`, … (best-effort) to trim old chunk parts.
+/// Deletes a single credential entry, treating a MISSING entry (`NoEntry`) as
+/// success and surfacing any other keyring error. Used by the clear paths so a
+/// genuine failure isn't silently swallowed.
+fn delete_credential_if_present(key: &str) -> Result<(), keyring::Error> {
+    match Entry::new(SERVICE, key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn clear_overflow_parts(base: &str, start_idx: usize) {
     for i in start_idx..start_idx + 64 {
         let _ = Entry::new(SERVICE, &chunk_part_key(base, i)).and_then(|e| e.delete_credential());
@@ -181,7 +220,9 @@ fn load_value_chunked(base: &str) -> Result<String, keyring::Error> {
 }
 
 fn clear_chunked_key(base: &str) -> Result<(), keyring::Error> {
-    let _ = Entry::new(SERVICE, base)?.delete_credential();
+    // Deleting the base key alone prevents resurrection (a chunked read starts from
+    // it), so surface a real failure there; the overflow parts stay best-effort.
+    let base_result = delete_credential_if_present(base);
     clear_overflow_parts(base, 0);
-    Ok(())
+    base_result
 }
