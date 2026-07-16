@@ -14,10 +14,11 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
-  IgnorableNamespaces="uap uap10 rescap">
+  IgnorableNamespaces="uap uap10 uap5 rescap">
 
   <Identity
     Name="DropboxSyncDesktop"
@@ -80,6 +81,14 @@
             </desktop3:CloudFilesContextMenus>
           </desktop3:CloudFiles>
         </desktop3:Extension>
+        <!-- DBSYNC-36 S4: registers the "DropboxSyncStartup" startup task consumed by
+             WinRT Windows.ApplicationModel.StartupTask (windows_startup.rs). TaskId
+             MUST match STARTUP_TASK_ID there. Enabled="false" is only the initial
+             manifest state; the actual on/off state is toggled at runtime via
+             RequestEnableAsync/Disable and is NOT re-read from here after install. -->
+        <uap5:Extension Category="windows.startupTask">
+          <uap5:StartupTask TaskId="DropboxSyncStartup" Enabled="false" DisplayName="DropboxSync" />
+        </uap5:Extension>
       </Extensions>
     </Application>
   </Applications>

@@ -633,3 +633,33 @@ pub fn trigger_hydrate_remote_folder(
 
     Ok(TriggerActionResponse { accepted: true })
 }
+
+/// DBSYNC-36 S4: whether the app is registered to start at login. WinRT
+/// `StartupTaskState` is the sole source of truth (no local mirror) — this
+/// queries live and only succeeds with package identity (DBSYNC-58).
+#[cfg(windows)]
+#[tauri::command]
+pub fn get_startup_at_login() -> Result<bool, String> {
+    crate::windows_startup::get_startup_enabled()
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn get_startup_at_login() -> Result<bool, String> {
+    Err("startup-at-login is only supported on Windows".into())
+}
+
+/// DBSYNC-36 S4: enable/disable starting at login. Returns the resulting
+/// enabled state per WinRT (may differ from the request, e.g. if the user or
+/// policy disabled it).
+#[cfg(windows)]
+#[tauri::command]
+pub fn set_startup_at_login(enabled: bool) -> Result<bool, String> {
+    crate::windows_startup::set_startup_enabled(enabled)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn set_startup_at_login(_enabled: bool) -> Result<bool, String> {
+    Err("startup-at-login is only supported on Windows".into())
+}
