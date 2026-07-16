@@ -138,13 +138,14 @@ pub fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
 
 /// Disconnects Dropbox and returns the app to a pre-onboarding state (DBSYNC-36).
 /// Order matters: the token is revoked with Dropbox BEFORE any local credential is
-/// cleared (revoke needs a still-valid token); the in-memory cache is cleared before
-/// the keyring so a concurrent reader can't resurrect a stale session from the cache
-/// after the keyring copy is gone. A keyring clear failure is logged and does NOT
-/// abort the rest of disconnect — leaving the DB/engine connected while only the
-/// cache is cleared would be a worse, more confusing half-state than a leftover
-/// (already-revoked) keyring entry that a later `has_stored_credentials` check may
-/// still pick up.
+/// cleared (revoke needs a still-valid token), then the in-memory cache, then the
+/// keyring, then the DB/engine state. The cache→keyring→DB window is not fully
+/// atomic — a concurrent sync tick could reload the cache from the still-present
+/// keyring in between — but that self-heals: the reloaded token is already revoked,
+/// so its next use 401s and `force_refresh` finds an empty keyring and fails clean.
+/// A keyring clear failure is logged and does NOT abort the rest of disconnect —
+/// leaving the DB/engine connected while only the cache is cleared would be a worse,
+/// more confusing half-state than a leftover (already-revoked) keyring entry.
 #[tauri::command]
 pub fn disconnect_dropbox(state: tauri::State<AppState>) -> Result<(), String> {
     revoke_dropbox_token_best_effort(state.inner());
