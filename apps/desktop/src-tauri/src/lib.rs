@@ -336,6 +336,17 @@ pub fn run() {
                     Err(e) => tracing::error!(error = %e, "failed to clean stale upload state"),
                 }
 
+                // Recover any `.dbsync-dehydrate.tmp` aside files left behind by a
+                // crash/kill mid-dehydration, before the scan/watcher can see them
+                // (DBSYNC-64).
+                match crate::cloudsc_ops::recover_stray_dehydrate_asides(state.inner()) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "recovered stray dehydration aside file(s) on startup");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "failed to recover stray dehydration asides"),
+                }
+
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
 
                 // DBSYNC-36: the ignore-glob predicate is backed by a process-wide

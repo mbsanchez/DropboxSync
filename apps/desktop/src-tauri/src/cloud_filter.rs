@@ -568,7 +568,10 @@ fn is_connected() -> bool {
 /// handler (`FileIdentity` carries `remote_path`; the handler also re-derives it
 /// from the local path). Marked in-sync so no upload is triggered. The caller MUST
 /// ensure `parent\name` does not already exist (`CfCreatePlaceholders` fails
-/// otherwise). Returns whether the placeholder was created.
+/// otherwise) — callers that are replacing a real file should MOVE it aside first
+/// (see `cloudsc_ops::dehydrate_file_atomic`, DBSYNC-64) rather than deleting it, so
+/// a failed placeholder create never loses data. Returns whether the placeholder
+/// was created.
 pub(crate) fn create_dehydrated_placeholder(
     parent: &Path,
     name: &str,
