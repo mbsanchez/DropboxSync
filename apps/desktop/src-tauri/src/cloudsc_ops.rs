@@ -688,15 +688,12 @@ fn dehydrate_one_file(state: &AppState, root: &Path, rel: &str) -> AppResult<boo
 /// placeholder at the SAME path (DBSYNC-59 Slice 2). The caller has already verified
 /// `rel` is fully synced, so the bytes are safely on Dropbox.
 ///
-/// Ordering is load-bearing for the DBSYNC-33/45 "a dehydration is never a Dropbox
-/// delete" guarantee. The index row is UNTRACKED before the file is removed, so a
-/// concurrent scan/watcher tick that catches the brief remove→create window sees no
-/// *tracked-file* deletion (the deletion loop iterates the index). The placeholder
-/// then lands at the same path — a real file that reaches `seen_paths` and is skipped
-/// by [`is_dehydrated_placeholder`], so it is never re-hashed, re-uploaded, or
-/// delete-detected. Finally the row is RE-TRACKED with the original sha256 so a later
-/// native hydration-on-open (which does NOT pass through our index-updating download)
-/// is a clean no-op: the hydrated bytes equal the remote, so no re-upload.
+/// Delegates to [`dehydrate_file_atomic`] (DBSYNC-64): the real file is moved aside
+/// rather than deleted, so a failed `CfCreatePlaceholders` call (observed live as
+/// `HRESULT(0x8007017C)`) restores the original file instead of losing it. On
+/// success the row is re-tracked with the original sha256 so a later native
+/// hydration-on-open (which does NOT pass through our index-updating download) is a
+/// clean no-op: the hydrated bytes equal the remote, so no re-upload.
 #[cfg(windows)]
 fn dehydrate_one_file_cfapi(state: &AppState, root: &Path, rel: &str) -> AppResult<bool> {
     let abs = safe_join(root, rel)?;
@@ -710,32 +707,77 @@ fn dehydrate_one_file_cfapi(state: &AppState, root: &Path, rel: &str) -> AppResu
     };
     let name = name.to_string_lossy().to_string();
 
-    // 1) Untrack BEFORE deleting so the remove→create window can't remote-delete.
+    dehydrate_file_atomic(state, rel, &abs, &row, || {
+        crate::cloud_filter::create_dehydrated_placeholder(parent, &name, &remote_path, row.size_bytes)
+    })
+}
+
+/// Atomically replace a real, fully-synced file at `abs` with a dehydrated placeholder
+/// produced by `create_placeholder`. The file is MOVED ASIDE first, so a FAILED
+/// placeholder op restores the original — a failed CfAPI op never loses the file
+/// (DBSYNC-64). Untracks before touching the file (DBSYNC-45 remove->create guard);
+/// re-tracks with the original hash on both success and restore.
+fn dehydrate_file_atomic(
+    state: &AppState,
+    rel: &str,
+    abs: &Path,
+    row: &crate::storage::db::FileIndexRow,
+    create_placeholder: impl FnOnce() -> bool,
+) -> AppResult<bool> {
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Err(AppError::Sync(format!("invalid path for dehydrate: {rel}")));
+    };
+    // The `.tmp` suffix matters: `path_util::is_editor_temp_path` ignores `*.tmp`,
+    // so a concurrent scan won't try to upload the aside copy while it's in flight.
+    let aside = parent.join(format!("{}.dbsync-dehydrate.tmp", name.to_string_lossy()));
+
+    // 1) Untrack BEFORE touching the file so the remove→create window can't
+    //    remote-delete it (DBSYNC-45).
     state.db.remove_local_file(rel)?;
-    // 2) Free the path (CfCreatePlaceholders requires the target not to exist).
-    if let Err(e) = fs::remove_file(&abs) {
-        // Couldn't free it (locked / in use) — restore the fully-synced state.
+
+    // 2) Move the real file aside (CfCreatePlaceholders/equivalent requires the
+    //    target path to not already exist).
+    if let Err(e) = fs::rename(abs, &aside) {
+        // Couldn't move it (locked / in use) — restore the fully-synced state.
         state
             .db
             .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
         return Err(AppError::Io(format!(
-            "failed removing local file for dehydrate: {e}"
+            "failed moving local file aside for dehydrate: {e}"
         )));
     }
-    // 3) Create the dehydrated placeholder.
-    if crate::cloud_filter::create_dehydrated_placeholder(parent, &name, &remote_path, row.size_bytes)
-    {
-        // 4) Re-track with the ORIGINAL sha256 → native hydration is a clean no-op.
+
+    // 3) Create the placeholder at the now-free `abs` path.
+    if create_placeholder() {
+        // Success — the placeholder now represents the file; drop the aside copy
+        // (that's the point of dehydration) and re-track with the ORIGINAL sha256
+        // so a later native hydration-on-open is a clean no-op.
+        let _ = fs::remove_file(&aside);
         state
             .db
             .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
         Ok(true)
     } else {
-        // Placeholder creation failed. The bytes are safe on Dropbox (fully synced);
-        // leave the path untracked so the next remote sweep re-represents it as
-        // cloud-only. Never re-track a now-absent file.
+        // Placeholder creation failed — restore the original file so nothing is
+        // ever lost (DBSYNC-64).
+        if let Err(e) = fs::rename(&aside, abs) {
+            tracing::error!(
+                rel,
+                aside = %aside.display(),
+                error = %e,
+                "CRITICAL: dehydrate placeholder creation failed AND restoring the \
+                 original file failed; the file's bytes are still safe at the \
+                 .dbsync-dehydrate.tmp aside path and must be recovered manually"
+            );
+        }
+        // Either way the bytes are still on disk (at `abs` or, in the critical
+        // case above, at `aside`) — re-track so the row reflects a still-synced,
+        // still-present file rather than stranding it as untracked.
+        state
+            .db
+            .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)?;
         Err(AppError::Io(format!(
-            "failed creating dehydrated placeholder for {rel}"
+            "failed creating dehydrated placeholder for {rel}; local file restored"
         )))
     }
 }
@@ -1287,6 +1329,76 @@ mod tests {
         assert!(sync.join("dir.cloudsc").exists(), "collapsed to one folder placeholder");
         let meta = read_cloudsc_placeholder_file(&sync.join("dir.cloudsc")).unwrap();
         assert_eq!(meta.tag, "folder");
+    }
+
+    // ---------------------------------------------------------------------------
+    // dehydrate_file_atomic (DBSYNC-64: move-aside + restore-on-failure)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn dehydrate_file_atomic_failure_restores_original_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        let content = b"original content, must survive a failed placeholder create";
+        track_synced_file(&state, &sync, "keep.txt", content);
+        let abs = sync.join("keep.txt");
+        let row = state.db.get_local_file("keep.txt").unwrap().unwrap();
+
+        let err = dehydrate_file_atomic(&state, "keep.txt", &abs, &row, || false).unwrap_err();
+
+        assert!(
+            format!("{err}").contains("local file restored"),
+            "got: {err}"
+        );
+        assert!(abs.exists(), "the original file must still exist");
+        assert_eq!(
+            std::fs::read(&abs).unwrap(),
+            content,
+            "restored file must have the ORIGINAL content"
+        );
+        assert!(
+            !sync.join("keep.txt.dbsync-dehydrate.tmp").exists(),
+            "no aside leftover after restore"
+        );
+        assert!(
+            state.db.get_local_file("keep.txt").unwrap().is_some(),
+            "row must be re-tracked after restore"
+        );
+    }
+
+    #[test]
+    fn dehydrate_file_atomic_success_drops_local_copy_and_retracks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        track_synced_file(&state, &sync, "gone.txt", b"will be dehydrated");
+        let abs = sync.join("gone.txt");
+        let row = state.db.get_local_file("gone.txt").unwrap().unwrap();
+
+        let ok = dehydrate_file_atomic(&state, "gone.txt", &abs, &row, || {
+            // Simulate what the real CfAPI call does: create the placeholder at
+            // the now-free `abs` path.
+            std::fs::write(&abs, b"placeholder").unwrap();
+            true
+        })
+        .unwrap();
+
+        assert!(ok);
+        assert!(
+            !sync.join("gone.txt.dbsync-dehydrate.tmp").exists(),
+            "aside copy must be dropped on success"
+        );
+        assert!(abs.exists(), "the placeholder file (created by the closure) is present");
+        assert!(
+            state.db.get_local_file("gone.txt").unwrap().is_some(),
+            "row must be re-tracked with the original hash on success"
+        );
+        assert_eq!(
+            state.db.get_local_file("gone.txt").unwrap().unwrap().hash,
+            row.hash,
+            "re-tracked hash must be the ORIGINAL sha256, not the placeholder bytes"
+        );
     }
 
     #[test]
