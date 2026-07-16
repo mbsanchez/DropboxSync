@@ -19,6 +19,7 @@ use crate::dropbox_transfer::{download_remote_file_internal, hydrate_remote_fold
 use crate::error::AppResult;
 use crate::models::*;
 use crate::oauth_listener::{start_oauth_callback_listener, stop_oauth_listener};
+use crate::path_util::{parse_ignore_globs_csv, set_user_ignore_globs};
 use crate::state::AppState;
 use crate::sync::engine::SyncStatus;
 use crate::sync_pipeline::{
@@ -46,6 +47,19 @@ pub fn set_selective_sync_filters(
 ) -> Result<(), String> {
     state.db.set_include_prefixes_csv(&include_csv)?;
     state.db.set_exclude_prefixes_csv(&exclude_csv)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_ignore_globs(state: tauri::State<AppState>) -> Result<IgnoreGlobs, String> {
+    let csv = state.db.get_ignore_globs_csv()?.unwrap_or_default();
+    Ok(IgnoreGlobs { csv })
+}
+
+#[tauri::command]
+pub fn set_ignore_globs(state: tauri::State<AppState>, csv: String) -> Result<(), String> {
+    state.db.set_ignore_globs_csv(&csv)?;
+    set_user_ignore_globs(parse_ignore_globs_csv(Some(csv)));
     Ok(())
 }
 

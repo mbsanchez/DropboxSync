@@ -15,7 +15,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
 use crate::error::{AppError, AppResult};
-use crate::path_util::{is_editor_temp_path, should_ignore_local_path, validate_relative};
+use crate::path_util::{is_ignored_local_path, validate_relative};
 use crate::state::AppState;
 
 /// Keeps the debouncer (its OS watch + worker thread) alive for the app's
@@ -159,11 +159,7 @@ pub(crate) fn map_event_path(
 
     let rel = rel.to_string_lossy().replace('\\', "/");
     let rel = rel.trim_start_matches('/').to_string();
-    if rel.is_empty()
-        || rel.ends_with(".cloudsc")
-        || should_ignore_local_path(&rel)
-        || is_editor_temp_path(&rel)
-    {
+    if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
         return None;
     }
     if validate_relative(&rel).is_err() {

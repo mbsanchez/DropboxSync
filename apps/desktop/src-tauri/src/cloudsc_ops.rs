@@ -15,8 +15,8 @@ use crate::models::{
     CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
 };
 use crate::path_util::{
-    hash_file, is_path_allowed, normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
-    should_ignore_local_path,
+    hash_file, is_ignored_local_path, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
+    relpath_under, safe_join,
 };
 use crate::state::AppState;
 
@@ -770,7 +770,7 @@ fn dehydrate_folder_cfapi(state: &AppState, root: &Path, folder_rel: &str) -> Ap
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
-        if file_rel.ends_with(".cloudsc") || should_ignore_local_path(&file_rel) {
+        if file_rel.ends_with(".cloudsc") || is_ignored_local_path(&file_rel) {
             continue;
         }
         // Already cloud-only — never re-hash it (that would hydrate it).
@@ -851,7 +851,7 @@ fn dehydrate_folder_collapse(
             cloudsc_children.push(entry.path().to_path_buf());
             continue;
         }
-        if should_ignore_local_path(&file_rel) {
+        if is_ignored_local_path(&file_rel) {
             continue; // ignored/ephemeral — not deleted; blocks the collapse (→ degrade)
         }
         if !is_file_fully_synced(state, root, &file_rel)? {

@@ -145,3 +145,9 @@ pub(crate) struct SelectiveSyncFilters {
     pub include_csv: String,
     pub exclude_csv: String,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IgnoreGlobs {
+    pub csv: String,
+}

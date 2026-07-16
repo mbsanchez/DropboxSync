@@ -238,6 +238,16 @@ impl Db {
         self.get_app_config("exclude_prefixes_csv")
     }
 
+    // User-defined local ignore globs (DBSYNC-36). CSV of basename / `*.ext` /
+    // relative-path patterns (e.g. "Thumbs.db,*.log,Notes/scratch.txt").
+    pub fn set_ignore_globs_csv(&self, csv: &str) -> AppResult<()> {
+        self.set_app_config("ignore_globs_csv", csv)
+    }
+
+    pub fn get_ignore_globs_csv(&self) -> AppResult<Option<String>> {
+        self.get_app_config("ignore_globs_csv")
+    }
+
     pub fn list_local_files(&self) -> AppResult<Vec<FileIndexRow>> {
         let conn = self
             .read
@@ -1489,5 +1499,18 @@ mod tests {
             .list_known_folders()
             .expect("list after reset")
             .is_empty());
+    }
+
+    #[test]
+    fn ignore_globs_csv_round_trip() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        assert_eq!(db.get_ignore_globs_csv().expect("get before set"), None);
+
+        db.set_ignore_globs_csv("Thumbs.db,*.log")
+            .expect("set ignore globs");
+        assert_eq!(
+            db.get_ignore_globs_csv().expect("get after set"),
+            Some("Thumbs.db,*.log".to_string())
+        );
     }
 }

@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -9,7 +10,12 @@ use crate::error::{AppError, AppResult};
 
 pub(crate) fn should_ignore_local_path(relative: &str) -> bool {
     let p = relative.replace('\\', "/");
-    p == ".DS_Store" || p.ends_with("/.DS_Store") || p.starts_with("._") || p.contains("/._")
+    p == ".DS_Store"
+        || p.ends_with("/.DS_Store")
+        || p.starts_with("._")
+        || p.contains("/._")
+        || p == "Thumbs.db"
+        || p.ends_with("/Thumbs.db")
 }
 
 /// True if the path looks like an editor/download temp or lock file that should
@@ -32,13 +38,93 @@ pub(crate) fn is_editor_temp_path(relative: &str) -> bool {
         || (name.starts_with(".~lock.") && name.ends_with('#')) // LibreOffice lock
 }
 
+/// True if `relative` matches any of `globs` (DBSYNC-36 user-defined ignore
+/// patterns). Pure/side-effect-free — takes the pattern list as an argument so it
+/// is trivially unit-testable without touching the process-wide
+/// [`USER_IGNORE_GLOBS`] static.
+///
+/// KISS matching, case-insensitive, three forms (no real `**`/glob crate):
+/// - Exact basename, e.g. `Thumbs.db` — matches the last path component only.
+/// - `*`-prefixed suffix, e.g. `*.log` — matches if the whole relative path ends
+///   with the suffix (so it also matches nested files like `sub/app.log`).
+/// - Exact relative path (contains `/`), e.g. `Notes/scratch.txt` — matches only
+///   that exact path, not any other file with the same basename.
+pub(crate) fn matches_ignore_globs(relative: &str, globs: &[String]) -> bool {
+    let rel_lower = relative.replace('\\', "/").to_ascii_lowercase();
+    let basename_lower = rel_lower.rsplit('/').next().unwrap_or(&rel_lower);
+
+    globs.iter().any(|pattern| {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return false;
+        }
+        let pattern_lower = pattern.to_ascii_lowercase();
+        if let Some(suffix) = pattern_lower.strip_prefix('*') {
+            !suffix.is_empty() && rel_lower.ends_with(suffix)
+        } else if pattern_lower.contains('/') {
+            rel_lower == pattern_lower
+        } else {
+            basename_lower == pattern_lower
+        }
+    })
+}
+
+/// Process-wide store of the user-defined ignore globs (DBSYNC-36), set once at
+/// startup from the persisted `ignore_globs_csv` app_config value and again
+/// whenever the user saves the settings panel ([`set_user_ignore_globs`]).
+/// `RwLock` because the predicate is read on every scan/watch event but written
+/// rarely (a settings save).
+static USER_IGNORE_GLOBS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
+fn user_ignore_globs_cell() -> &'static RwLock<Vec<String>> {
+    USER_IGNORE_GLOBS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Replaces the active set of user-defined ignore globs. Called at startup (with
+/// the persisted value) and after the user saves the settings panel.
+pub(crate) fn set_user_ignore_globs(globs: Vec<String>) {
+    if let Ok(mut guard) = user_ignore_globs_cell().write() {
+        *guard = globs;
+    }
+}
+
+/// Checks `relative` against the current process-wide user ignore globs. A
+/// poisoned lock fails open to "not ignored" rather than panicking or wedging the
+/// sync pipeline.
+fn user_ignore_globs_match(relative: &str) -> bool {
+    match user_ignore_globs_cell().read() {
+        Ok(guard) => matches_ignore_globs(relative, &guard),
+        Err(_) => false,
+    }
+}
+
+/// Parses the comma-separated `ignore_globs_csv` app_config value into a list of
+/// trimmed, non-empty patterns. Mirrors [`parse_prefix_csv`] but does not strip a
+/// leading `/` — ignore patterns are basenames/suffixes/relative paths, not
+/// selective-sync prefixes.
+pub(crate) fn parse_ignore_globs_csv(csv: Option<String>) -> Vec<String> {
+    match csv {
+        None => Vec::new(),
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .collect(),
+    }
+}
+
 /// Single "never sync this local path" predicate for the whole pipeline: OS junk
 /// ([`should_ignore_local_path`]) plus editor/download temp & lock files
-/// ([`is_editor_temp_path`]). Editor temps must be excluded from the full scan too
-/// — not just the fs watcher — or an `~$doc.docx` the scan sees gets enqueued and
-/// tracked, then fails the upload when the editor deletes it (DBSYNC-55).
+/// ([`is_editor_temp_path`]) plus user-defined ignore globs
+/// ([`set_user_ignore_globs`], DBSYNC-36). Editor temps must be excluded from the
+/// full scan too — not just the fs watcher — or an `~$doc.docx` the scan sees gets
+/// enqueued and tracked, then fails the upload when the editor deletes it
+/// (DBSYNC-55).
 pub(crate) fn is_ignored_local_path(relative: &str) -> bool {
-    should_ignore_local_path(relative) || is_editor_temp_path(relative)
+    should_ignore_local_path(relative)
+        || is_editor_temp_path(relative)
+        || user_ignore_globs_match(relative)
 }
 
 /// True if `abs` is a Windows CfAPI dehydrated (online-only) placeholder — a real
@@ -290,7 +376,8 @@ mod tests {
 
     use super::{
         backoff_seconds, hash_file, is_dehydrated_placeholder, is_ignored_local_path,
-        normalize_dropbox_path, safe_join, validate_relative, DROPBOX_BLOCK_SIZE,
+        matches_ignore_globs, normalize_dropbox_path, safe_join, set_user_ignore_globs,
+        should_ignore_local_path, validate_relative, DROPBOX_BLOCK_SIZE,
     };
 
     #[test]
@@ -329,6 +416,47 @@ mod tests {
         for p in ["report.docx", "dir/photo.jpg", "notes.txt"] {
             assert!(!is_ignored_local_path(p), "should not ignore {p:?}");
         }
+    }
+
+    #[test]
+    fn thumbs_db_is_ignored_by_default() {
+        assert!(should_ignore_local_path("Thumbs.db"));
+        assert!(should_ignore_local_path("sub/Thumbs.db"));
+    }
+
+    #[test]
+    fn matches_ignore_globs_suffix_form() {
+        let globs = vec!["*.log".to_string()];
+        assert!(matches_ignore_globs("app.log", &globs));
+        assert!(matches_ignore_globs("sub/app.log", &globs));
+        assert!(!matches_ignore_globs("app.txt", &globs));
+    }
+
+    #[test]
+    fn matches_ignore_globs_exact_basename_form() {
+        let globs = vec!["secret.key".to_string()];
+        assert!(matches_ignore_globs("dir/secret.key", &globs));
+        assert!(matches_ignore_globs("secret.key", &globs));
+        assert!(!matches_ignore_globs("dir/other.key", &globs));
+    }
+
+    #[test]
+    fn matches_ignore_globs_exact_relative_path_form() {
+        let globs = vec!["Notes/scratch.txt".to_string()];
+        assert!(matches_ignore_globs("Notes/scratch.txt", &globs));
+        // Same basename elsewhere is NOT matched — the pattern is a full relative path.
+        assert!(!matches_ignore_globs("Other/scratch.txt", &globs));
+        assert!(!matches_ignore_globs("scratch.txt", &globs));
+    }
+
+    #[test]
+    fn user_ignore_globs_apply_through_is_ignored_local_path() {
+        // The static is process-wide and cargo tests run in parallel — reset it to
+        // empty when done so other tests in this file aren't affected.
+        set_user_ignore_globs(vec!["*.log".to_string()]);
+        assert!(is_ignored_local_path("a.log"));
+        set_user_ignore_globs(Vec::new());
+        assert!(!is_ignored_local_path("a.log"));
     }
 
     // ---------------------------------------------------------------------------
