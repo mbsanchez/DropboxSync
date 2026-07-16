@@ -30,13 +30,21 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
     let queue_depth = state.db.count_active_jobs()?;
 
     let failed_error = state.db.latest_failed_error()?;
+    // DBSYNC-64: the mass-deletion pause is a DURABLE app_config flag, not a failed
+    // job — so surface it here (with precedence over a transient job error) instead
+    // of a bare `engine.set_last_error`, which this very function would then clear on
+    // the next tick (the block enqueues no failed rows).
+    let paused = state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_KEY)?
+        .filter(|s| !s.is_empty());
 
     let mut engine = state
         .sync_engine
         .lock()
         .map_err(|_| AppError::Sync("sync engine lock poisoned".to_string()))?;
     engine.set_queue_depth(queue_depth);
-    match failed_error {
+    match paused.or(failed_error) {
         Some(msg) => engine.set_last_error(msg),
         None => engine.clear_last_error(),
     }
@@ -393,6 +401,11 @@ const MASS_DELETE_FRACTION_PERCENT: usize = 10;
 /// the next mass deletion through.
 const MASS_DELETE_OVERRIDE_KEY: &str = "mass_delete_override_once";
 
+/// Durable app_config flag holding the "sync paused: mass deletion blocked" message.
+/// Persisted (not a transient engine field) so `refresh_queue_depth_internal` keeps
+/// surfacing it every tick until the block clears. Empty string = not paused.
+const MASS_DELETE_BLOCKED_KEY: &str = "mass_delete_blocked";
+
 /// True if this many deletion candidates out of `tracked` tracked entries looks like
 /// a catastrophe rather than an intentional bulk delete.
 pub(crate) fn is_mass_deletion(candidates: usize, tracked: usize) -> bool {
@@ -415,7 +428,8 @@ fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
 }
 
 /// Block a suspicious mass deletion: propagate NONE of it, log loudly, notify, and
-/// surface a sticky error so the UI shows sync is paused (DBSYNC-64).
+/// persist a DURABLE "sync paused" flag so the UI keeps showing it every tick until
+/// the block clears (DBSYNC-64).
 fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
     let msg = format!(
         "Sync paused: {candidates} deletions in one pass ({tracked} tracked) look like a bug \
@@ -427,10 +441,28 @@ fn block_mass_deletion(state: &AppState, candidates: usize, tracked: usize) {
         tracked,
         "MASS-DELETION BLOCKED by circuit breaker; no deletions propagated (DBSYNC-64)"
     );
+    // Durable so `refresh_queue_depth_internal` re-surfaces it instead of clearing it.
+    if let Err(e) = state.db.set_app_config(MASS_DELETE_BLOCKED_KEY, &msg) {
+        tracing::error!(error = %e, "failed to persist mass-deletion pause flag");
+    }
     if let Ok(mut engine) = state.sync_engine.lock() {
         engine.set_last_error(msg.clone());
     }
     crate::sharing::notify("DropboxSync - sync paused", &msg);
+}
+
+/// Clear the durable mass-deletion pause flag — the situation resolved (no mass
+/// deletion this pass, or the user overrode it), so sync is no longer paused.
+fn clear_mass_delete_blocked(state: &AppState) {
+    if state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|s| !s.is_empty())
+    {
+        let _ = state.db.set_app_config(MASS_DELETE_BLOCKED_KEY, "");
+    }
 }
 
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
@@ -575,11 +607,16 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         let candidate_count = file_deletions.len() + folder_deletions.len();
         let tracked_count = known.len() + seen_dirs.len();
 
-        if is_mass_deletion(candidate_count, tracked_count)
-            && !consume_mass_delete_override(state)?
-        {
+        // Consume the one-shot override whenever THIS pass actually has deletions, so
+        // a stale confirmation can't linger and silently authorize an unrelated future
+        // mass deletion (only read it when there's something to authorize).
+        let overridden = candidate_count > 0 && consume_mass_delete_override(state)?;
+
+        if is_mass_deletion(candidate_count, tracked_count) && !overridden {
             block_mass_deletion(state, candidate_count, tracked_count);
         } else {
+            // Not a mass deletion (or the user confirmed) → sync is not paused.
+            clear_mass_delete_blocked(state);
             for rel in &file_deletions {
                 enqueued_jobs += process_local_file_deletion(state, &tracked_root, rel)?;
             }
@@ -1592,10 +1629,12 @@ mod tests {
         }
 
         // First scan: the batch is a mass deletion → BLOCKED. Nothing propagated,
-        // index rows kept, a sticky error surfaced. (The scan's later remote-refresh
-        // step errors here with no token, but the deletion decision runs BEFORE it,
-        // so its side effects are already committed — ignore the Result and assert
-        // those.)
+        // index rows kept, and a DURABLE pause flag persisted. (The scan's later
+        // remote-refresh step errors here with no token, but the deletion decision +
+        // the pause-flag write run BEFORE it, so those side effects are committed —
+        // ignore the Result and assert them. Asserting the DURABLE app_config flag,
+        // not the transient engine error, is what proves the pause survives a full
+        // scan in production — `refresh_queue_depth_internal` reads this flag.)
         let _ = scan_local_changes_internal(&state);
         assert!(
             job_targets(&state, "delete").is_empty(),
@@ -1608,16 +1647,15 @@ mod tests {
         );
         assert!(
             state
-                .sync_engine
-                .lock()
+                .db
+                .get_app_config("mass_delete_blocked")
                 .unwrap()
-                .current_status(false)
-                .last_error
-                .is_some(),
-            "a blocked mass deletion must surface a sticky error"
+                .is_some_and(|s| !s.is_empty()),
+            "a blocked mass deletion must persist a durable pause flag"
         );
 
-        // User reviews and confirms → the next scan propagates the deletions.
+        // User reviews and confirms → the next scan propagates the deletions AND
+        // clears the pause flag.
         state
             .db
             .set_app_config("mass_delete_override_once", "1")
@@ -1627,6 +1665,15 @@ mod tests {
             job_targets(&state, "delete").len(),
             30,
             "an explicit override lets the reviewed batch through"
+        );
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "overriding the batch must clear the pause flag"
         );
     }
 }
