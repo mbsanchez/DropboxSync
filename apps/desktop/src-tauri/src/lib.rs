@@ -246,9 +246,10 @@ pub fn run() {
 
             // "Open Dashboard" is gone: the tray icon itself now toggles the `main`
             // flyout on a single left click (see `on_tray_icon_event` below); the menu
-            // only needs Exit.
+            // needs Settings (DBSYNC-36, opens the `setup` window) and Exit.
+            let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit])?;
+            let menu = Menu::with_items(app, &[&settings, &quit])?;
             // DBSYNC-32: start on the idle brand icon; update_tray_tooltip swaps the glyph
             // (sync/error) live. Not a template — we keep the brand blue in every state.
             let tray_image = Image::from_bytes(include_bytes!("icons/tray-idle.png"))
@@ -284,6 +285,12 @@ pub fn run() {
                 .on_menu_event(move |app, event| {
                     if event.id.as_ref() == "quit" {
                         app.exit(0);
+                    } else if event.id.as_ref() == "settings" {
+                        if let Some(window) = app.get_webview_window("setup") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
                     }
                 });
 
@@ -328,6 +335,19 @@ pub fn run() {
                 }
 
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
+
+                // DBSYNC-36: the ignore-glob predicate is backed by a process-wide
+                // static (`path_util::USER_IGNORE_GLOBS`), so the persisted CSV must be
+                // loaded into it here — otherwise saved patterns stay inactive until the
+                // user re-saves the settings panel this session.
+                match state.db.get_ignore_globs_csv() {
+                    Ok(csv) => {
+                        crate::path_util::set_user_ignore_globs(
+                            crate::path_util::parse_ignore_globs_csv(csv),
+                        );
+                    }
+                    Err(e) => tracing::error!(error = %e, "failed to load ignore globs at startup"),
+                }
 
                 if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
                     if let Some(setup_window) = app.get_webview_window("setup") {
@@ -385,7 +405,9 @@ pub fn run() {
             commands::list_cloudsc_placeholders,
             commands::trigger_hydrate_cloudsc_placeholder,
             commands::get_selective_sync_filters,
-            commands::set_selective_sync_filters
+            commands::set_selective_sync_filters,
+            commands::get_ignore_globs,
+            commands::set_ignore_globs
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

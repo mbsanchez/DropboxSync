@@ -66,6 +66,12 @@ export type SelectiveSyncFilters = {
   excludeCsv: string;
 };
 
+/** User-defined local ignore glob patterns (device-local only, distinct from
+ *  remote selective sync). See Rust `path_util::matches_ignore_globs`. */
+export type IgnoreGlobs = {
+  csv: string;
+};
+
 export type TriggerActionResponse = {
   accepted: boolean;
 };

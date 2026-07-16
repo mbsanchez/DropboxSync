@@ -5,6 +5,7 @@ import { useActivityLog } from "../hooks/useActivityLog";
 import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useAuthFlow } from "../hooks/useAuthFlow";
 import { useSelectiveSync } from "../hooks/useSelectiveSync";
+import { useIgnoreGlobs } from "../hooks/useIgnoreGlobs";
 import "../App.css";
 
 /**
@@ -37,6 +38,7 @@ function SetupApp() {
   });
   const { includeCsv, setIncludeCsv, excludeCsv, setExcludeCsv, saveSelectiveSync } =
     useSelectiveSync(pushLog);
+  const { ignoreGlobsCsv, setIgnoreGlobsCsv, saveIgnoreGlobs } = useIgnoreGlobs(pushLog);
 
   const [showFolderSetup, setShowFolderSetup] = useState(false);
 
@@ -201,6 +203,30 @@ function SetupApp() {
               placeholder="Exclude prefixes (CSV), e.g. Videos/Secret"
             />
             <button onClick={() => void saveSelectiveSync()}>Save selective sync</button>
+          </div>
+
+          <h3>Ignored files</h3>
+          <p style={{ fontSize: "0.85rem", color: "#64748b", marginTop: -4, marginBottom: 8 }}>
+            Local-only filters — matching files are skipped on this device only (Dropbox and your
+            other devices are unaffected). <code>Thumbs.db</code> and <code>.DS_Store</code> are
+            already ignored by default.
+          </p>
+          <div
+            style={{
+              display: "grid",
+              gap: 8,
+              padding: 10,
+              background: "#f8fafc",
+              border: "1px dashed #c5d1e3",
+              borderRadius: 10,
+            }}
+          >
+            <input
+              value={ignoreGlobsCsv}
+              onChange={(e) => setIgnoreGlobsCsv(e.currentTarget.value)}
+              placeholder="Ignore patterns (CSV), e.g. *.log,Notes/scratch.txt"
+            />
+            <button onClick={() => void saveIgnoreGlobs()}>Save ignored files</button>
           </div>
         </section>
       )}
