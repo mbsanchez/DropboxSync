@@ -35,6 +35,7 @@ pub struct SyncJobRow {
     pub next_retry_at: Option<String>,
     pub updated_at: String,
     pub last_error: Option<String>,
+    pub delete_parent_rev: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -450,6 +451,30 @@ impl Db {
         Ok(())
     }
 
+    /// DBSYNC-65 (Slice 1): dedicated `delete` job enqueue that also captures the
+    /// Dropbox `rev` of the file being deleted at enqueue time, so a later drain
+    /// can detect (Slice 2) whether the remote copy changed since the local
+    /// delete was observed. Mirrors `enqueue_job`'s ON CONFLICT collapse, but the
+    /// `DO UPDATE SET` additionally refreshes `delete_parent_rev` — re-enqueuing a
+    /// delete for an already-queued path must NOT keep a stale captured rev.
+    pub fn enqueue_delete_job(&self, target_path: &str, parent_rev: Option<&str>) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
+            INSERT INTO sync_jobs(job_type, source_path, target_path, delete_parent_rev, status, attempt_count, next_retry_at, created_at, updated_at)
+            VALUES('delete', ?1, ?1, ?2, 'queued', 0, NULL, ?3, ?3)
+            ON CONFLICT(job_type, target_path) WHERE status IN ('queued','retry_wait','running')
+            DO UPDATE SET source_path=excluded.source_path, delete_parent_rev=excluded.delete_parent_rev, updated_at=excluded.updated_at
+            ",
+            params![target_path, parent_rev, now],
+        )?;
+        Ok(())
+    }
+
     pub fn count_active_jobs(&self) -> AppResult<usize> {
         let conn = self
             .read
@@ -498,7 +523,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error, delete_parent_rev
                 FROM sync_jobs
                 ORDER BY id DESC
                 LIMIT ?1
@@ -517,6 +542,7 @@ impl Db {
                 next_retry_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 last_error: row.get(8)?,
+                delete_parent_rev: row.get(9)?,
             })
         })?;
 
@@ -533,7 +559,7 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "
-                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error, delete_parent_rev
                 FROM sync_jobs
                 WHERE status = 'queued' OR (status = 'retry_wait' AND (next_retry_at IS NULL OR next_retry_at <= ?1))
                 ORDER BY id ASC
@@ -554,6 +580,7 @@ impl Db {
                     next_retry_at: row.get(6)?,
                     updated_at: row.get(7)?,
                     last_error: row.get(8)?,
+                    delete_parent_rev: row.get(9)?,
                 })
             } else {
                 None
@@ -971,6 +998,7 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "sync_jobs", "upload_session_offset", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_len", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_mtime", "INTEGER")?;
+    add_column_if_missing(conn, "sync_jobs", "delete_parent_rev", "TEXT")?;
 
     // DBSYNC-35: structured fields for conflict resolution — the sibling copy holding
     // the preserved local content, and a flag for the remote-deleted scenario. Both
@@ -1042,12 +1070,13 @@ fn migrate(conn: &Connection) -> AppResult<()> {
                 upload_session_id TEXT,
                 upload_session_offset INTEGER,
                 upload_session_file_len INTEGER,
-                upload_session_file_mtime INTEGER
+                upload_session_file_mtime INTEGER,
+                delete_parent_rev TEXT
             );
             INSERT INTO sync_jobs_new
                 SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at,
                        created_at, updated_at, last_error, upload_session_id, upload_session_offset,
-                       upload_session_file_len, upload_session_file_mtime
+                       upload_session_file_len, upload_session_file_mtime, delete_parent_rev
                 FROM sync_jobs
                 WHERE status IN ('queued','running','retry_wait','done','failed')
                   AND job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc');
@@ -1362,6 +1391,37 @@ mod tests {
             .filter(|j| j.job_type == "upload")
             .count();
         assert_eq!(uploads, 2, "a new active upload coexists with the completed one");
+    }
+
+    #[test]
+    fn enqueue_delete_job_persists_parent_rev() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.enqueue_delete_job("a.txt", Some("rev123")).expect("enqueue");
+
+        let jobs = db.list_recent_jobs(10).expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, "delete");
+        assert_eq!(jobs[0].target_path.as_deref(), Some("a.txt"));
+        assert_eq!(jobs[0].delete_parent_rev.as_deref(), Some("rev123"));
+    }
+
+    #[test]
+    fn enqueue_delete_job_on_conflict_updates_rev_not_just_source_path() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        // DBSYNC-65 (Slice 1) crux regression: re-enqueuing an already-active delete
+        // for the same target must refresh `delete_parent_rev`, not keep the stale
+        // value captured by the first enqueue.
+        db.enqueue_delete_job("a.txt", Some("old_rev")).expect("first enqueue");
+        db.enqueue_delete_job("a.txt", Some("new_rev")).expect("second enqueue");
+
+        assert_eq!(
+            db.count_active_jobs().unwrap(),
+            1,
+            "re-enqueuing the same delete target must collapse into one active job"
+        );
+        let jobs = db.list_recent_jobs(10).expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delete_parent_rev.as_deref(), Some("new_rev"));
     }
 
     #[test]

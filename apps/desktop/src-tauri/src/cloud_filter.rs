@@ -846,7 +846,22 @@ fn enqueue_remote_delete_async(rel: String, is_dir: bool) {
             tracing::debug!(rel = %rel, "cfapi event-delete: app state unavailable; skipping (scan backstop covers it)");
             return;
         };
-        if let Err(e) = state.db.enqueue_job("delete", Some(&rel), Some(&rel)) {
+        // DBSYNC-65 (Slice 1): capture the remote rev at enqueue time (files only —
+        // folders aren't keyed in `remote_file_index`) so a later drain (Slice 2) can
+        // detect whether the remote copy changed since this delete was observed. A
+        // lookup failure here must not abort the delete enqueue; fall back to `None`.
+        let parent_rev = if is_dir {
+            None
+        } else {
+            match state.db.get_remote_file(&rel) {
+                Ok(row) => row.map(|r| r.rev),
+                Err(e) => {
+                    tracing::warn!(rel = %rel, error = %e, "cfapi event-delete: parent rev lookup failed; enqueuing without it");
+                    None
+                }
+            }
+        };
+        if let Err(e) = state.db.enqueue_delete_job(&rel, parent_rev.as_deref()) {
             tracing::warn!(rel = %rel, error = %e, "cfapi event-delete: enqueue failed");
             return;
         }
