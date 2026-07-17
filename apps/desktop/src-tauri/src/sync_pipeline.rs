@@ -187,7 +187,11 @@ fn process_local_file_deletion(
         state.db.remove_local_file(prev_rel)?;
         return Ok(0);
     }
-    state.db.enqueue_job("delete", Some(prev_rel), Some(prev_rel))?;
+    // DBSYNC-65 (Slice 1): capture the remote rev at enqueue time so a later drain
+    // (Slice 2) can detect whether the remote copy changed since this delete was
+    // observed. Not yet read/enforced — plumbing only.
+    let parent_rev = state.db.get_remote_file(prev_rel)?.map(|r| r.rev);
+    state.db.enqueue_delete_job(prev_rel, parent_rev.as_deref())?;
     state.db.remove_local_file(prev_rel)?;
     Ok(1)
 }
@@ -210,7 +214,8 @@ fn process_known_folder_deletion(
         state.db.remove_known_folder(rel)?;
         return Ok(0);
     }
-    state.db.enqueue_job("delete", Some(rel), Some(rel))?;
+    // Folders are never keyed in `remote_file_index`, so there is no rev to capture.
+    state.db.enqueue_delete_job(rel, None)?;
     state.db.remove_known_folder(rel)?;
     Ok(1)
 }
@@ -1413,6 +1418,106 @@ mod tests {
             !super::delete_suppressed_by_dehydration(&state, "gone.txt"),
             "a genuinely deleted file (no placeholder) must still be deleted on remote"
         );
+    }
+
+    // ---- DBSYNC-65 (Slice 1): capture delete-time parent rev (plumbing only) ----
+
+    #[test]
+    fn file_deletion_captures_remote_rev_on_enqueue() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        // No `.cloudsc`/native placeholder at this path, so the enqueue path in
+        // `process_local_file_deletion` is actually exercised (not short-circuited).
+        state
+            .db
+            .upsert_remote_file("foo.txt", "hash", "rev123", 0)
+            .expect("seed remote row");
+
+        let n = super::process_local_file_deletion(&state, &root, "foo.txt").expect("process");
+        assert_eq!(n, 1);
+
+        let job = state
+            .db
+            .pick_next_due_job()
+            .expect("pick job")
+            .expect("job present");
+        assert_eq!(job.job_type, "delete");
+        assert_eq!(job.delete_parent_rev, Some("rev123".to_string()));
+    }
+
+    #[test]
+    fn file_deletion_with_no_remote_index_row_enqueues_none_rev() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        // No `remote_file_index` row seeded for this path.
+
+        let n = super::process_local_file_deletion(&state, &root, "gone.txt").expect("process");
+        assert_eq!(n, 1);
+
+        let job = state
+            .db
+            .pick_next_due_job()
+            .expect("pick job")
+            .expect("job present");
+        assert_eq!(job.delete_parent_rev, None);
+    }
+
+    #[test]
+    fn folder_deletion_always_enqueues_none_rev() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        // Seeded defensively at the folder's path — `process_known_folder_deletion`
+        // must never consult `remote_file_index` (folders aren't keyed there).
+        state
+            .db
+            .upsert_remote_file("dir", "hash", "rev999", 0)
+            .expect("seed remote row");
+
+        let n = super::process_known_folder_deletion(&state, &root, "dir").expect("process");
+        assert_eq!(n, 1);
+
+        let job = state
+            .db
+            .pick_next_due_job()
+            .expect("pick job")
+            .expect("job present");
+        assert_eq!(job.job_type, "delete");
+        assert_eq!(job.delete_parent_rev, None);
+    }
+
+    #[test]
+    fn re_enqueuing_delete_refreshes_stale_parent_rev() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        state
+            .db
+            .enqueue_delete_job("foo.txt", Some("old_rev"))
+            .expect("enqueue old");
+        state
+            .db
+            .enqueue_delete_job("foo.txt", Some("new_rev"))
+            .expect("enqueue new");
+
+        let active: Vec<_> = state
+            .db
+            .list_recent_jobs(50)
+            .expect("list jobs")
+            .into_iter()
+            .filter(|j| {
+                j.job_type == "delete"
+                    && matches!(j.status.as_str(), "queued" | "retry_wait" | "running")
+            })
+            .collect();
+        assert_eq!(
+            active.len(),
+            1,
+            "re-enqueuing the same delete target must collapse into one active job, not duplicate"
+        );
+        assert_eq!(active[0].delete_parent_rev, Some("new_rev".to_string()));
     }
 
     // ---- DBSYNC-55: editor-temp / vanished-source handling ----
