@@ -64,7 +64,7 @@ use windows::Win32::Storage::FileSystem::{
     OPEN_EXISTING,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
 
 use crate::error::{AppError, AppResult};
 
@@ -411,15 +411,28 @@ fn app_state() -> Option<crate::state::AppState> {
     Some(handle.try_state::<crate::state::AppState>()?.inner().clone())
 }
 
-/// Reconstruct the placeholder's absolute path from the callback info
-/// (`VolumeDosName` = `C:` + `NormalizedPath` = `\Users\…\file`).
-unsafe fn full_local_path(info: &CF_CALLBACK_INFO) -> Option<PathBuf> {
-    let vol = info.VolumeDosName.to_string().ok()?;
-    let norm = info.NormalizedPath.to_string().ok()?;
+/// Join a CfAPI-normalized, DRIVE-LESS path (e.g. `\Users\me\Dropbox\file.txt`) with
+/// the callback's `VolumeDosName` (e.g. `C:`) into a full absolute path. EVERY
+/// CfAPI-supplied path field is drive-less this way — `CF_CALLBACK_INFO.NormalizedPath`
+/// AND `CF_CALLBACK_PARAMETERS.RenameCompletion.SourcePath` alike — so this is the ONE
+/// helper for all of them (DBSYNC-64 CTO review H1: `on_notify_rename_completion`
+/// previously resolved `SourcePath` as if it were already absolute via a bare
+/// `PCWSTR::to_string`, which silently failed `relpath_under` against the sync root
+/// and dropped every rename-completion event before `take_rename_in_flight` could even
+/// run, leaking its in-flight marker).
+unsafe fn full_path_from(vol: PCWSTR, normalized: PCWSTR) -> Option<PathBuf> {
+    let vol = vol.to_string().ok()?;
+    let norm = normalized.to_string().ok()?;
     if norm.is_empty() {
         return None;
     }
     Some(PathBuf::from(format!("{vol}{norm}")))
+}
+
+/// Reconstruct the placeholder's absolute path from the callback info
+/// (`VolumeDosName` = `C:` + `NormalizedPath` = `\Users\…\file`).
+unsafe fn full_local_path(info: &CF_CALLBACK_INFO) -> Option<PathBuf> {
+    full_path_from(info.VolumeDosName, info.NormalizedPath)
 }
 
 /// `FETCH_DATA`: the platform needs `[offset, offset+length)` of a dehydrated
@@ -500,6 +513,18 @@ unsafe extern "system" fn on_cancel_fetch_data(
 // Every enqueued delete still runs through the normal drain-time guards
 // (`delete_suppressed_by_dehydration`: DBSYNC-45 `.cloudsc`/native-dehydration
 // suppression, DBSYNC-62 post-registration grace) — this is additive, not a bypass.
+//
+// CRITICAL (DBSYNC-64 CTO review C1): CfAPI fires NOTIFY_DELETE/NOTIFY_RENAME for ANY
+// placeholder delete/rename under the sync root, INCLUDING our OWN `fs::remove_file`/
+// `fs::remove_dir`/rename calls (free-up-space collapse in `cloudsc_ops.rs`, "use
+// remote" conflict resolution, `local_delete`). Those operate on fully-synced
+// placeholders whose content still lives on Dropbox — treating them as a user event
+// would enqueue a Dropbox delete that the dehydration guard does NOT catch (the file
+// is genuinely gone, no `.cloudsc` survives it), silently deleting the user's Dropbox
+// content. `on_notify_delete`/`on_notify_rename` therefore check `is_own_process`
+// (via `CF_CALLBACK_INFO.ProcessInfo`, populated by `CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO`)
+// and skip marking a self-initiated op in-flight — its completion then has no marker to
+// consume and enqueues nothing. See `is_own_process` for the full rationale.
 
 /// In-flight user-initiated deletes observed by `on_notify_delete`: rel → was a
 /// directory. NOTIFY_DELETE_COMPLETION's parameters carry no IS_DIRECTORY flag, so
@@ -536,20 +561,47 @@ fn take_rename_in_flight(rel: &str) -> Option<bool> {
     take_in_flight(&PENDING_RENAMES_IN_FLIGHT, rel)
 }
 
-/// `PCWSTR` → owned `PathBuf`, or `None` for a null/unreadable pointer.
-unsafe fn pcwstr_to_path(p: PCWSTR) -> Option<PathBuf> {
-    if p.is_null() {
-        return None;
+/// True when `info.ProcessInfo` identifies THIS process as the one performing the
+/// delete/rename (DBSYNC-64 CTO review C1, CRITICAL / data-loss). CfAPI fires
+/// `NOTIFY_DELETE`/`NOTIFY_RENAME` for EVERY placeholder delete/rename under the sync
+/// root — including our OWN `fs::remove_file`/`fs::remove_dir`/rename calls (the
+/// free-up-space collapse in `cloudsc_ops.rs`, "use remote" conflict resolution,
+/// `local_delete`). Those delete/rename fully-synced placeholders whose content still
+/// lives on Dropbox; if treated as a user event, the completion handler would enqueue
+/// a Dropbox delete that `delete_suppressed_by_dehydration` does NOT catch (the file
+/// is genuinely gone locally, no per-file `.cloudsc` survives it) — silently deleting
+/// the user's Dropbox content (recursively, for a folder). `ProcessInfo` is populated
+/// because the provider connects with `CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO`. A null
+/// `ProcessInfo` (should not happen given that flag, but fails safe in the direction
+/// that only risks a harmless duplicate rather than a dropped user delete) is treated
+/// as NOT self, i.e. still tracked as a genuine user event.
+unsafe fn is_own_process(info: &CF_CALLBACK_INFO) -> bool {
+    if info.ProcessInfo.is_null() {
+        return false;
     }
-    p.to_string().ok().map(PathBuf::from)
+    (*info.ProcessInfo).ProcessId == GetCurrentProcessId()
 }
 
 /// Pure classification of a rename TARGET against the sync root: `Some(rel)` when
 /// `target` is still under `root` (a move WITHIN the sync root — `rel` is the new
-/// `/`-relative path); `None` when `target` fell OUTSIDE `root` entirely (treated
-/// as a delete of the source). No I/O — unit-testable without a live sync root.
+/// `/`-relative path); `None` when `target` fell OUTSIDE `root` entirely. Per the
+/// DBSYNC-64 CTO review (H2), the completion handler treats these asymmetrically:
+/// within-root → NO-OP (no delete enqueued this increment — see
+/// `on_notify_rename_completion`); outside-root → delete-of-source. No I/O —
+/// unit-testable without a live sync root.
 fn classify_rename_target(root: &Path, target: &Path) -> Option<String> {
     crate::path_util::relpath_under(root, target).ok()
+}
+
+/// Pure decision (DBSYNC-64 CTO review H2) for `on_notify_rename_completion`: given
+/// `classify_rename_target`'s result, should the completed rename propagate a delete
+/// of the source? `Some(_)` (target still under the sync root) → `false` — a move
+/// within the root is a NO-OP this increment (see `on_notify_rename_completion` for
+/// why: it would otherwise orphan a moved DEHYDRATED placeholder's Dropbox content).
+/// `None` (target fell outside the sync root) → `true` — nothing is left behind, so
+/// deleting the source is safe. No I/O — unit-testable without a live sync root.
+fn rename_completion_should_delete_source(target_rel: &Option<String>) -> bool {
+    target_rel.is_none()
 }
 
 /// `NOTIFY_DELETE`: fires BEFORE a placeholder under the sync root is deleted. We
@@ -557,8 +609,11 @@ fn classify_rename_target(root: &Path, target: &Path) -> Option<String> {
 /// directory, needed by the completion handler) and ACK immediately so the delete
 /// proceeds. CRITICAL: registering this callback type makes CfAPI WAIT for our ACK
 /// before the delete completes, so this must never block (no DB/network here — see
-/// `CONNECTED_ROOT`). Panic-firewalled like `on_fetch_data` — a panic crossing this
-/// `extern "system"` boundary would abort the process.
+/// `CONNECTED_ROOT`). DBSYNC-64 CTO review C1: a delete performed by OUR OWN process
+/// (`is_own_process`) is deliberately NOT marked in-flight — see `is_own_process` for
+/// why treating our own `fs::remove_file` calls as a "user delete" is a data-loss bug.
+/// Panic-firewalled like `on_fetch_data` — a panic crossing this `extern "system"`
+/// boundary would abort the process.
 unsafe extern "system" fn on_notify_delete(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
@@ -572,15 +627,17 @@ unsafe extern "system" fn on_notify_delete(
     } else {
         (*params).Anonymous.Delete.Flags.contains(CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY)
     };
-    let marked: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        full_local_path(info)
-            .and_then(|abs| rel_under_connected_root(&abs))
-            .inspect(|rel| mark_user_delete_in_flight(rel, is_dir))
+    let _: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rel = full_local_path(info).and_then(|abs| rel_under_connected_root(&abs))?;
+        if is_own_process(info) {
+            tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: self-initiated (our own process) — not tracked, no remote delete will be enqueued");
+        } else {
+            mark_user_delete_in_flight(&rel, is_dir);
+            tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: user delete observed");
+        }
+        Some(rel)
     }))
     .unwrap_or(None);
-    if let Some(rel) = &marked {
-        tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: user delete observed");
-    }
     // Never veto, never block: ACK unconditionally, even if path resolution above
     // failed or panicked — the user's delete must proceed either way.
     let _ = ack_delete(info.ConnectionKey, info.TransferKey, STATUS_SUCCESS);
@@ -618,9 +675,11 @@ unsafe extern "system" fn on_notify_delete_completion(
 
 /// `NOTIFY_RENAME`: fires BEFORE a placeholder under the sync root is renamed or
 /// moved. We never veto — we only record whether it was a directory (needed by the
-/// completion handler, same reasoning as `on_notify_delete`) and ACK promptly. All
-/// routing happens on completion (`on_notify_rename_completion`), where both the
-/// source and final path are available. Panic-firewalled like `on_fetch_data`.
+/// completion handler, same reasoning as `on_notify_delete`) and ACK promptly. DBSYNC-64
+/// CTO review C1: a rename performed by OUR OWN process is NOT marked in-flight — same
+/// data-loss reasoning as `on_notify_delete` (see `is_own_process`). All routing happens
+/// on completion (`on_notify_rename_completion`), where both the source and final path
+/// are available. Panic-firewalled like `on_fetch_data`.
 unsafe extern "system" fn on_notify_rename(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
@@ -635,9 +694,13 @@ unsafe extern "system" fn on_notify_rename(
         (*params).Anonymous.Rename.Flags.contains(CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY)
     };
     let _: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        full_local_path(info)
-            .and_then(|abs| rel_under_connected_root(&abs))
-            .inspect(|rel| mark_rename_in_flight(rel, is_dir))
+        let rel = full_local_path(info).and_then(|abs| rel_under_connected_root(&abs))?;
+        if is_own_process(info) {
+            tracing::debug!(rel = %rel, is_dir, "cfapi notify-rename: self-initiated (our own process) — not tracked, no remote delete will be enqueued");
+        } else {
+            mark_rename_in_flight(&rel, is_dir);
+        }
+        Some(rel)
     }))
     .unwrap_or(None);
     let _ = ack_rename(info.ConnectionKey, info.TransferKey, STATUS_SUCCESS);
@@ -646,21 +709,29 @@ unsafe extern "system" fn on_notify_rename(
 /// `NOTIFY_RENAME_COMPLETION`: fires AFTER the rename/move completed.
 /// `CF_CALLBACK_INFO.NormalizedPath` (via `full_local_path`) is the item's NEW
 /// (post-rename) location; `params.RenameCompletion.SourcePath` is the ORIGINAL
-/// location.
+/// location — ALSO drive-less, so it's resolved via the SAME `full_path_from` helper
+/// (with `info.VolumeDosName`) as the target, not a bare `PCWSTR::to_string` (DBSYNC-64
+/// CTO review H1: the previous bare resolution always failed `relpath_under` against the
+/// absolute sync root, so `source_rel` was always `None`, the function returned BEFORE
+/// `take_rename_in_flight` ran, and every `on_notify_rename` marker leaked forever).
 ///
-/// Handling for this increment (kept deliberately conservative, per DBSYNC-64 part
-/// 2 scope): a rename is ALWAYS propagated as delete-of-source.
-/// - Target still under the sync root (a move/rename within it): the new path is
-///   picked up as a fresh upload by the EXISTING scan/watcher change-detection —
-///   this is not yet a true Dropbox "move" (the old remote copy is deleted and a
-///   new one uploaded, rather than one `move_v2` call), which is safe (no data
-///   loss) but not byte-for-byte efficient or revision-history-preserving. A
-///   dedicated move-aware path (calling Dropbox's move API directly) is a
-///   documented follow-up.
-/// - Target outside the sync root: unambiguously a delete of the source.
+/// Handling for this increment (kept deliberately conservative, per DBSYNC-64 part 2
+/// scope, tightened by CTO review H2):
+/// - Target still under the sync root (a move/rename within it): NO-OP — ACK already
+///   happened in `on_notify_rename`; here we only log and enqueue NOTHING. Moving a
+///   DEHYDRATED placeholder within the root would otherwise delete the (still
+///   Dropbox-only) source while the new path is silently skipped by the scan's
+///   dehydrated-placeholder guard (`process_local_file_change`) — the content would be
+///   deleted on Dropbox with NO local or remote copy left (data loss). Deferring
+///   entirely to the existing scan/watcher for real (hydrated) files is safe (nothing
+///   is deleted); a dedicated move-aware path (`move_v2`, handling both hydrated and
+///   dehydrated placeholders) is a documented follow-up.
+/// - Target outside the sync root: unambiguously a delete of the source (nothing at
+///   the target for a dehydrated placeholder to orphan).
 ///
-/// If no matching `on_notify_rename` marker is found we skip (same conservative
-/// default as delete-completion). Panic-firewalled like `on_fetch_data`.
+/// If no matching `on_notify_rename` marker is found (self-initiated rename per C1, or
+/// unexpected callback ordering) we skip (same conservative default as
+/// delete-completion). Panic-firewalled like `on_fetch_data`.
 unsafe extern "system" fn on_notify_rename_completion(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
@@ -673,7 +744,8 @@ unsafe extern "system" fn on_notify_rename_completion(
     let outcome: Option<(String, Option<String>)> =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let root = connected_root()?;
-            let source_abs = pcwstr_to_path(params.Anonymous.RenameCompletion.SourcePath)?;
+            let source_abs =
+                full_path_from(info.VolumeDosName, params.Anonymous.RenameCompletion.SourcePath)?;
             let source_rel = crate::path_util::relpath_under(&root, &source_abs).ok()?;
             let target_rel =
                 full_local_path(info).and_then(|target_abs| classify_rename_target(&root, &target_abs));
@@ -684,21 +756,25 @@ unsafe extern "system" fn on_notify_rename_completion(
     let Some((source_rel, target_rel)) = outcome else {
         return;
     };
+    // Consumed unconditionally (matching in-flight marker or not) — never leaves a
+    // dangling entry, regardless of which branch below runs (DBSYNC-64 CTO review M1).
     let Some(is_dir) = take_rename_in_flight(&source_rel) else {
-        tracing::debug!(rel = %source_rel, "cfapi notify-rename-completion: no matching in-flight marker; skipping (scan backstop covers it)");
+        tracing::debug!(rel = %source_rel, "cfapi notify-rename-completion: no matching in-flight marker (self-initiated, or unexpected ordering); skipping (scan backstop covers it)");
         return;
     };
-    match &target_rel {
-        Some(new_rel) => tracing::info!(
-            source = %source_rel, target = %new_rel,
-            "cfapi notify-rename-completion: move within sync root — propagating delete(source); the new path is picked up as a fresh upload by the existing scan/watcher (not yet a true Dropbox move — DBSYNC-64 follow-up)"
-        ),
-        None => tracing::info!(
+    if rename_completion_should_delete_source(&target_rel) {
+        tracing::info!(
             source = %source_rel,
             "cfapi notify-rename-completion: moved outside the sync root — propagating delete(source)"
-        ),
+        );
+        enqueue_remote_delete_async(source_rel, is_dir);
+    } else {
+        let new_rel = target_rel.as_deref().unwrap_or("?");
+        tracing::info!(
+            source = %source_rel, target = %new_rel,
+            "cfapi notify-rename-completion: move within sync root — deferring entirely to the existing scan/watcher (no remote delete enqueued this increment, per DBSYNC-64 CTO review H2; a proper Dropbox move is a documented follow-up)"
+        );
     }
-    enqueue_remote_delete_async(source_rel, is_dir);
 }
 
 /// One `CfExecute(CF_OPERATION_TYPE_ACK_DELETE)` — unconditionally lets the
@@ -1413,5 +1489,44 @@ mod tests {
         let root = Path::new(r"C:\Users\me\Dropbox");
         let target = Path::new(r"C:\Users\me\DropboxOther\moved.txt");
         assert_eq!(classify_rename_target(root, target), None);
+    }
+
+    // DBSYNC-64 CTO review H2: the completion decision built on top of
+    // `classify_rename_target` — within-root → no delete; outside-root → delete.
+
+    #[test]
+    fn rename_completion_should_delete_source_within_root_is_false() {
+        // classify_rename_target's Some(rel) case: target is still under the sync
+        // root — a move within it must NOT delete the source this increment.
+        assert!(!rename_completion_should_delete_source(&Some(
+            "Docs/renamed.txt".to_string()
+        )));
+    }
+
+    #[test]
+    fn rename_completion_should_delete_source_outside_root_is_true() {
+        // classify_rename_target's None case: target left the sync root entirely —
+        // nothing is orphaned, so deleting the source is safe.
+        assert!(rename_completion_should_delete_source(&None));
+    }
+
+    // DBSYNC-64 CTO review H1: the shared path-resolution helper used for BOTH the
+    // rename target (`full_local_path`) and the rename-completion source
+    // (`RenameCompletion.SourcePath`) — both are drive-less CfAPI paths.
+
+    #[test]
+    fn full_path_from_joins_volume_and_normalized_path() {
+        let vol = to_wide("C:");
+        let norm = to_wide(r"\Users\me\Dropbox\file.txt");
+        let joined = unsafe { full_path_from(PCWSTR(vol.as_ptr()), PCWSTR(norm.as_ptr())) };
+        assert_eq!(joined, Some(PathBuf::from(r"C:\Users\me\Dropbox\file.txt")));
+    }
+
+    #[test]
+    fn full_path_from_empty_normalized_is_none() {
+        let vol = to_wide("C:");
+        let norm = to_wide("");
+        let joined = unsafe { full_path_from(PCWSTR(vol.as_ptr()), PCWSTR(norm.as_ptr())) };
+        assert_eq!(joined, None);
     }
 }
