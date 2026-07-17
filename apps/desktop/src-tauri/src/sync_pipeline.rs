@@ -803,7 +803,7 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
                     tracing::info!(rel, "remote delete suppressed: path is a cloud-only placeholder (dehydration, not a deletion)");
                     Ok(())
                 } else {
-                    delete_remote_file_internal(state, rel)
+                    delete_remote_file_internal(state, rel, job.delete_parent_rev.as_deref())
                 }
             }),
         "local_delete" => job
