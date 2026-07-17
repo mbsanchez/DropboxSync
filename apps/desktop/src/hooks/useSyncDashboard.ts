@@ -17,6 +17,7 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
   const [status, setStatus] = useState<SyncStatus>(idleStatus);
   const [jobs, setJobs] = useState<SyncJob[]>([]);
   const [conflicts, setConflicts] = useState<SyncConflict[]>([]);
+  const [massDeletePaused, setMassDeletePaused] = useState(false);
   const prevSyncRunningRef = useRef(false);
 
   const refreshDashboard = useCallback(async () => {
@@ -25,6 +26,7 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
       setStatus(dashboard.status);
       setJobs(dashboard.jobs);
       setConflicts(dashboard.conflicts);
+      setMassDeletePaused(dashboard.massDeletePaused);
     } catch (e) {
       pushLog(`Dashboard refresh failed: ${String(e)}`);
     }
@@ -55,6 +57,18 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
     },
     [pushLog, refreshDashboard],
   );
+
+  // DBSYNC-64: user reviewed the blocked deletion batch and wants to proceed.
+  // Sets a one-shot backend override for the next scan/sweep and clears the pause.
+  const confirmPendingDeletions = useCallback(async () => {
+    try {
+      await invoke("confirm_pending_deletions");
+      pushLog("Confirmed pending deletions; sync will resume and apply them.");
+    } catch (error) {
+      pushLog(`Confirm pending deletions error: ${String(error)}`);
+    }
+    await refreshDashboard();
+  }, [pushLog, refreshDashboard]);
 
   useEffect(() => {
     void refreshDashboard();
@@ -139,5 +153,14 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
     prevSyncRunningRef.current = status.syncRunning;
   }, [status.syncRunning, status.lastError, status.lastScanAt, refreshDashboard, pushLog]);
 
-  return { status, jobs, conflicts, refreshDashboard, retryFailedJobs, resolveConflict };
+  return {
+    status,
+    jobs,
+    conflicts,
+    massDeletePaused,
+    refreshDashboard,
+    retryFailedJobs,
+    resolveConflict,
+    confirmPendingDeletions,
+  };
 }

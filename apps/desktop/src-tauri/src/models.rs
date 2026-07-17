@@ -16,6 +16,11 @@ pub(crate) struct SyncDashboard {
     pub status: SyncStatus,
     pub jobs: Vec<SyncJobRow>,
     pub conflicts: Vec<ConflictRow>,
+    /// DBSYNC-64: true while the mass-deletion circuit breaker has paused sync
+    /// (either direction's durable `mass_delete_blocked_*` flag is set), so the
+    /// frontend can show a "review & confirm deletions" button that calls
+    /// `confirm_pending_deletions`. See `sync_pipeline::mass_delete_pause_active`.
+    pub mass_delete_paused: bool,
 }
 
 #[derive(Serialize)]

@@ -46,6 +46,9 @@ export type SyncDashboard = {
   status: SyncStatus;
   jobs: SyncJob[];
   conflicts: SyncConflict[];
+  /** DBSYNC-64: true while the mass-deletion circuit breaker has paused sync
+   *  (a blocked deletion batch is pending `confirm_pending_deletions`). */
+  massDeletePaused: boolean;
 };
 
 export type RemoteEntry = {

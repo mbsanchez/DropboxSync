@@ -538,6 +538,23 @@ pub(crate) fn clear_mass_delete_blocked(state: &AppState, source: MassDeleteSour
     }
 }
 
+/// True while EITHER direction's durable mass-deletion pause flag is set
+/// (DBSYNC-64), i.e. sync is currently paused pending `confirm_pending_deletions`.
+/// Shared by `refresh_queue_depth_internal`'s message surfacing and by
+/// `get_sync_dashboard`'s `massDeletePaused` flag, so the frontend can show a
+/// "review & confirm deletions" button without re-deriving the two key names.
+pub(crate) fn mass_delete_pause_active(state: &AppState) -> AppResult<bool> {
+    let scan_paused = state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_SCAN_KEY)?
+        .is_some_and(|s| !s.is_empty());
+    let remote_paused = state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_REMOTE_KEY)?
+        .is_some_and(|s| !s.is_empty());
+    Ok(scan_paused || remote_paused)
+}
+
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
     let folder = state
         .db
@@ -1125,9 +1142,9 @@ mod tests {
 
     use super::{
         block_mass_deletion, cleanup_stale_upload_state, clear_mass_delete_blocked,
-        is_mass_deletion, process_changed_paths, resolve_conflict_internal,
-        run_sync_tick_internal, scan_local_changes_internal, ConflictAction, MassDeleteSource,
-        SYNC_BATCH_CAP,
+        is_mass_deletion, mass_delete_pause_active, process_changed_paths,
+        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_internal,
+        ConflictAction, MassDeleteSource, SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
     use crate::storage::db::Db;
@@ -1820,6 +1837,35 @@ mod tests {
                 .unwrap()
                 .is_some_and(|s| !s.is_empty()),
             "scan clear must leave the remote pause flag untouched"
+        );
+    }
+
+    #[test]
+    fn mass_delete_pause_active_reflects_either_direction_flag() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        assert!(
+            !mass_delete_pause_active(&state).unwrap(),
+            "neither key set → not paused"
+        );
+
+        block_mass_deletion(&state, 40, 100, MassDeleteSource::LocalScan);
+        assert!(
+            mass_delete_pause_active(&state).unwrap(),
+            "scan key set (non-empty) → paused"
+        );
+
+        clear_mass_delete_blocked(&state, MassDeleteSource::LocalScan);
+        assert!(
+            !mass_delete_pause_active(&state).unwrap(),
+            "scan key cleared back to empty string → not paused"
+        );
+
+        block_mass_deletion(&state, 50, 100, MassDeleteSource::RemoteSweep);
+        assert!(
+            mass_delete_pause_active(&state).unwrap(),
+            "remote key set (non-empty) → paused"
         );
     }
 }

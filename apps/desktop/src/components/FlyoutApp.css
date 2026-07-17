@@ -162,6 +162,57 @@ html, body, #root {
   font-size: 12px;
 }
 
+/* DBSYNC-64: mass-delete circuit breaker — impossible-to-miss warning banner.
+   Distinct from .flyout-banner (info) via the error palette + a left accent bar. */
+.mass-delete-banner {
+  align-items: flex-start;
+  background: var(--flyout-error-soft);
+  border: 1px solid var(--flyout-error);
+  border-left-width: 4px;
+}
+
+.mass-delete-banner-icon .event-icon {
+  background: transparent;
+  color: var(--flyout-error);
+  width: 20px;
+  height: 20px;
+}
+
+.mass-delete-banner-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mass-delete-banner-body h3 {
+  margin: 0 0 4px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--flyout-error);
+}
+
+.mass-delete-banner-body p {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  color: var(--flyout-text);
+  word-break: break-word;
+}
+
+.mass-delete-banner-note {
+  font-weight: 600;
+  font-style: italic;
+}
+
+.mass-delete-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.mass-delete-confirm-btn {
+  background: linear-gradient(180deg, #ef4444 0%, #c0392b 100%);
+}
+
 .flyout-section h2 {
   font-size: 11px;
   text-transform: uppercase;
