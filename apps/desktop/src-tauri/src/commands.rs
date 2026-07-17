@@ -23,8 +23,8 @@ use crate::path_util::{parse_ignore_globs_csv, set_user_ignore_globs};
 use crate::state::AppState;
 use crate::sync::engine::SyncStatus;
 use crate::sync_pipeline::{
-    process_sync_queue_internal, refresh_queue_depth_internal, run_sync_tick_internal,
-    scan_local_changes_internal,
+    mass_delete_pause_active, process_sync_queue_internal, refresh_queue_depth_internal,
+    run_sync_tick_internal, scan_local_changes_internal,
 };
 
 #[tauri::command]
@@ -435,10 +435,13 @@ pub fn get_sync_dashboard(state: tauri::State<AppState>) -> Result<SyncDashboard
         .map_err(|_| "sync engine lock poisoned".to_string())?
         .current_status(state.sync_running.load(Ordering::Acquire));
 
+    let mass_delete_paused = mass_delete_pause_active(state.inner())?;
+
     Ok(SyncDashboard {
         status,
         jobs,
         conflicts,
+        mass_delete_paused,
     })
 }
 

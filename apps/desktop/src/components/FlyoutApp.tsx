@@ -284,7 +284,9 @@ function buildActivityFeed(jobs: SyncJob[], activity: ActivityEntry[]): Activity
 function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
   const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
-  const { status, jobs, conflicts, retryFailedJobs, resolveConflict } = useSyncDashboard(pushLog);
+  const { status, jobs, conflicts, massDeletePaused, retryFailedJobs, resolveConflict, confirmPendingDeletions } =
+    useSyncDashboard(pushLog);
+  const [confirmingDeletions, setConfirmingDeletions] = useState(false);
   const { activeTransfer } = useTransferProgress();
   usePlaceholderEvents(pushLog);
 
@@ -351,6 +353,21 @@ function FlyoutApp() {
       pushLog(accepted?.accepted ? "Sync requested." : "Sync already running.");
     } catch (e) {
       pushLog(`Failed to trigger sync: ${String(e)}`);
+    }
+  };
+
+  // DBSYNC-64: mass-delete circuit breaker paused sync. Nothing was deleted yet;
+  // require an explicit confirm before letting the blocked batch proceed.
+  const onConfirmPendingDeletions = async () => {
+    const ok = window.confirm(
+      "This will delete the blocked items from Dropbox (or locally). Only confirm if you intentionally deleted them. Continue?",
+    );
+    if (!ok) return;
+    setConfirmingDeletions(true);
+    try {
+      await confirmPendingDeletions();
+    } finally {
+      setConfirmingDeletions(false);
     }
   };
 
@@ -421,6 +438,32 @@ function FlyoutApp() {
       </nav>
 
       <div className="flyout-body">
+        {massDeletePaused && (
+          <div className="flyout-banner mass-delete-banner" role="alert">
+            <div className="mass-delete-banner-icon" aria-hidden="true">
+              <EventIcon kind="conflict" />
+            </div>
+            <div className="mass-delete-banner-body">
+              <h3>Sync paused — mass deletion blocked</h3>
+              <p>{status.lastError || "A large batch of deletions looked suspicious, so nothing was deleted. Review, then confirm to proceed."}</p>
+              <p className="mass-delete-banner-note">Nothing has been deleted yet.</p>
+              <div className="mass-delete-banner-actions">
+                <button type="button" className="flyout-btn" onClick={() => void openSyncFolder()}>
+                  Review deletions
+                </button>
+                <button
+                  type="button"
+                  className="flyout-btn mass-delete-confirm-btn"
+                  onClick={() => void onConfirmPendingDeletions()}
+                  disabled={confirmingDeletions}
+                >
+                  {confirmingDeletions ? "Confirming..." : "Confirm & resume"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {!authOk && (
           <div className="flyout-banner">
             <p>Dropbox is not connected.</p>
