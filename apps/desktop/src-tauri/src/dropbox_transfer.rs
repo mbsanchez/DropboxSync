@@ -924,7 +924,43 @@ pub(crate) fn upload_local_file_internal(
     Ok(())
 }
 
-pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> AppResult<()> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    Deleted,
+    AlreadyGoneOrConflict,
+    Error,
+}
+
+/// Classifies a `files/delete_v2` response. `AlreadyGoneOrConflict` means
+/// treat as a no-op and drop the job: the target is already gone
+/// (`not_found`) OR a `parent_rev` precondition failed because the file was
+/// restored/changed on the server (`path_write/conflict`). Anything else on a
+/// failure status is a real `Error`.
+pub(crate) fn classify_delete_response(status_success: bool, body: &str) -> DeleteOutcome {
+    if status_success {
+        return DeleteOutcome::Deleted;
+    }
+    if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
+        return DeleteOutcome::AlreadyGoneOrConflict;
+    }
+    // parent_rev mismatch: Dropbox has no dedicated DeleteError tag for it
+    // (verified against files.stone). Best-available signal is the contiguous
+    // `path_write/conflict` error_summary. Match defensively; confirm the exact
+    // live body via manual QA before closing.
+    if body.contains("path_write/conflict") {
+        return DeleteOutcome::AlreadyGoneOrConflict;
+    }
+    DeleteOutcome::Error
+}
+
+/// Performs a live `files/delete_v2` call against the Dropbox API; manual-QA-only
+/// for the network path (the response-classification logic is covered by the
+/// pure `classify_delete_response` tests below).
+pub(crate) fn delete_remote_file_internal(
+    state: &AppState,
+    relative: &str,
+    parent_rev: Option<&str>,
+) -> AppResult<()> {
     if relative.ends_with(".cloudsc") {
         return Ok(());
     }
@@ -932,12 +968,14 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> A
     let token = get_access_token(state)?;
     let dropbox_path = normalize_dropbox_path(relative)?;
     let client = &state.http_client;
+    let mut body = serde_json::json!({ "path": dropbox_path });
+    if let Some(rev) = parent_rev {
+        body["parent_rev"] = serde_json::json!(rev);
+    }
     let resp = client
         .post("https://api.dropboxapi.com/2/files/delete_v2")
         .bearer_auth(token.as_str())
-        .json(&serde_json::json!({
-            "path": dropbox_path
-        }))
+        .json(&body)
         .send()
         .map_err(|e| {
             AppError::Network(format!(
@@ -949,11 +987,11 @@ pub(crate) fn delete_remote_file_internal(state: &AppState, relative: &str) -> A
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_else(|_| "<unreadable body>".to_string());
-        // Already gone (or never existed on the remote): folder deletes for
-        // local-only folders, and redundant per-file deletes under a folder
-        // that was just recursively deleted, both land here. Treat as a no-op
-        // rather than a failure.
-        if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
+        if matches!(
+            classify_delete_response(false, &body),
+            DeleteOutcome::AlreadyGoneOrConflict
+        ) {
+            tracing::info!(rel = %relative, "remote delete skipped: already gone or rev-conflict (restored on server) — dropping job");
             return Ok(());
         }
         return Err(AppError::Dropbox {
@@ -1274,9 +1312,10 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_replace, choose_upload_strategy, conflict_copy_with_content_exists,
-        download_would_conflict, emit_sync_conflict, emit_upload_progress, is_final_chunk,
-        retry_transient, UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        atomic_replace, choose_upload_strategy, classify_delete_response,
+        conflict_copy_with_content_exists, download_would_conflict, emit_sync_conflict,
+        emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome, UploadStrategy,
+        UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
@@ -1372,6 +1411,70 @@ mod tests {
         // At/after the expected end, a 0-byte read is a normal terminal finish,
         // not the premature-EOF path.
         assert!(is_final_chunk(24, 0, 24));
+    }
+
+    // `delete_remote_file_internal` performs a live HTTP call against the
+    // Dropbox API and is manual-QA-only; this module covers the pure
+    // `classify_delete_response` response-classification helper instead.
+
+    #[test]
+    fn classify_delete_response_success_is_deleted() {
+        assert_eq!(
+            classify_delete_response(true, ""),
+            DeleteOutcome::Deleted
+        );
+    }
+
+    #[test]
+    fn classify_delete_response_not_found_variants_are_noop() {
+        assert_eq!(
+            classify_delete_response(
+                false,
+                r#"{"error_summary":"path_lookup/not_found/..","error":{".tag":"path_lookup"}}"#
+            ),
+            DeleteOutcome::AlreadyGoneOrConflict
+        );
+        assert_eq!(
+            classify_delete_response(
+                false,
+                r#"{"error_summary":"path/not_found/..","error":{".tag":"path"}}"#
+            ),
+            DeleteOutcome::AlreadyGoneOrConflict
+        );
+    }
+
+    #[test]
+    fn classify_delete_response_path_write_conflict_is_noop() {
+        // This body shape is reconstructed from the `files.stone` API spec
+        // (WriteError::conflict / WriteConflictError::file), not an observed
+        // live response — the exact `parent_rev`-mismatch body must be
+        // confirmed via manual QA (see PR description) before this match is
+        // considered final.
+        let body = r#"{"error_summary":"path_write/conflict/..","error":{".tag":"path_write","path_write":{".tag":"conflict","conflict":{".tag":"file"}}}}"#;
+        assert_eq!(
+            classify_delete_response(false, body),
+            DeleteOutcome::AlreadyGoneOrConflict
+        );
+    }
+
+    #[test]
+    fn classify_delete_response_unrelated_error_is_error() {
+        let no_write_permission = r#"{"error_summary":"path_write/no_write_permission/..","error":{".tag":"path_write","path_write":{".tag":"no_write_permission"}}}"#;
+        assert_eq!(
+            classify_delete_response(false, no_write_permission),
+            DeleteOutcome::Error
+        );
+
+        let insufficient_space = r#"{"error_summary":"path_write/insufficient_space/..","error":{".tag":"path_write","path_write":{".tag":"insufficient_space"}}}"#;
+        assert_eq!(
+            classify_delete_response(false, insufficient_space),
+            DeleteOutcome::Error
+        );
+    }
+
+    #[test]
+    fn classify_delete_response_malformed_or_empty_body_is_error() {
+        assert_eq!(classify_delete_response(false, ""), DeleteOutcome::Error);
     }
 
     #[test]
