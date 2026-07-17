@@ -944,9 +944,10 @@ pub(crate) fn classify_delete_response(status_success: bool, body: &str) -> Dele
         return DeleteOutcome::AlreadyGoneOrConflict;
     }
     // parent_rev mismatch: Dropbox has no dedicated DeleteError tag for it
-    // (verified against files.stone). Best-available signal is path_write/conflict.
-    // Match defensively; confirm the exact live body via manual QA before closing.
-    if body.contains("path_write") && body.contains("conflict") {
+    // (verified against files.stone). Best-available signal is the contiguous
+    // `path_write/conflict` error_summary. Match defensively; confirm the exact
+    // live body via manual QA before closing.
+    if body.contains("path_write/conflict") {
         return DeleteOutcome::AlreadyGoneOrConflict;
     }
     DeleteOutcome::Error
