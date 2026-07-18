@@ -116,6 +116,68 @@ pub(crate) fn in_post_registration_grace() -> bool {
         .unwrap_or(false)
 }
 
+/// `prefix (armed subtree) → last-armed-at`. Armed by the placeholder-materialization
+/// drivers (`cloudsc_ops.rs`, DBSYNC-66 Slice 1) whenever they are about to create a
+/// placeholder / real directory for restored content. While a prefix is armed, CfAPI
+/// churn under it (Explorer/the shell deleting-then-recreating placeholders as part of
+/// materializing a large restored subtree) must NOT be read as a user delete — see
+/// `in_materialization_grace` and its use in `on_notify_delete` /
+/// `delete_suppressed_by_dehydration`.
+static MATERIALIZATION_IN_FLIGHT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+/// Grace window during which an armed subtree's delete notifications are suppressed.
+/// Comfortably longer than the observed ~26s restore-churn lag (see the Slice 1 issue).
+const MATERIALIZATION_GRACE_WINDOW: Duration = Duration::from_secs(120);
+
+/// Arm `prefix` (a `/`-relative path — a folder's own rel, or a file's parent rel) for
+/// [`MATERIALIZATION_GRACE_WINDOW`], starting/refreshing its grace window. Also prunes
+/// any already-expired entries so the map doesn't grow unbounded across a long-running
+/// session (no separate GC needed).
+pub(crate) fn mark_materialization(prefix: &str) {
+    if let Ok(mut m) = MATERIALIZATION_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        let now = Instant::now();
+        m.retain(|_, at| {
+            now.checked_duration_since(*at)
+                .map(|d| d < MATERIALIZATION_GRACE_WINDOW)
+                .unwrap_or(true)
+        });
+        m.insert(prefix.to_string(), now);
+    }
+}
+
+/// Pure decision (unit-testable, `now`/`window` injected — no wall-clock): is `rel`
+/// under an armed, still-within-window prefix? `rel == prefix` also matches (a folder
+/// arms its own rel; a delete notification can fire for the folder itself, not just a
+/// child). Boundary-safe: `"foo/bar"` does NOT match `rel = "foo/barbaz"` — only an
+/// exact match or a `/`-separated descendant counts.
+fn materialization_grace_contains(
+    entries: &HashMap<String, Instant>,
+    rel: &str,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    entries.iter().any(|(prefix, at)| {
+        let in_window = now.checked_duration_since(*at).map(|d| d < window).unwrap_or(true);
+        in_window && (rel == prefix || rel.starts_with(&format!("{prefix}/")))
+    })
+}
+
+/// True when `rel` falls under a subtree currently armed by [`mark_materialization`]
+/// (within its grace window) — i.e. a delete notification for it is very likely
+/// materialization churn (a restore re-creating placeholders), not a genuine user
+/// delete. Checked both at CfAPI event time (`on_notify_delete`) and at drain time
+/// (`delete_suppressed_by_dehydration`), matching the `in_post_registration_grace`
+/// two-checkpoint pattern.
+pub(crate) fn in_materialization_grace(rel: &str) -> bool {
+    let Some(lock) = MATERIALIZATION_IN_FLIGHT.get() else {
+        return false;
+    };
+    let Ok(m) = lock.lock() else {
+        return false;
+    };
+    materialization_grace_contains(&m, rel, Instant::now(), MATERIALIZATION_GRACE_WINDOW)
+}
+
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -631,6 +693,9 @@ unsafe extern "system" fn on_notify_delete(
         let rel = full_local_path(info).and_then(|abs| rel_under_connected_root(&abs))?;
         if is_own_process(info) {
             tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: self-initiated (our own process) — not tracked, no remote delete will be enqueued");
+        } else if in_materialization_grace(&rel) {
+            mark_materialization(&rel); // refresh — keeps active churn armed
+            tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: suppressed — under active materialization grace (restore churn, not a user delete)");
         } else {
             mark_user_delete_in_flight(&rel, is_dir);
             tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: user delete observed");
@@ -1543,5 +1608,79 @@ mod tests {
         let norm = to_wide("");
         let joined = unsafe { full_path_from(PCWSTR(vol.as_ptr()), PCWSTR(norm.as_ptr())) };
         assert_eq!(joined, None);
+    }
+
+    // DBSYNC-66 Slice 1: `materialization_grace_contains` is the pure core of the
+    // subtree-scoped materialization grace window — `now`/`window` are injected so
+    // these tests don't touch the wall clock (like `is_mass_deletion`).
+
+    #[test]
+    fn materialization_grace_contains_true_within_window_under_armed_prefix() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("Photos".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(materialization_grace_contains(
+            &entries,
+            "Photos/img.jpg",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_false_when_expired() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("Photos".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(130)).unwrap();
+        assert!(!materialization_grace_contains(
+            &entries,
+            "Photos/img.jpg",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_false_for_unrelated_subtree() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("Photos".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(!materialization_grace_contains(
+            &entries,
+            "Docs/report.pdf",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_boundary_safe() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("foo/bar".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(!materialization_grace_contains(
+            &entries,
+            "foo/barbaz",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_exact_rel_match() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("top.txt".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(materialization_grace_contains(
+            &entries,
+            "top.txt",
+            now,
+            Duration::from_secs(120)
+        ));
     }
 }

@@ -176,6 +176,12 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                 } else if tag == "folder" {
                     // A cloud-only folder is a real directory (its children surface as
                     // placeholders next sweep), never a `<name>.cloudsc`.
+                    // DBSYNC-66 Slice 1: arm this folder's own rel BEFORE creating it —
+                    // the shell may churn (delete-then-recreate) placeholders while
+                    // materializing a restored subtree, and that churn must not be
+                    // read as a user delete.
+                    #[cfg(windows)]
+                    crate::cloud_filter::mark_materialization(&relative);
                     match fs::create_dir_all(&target_path) {
                         Ok(()) => {
                             let _ = state.db.upsert_known_folder(&relative);
@@ -274,6 +280,14 @@ fn create_remote_only_placeholder(
     size: i64,
     modified_ts: i64,
 ) -> bool {
+    // DBSYNC-66 Slice 1: arm the PARENT-folder prefix BEFORE creating the placeholder
+    // — covers siblings/descendants under an actively-materializing folder, whose
+    // CfAPI delete-then-recreate churn must not be read as a user delete.
+    #[cfg(windows)]
+    {
+        let arm = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or(rel);
+        crate::cloud_filter::mark_materialization(arm);
+    }
     if !crate::cloud_filter::create_dehydrated_placeholder(
         local_dir,
         child_name,
@@ -338,6 +352,14 @@ pub(crate) fn materialize_remote_only_file_if_absent(
         return; // parent folder not materialized yet — the indexer handles it
     }
     let name = name.to_string_lossy().to_string();
+    // DBSYNC-66 Slice 1: arm rel's parent prefix before materializing (belt-and-
+    // braces alongside the arm inside `create_remote_only_placeholder` itself, since
+    // this is a distinct materialization driver per the Slice 1 plan).
+    #[cfg(windows)]
+    {
+        let arm = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or(rel);
+        crate::cloud_filter::mark_materialization(arm);
+    }
     if create_remote_only_placeholder(
         state,
         parent,

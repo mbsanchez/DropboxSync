@@ -87,6 +87,13 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
     if crate::cloud_filter::in_post_registration_grace() {
         return true;
     }
+    // DBSYNC-66 Slice 1: drain-time backstop mirroring the `on_notify_delete` event-
+    // time check — a delete under an actively-materializing subtree (restore churn)
+    // must not run even if it slipped past the event-time suppression.
+    #[cfg(windows)]
+    if crate::cloud_filter::in_materialization_grace(rel) {
+        return true;
+    }
     let Ok(Some(folder)) = state.db.get_sync_folder() else {
         return false;
     };
