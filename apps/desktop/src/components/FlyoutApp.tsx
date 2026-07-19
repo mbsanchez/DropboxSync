@@ -366,24 +366,26 @@ function FlyoutApp() {
       const result = await invoke<TriggerSyncResponse>("trigger_sync_tick");
       if (result.reason === "already_running") {
         pushLog("Sync already running.");
-      } else {
-        pushLog("Sync requested.");
-        setOptimisticSyncing(true);
-        void refreshDashboardNow();
+        return;
+      }
+      pushLog("Sync requested.");
+      // Optimistic feedback: disable the button/indicator immediately, then
+      // hand off to the real dashboard status. The flag only bridges the
+      // click -> first-fetch gap; clearing it in `finally` (once the refreshed
+      // status has been read from the backend) guarantees it can never get
+      // stuck — even for a fast/no-op cycle that finishes before any poll ever
+      // observes syncRunning=true. A genuinely running sync keeps the UI busy
+      // via the real `status.syncRunning` flag after the flag clears.
+      setOptimisticSyncing(true);
+      try {
+        await refreshDashboardNow();
+      } finally {
+        setOptimisticSyncing(false);
       }
     } catch (e) {
       pushLog(`Failed to trigger sync: ${String(e)}`);
     }
   };
-
-  // Defensive clear: once the real dashboard status observes syncRunning, the
-  // real flag drives the UI, so drop the optimistic one to avoid it ever
-  // getting stuck (e.g. if a completion event is missed).
-  useEffect(() => {
-    if (status.syncRunning) {
-      setOptimisticSyncing(false);
-    }
-  }, [status.syncRunning]);
 
   // DBSYNC-64: mass-delete circuit breaker paused sync. Nothing was deleted yet;
   // require an explicit confirm before letting the blocked batch proceed.
