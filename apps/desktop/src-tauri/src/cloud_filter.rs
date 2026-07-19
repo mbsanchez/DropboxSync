@@ -1001,7 +1001,23 @@ fn run_delete_flush_worker() {
                 Some(batch) if !batch.is_empty() => {
                     idle_polls = 0;
                     match app_state() {
-                        Some(state) => flush_pending_deletes(&state, batch),
+                        // Panic-firewall the flush: a panic here would kill this
+                        // worker thread with DELETE_FLUSH_RUNNING still set, silently
+                        // disabling event-delete coalescing for the rest of the
+                        // session. Catch it so the loop reaches its normal exit,
+                        // which resets the flag. (The scan backstop still propagates
+                        // deletes regardless.)
+                        Some(state) => {
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                flush_pending_deletes(&state, batch)
+                            }))
+                            .is_err()
+                            {
+                                tracing::error!(
+                                    "cfapi event-delete: coalesced flush panicked (caught); worker continues"
+                                );
+                            }
+                        }
                         None => tracing::debug!(
                             "cfapi event-delete: app state unavailable; dropping buffered batch (scan backstop covers it)"
                         ),
