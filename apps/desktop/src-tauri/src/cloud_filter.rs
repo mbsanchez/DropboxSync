@@ -116,6 +116,68 @@ pub(crate) fn in_post_registration_grace() -> bool {
         .unwrap_or(false)
 }
 
+/// `prefix (armed subtree) → last-armed-at`. Armed by the placeholder-materialization
+/// drivers (`cloudsc_ops.rs`, DBSYNC-66 Slice 1) whenever they are about to create a
+/// placeholder / real directory for restored content. While a prefix is armed, CfAPI
+/// churn under it (Explorer/the shell deleting-then-recreating placeholders as part of
+/// materializing a large restored subtree) must NOT be read as a user delete — see
+/// `in_materialization_grace` and its use in `on_notify_delete` /
+/// `delete_suppressed_by_dehydration`.
+static MATERIALIZATION_IN_FLIGHT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+/// Grace window during which an armed subtree's delete notifications are suppressed.
+/// Comfortably longer than the observed ~26s restore-churn lag (see the Slice 1 issue).
+const MATERIALIZATION_GRACE_WINDOW: Duration = Duration::from_secs(120);
+
+/// Arm `prefix` (a `/`-relative path — a folder's own rel, or a file's parent rel) for
+/// [`MATERIALIZATION_GRACE_WINDOW`], starting/refreshing its grace window. Also prunes
+/// any already-expired entries so the map doesn't grow unbounded across a long-running
+/// session (no separate GC needed).
+pub(crate) fn mark_materialization(prefix: &str) {
+    if let Ok(mut m) = MATERIALIZATION_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        let now = Instant::now();
+        m.retain(|_, at| {
+            now.checked_duration_since(*at)
+                .map(|d| d < MATERIALIZATION_GRACE_WINDOW)
+                .unwrap_or(true)
+        });
+        m.insert(prefix.to_string(), now);
+    }
+}
+
+/// Pure decision (unit-testable, `now`/`window` injected — no wall-clock): is `rel`
+/// under an armed, still-within-window prefix? `rel == prefix` also matches (a folder
+/// arms its own rel; a delete notification can fire for the folder itself, not just a
+/// child). Boundary-safe: `"foo/bar"` does NOT match `rel = "foo/barbaz"` — only an
+/// exact match or a `/`-separated descendant counts.
+fn materialization_grace_contains(
+    entries: &HashMap<String, Instant>,
+    rel: &str,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    entries.iter().any(|(prefix, at)| {
+        let in_window = now.checked_duration_since(*at).map(|d| d < window).unwrap_or(true);
+        in_window && (rel == prefix || rel.starts_with(&format!("{prefix}/")))
+    })
+}
+
+/// True when `rel` falls under a subtree currently armed by [`mark_materialization`]
+/// (within its grace window) — i.e. a delete notification for it is very likely
+/// materialization churn (a restore re-creating placeholders), not a genuine user
+/// delete. Checked both at CfAPI event time (`on_notify_delete`) and at drain time
+/// (`delete_suppressed_by_dehydration`), matching the `in_post_registration_grace`
+/// two-checkpoint pattern.
+pub(crate) fn in_materialization_grace(rel: &str) -> bool {
+    let Some(lock) = MATERIALIZATION_IN_FLIGHT.get() else {
+        return false;
+    };
+    let Ok(m) = lock.lock() else {
+        return false;
+    };
+    materialization_grace_contains(&m, rel, Instant::now(), MATERIALIZATION_GRACE_WINDOW)
+}
+
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -631,6 +693,9 @@ unsafe extern "system" fn on_notify_delete(
         let rel = full_local_path(info).and_then(|abs| rel_under_connected_root(&abs))?;
         if is_own_process(info) {
             tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: self-initiated (our own process) — not tracked, no remote delete will be enqueued");
+        } else if in_materialization_grace(&rel) {
+            mark_materialization(&rel); // refresh — keeps active churn armed
+            tracing::info!(rel = %rel, is_dir, "cfapi notify-delete: suppressed — under active materialization grace (restore churn, not a user delete)");
         } else {
             mark_user_delete_in_flight(&rel, is_dir);
             tracing::debug!(rel = %rel, is_dir, "cfapi notify-delete: user delete observed");
@@ -829,31 +894,208 @@ unsafe fn ack_rename(conn: CF_CONNECTION_KEY, transfer: i64, status: NTSTATUS) -
     CfExecute(&op_info, &mut params)
 }
 
-/// Route a CONFIRMED user delete (from `on_notify_delete_completion`) or a
-/// rename-treated-as-delete (from `on_notify_rename_completion`) into the sync
-/// engine: enqueue the Dropbox `delete` job and untrack the local index row (same
-/// as the scan-inferred path's `process_local_file_deletion` /
-/// `process_known_folder_deletion`), then kick a drain — all OFF the CfAPI callback
-/// thread (never touch the DB/network from inside the `extern "system"` ABI).
-/// Draining goes through the normal `drain_sync_queue`, so the DBSYNC-45/62 guards
-/// (`delete_suppressed_by_dehydration`) still apply at execution time — this is
-/// additive, not a bypass. No-op if `app_state()` is unavailable (e.g.
-/// mid-shutdown); best-effort if another drain already owns `sync_running` — the
-/// job is already persisted and will be picked up by that drain or the next cycle.
-fn enqueue_remote_delete_async(rel: String, is_dir: bool) {
-    std::thread::spawn(move || {
-        let Some(state) = app_state() else {
-            tracing::debug!(rel = %rel, "cfapi event-delete: app state unavailable; skipping (scan backstop covers it)");
-            return;
-        };
+// ── DBSYNC-66 Slice 2: coalesced folder deletes ─────────────────────────────────
+//
+// Deleting a folder tree makes CfAPI fire ONE NOTIFY_DELETE(_COMPLETION) pair per
+// DESCENDANT (every file + every subfolder) — e.g. 32 events for a 32-item tree.
+// Turning each into its own `files/delete_v2` job serializes 32 network round-trips
+// (~30s observed) and, worse, holds the delete queue open for that whole window,
+// during which a concurrent restore can re-materialize part of the tree the user
+// just deleted. Dropbox's `delete_v2` on a FOLDER is already recursive — deleting
+// the top-level folder alone deletes its entire remote subtree — so the fix is to
+// BUFFER the burst of per-descendant events and, once it goes quiet, collapse it to
+// the MINIMAL set of top-level roots and enqueue exactly one recursive `delete_v2`
+// job per root (`minimal_delete_roots` / `flush_pending_deletes`).
+
+/// One buffered CfAPI delete event, captured from a confirmed
+/// `on_notify_delete_completion` (or a rename treated as a delete), awaiting
+/// coalescing by the debounce-flush worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDelete {
+    rel: String,
+    is_dir: bool,
+}
+
+/// Delete events observed since the last flush. Drained wholesale (and coalesced —
+/// see `minimal_delete_roots`) by `run_delete_flush_worker` once the burst goes
+/// quiet for [`DELETE_DEBOUNCE_WINDOW`].
+static PENDING_EVENT_DELETES: OnceLock<Mutex<Vec<PendingDelete>>> = OnceLock::new();
+/// Instant of the most recent push into `PENDING_EVENT_DELETES`, used by the
+/// debounce worker to decide whether the burst has gone quiet.
+static PENDING_DELETES_LAST_ACTIVITY: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+/// Guards against spawning more than one debounce-flush worker at a time. Set by
+/// whichever `enqueue_remote_delete_async` call wins the race to start a worker;
+/// cleared by the worker itself once the buffer has been empty for a couple of
+/// polls (with a re-check to avoid dropping a push that lands in that exact
+/// window — see `run_delete_flush_worker`).
+static DELETE_FLUSH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the buffer must be quiet (no new pushes) before it is flushed.
+/// Comfortably longer than the gap between consecutive descendant
+/// NOTIFY_DELETE_COMPLETION events within a single folder-delete burst, so the
+/// whole burst is captured by one flush.
+const DELETE_DEBOUNCE_WINDOW: Duration = Duration::from_millis(700);
+/// Poll interval for the debounce worker.
+const DELETE_DEBOUNCE_POLL: Duration = Duration::from_millis(400);
+
+/// Buffer one CfAPI delete event and make sure a debounce-flush worker is running.
+/// Runs off the CfAPI callback thread (called from `enqueue_remote_delete_async`,
+/// itself only ever called from a spawned thread) — cheap, no DB/network here.
+fn push_pending_delete(rel: String, is_dir: bool) {
+    if let Ok(mut buf) = PENDING_EVENT_DELETES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    {
+        buf.push(PendingDelete { rel, is_dir });
+    }
+    if let Ok(mut last) = PENDING_DELETES_LAST_ACTIVITY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *last = Some(Instant::now());
+    }
+    ensure_delete_flush_worker();
+}
+
+/// Start the debounce-flush worker if one isn't already running (single-thread
+/// gate via `DELETE_FLUSH_RUNNING`). A no-op when a worker is already draining the
+/// buffer — that worker will pick up this push on its next poll.
+fn ensure_delete_flush_worker() {
+    use std::sync::atomic::Ordering;
+    if DELETE_FLUSH_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(run_delete_flush_worker);
+}
+
+/// The single debounce-flush worker thread: polls every [`DELETE_DEBOUNCE_POLL`],
+/// and once the buffer has been quiet for [`DELETE_DEBOUNCE_WINDOW`] and is
+/// non-empty, takes the whole buffer and flushes it (`flush_pending_deletes`).
+/// Stops once the buffer has been empty for a couple of polls — but re-checks
+/// after clearing `DELETE_FLUSH_RUNNING` so a push landing in the narrow window
+/// between "decided to stop" and "flag cleared" is still picked up (by this same
+/// worker looping again, or ceded to a fresh one if another thread already won the
+/// race), rather than silently stranded in the buffer.
+fn run_delete_flush_worker() {
+    use std::sync::atomic::Ordering;
+    loop {
+        let mut idle_polls = 0u32;
+        loop {
+            std::thread::sleep(DELETE_DEBOUNCE_POLL);
+            let quiet_long_enough = PENDING_DELETES_LAST_ACTIVITY
+                .get()
+                .and_then(|m| m.lock().ok().and_then(|g| *g))
+                .map(|t| t.elapsed() >= DELETE_DEBOUNCE_WINDOW)
+                .unwrap_or(true);
+            let batch = if quiet_long_enough {
+                PENDING_EVENT_DELETES
+                    .get()
+                    .and_then(|m| m.lock().ok().map(|mut b| std::mem::take(&mut *b)))
+            } else {
+                None
+            };
+            match batch {
+                Some(batch) if !batch.is_empty() => {
+                    idle_polls = 0;
+                    match app_state() {
+                        // Panic-firewall the flush: a panic here would kill this
+                        // worker thread with DELETE_FLUSH_RUNNING still set, silently
+                        // disabling event-delete coalescing for the rest of the
+                        // session. Catch it so the loop reaches its normal exit,
+                        // which resets the flag. (The scan backstop still propagates
+                        // deletes regardless.)
+                        Some(state) => {
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                flush_pending_deletes(&state, batch)
+                            }))
+                            .is_err()
+                            {
+                                tracing::error!(
+                                    "cfapi event-delete: coalesced flush panicked (caught); worker continues"
+                                );
+                            }
+                        }
+                        None => tracing::debug!(
+                            "cfapi event-delete: app state unavailable; dropping buffered batch (scan backstop covers it)"
+                        ),
+                    }
+                }
+                _ => {
+                    idle_polls += 1;
+                    if idle_polls >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        DELETE_FLUSH_RUNNING.store(false, Ordering::Release);
+        let more_pending = PENDING_EVENT_DELETES
+            .get()
+            .and_then(|m| m.lock().ok().map(|b| !b.is_empty()))
+            .unwrap_or(false);
+        if !more_pending {
+            break;
+        }
+        if DELETE_FLUSH_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            break; // another thread already spawned a fresh worker; let it take over
+        }
+    }
+}
+
+/// Pure core of the coalescing (DBSYNC-66 Slice 2): given the descendant-level
+/// `(rel, is_dir)` events buffered from one delete burst, return only the entries
+/// that have no OTHER entry in `batch` as an ancestor. Dropbox's `delete_v2` on a
+/// folder is already recursive, so a root's own delete job already covers every
+/// entry it is an ancestor of — only the roots need a job. Boundary-safe (mirrors
+/// `materialization_grace_contains`): `"foo/bar"` is NOT an ancestor of
+/// `"foo/barbaz"` — only an exact `/`-separated descendant counts. Pure / no I/O,
+/// no wall-clock — fully unit-testable.
+fn minimal_delete_roots(batch: &[(String, bool)]) -> Vec<(String, bool)> {
+    batch
+        .iter()
+        .filter(|(rel, _)| {
+            !batch
+                .iter()
+                .any(|(other, _)| other != rel && rel.starts_with(&format!("{other}/")))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Flush one debounced batch: coalesce it to its minimal root set
+/// (`minimal_delete_roots`), enqueue ONE recursive `delete_v2` job per root, untrack
+/// EVERY entry in the batch from the local index (so it matches what was deleted —
+/// the remote index rows for the deleted subtree are cleared by the delete drain's
+/// `remove_remote_file` / `prune_empty_deleted_ancestors`), then kick a single
+/// drain. Draining goes through the normal `drain_sync_queue`, so the DBSYNC-45/62
+/// guards (`delete_suppressed_by_dehydration`) still apply per job at execution
+/// time — this is additive, not a bypass. No-op if `sync_running` is already held
+/// by another drain — the jobs are already persisted and will be picked up by that
+/// drain or the next cycle. Called from `run_delete_flush_worker`, off the CfAPI
+/// callback thread.
+fn flush_pending_deletes(state: &crate::state::AppState, batch: Vec<PendingDelete>) {
+    if batch.is_empty() {
+        return;
+    }
+    let entries: Vec<(String, bool)> =
+        batch.iter().map(|p| (p.rel.clone(), p.is_dir)).collect();
+    let roots = minimal_delete_roots(&entries);
+
+    for (rel, is_dir) in &roots {
         // DBSYNC-65 (Slice 1): capture the remote rev at enqueue time (files only —
-        // folders aren't keyed in `remote_file_index`) so a later drain (Slice 2) can
-        // detect whether the remote copy changed since this delete was observed. A
-        // lookup failure here must not abort the delete enqueue; fall back to `None`.
-        let parent_rev = if is_dir {
+        // folders aren't keyed in `remote_file_index`) so a later drain can detect
+        // whether the remote copy changed since this delete was observed. A lookup
+        // failure here must not abort the delete enqueue; fall back to `None`.
+        let parent_rev = if *is_dir {
             None
         } else {
-            match state.db.get_remote_file(&rel) {
+            match state.db.get_remote_file(rel) {
                 Ok(row) => row.map(|r| r.rev),
                 Err(e) => {
                     tracing::warn!(rel = %rel, error = %e, "cfapi event-delete: parent rev lookup failed; enqueuing without it");
@@ -861,45 +1103,66 @@ fn enqueue_remote_delete_async(rel: String, is_dir: bool) {
                 }
             }
         };
-        if let Err(e) = state.db.enqueue_delete_job(&rel, parent_rev.as_deref()) {
+        if let Err(e) = state.db.enqueue_delete_job(rel, parent_rev.as_deref()) {
             tracing::warn!(rel = %rel, error = %e, "cfapi event-delete: enqueue failed");
-            return;
         }
-        let untrack = if is_dir {
-            state.db.remove_known_folder(&rel)
+    }
+
+    for entry in &batch {
+        let untrack = if entry.is_dir {
+            state.db.remove_known_folder(&entry.rel)
         } else {
-            state.db.remove_local_file(&rel)
+            state.db.remove_local_file(&entry.rel)
         };
         if let Err(e) = untrack {
-            tracing::warn!(rel = %rel, is_dir, error = %e, "cfapi event-delete: untrack failed (job still enqueued)");
+            tracing::warn!(rel = %entry.rel, is_dir = entry.is_dir, error = %e, "cfapi event-delete: untrack failed (job still enqueued)");
         }
-        tracing::info!(rel = %rel, is_dir, "cfapi event-delete: remote delete enqueued from NOTIFY_DELETE/NOTIFY_RENAME completion");
+    }
 
-        use std::sync::atomic::Ordering;
-        if state
-            .sync_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // Tray tooltip refresh is UI-only (not correctness-load-bearing here —
-            // the enqueue above already persisted the job). Gated out of `cfg(test)`
-            // for the SAME reason as the notification plugin in `lib.rs`: taking
-            // `Some(on_notify_delete_completion)`'s address for the CfAPI callback
-            // table (above) makes this call chain statically reachable in the
-            // `cargo test --lib` harness binary — which, unlike the real shipped
-            // `.exe`, has no embedded manifest requesting ComCtl32 v6 — and the
-            // `tray-icon`/`muda` Windows backend statically imports
-            // `TaskDialogIndirect` (a ComCtl32 v6-only export), so the test binary
-            // fails to LOAD at all (STATUS_ENTRYPOINT_NOT_FOUND) rather than merely
-            // failing a test. The shipped app is unaffected (real manifest, and this
-            // path already runs on a background thread there regardless).
-            #[cfg(not(test))]
-            crate::auth_session::refresh_tray_tooltip(&state);
-            crate::sync_pipeline::drain_sync_queue(&state);
-            state.sync_running.store(false, Ordering::Release);
-            #[cfg(not(test))]
-            crate::auth_session::refresh_tray_tooltip(&state);
-        }
+    tracing::info!(
+        events = batch.len(),
+        roots = roots.len(),
+        "cfapi event-delete: coalesced burst flushed into recursive delete_v2 job(s)"
+    );
+
+    use std::sync::atomic::Ordering;
+    if state
+        .sync_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // Tray tooltip refresh is UI-only (not correctness-load-bearing here —
+        // the enqueues above already persisted the jobs). Gated out of `cfg(test)`
+        // for the SAME reason as the notification plugin in `lib.rs`: taking
+        // `Some(on_notify_delete_completion)`'s address for the CfAPI callback
+        // table (above) makes this call chain statically reachable in the
+        // `cargo test --lib` harness binary — which, unlike the real shipped
+        // `.exe`, has no embedded manifest requesting ComCtl32 v6 — and the
+        // `tray-icon`/`muda` Windows backend statically imports
+        // `TaskDialogIndirect` (a ComCtl32 v6-only export), so the test binary
+        // fails to LOAD at all (STATUS_ENTRYPOINT_NOT_FOUND) rather than merely
+        // failing a test. The shipped app is unaffected (real manifest, and this
+        // path already runs on a background thread there regardless).
+        #[cfg(not(test))]
+        crate::auth_session::refresh_tray_tooltip(state);
+        crate::sync_pipeline::drain_sync_queue(state);
+        state.sync_running.store(false, Ordering::Release);
+        #[cfg(not(test))]
+        crate::auth_session::refresh_tray_tooltip(state);
+    }
+}
+
+/// Route a CONFIRMED user delete (from `on_notify_delete_completion`) or a
+/// rename-treated-as-delete (from `on_notify_rename_completion`) into the sync
+/// engine. DBSYNC-66 Slice 2: rather than enqueueing immediately, this now BUFFERS
+/// the event (`push_pending_delete`) so a burst of per-descendant events from one
+/// user folder-delete coalesces into a handful of recursive `delete_v2` jobs
+/// instead of one job per descendant — see `run_delete_flush_worker` /
+/// `flush_pending_deletes`. Still runs OFF the CfAPI callback thread (never touch
+/// the DB/network from inside the `extern "system"` ABI).
+fn enqueue_remote_delete_async(rel: String, is_dir: bool) {
+    std::thread::spawn(move || {
+        push_pending_delete(rel, is_dir);
     });
 }
 
@@ -1543,5 +1806,150 @@ mod tests {
         let norm = to_wide("");
         let joined = unsafe { full_path_from(PCWSTR(vol.as_ptr()), PCWSTR(norm.as_ptr())) };
         assert_eq!(joined, None);
+    }
+
+    // DBSYNC-66 Slice 1: `materialization_grace_contains` is the pure core of the
+    // subtree-scoped materialization grace window — `now`/`window` are injected so
+    // these tests don't touch the wall clock (like `is_mass_deletion`).
+
+    #[test]
+    fn materialization_grace_contains_true_within_window_under_armed_prefix() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("Photos".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(materialization_grace_contains(
+            &entries,
+            "Photos/img.jpg",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_false_when_expired() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("Photos".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(130)).unwrap();
+        assert!(!materialization_grace_contains(
+            &entries,
+            "Photos/img.jpg",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_false_for_unrelated_subtree() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("Photos".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(!materialization_grace_contains(
+            &entries,
+            "Docs/report.pdf",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_boundary_safe() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("foo/bar".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(!materialization_grace_contains(
+            &entries,
+            "foo/barbaz",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    #[test]
+    fn materialization_grace_contains_exact_rel_match() {
+        let base = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("top.txt".to_string(), base);
+        let now = base.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(materialization_grace_contains(
+            &entries,
+            "top.txt",
+            now,
+            Duration::from_secs(120)
+        ));
+    }
+
+    // DBSYNC-66 Slice 2: `minimal_delete_roots` is the pure core of coalescing a
+    // NOTIFY_DELETE burst (one event per descendant) into the minimal set of
+    // top-level roots that actually need a `delete_v2` job (Dropbox's `delete_v2`
+    // on a folder is already recursive, so a root's job covers every descendant
+    // under it that also appears in the same burst).
+
+    fn pd(rel: &str, is_dir: bool) -> (String, bool) {
+        (rel.to_string(), is_dir)
+    }
+
+    #[test]
+    fn minimal_delete_roots_empty_input_is_empty() {
+        let batch: Vec<(String, bool)> = Vec::new();
+        assert_eq!(minimal_delete_roots(&batch), Vec::new());
+    }
+
+    #[test]
+    fn minimal_delete_roots_deep_tree_collapses_to_top_folder() {
+        // Deleting "Photos" (with subfolders and files) fires one event per
+        // descendant + the folder itself — only "Photos" should survive.
+        let batch = vec![
+            pd("Photos", true),
+            pd("Photos/2024", true),
+            pd("Photos/2024/img1.jpg", false),
+            pd("Photos/2024/img2.jpg", false),
+            pd("Photos/2025", true),
+            pd("Photos/2025/img3.jpg", false),
+        ];
+        assert_eq!(minimal_delete_roots(&batch), vec![pd("Photos", true)]);
+    }
+
+    #[test]
+    fn minimal_delete_roots_keeps_both_sibling_folders() {
+        let batch = vec![
+            pd("Photos", true),
+            pd("Photos/img.jpg", false),
+            pd("Docs", true),
+            pd("Docs/report.pdf", false),
+        ];
+        let mut roots = minimal_delete_roots(&batch);
+        roots.sort();
+        let mut expected = vec![pd("Docs", true), pd("Photos", true)];
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    #[test]
+    fn minimal_delete_roots_boundary_safe_not_treated_as_ancestor() {
+        // "foo/bar" must NOT be treated as an ancestor of "foo/barbaz" — only an
+        // exact `/`-separated descendant counts (same boundary rule as
+        // `materialization_grace_contains`). Both are roots.
+        let batch = vec![pd("foo/bar", false), pd("foo/barbaz", false)];
+        let mut roots = minimal_delete_roots(&batch);
+        roots.sort();
+        let mut expected = batch.clone();
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    #[test]
+    fn minimal_delete_roots_file_with_parent_folder_in_batch_keeps_only_parent() {
+        let batch = vec![pd("Photos", true), pd("Photos/img.jpg", false)];
+        assert_eq!(minimal_delete_roots(&batch), vec![pd("Photos", true)]);
+    }
+
+    #[test]
+    fn minimal_delete_roots_single_file_no_folder_is_its_own_root() {
+        let batch = vec![pd("top.txt", false)];
+        assert_eq!(minimal_delete_roots(&batch), vec![pd("top.txt", false)]);
     }
 }

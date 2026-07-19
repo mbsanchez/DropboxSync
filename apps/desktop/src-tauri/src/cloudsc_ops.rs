@@ -9,7 +9,7 @@ use crate::auth_session::get_access_token;
 use crate::cloudsc::{
     cloudsc_target_path, read_cloudsc_placeholder_file, write_cloudsc_placeholder_file,
 };
-use crate::dropbox_transfer::download_remote_file_internal;
+use crate::dropbox_transfer::{delete_remote_file_internal, download_remote_file_internal};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
@@ -57,6 +57,20 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
         Ok(Some(f)) => crate::cloud_filter::placeholders_active(&f),
         _ => false,
     };
+
+    // DBSYNC-66: on Windows, native CfAPI placeholders are the ONLY correct
+    // representation of cloud-only content — never fall back to `.cloudsc`
+    // sidecars (they show a broken icon and, worse, shadow the native placeholder
+    // so the file never materializes correctly). If CfAPI isn't connected yet — a
+    // brief startup race where this sweep runs before `CfConnectSyncRoot`
+    // completes, or a restore that materializes before the connection is live —
+    // DEFER instead of writing `.cloudsc`: the sweep re-runs on the next tick and
+    // materializes natively once connected.
+    #[cfg(windows)]
+    if !cfapi_active {
+        tracing::debug!("materialization sweep deferred: CfAPI not active yet (avoiding .cloudsc fallback on Windows)");
+        return Ok(0);
+    }
 
     // Page through the folder with cursor + has_more; a folder with more than one
     // page of entries (Dropbox returns up to ~2000 per page) would otherwise be
@@ -139,7 +153,22 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             // file/dir (a hydrated folder is a real dir, so we never shadow it with
             // a `<name>.cloudsc`).
             if placeholder_path.exists() {
-                continue;
+                // DBSYNC-66: on Windows a `.cloudsc` sidecar is always wrong (a
+                // leftover from an older build or from a moment CfAPI was inactive)
+                // and it shadows the native placeholder — remove it and materialize
+                // natively below. On non-Windows the `.cloudsc` IS the placeholder,
+                // so keep it.
+                #[cfg(windows)]
+                {
+                    if let Err(e) = fs::remove_file(&placeholder_path) {
+                        tracing::warn!(name = %child_name, error = %e, "failed to remove stale .cloudsc sidecar; skipping");
+                        continue;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    continue;
+                }
             }
             if target_path.exists() {
                 continue;
@@ -176,11 +205,35 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                 } else if tag == "folder" {
                     // A cloud-only folder is a real directory (its children surface as
                     // placeholders next sweep), never a `<name>.cloudsc`.
+                    // DBSYNC-66 Slice 1: arm this folder's own rel BEFORE creating it —
+                    // the shell may churn (delete-then-recreate) placeholders while
+                    // materializing a restored subtree, and that churn must not be
+                    // read as a user delete.
+                    #[cfg(windows)]
+                    crate::cloud_filter::mark_materialization(&relative);
                     match fs::create_dir_all(&target_path) {
                         Ok(()) => {
                             let _ = state.db.upsert_known_folder(&relative);
                             created += 1;
                             created_names.push(child_name.clone());
+                            // DBSYNC-66: recurse into the just-created folder now so a
+                            // restored/new subtree materializes fully in ONE sweep
+                            // (depth-first, each folder listed once) instead of one
+                            // level per scan tick — the cause of the minutes-long
+                            // trickle after a cloud folder restore.
+                            match normalize_dropbox_path(&relative) {
+                                Ok(child_remote) => {
+                                    match index_remote_folder_children_as_cloudsc_placeholders_internal(
+                                        state,
+                                        &child_remote,
+                                        &target_path,
+                                    ) {
+                                        Ok(n) => created += n,
+                                        Err(e) => tracing::warn!(rel = %relative, error = %e, "recursive materialization of subfolder failed"),
+                                    }
+                                }
+                                Err(e) => tracing::warn!(rel = %relative, error = %e, "recursive materialization: unsafe child path"),
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(name = %child_name, error = %e, "remote-only folder: create dir failed");
@@ -274,6 +327,14 @@ fn create_remote_only_placeholder(
     size: i64,
     modified_ts: i64,
 ) -> bool {
+    // DBSYNC-66 Slice 1: arm the PARENT-folder prefix BEFORE creating the placeholder
+    // — covers siblings/descendants under an actively-materializing folder, whose
+    // CfAPI delete-then-recreate churn must not be read as a user delete.
+    #[cfg(windows)]
+    {
+        let arm = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or(rel);
+        crate::cloud_filter::mark_materialization(arm);
+    }
     if !crate::cloud_filter::create_dehydrated_placeholder(
         local_dir,
         child_name,
@@ -338,6 +399,14 @@ pub(crate) fn materialize_remote_only_file_if_absent(
         return; // parent folder not materialized yet — the indexer handles it
     }
     let name = name.to_string_lossy().to_string();
+    // DBSYNC-66 Slice 1: arm rel's parent prefix before materializing (belt-and-
+    // braces alongside the arm inside `create_remote_only_placeholder` itself, since
+    // this is a distinct materialization driver per the Slice 1 plan).
+    #[cfg(windows)]
+    {
+        let arm = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or(rel);
+        crate::cloud_filter::mark_materialization(arm);
+    }
     if create_remote_only_placeholder(
         state,
         parent,
@@ -1083,6 +1152,211 @@ fn untrack_folders_subtree(state: &AppState, folder_rel: &str) -> AppResult<()> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// DBSYNC-66: folder-delete completeness
+// ---------------------------------------------------------------------------
+//
+// CfAPI/Explorer fires NOTIFY_DELETE for the deleted files and the LEAF folder
+// of a deleted tree, but never for empty INTERMEDIATE ancestor folders — those
+// are left behind both locally and on Dropbox, along with a stale
+// `known_folders` row. `prune_empty_deleted_ancestors` walks up from a just-
+// deleted path and prunes any ancestor the delete genuinely emptied out.
+
+/// Max ancestor-chain depth walked by `prune_empty_deleted_ancestors`. A purely
+/// defensive backstop — real sync-root trees never come close to this — against
+/// an unbounded loop from a malformed/corrupt rel.
+const PRUNE_ANCESTOR_DEPTH_CAP: usize = 64;
+
+/// Returns the chain of ancestor folder rels for `deleted_rel`, nearest-first
+/// (parent, grandparent, …), stopping before the sync root (`""`). Pure and
+/// IO-free so it is unit-tested directly; `deleted_rel` is assumed already
+/// `/`-canonical, as every rel path in this codebase is (see `relpath_under`).
+///
+/// Example: `ancestor_rels("UNET/Ascensos/Asociado/artículos/file.txt")` ==
+/// `["UNET/Ascensos/Asociado/artículos", "UNET/Ascensos/Asociado", "UNET/Ascensos", "UNET"]`.
+pub(crate) fn ancestor_rels(deleted_rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = deleted_rel;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        out.push(parent.to_string());
+        current = parent;
+    }
+    out
+}
+
+/// Classification of a `files/list_folder` probe against a candidate ancestor,
+/// used by `prune_empty_deleted_ancestors` to decide whether it is safe to
+/// prune. Kept as a small enum so the call site is a single 3-way match instead
+/// of inlining the status/body parsing there.
+enum RemoteFolderProbe {
+    /// At least one entry remains on Dropbox — never prune (may still
+    /// materialize locally later).
+    HasContent,
+    /// The folder no longer exists on Dropbox at all — safe to prune locally
+    /// and drop the index rows; nothing to delete remotely.
+    AlreadyGone,
+    /// The folder exists on Dropbox and is empty — safe to `delete_v2` it, then
+    /// prune locally and drop the index rows.
+    Empty,
+}
+
+/// Non-recursive `files/list_folder` probe for `rel`, classified per
+/// `RemoteFolderProbe`. Mirrors the existing `list_folder` call in
+/// `index_remote_folder_children_as_cloudsc_placeholders_internal`. Manual-QA-
+/// only for the network path — no HTTP mock in this repo (existing convention).
+fn probe_remote_folder_empty(state: &AppState, rel: &str) -> AppResult<RemoteFolderProbe> {
+    let token = get_access_token(state)?;
+    let dropbox_path = normalize_dropbox_path(rel)?;
+    let response = state
+        .http_client
+        .post("https://api.dropboxapi.com/2/files/list_folder")
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "path": dropbox_path,
+            "recursive": false,
+            "include_deleted": false
+        }))
+        .send()
+        .map_err(|e| {
+            AppError::Network(format!("list_folder (prune probe) request failed: {e}"))
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        if body.contains("path/not_found") {
+            return Ok(RemoteFolderProbe::AlreadyGone);
+        }
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("list_folder (prune probe) for {dropbox_path}: {body}"),
+        });
+    }
+
+    let parsed: DropboxListFolderResponse = response
+        .json()
+        .map_err(|e| AppError::Other(format!("list_folder (prune probe) parse failed: {e}")))?;
+
+    // Conservative on the (practically impossible) empty-page-but-more-follows
+    // shape: treat it as content present rather than prune.
+    if parsed.entries.is_empty() && !parsed.has_more {
+        Ok(RemoteFolderProbe::Empty)
+    } else {
+        Ok(RemoteFolderProbe::HasContent)
+    }
+}
+
+/// DBSYNC-66 folder-delete completeness: after a delete job for `deleted_rel`
+/// genuinely succeeds, walk up its ancestor chain pruning any folder that the
+/// delete just emptied out — locally, on Dropbox, and from `known_folders` —
+/// so deleting a folder tree doesn't leave empty ancestor shells behind on
+/// either side (CfAPI only fires NOTIFY_DELETE for files and leaf folders,
+/// never intermediate ones).
+///
+/// SAFETY: a candidate ancestor is pruned only when BOTH (a) its local
+/// directory is missing or empty — any remaining local sibling stops the walk
+/// there — AND (b) Dropbox itself reports it empty or already gone. Never
+/// decided from the local remote-index alone, since it can lag un-materialized
+/// cloud-only content. Never walks past the sync root (`rel == ""`).
+///
+/// Intended to be called from the sequential delete drain (one job at a time),
+/// so there is no TOCTOU race on the emptiness check between ancestors — each
+/// ancestor only becomes locally empty once its last child's delete job has
+/// actually drained. Every remote call here goes straight through
+/// `delete_remote_file_internal` (never the async enqueue path), so a prune
+/// cannot itself re-trigger the burst/mass-delete circuit breaker.
+///
+/// Returns the number of ancestors pruned. A failure partway through the walk
+/// stops the walk (never partially prunes past an error) but is still returned
+/// as an `Err` — callers that must not fail the delete job the prune was
+/// triggered by should treat that `Err` as best-effort/log-and-swallow.
+pub(crate) fn prune_empty_deleted_ancestors(
+    state: &AppState,
+    deleted_rel: &str,
+) -> AppResult<usize> {
+    let Some(folder) = state.db.get_sync_folder()? else {
+        return Ok(0);
+    };
+    let root = Path::new(&folder);
+    let mut pruned = 0usize;
+
+    for rel in ancestor_rels(deleted_rel)
+        .into_iter()
+        .take(PRUNE_ANCESTOR_DEPTH_CAP)
+    {
+        if rel.is_empty() {
+            break; // never touch the sync root
+        }
+
+        let abs = match safe_join(root, &rel) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(rel = %rel, error = %e, "folder-delete completeness: unsafe ancestor rel, stopping walk");
+                break;
+            }
+        };
+
+        let locally_present = abs.exists();
+        if locally_present {
+            let non_empty = match fs::read_dir(&abs) {
+                Ok(mut it) => it.next().is_some(),
+                // Unreadable dir: treat conservatively as "has content" so we
+                // never prune on an inconclusive local read.
+                Err(_) => true,
+            };
+            if non_empty {
+                break; // a sibling remains — legitimately populated, stop the walk
+            }
+        }
+
+        // Locally empty (or already gone) — confirm on Dropbox before touching
+        // anything remote; the local index can lag un-materialized cloud content.
+        match probe_remote_folder_empty(state, &rel) {
+            Ok(RemoteFolderProbe::HasContent) => {
+                tracing::debug!(rel = %rel, "folder-delete completeness: ancestor empty locally but has remote content, not pruning");
+                break; // may still materialize locally later — leave it alone
+            }
+            Ok(RemoteFolderProbe::AlreadyGone) => {
+                // Nothing to delete remotely — fall through to local/index cleanup.
+            }
+            Ok(RemoteFolderProbe::Empty) => {
+                if let Err(e) = delete_remote_file_internal(state, &rel, None) {
+                    tracing::warn!(rel = %rel, error = %e, "folder-delete completeness: remote delete of empty ancestor failed, stopping walk");
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(rel = %rel, error = %e, "folder-delete completeness: remote emptiness probe failed, stopping walk");
+                break;
+            }
+        }
+
+        // Cleanup: the dir must be empty by now (or already gone) — `remove_dir`
+        // (never `remove_dir_all`) refuses to remove anything unexpectedly
+        // repopulated between the checks above, which stops the walk safely
+        // instead of deleting new content.
+        if locally_present {
+            if let Err(e) = fs::remove_dir(&abs) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(rel = %rel, error = %e, "folder-delete completeness: local empty-dir removal failed, stopping walk");
+                    break;
+                }
+            }
+        }
+        let _ = state.db.remove_known_folder(&rel);
+        let _ = state.db.remove_remote_file(&rel);
+        pruned += 1;
+        tracing::info!(rel = %rel, "folder-delete completeness: pruned empty ancestor");
+    }
+
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1379,57 @@ mod tests {
         let rel = relpath_under(&root, &dir).expect("relpath");
         // `normalize_dropbox_path` itself converts OS separators to '/'.
         assert_eq!(normalize_dropbox_path(&rel).unwrap(), "/Cocina/Pizza");
+    }
+
+    // ---------------------------------------------------------------------------
+    // DBSYNC-66: folder-delete completeness — `ancestor_rels` (pure helper)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn ancestor_rels_deep_file_lists_every_ancestor_nearest_first() {
+        assert_eq!(
+            ancestor_rels("UNET/Ascensos/Asociado/artículos/file.txt"),
+            vec![
+                "UNET/Ascensos/Asociado/artículos".to_string(),
+                "UNET/Ascensos/Asociado".to_string(),
+                "UNET/Ascensos".to_string(),
+                "UNET".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestor_rels_deleted_folder_itself_excludes_itself() {
+        // Deleting a leaf folder directly: its own rel is never in the chain,
+        // only its ancestors.
+        assert_eq!(
+            ancestor_rels("UNET/Ascensos/Asociado"),
+            vec!["UNET/Ascensos".to_string(), "UNET".to_string()]
+        );
+    }
+
+    #[test]
+    fn ancestor_rels_top_level_file_has_no_ancestors() {
+        assert_eq!(ancestor_rels("top.txt"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ancestor_rels_top_level_folder_has_no_ancestors() {
+        assert_eq!(ancestor_rels("UNET"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ancestor_rels_empty_input_has_no_ancestors() {
+        assert_eq!(ancestor_rels(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ancestor_rels_never_yields_the_sync_root() {
+        // No ancestor chain should ever surface "" — callers rely on this to
+        // avoid an explicit root check per iteration.
+        for rel in ancestor_rels("a/b/c/d.txt") {
+            assert!(!rel.is_empty(), "ancestor_rels must never yield \"\"");
+        }
     }
 
     // ---------------------------------------------------------------------------

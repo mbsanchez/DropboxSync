@@ -87,6 +87,13 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
     if crate::cloud_filter::in_post_registration_grace() {
         return true;
     }
+    // DBSYNC-66 Slice 1: drain-time backstop mirroring the `on_notify_delete` event-
+    // time check — a delete under an actively-materializing subtree (restore churn)
+    // must not run even if it slipped past the event-time suppression.
+    #[cfg(windows)]
+    if crate::cloud_filter::in_materialization_grace(rel) {
+        return true;
+    }
     let Ok(Some(folder)) = state.db.get_sync_folder() else {
         return false;
     };
@@ -801,10 +808,18 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
                 // placeholder, drop this job instead of deleting the remote file.
                 if delete_suppressed_by_dehydration(state, rel) {
                     tracing::info!(rel, "remote delete suppressed: path is a cloud-only placeholder (dehydration, not a deletion)");
-                    Ok(())
-                } else {
-                    delete_remote_file_internal(state, rel, job.delete_parent_rev.as_deref())
+                    return Ok(());
                 }
+                delete_remote_file_internal(state, rel, job.delete_parent_rev.as_deref())?;
+                // DBSYNC-66 folder-delete completeness: the delete genuinely
+                // succeeded — walk up rel's ancestor chain pruning any empty
+                // ancestor folder it just emptied out (locally + Dropbox +
+                // known_folders). Best-effort: a prune failure must never fail
+                // the delete job that already succeeded.
+                if let Err(e) = crate::cloudsc_ops::prune_empty_deleted_ancestors(state, rel) {
+                    tracing::warn!(rel, error = %e, "folder-delete completeness: ancestor prune failed (delete itself still succeeded)");
+                }
+                Ok(())
             }),
         "local_delete" => job
             .target_path
