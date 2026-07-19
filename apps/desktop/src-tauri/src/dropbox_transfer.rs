@@ -1000,6 +1000,15 @@ pub(crate) fn delete_remote_file_internal(
         });
     }
 
+    // DBSYNC-66: the delete genuinely succeeded on Dropbox (a 200 — NOT the
+    // skipped/rev-conflict no-op above, which returns early and leaves the row
+    // intact because the file is back on the server). Clear the remote-index row
+    // for this path AND its whole subtree now so the materialization sweep does
+    // not re-create placeholders for the just-deleted content before longpoll
+    // catches up — the race that forced users to delete a folder twice. The
+    // subtree clear matters for a coalesced folder delete: `delete_v2` on a
+    // folder is recursive, so its descendants' remote rows must go too.
+    state.db.remove_remote_subtree(relative)?;
     Ok(())
 }
 

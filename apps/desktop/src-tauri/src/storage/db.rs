@@ -419,6 +419,32 @@ impl Db {
         Ok(())
     }
 
+    /// DBSYNC-66: clear the remote-index row for `prefix` AND every descendant
+    /// under it (`prefix/...`). A folder delete on Dropbox is recursive, so its
+    /// whole subtree of remote rows must go too — otherwise the materialization
+    /// sweep re-creates placeholders for the (now-deleted) descendants, forcing
+    /// the "delete a folder twice" behavior. Boundary-safe via `LIKE ... ESCAPE`
+    /// so a sibling like `prefix-other` is never matched and `%`/`_`/accents in
+    /// the path are treated literally. For a plain file `prefix` this is
+    /// equivalent to `remove_remote_file` (no `prefix/...` descendants exist).
+    pub fn remove_remote_subtree(&self, prefix: &str) -> AppResult<()> {
+        let prefix = prefix.replace('\\', "/");
+        let escaped = prefix
+            .replace('!', "!!")
+            .replace('%', "!%")
+            .replace('_', "!_");
+        let child_pattern = format!("{escaped}/%");
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM remote_file_index WHERE relative_path = ?1 OR relative_path LIKE ?2 ESCAPE '!'",
+            params![prefix, child_pattern],
+        )?;
+        Ok(())
+    }
+
     pub fn enqueue_job(
         &self,
         job_type: &str,
@@ -1557,6 +1583,32 @@ mod tests {
         db.remove_known_folder("Cocina/Otra").expect("remove");
         let folders = db.list_known_folders().expect("list after remove");
         assert_eq!(folders, vec!["Cocina/Test".to_string()]);
+    }
+
+    #[test]
+    fn remove_remote_subtree_clears_prefix_and_descendants_boundary_safe() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        // The folder itself, a descendant (with an accent + a space), and two
+        // rows that must NOT be touched: a boundary-collision sibling and an
+        // unrelated tree.
+        db.upsert_remote_file("UNET", "h", "r", 0).expect("u1");
+        db.upsert_remote_file("UNET/Ascensos/artículos/a b.pdf", "h", "r", 0)
+            .expect("u2");
+        db.upsert_remote_file("UNET-other/keep.txt", "h", "r", 0)
+            .expect("u3");
+        db.upsert_remote_file("Otra/keep.txt", "h", "r", 0)
+            .expect("u4");
+
+        db.remove_remote_subtree("UNET").expect("prune subtree");
+
+        assert!(db.get_remote_file("UNET").expect("g1").is_none());
+        assert!(db
+            .get_remote_file("UNET/Ascensos/artículos/a b.pdf")
+            .expect("g2")
+            .is_none());
+        // Boundary-collision sibling and unrelated tree survive.
+        assert!(db.get_remote_file("UNET-other/keep.txt").expect("g3").is_some());
+        assert!(db.get_remote_file("Otra/keep.txt").expect("g4").is_some());
     }
 
     #[test]
