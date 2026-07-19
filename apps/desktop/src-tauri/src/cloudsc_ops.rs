@@ -216,6 +216,15 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                             let _ = state.db.upsert_known_folder(&relative);
                             created += 1;
                             created_names.push(child_name.clone());
+                            // DBSYNC-67: convert this folder to an in-sync placeholder
+                            // NOW, while it is still empty — CfConvertToPlaceholder
+                            // only works on an empty directory (it returns 0x8007017C
+                            // once the folder holds placeholder children). Doing it
+                            // here, BEFORE the recursion below materializes children,
+                            // is what makes Explorer render the cloud/aggregate icon
+                            // instead of a stuck "syncing" glyph.
+                            #[cfg(windows)]
+                            crate::cloud_filter::apply_folder_state(&target_path);
                             // DBSYNC-66: recurse into the just-created folder now so a
                             // restored/new subtree materializes fully in ONE sweep
                             // (depth-first, each folder listed once) instead of one
@@ -514,6 +523,20 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
             // One unreadable folder must not abort the whole sweep.
             Err(e) => tracing::error!(remote_path = %remote_path, error = %e, "index remote folder failed"),
         }
+    }
+
+    // DBSYNC-67: if this sweep materialized new placeholders, the aggregate cloud
+    // state of the folders holding them has changed — but Explorer caches the
+    // folder overlay and won't re-query it until a restart. Nudge the shell to
+    // re-render every known folder now so they drop the stale "syncing" glyph and
+    // show the cloud/aggregate icon promptly (windows-gated; near-free no-op for
+    // folders whose overlay is already correct).
+    #[cfg(windows)]
+    if created > 0 {
+        crate::cloud_filter::notify_shell_folders_changed(
+            Some(&sync_folder_str),
+            &state.db.list_known_folders().unwrap_or_default(),
+        );
     }
 
     Ok(created)
