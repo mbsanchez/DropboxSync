@@ -1137,6 +1137,8 @@ fn flush_pending_deletes(state: &crate::state::AppState, batch: Vec<PendingDelet
     if batch.is_empty() {
         return;
     }
+    // DBSYNC-70: measure where a coalesced folder-delete flush spends its time.
+    let flush_start = std::time::Instant::now();
     let entries: Vec<(String, bool)> =
         batch.iter().map(|p| (p.rel.clone(), p.is_dir)).collect();
     let roots = minimal_delete_roots(&entries);
@@ -1180,11 +1182,11 @@ fn flush_pending_deletes(state: &crate::state::AppState, batch: Vec<PendingDelet
     );
 
     use std::sync::atomic::Ordering;
-    if state
+    let drained_inline = state
         .sync_running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
+        .is_ok();
+    if drained_inline {
         // Tray tooltip refresh is UI-only (not correctness-load-bearing here —
         // the enqueues above already persisted the jobs). Gated out of `cfg(test)`
         // for the SAME reason as the notification plugin in `lib.rs`: taking
@@ -1204,6 +1206,19 @@ fn flush_pending_deletes(state: &crate::state::AppState, batch: Vec<PendingDelet
         #[cfg(not(test))]
         crate::auth_session::refresh_tray_tooltip(state);
     }
+
+    // DBSYNC-70 (measurement-only): aggregate cost of this flush so we can see
+    // where a folder-delete's latency actually goes (sequential delete_v2
+    // round-trips vs prune probes vs pacing) before deciding on any further
+    // optimization. `drained_inline=false` means another sync owned the gate and
+    // the enqueued jobs drain on the next tick (so elapsed_ms excludes the drain).
+    tracing::info!(
+        events = batch.len(),
+        roots = roots.len(),
+        drained_inline,
+        elapsed_ms = flush_start.elapsed().as_millis(),
+        "cfapi event-delete: flush cycle complete"
+    );
 }
 
 /// Route a CONFIRMED user delete (from `on_notify_delete_completion`) or a
