@@ -159,6 +159,11 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
     conflicts,
     massDeletePaused,
     refreshDashboard,
+    // One-shot immediate dashboard fetch (same fetch logic as refreshDashboard),
+    // exposed under this name for callers that want to read the freshest status
+    // right after triggering a background action (e.g. Sync Now) instead of
+    // waiting for the next mount/focus refresh.
+    refreshDashboardNow: refreshDashboard,
     retryFailedJobs,
     resolveConflict,
     confirmPendingDeletions,

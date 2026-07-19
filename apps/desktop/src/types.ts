@@ -75,8 +75,19 @@ export type IgnoreGlobs = {
   csv: string;
 };
 
+/** Mirror of Rust `models::TriggerActionResponse`, returned by
+ *  `trigger_hydrate_cloudsc_placeholder`, `trigger_download_remote_file`, and
+ *  `trigger_hydrate_remote_folder`. */
 export type TriggerActionResponse = {
   accepted: boolean;
+};
+
+export type TriggerSyncReason = "started" | "already_running";
+
+/** Mirror of Rust `models::TriggerSyncResponse`, returned by `trigger_sync_tick` only. */
+export type TriggerSyncResponse = {
+  accepted: boolean;
+  reason: TriggerSyncReason;
 };
 
 export type CloudscPlaceholderInfo = {

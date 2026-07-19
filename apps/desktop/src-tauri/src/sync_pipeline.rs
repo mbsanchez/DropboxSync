@@ -1152,6 +1152,22 @@ pub(crate) fn run_sync_tick_internal(state: &AppState) -> AppResult<SyncTickResu
     })
 }
 
+/// Run the full sync cycle: local scan + queue drain, THEN the remote
+/// materialization sweep. Ordering is load-bearing — the tick must run
+/// first so a local folder deletion's `delete` job drains (deleting the
+/// folder remotely) BEFORE discovery runs; otherwise discovery would see
+/// the still-orphaned remote folder and re-create its `.cloudsc`
+/// placeholder (DBSYNC-66). Callers own the `sync_running` gate; this
+/// helper does not touch it.
+pub(crate) fn full_sync_cycle(state: &AppState) {
+    let _ = run_sync_tick_internal(state);
+    match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state) {
+        Ok(n) if n > 0 => tracing::info!(count = n, "indexed new remote placeholder(s)"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
