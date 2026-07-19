@@ -174,6 +174,19 @@ fn apply_and_drain(state: &AppState) -> bool {
         Err(e) => tracing::error!(error = %e, "apply_remote_delta failed"),
     }
     crate::sync_pipeline::drain_sync_queue(state);
+    // DBSYNC-69: drive the materialization sweep on the longpoll path too, so a
+    // cloud restore materializes within seconds instead of waiting for the 5-min
+    // periodic sweep. apply_remote_delta only records rows / materializes files
+    // whose parent is already a real dir; restored FOLDERS (delta Ignore) and
+    // files under a not-yet-materialized parent need the tree sweep. Runs inside
+    // this same sync_running gate, AFTER the drain (so delta-driven deletes drain
+    // before discovery). The DBSYNC-66 grace window is armed inside the sweep, so
+    // restore churn still can't be read as a user delete.
+    match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state) {
+        Ok(n) if n > 0 => tracing::info!(count = n, "indexed new remote placeholder(s) (longpoll)"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed (longpoll)"),
+    }
     state.sync_running.store(false, Ordering::Release);
     crate::auth_session::refresh_tray_tooltip(state);
     true
