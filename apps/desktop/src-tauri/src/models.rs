@@ -35,6 +35,14 @@ pub(crate) struct SyncTickResult {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TriggerSyncResponse {
     pub accepted: bool,
+    pub reason: TriggerSyncReason,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TriggerSyncReason {
+    Started,
+    AlreadyRunning,
 }
 
 #[derive(Deserialize)]

@@ -6,7 +6,7 @@ import { useSyncDashboard } from "../hooks/useSyncDashboard";
 import { useTransferProgress } from "../hooks/useTransferProgress";
 import { usePlaceholderEvents } from "../hooks/usePlaceholderEvents";
 import { formatBytes, formatSpeed } from "../format";
-import type { ActiveTransfer, ActivityEntry, SyncConflict, SyncJob } from "../types";
+import type { ActiveTransfer, ActivityEntry, SyncConflict, SyncJob, TriggerSyncResponse } from "../types";
 import "./FlyoutApp.css";
 
 type Section = "home" | "folders" | "activity";
@@ -284,9 +284,21 @@ function buildActivityFeed(jobs: SyncJob[], activity: ActivityEntry[]): Activity
 function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
   const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
-  const { status, jobs, conflicts, massDeletePaused, retryFailedJobs, resolveConflict, confirmPendingDeletions } =
-    useSyncDashboard(pushLog);
+  const {
+    status,
+    jobs,
+    conflicts,
+    massDeletePaused,
+    refreshDashboardNow,
+    retryFailedJobs,
+    resolveConflict,
+    confirmPendingDeletions,
+  } = useSyncDashboard(pushLog);
   const [confirmingDeletions, setConfirmingDeletions] = useState(false);
+  // DBSYNC-68: optimistic "Sync Now" flag — flips the disabled/Syncing state
+  // instantly on click, before the 400ms dashboard poll observes the real
+  // `status.syncRunning`. Cleared as soon as the real flag catches up.
+  const [optimisticSyncing, setOptimisticSyncing] = useState(false);
   const { activeTransfer } = useTransferProgress();
   usePlaceholderEvents(pushLog);
 
@@ -345,16 +357,33 @@ function FlyoutApp() {
     }
   };
 
-  // DBSYNC-32: "Sync Now" — kick off an immediate sync tick (non-blocking; the
+  // DBSYNC-32/68: "Sync Now" — kick off an immediate sync tick (non-blocking; the
   // backend CAS-guards against overlapping runs and refreshes the tray state).
+  // Distinguishes "started" from "already_running" and flips the optimistic
+  // syncing flag right away so the button/indicator react before the next poll.
   const syncNow = async () => {
     try {
-      const accepted = await invoke<{ accepted: boolean }>("trigger_sync_tick");
-      pushLog(accepted?.accepted ? "Sync requested." : "Sync already running.");
+      const result = await invoke<TriggerSyncResponse>("trigger_sync_tick");
+      if (result.reason === "already_running") {
+        pushLog("Sync already running.");
+      } else {
+        pushLog("Sync requested.");
+        setOptimisticSyncing(true);
+        void refreshDashboardNow();
+      }
     } catch (e) {
       pushLog(`Failed to trigger sync: ${String(e)}`);
     }
   };
+
+  // Defensive clear: once the real dashboard status observes syncRunning, the
+  // real flag drives the UI, so drop the optimistic one to avoid it ever
+  // getting stuck (e.g. if a completion event is missed).
+  useEffect(() => {
+    if (status.syncRunning) {
+      setOptimisticSyncing(false);
+    }
+  }, [status.syncRunning]);
 
   // DBSYNC-64: mass-delete circuit breaker paused sync. Nothing was deleted yet;
   // require an explicit confirm before letting the blocked batch proceed.
@@ -378,17 +407,19 @@ function FlyoutApp() {
     }
   };
 
+  const isSyncing = status.syncRunning || optimisticSyncing;
+
   const footerLabel = startupLoading
     ? "Starting..."
     : !authOk || !syncFolderOk
       ? "Setup required"
       : status.lastError
         ? "Error"
-        : status.syncRunning
+        : isSyncing
           ? "Syncing..."
           : "Vos fichiers sont à jour";
 
-  const footerClass = !authOk || !syncFolderOk || status.lastError ? "warn" : status.syncRunning ? "busy" : "ok";
+  const footerClass = !authOk || !syncFolderOk || status.lastError ? "warn" : isSyncing ? "busy" : "ok";
 
   const recentJobs: SyncJob[] = jobs.slice(0, 8);
   const hasFailedJobs = jobs.some((job) => job.status === "failed");
@@ -427,7 +458,7 @@ function FlyoutApp() {
           type="button"
           className="flyout-settings"
           onClick={() => void syncNow()}
-          disabled={status.syncRunning}
+          disabled={isSyncing}
           title="Synchroniser maintenant"
         >
           <span className="glyph">{"🔄"}</span>

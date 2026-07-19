@@ -262,17 +262,9 @@ pub fn start_background_scheduler(
             // Show "Syncing" for the duration of this tick (DBSYNC-48); the
             // tooltip is refreshed back to Idle/Error after the store below.
             update_tray_tooltip(&app, &current_tray_status_label(&app_state));
-            // Run the sync tick first so a local folder deletion is detected,
-            // its `delete` job enqueued, and drained within this same tick
-            // (deleting the folder remotely) before discovery runs. Otherwise
-            // discovery would still see the (now-orphaned) remote folder and
-            // re-create its `.cloudsc` placeholder.
-            let _ = run_sync_tick_internal(&app_state);
-            match index_materialized_folders_as_cloudsc_placeholders_internal(&app_state) {
-                Ok(n) if n > 0 => tracing::info!(count = n, "indexed new remote placeholder(s)"),
-                Ok(_) => {}
-                Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed"),
-            }
+            // Ordering (tick before discovery) is load-bearing — see the doc
+            // comment on `full_sync_cycle` (DBSYNC-66).
+            crate::sync_pipeline::full_sync_cycle(&app_state);
             app_state.sync_running.store(false, Ordering::Release);
             update_tray_tooltip(&app, &current_tray_status_label(&app_state));
         }
@@ -503,24 +495,25 @@ pub fn trigger_sync_tick(state: tauri::State<AppState>) -> Result<TriggerSyncRes
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return Ok(TriggerSyncResponse { accepted: false });
+        return Ok(TriggerSyncResponse {
+            accepted: false,
+            reason: TriggerSyncReason::AlreadyRunning,
+        });
     }
 
     // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
     crate::auth_session::refresh_tray_tooltip(state.inner());
     let app_state = state.inner().clone();
     std::thread::spawn(move || {
-        let result = run_sync_tick_internal(&app_state);
-        if let Err(err) = result {
-            if let Ok(mut engine) = app_state.sync_engine.lock() {
-                engine.set_last_error(format!("sync tick failed: {err}"));
-            }
-        }
+        crate::sync_pipeline::full_sync_cycle(&app_state);
         app_state.sync_running.store(false, Ordering::Release);
         crate::auth_session::refresh_tray_tooltip(&app_state);
     });
 
-    Ok(TriggerSyncResponse { accepted: true })
+    Ok(TriggerSyncResponse {
+        accepted: true,
+        reason: TriggerSyncReason::Started,
+    })
 }
 
 #[tauri::command]
