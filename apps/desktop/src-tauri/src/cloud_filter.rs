@@ -65,6 +65,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
+use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEITEM, SHCNF_PATHW};
 
 use crate::error::{AppError, AppResult};
 
@@ -269,7 +270,7 @@ pub(crate) fn sync_folder_states(sync_folder: Option<&str>, folder_rels: &[Strin
 /// Convert a directory to an in-sync placeholder (no pin) so the shell renders its
 /// aggregate status. Under PopulationPolicy=AlwaysFull this never hides children.
 /// Fails soft.
-fn apply_folder_state(abs: &Path) -> bool {
+pub(crate) fn apply_folder_state(abs: &Path) -> bool {
     let path = to_wide(&abs.to_string_lossy());
     unsafe {
         let handle = match CreateFileW(
@@ -292,8 +293,61 @@ fn apply_folder_state(abs: &Path) -> bool {
         let conv = CfConvertToPlaceholder(handle, None, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None);
         let sync = CfSetInSyncState(handle, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None);
         let _ = CloseHandle(handle);
-        tracing::debug!(dir = %abs.display(), convert = ?conv, set_in_sync = ?sync, "cfapi apply_folder_state");
+        // DBSYNC-67: CfConvertToPlaceholder only succeeds on an EMPTY directory —
+        // once the folder holds placeholder children it returns 0x8007017C
+        // ("cloud operation not valid"). We therefore call this at folder-CREATE
+        // time (empty), before materializing children (see cloudsc_ops). A convert
+        // failure on an already-populated folder is expected and benign (logged at
+        // debug); a real problem shows via SetInSyncState.
+        if conv.is_err() {
+            tracing::debug!(dir = %abs.display(), convert = ?conv, set_in_sync = ?sync, "cfapi apply_folder_state: convert skipped (folder not empty / not convertible)");
+        }
+        // Return true so the once-per-session cache (APPLIED_FOLDERS in
+        // sync_folder_states) does NOT retry a folder every sweep — a convert
+        // failure on a populated folder is permanent, retrying it is a wasteful
+        // storm. The real conversion happens at folder-create time (empty) in the
+        // materialization sweep, where this caller ignores the return value.
         true
+    }
+}
+
+/// DBSYNC-67: nudge Explorer to re-render the cloud overlay of the given folders.
+///
+/// Under `PopulationPolicy=AlwaysFull` a folder's cloud glyph is the AGGREGATE of
+/// its children — once every child is an in-sync placeholder the folder is
+/// "cloud", not "syncing". But Explorer caches that overlay and only re-queries it
+/// on a shell change notification or a restart, so a folder freshly filled by the
+/// materialization sweep stays stuck on the "syncing" glyph until the app is
+/// reopened (converting the folder itself to a placeholder is NOT the fix — and in
+/// fact fails with `0x8007017C` once it already holds placeholder children).
+/// `SHChangeNotify(SHCNE_UPDATEITEM)` forces the re-query now. `folder_rels` are
+/// `/`-relative under the sync root; missing dirs are skipped. Best-effort, no-op
+/// if the shell call is unavailable.
+pub(crate) fn notify_shell_folders_changed(sync_folder: Option<&str>, folder_rels: &[String]) {
+    let Some(folder) = sync_folder else {
+        return;
+    };
+    let root = Path::new(folder);
+    tracing::debug!(count = folder_rels.len(), "SHChangeNotify(SHCNE_UPDATEITEM) refreshing folder overlays");
+    for rel in folder_rels {
+        if rel.is_empty() {
+            continue;
+        }
+        let abs = root.join(rel);
+        if !abs.is_dir() {
+            continue;
+        }
+        let wide = to_wide(&abs.to_string_lossy());
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
+        // SHChangeNotify with SHCNF_PATHW reads it as a PCWSTR and does not retain it.
+        unsafe {
+            SHChangeNotify(
+                SHCNE_UPDATEITEM,
+                SHCNF_PATHW,
+                Some(wide.as_ptr() as *const core::ffi::c_void),
+                None,
+            );
+        }
     }
 }
 
