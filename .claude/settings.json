@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "cowork-workflow@workflow-marketplace": true,
+    "md-issue-workflow@workflow-marketplace": false
+  }
+}
