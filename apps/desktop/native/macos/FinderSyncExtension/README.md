@@ -19,7 +19,9 @@ Produces `native/macos/FinderSyncExtension/build/DropboxSyncFinderSync.appex` (a
 
 ## Xcode GUI
 
-Open `DropboxSyncFinderSync.xcodeproj` to edit signing (**Signing & Capabilities** → Team) or Swift. Embed the built **`DropboxSyncFinderSync.appex`** into the main app at **`Contents/PlugIns/`**; host app and extension must use the **same development team** for production. `Info.plist.example` mirrors the committed `Info.plist` for reference.
+Open `DropboxSyncFinderSync.xcodeproj` to edit Swift. Embedding into the main app at **`Contents/PlugIns/`** is automatic via `bundle.macOS.files`, and host app and extension must use the **same Apple team**. `Info.plist.example` mirrors the committed `Info.plist` for reference.
+
+**Do not set the Team under Signing & Capabilities.** The GUI writes `DEVELOPMENT_TEAM` into the committed `project.pbxproj`, which is exactly what the signing section below keeps empty on purpose. Export `APPLE_TEAM_ID` instead.
 
 After install, the user may need to enable the extension under **System Settings → Privacy & Security → Extensions → Finder** (wording varies by macOS version).
 
@@ -27,9 +29,13 @@ After install, the user may need to enable the extension under **System Settings
 
 **Status:** Accepted — 2026-08-19 (DBSYNC-72).
 
-**Decision.** The extension is **not sandboxed**. It ships with Hardened Runtime enabled and no entitlements
-file, and it reads `overlay_state.json` straight from `~/Library/Application Support/DropboxSyncDesktop/`.
+**Decision.** The extension is **not sandboxed**. It ships with Hardened Runtime enabled and carries no
+entitlements, and it reads `overlay_state.json` straight from `~/Library/Application Support/DropboxSyncDesktop/`.
 No App Group container is introduced and `db::app_data_dir()` is not changed.
+
+"Carries no entitlements" is a claim about the **shipped artifact**, not merely about the sources, and the two
+can diverge: `xcodebuild` injects `com.apple.security.get-task-allow` unless told not to. Check the product,
+never the project file — `codesign -d --entitlements - build/DropboxSyncFinderSync.appex` must print nothing.
 
 **Context.** The app is distributed with **Developer ID** (direct download), not through the Mac App Store.
 App Sandbox is mandatory only for the App Store; Developer ID requires Hardened Runtime plus notarization
@@ -54,32 +60,48 @@ or the decoder key-conversion issue (DBSYNC-73).
 
 ## Signing: environment-driven, never committed
 
-`tauri.conf.json` deliberately does **not** set `bundle.macOS.signingIdentity`, and `project.pbxproj` keeps
-`DEVELOPMENT_TEAM = ""`. A value in either place would take precedence over the environment and silently pin
-an identity — which also breaks every unsigned build path, including CI, which holds no certificate.
+Nothing in the repository names a real identity. Two committed values look like they might, and both are
+deliberate fallbacks rather than pins:
 
-Export both variables for a signed build; the same team must be used for the app and the extension:
+- `tauri.conf.json` keeps `bundle.macOS.signingIdentity: "-"` (ad-hoc). **`APPLE_SIGNING_IDENTITY` wins over
+  it** — tauri-cli reads the environment variable first and falls back to the config key only when it is unset
+  (`interface/rust.rs`, verified in 2.10.1). The `"-"` must stay: `tauri-bundler` skips its entire signing
+  block when no identity resolves, so removing it would leave unsigned builds with no signature and no
+  `CodeResources` seal over `Contents/PlugIns/*.appex`.
+- `project.pbxproj` keeps `DEVELOPMENT_TEAM = ""`. `build-appex.sh` passes the team to `xcodebuild` as a
+  command-line override, which takes precedence, so a committed team id would buy nothing.
+
+For a signed build, export both; the same team must be used for the app and the extension:
 
 ```bash
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"   # Tauri, host app
-export APPLE_TEAM_ID=TEAMID                                                    # xcodebuild + notarization
-npm run build:finder-sync
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"   # host app, read by tauri build
+export APPLE_TEAM_ID=TEAMID                                                    # appex build + notarization
+npm run build:finder-sync    # reads APPLE_TEAM_ID only
+npm run tauri build          # reads both
 ```
 
-Two things about `build-appex.sh` that are easy to get wrong:
+Three things about `build-appex.sh` that are easy to get wrong:
 
-1. **A team alone is not enough.** The project uses `CODE_SIGN_STYLE = Automatic`, and automatic signing
-   resolves a *development* certificate for a build action. With a team set and no **Mac Development**
-   certificate in the keychain — which a Developer ID-only account never has — xcodebuild fails outright with
-   `No signing certificate "Mac Development" found`. The script therefore switches to `CODE_SIGN_STYLE=Manual`
-   and names `CODE_SIGN_IDENTITY` explicitly whenever a team is present. Override the identity with
-   `APPEX_CODE_SIGN_IDENTITY` if you need something other than `Developer ID Application`.
-2. **Xcode signs without a secure timestamp** (`--timestamp=none`). Notarization requires a secure timestamp on
-   every nested bundle, so the `.appex` as produced here is *not* notarizable on its own: it must be re-signed
-   with `--timestamp` before submission. Whether Tauri's bundling pass does that re-signing is still unverified
-   — that is finding F4 of DBSYNC-72, resolved in Slice 4 (#84).
+1. **A team alone is not enough — it breaks the build.** The project uses `CODE_SIGN_STYLE = Automatic`, and
+   automatic signing resolves a *development* certificate for a build action. With a team set and no **Mac
+   Development** certificate in the keychain — which a Developer ID-only account never has — xcodebuild fails
+   with `No signing certificate "Mac Development" found`. The script therefore switches to
+   `CODE_SIGN_STYLE=Manual` and names `CODE_SIGN_IDENTITY` explicitly whenever a team is present. Override it
+   with `APPEX_CODE_SIGN_IDENTITY` if you need something other than `Developer ID Application`.
+2. **`xcodebuild build` injects `com.apple.security.get-task-allow`** by default
+   (`CODE_SIGN_INJECT_BASE_ENTITLEMENTS`). That is a debugging entitlement: notarization refuses it outright,
+   and it defeats part of Hardened Runtime. The script sets it to `NO`.
+3. **Xcode signs with `--timestamp=none`**, while notarization requires a secure TSA timestamp on every nested
+   bundle. The script passes `OTHER_CODE_SIGN_FLAGS=--timestamp`.
 
-With neither variable exported the build is ad-hoc signed (`Signature=adhoc`, `TeamIdentifier=not set`), which
+Points 2 and 3 are not optional polish, because **this signature is final**: Tauri does not re-sign the appex.
+`copy_custom_files_to_bundle()` places it into `Contents/PlugIns/` without adding it to the bundler's
+`sign_paths`, and the bundler's own `codesign` call carries no `--deep` (verified in `tauri-bundler` 2.8.1,
+the version behind `@tauri-apps/cli` 2.10.1). Whatever is wrong here reaches Apple unchanged — and the bundler
+auto-submits for notarization as soon as credentials are present, so a bad signature is submitted without
+anyone asking for it.
+
+With neither variable exported the appex is ad-hoc signed (`Signature=adhoc`, `TeamIdentifier=not set`), which
 is correct for development and for CI, and cannot be notarized.
 
 ## Why not pure Tauri?

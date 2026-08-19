@@ -32,6 +32,17 @@ echo "Building ${SCHEME}.appex (${CONFIG})…"
 #   error: No signing certificate "Mac Development" found
 # A Developer ID-only account (the distribution model for this app) never has that certificate. So whenever a
 # team is present we switch to manual signing and name the identity explicitly.
+# This signature is FINAL: Tauri does not re-sign it. `copy_custom_files_to_bundle()` places the appex from
+# bundle.macOS.files into Contents/PlugIns/ without adding it to the bundler's sign_paths, and the bundler's
+# codesign invocation carries no --deep (verified in tauri-bundler 2.8.1, the version behind @tauri-apps/cli
+# 2.10.1). Whatever is wrong here reaches notarization unchanged, so the two extra settings below are not
+# optional polish — without them Apple rejects the build:
+#
+#   CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO   `xcodebuild build` otherwise injects
+#                                           com.apple.security.get-task-allow, a debugging entitlement that
+#                                           notarization refuses and that defeats part of Hardened Runtime.
+#   OTHER_CODE_SIGN_FLAGS=--timestamp       Xcode signs build products with --timestamp=none; notarization
+#                                           requires a secure TSA timestamp on every nested bundle.
 SIGN_ARGS=()
 TEAM="${APPLE_TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
 APPEX_IDENTITY="${APPEX_CODE_SIGN_IDENTITY:-Developer ID Application}"
@@ -40,17 +51,16 @@ if [[ -n "$TEAM" ]]; then
     DEVELOPMENT_TEAM="$TEAM"
     CODE_SIGN_STYLE=Manual
     CODE_SIGN_IDENTITY="$APPEX_IDENTITY"
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
+    OTHER_CODE_SIGN_FLAGS="--timestamp"
   )
-  echo "Signing appex as '${APPEX_IDENTITY}' for team ${TEAM}."
-  # Xcode signs build products with --timestamp=none. A secure timestamp is mandatory for notarization, so
-  # the appex must be re-signed with --timestamp before submission (see DBSYNC-72 Slice 4 / finding F4).
-  echo "NOTE: no secure timestamp is applied here; re-sign with --timestamp before notarizing."
+  echo "Signing appex as '${APPEX_IDENTITY}' for team ${TEAM} (hardened runtime, secure timestamp, no injected entitlements)."
 else
   echo "No APPLE_TEAM_ID/DEVELOPMENT_TEAM set: ad-hoc signing (fine for development and CI, not notarizable)."
 fi
 
 # -scheme is required with -derivedDataPath on recent Xcode; keeps all output under native/.../build/.
-# With `set -u`, a plain "${TEAM_ARGS[@]}" can fail when the array is empty (macOS Bash 3.2).
+# With `set -u`, a plain "${SIGN_ARGS[@]}" can fail when the array is empty (macOS Bash 3.2).
 xcodebuild \
   -project "$PROJECT" \
   -scheme "$SCHEME" \
