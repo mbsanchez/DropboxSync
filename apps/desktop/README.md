@@ -132,7 +132,7 @@ APPLE_TEAM_ID=XXXXXXXXXX npm run build:finder-sync
 
 The Rust backend writes:
 
-- macOS: `~/Library/Applications/DropboxSyncDesktop/overlay_state.json`
+- macOS: `~/Library/Application Support/DropboxSyncDesktop/overlay_state.json`
 - Windows: `%LOCALAPPDATA%\\DropboxSyncDesktop\\overlay_state.json`
 
 Schema summary:
