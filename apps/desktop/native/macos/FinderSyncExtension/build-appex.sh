@@ -44,6 +44,16 @@ echo "Building ${SCHEME}.appex (${CONFIG})…"
 # APPLE_TEAM_ID would produce a Developer ID host wrapping an ad-hoc appex that still has it, and the
 # bundler's notarize_auth() accepts an ASC API key without APPLE_TEAM_ID, so that could be submitted.
 SIGN_ARGS=(CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO)
+
+# App Sandbox. Apple's Finder Sync template generates an entitlements file, and every working Finder Sync
+# extension on a reference Mac is sandboxed (Dropbox's garcon.appex, OneDrive's FinderSync.appex, odrive).
+# Passed here rather than through the environment: xcodebuild command-line settings win over env vars, so an
+# exported CODE_SIGN_ENTITLEMENTS was silently ignored.
+ENTITLEMENTS="${ROOT}/DropboxSyncFinderSync.entitlements"
+if [[ -f "$ENTITLEMENTS" ]]; then
+  SIGN_ARGS+=(CODE_SIGN_ENTITLEMENTS="$ENTITLEMENTS")
+fi
+
 TEAM="${APPLE_TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
 APPEX_IDENTITY="${APPEX_CODE_SIGN_IDENTITY:-Developer ID Application}"
 if [[ -n "$TEAM" ]]; then

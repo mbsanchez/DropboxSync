@@ -28,18 +28,31 @@ final class DropboxSyncFinderSync: FIFinderSync {
         }
     }
 
+    /// The real home directory, bypassing the sandbox container.
+    ///
+    /// This extension IS sandboxed — Finder refuses to register it otherwise (DBSYNC-76) — and
+    /// inside a sandbox every Foundation home API (`homeDirectoryForCurrentUser`, `NSHomeDirectory()`,
+    /// `.userDomainMask` searches) is redirected to `~/Library/Containers/<bundle-id>/Data/`. That
+    /// container's `Library/Application Support` holds only Apple's own symlinks (AddressBook,
+    /// SyncServices, iCloud), so resolving through it silently yields a path that never exists.
+    /// `getpwuid` reads the passwd database directly and is not redirected.
+    private func realHomeDirectory() -> URL {
+        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
+            return URL(fileURLWithPath: String(cString: dir), isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
     /// Resolves the same path the Rust side writes in `db::app_data_dir()`:
     /// `~/Library/Application Support/DropboxSyncDesktop/overlay_state.json`.
-    /// The extension is not sandboxed, so `.userDomainMask` yields the plain
-    /// per-user Application Support directory rather than a container path.
+    ///
+    /// Reading it from the sandbox is what
+    /// `com.apple.security.temporary-exception.files.home-relative-path.read-only` grants in
+    /// DropboxSyncFinderSync.entitlements — and that entitlement is relative to the REAL home,
+    /// which is why the path must be built from [`realHomeDirectory`].
     private func overlayStateURL() -> URL {
-        let appSupport = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support")
-        return appSupport
-            .appendingPathComponent("DropboxSyncDesktop/overlay_state.json")
+        realHomeDirectory()
+            .appendingPathComponent("Library/Application Support/DropboxSyncDesktop/overlay_state.json")
     }
 
     private func monitoredDirectoryURLs() -> Set<URL> {
@@ -51,26 +64,45 @@ final class DropboxSyncFinderSync: FIFinderSync {
 
     private func registerBadgeImages() {
         let c = FIFinderSyncController.default()
-        let triples: [(String, String)] = [
-            ("synced", "cloud-check"),
-            ("out_of_sync", "cloud-alert"),
-            ("syncing", "cloud-sync"),
+        // `label` is the accessibility description VoiceOver reads for the badge; an empty
+        // string leaves the status unannounced.
+        let badges: [(id: String, resource: String, label: String)] = [
+            ("synced", "cloud-check", "Synced"),
+            ("out_of_sync", "cloud-alert", "Out of sync"),
+            ("syncing", "cloud-sync", "Syncing"),
         ]
-        for (id, base) in triples {
-            guard let path = Bundle.main.path(forResource: base, ofType: "png") else {
-                NSLog("DropboxSync FinderSync: missing \(base).png in bundle")
+        for badge in badges {
+            // `image(forResource:)`, not `NSImage(contentsOfFile:)`: only the former pairs
+            // cloud-check.png with cloud-check@2x.png. Loading the 1x file by path yields a
+            // single 24px representation that Finder upscales on Retina.
+            guard let image = Bundle.main.image(forResource: badge.resource) else {
+                NSLog("DropboxSync FinderSync: %@.png missing from the bundle — no '%@' badge.",
+                      badge.resource, badge.id)
                 continue
             }
-            let image = NSImage(contentsOfFile: path)!
-            c.setBadgeImage(image, label: "", forBadgeIdentifier: id)
+            c.setBadgeImage(image, label: badge.label, forBadgeIdentifier: badge.id)
         }
     }
+
+    /// Logged transitions only: `reloadState()` runs every 2s, so an unconditional NSLog would
+    /// spam the system log. Silence here is what made the sandbox-container bug (DBSYNC-76) so
+    /// expensive to find — an unreadable state file looks exactly like "no files tracked yet".
+    private var lastLoadFailed = false
 
     private func reloadState() {
         let url = overlayStateURL()
         guard let data = try? Data(contentsOf: url) else {
+            if !lastLoadFailed {
+                NSLog("DropboxSync FinderSync: cannot read %@ — no badges will be shown. "
+                    + "Check the sandbox entitlement covers this path.", url.path)
+                lastLoadFailed = true
+            }
             state = nil
             return
+        }
+        if lastLoadFailed {
+            NSLog("DropboxSync FinderSync: reading %@ again.", url.path)
+            lastLoadFailed = false
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
