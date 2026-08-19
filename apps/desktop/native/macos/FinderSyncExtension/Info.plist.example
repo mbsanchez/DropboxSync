@@ -20,12 +20,17 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.FinderSync</string>
+		<!-- Bare class name: @objc(DropboxSyncFinderSync) replaces the mangled Swift name. -->
 		<key>NSExtensionPrincipalClass</key>
-		<string>$(PRODUCT_MODULE_NAME).DropboxSyncFinderSync</string>
+		<string>DropboxSyncFinderSync</string>
 	</dict>
 </dict>
 </plist>
