@@ -3,16 +3,22 @@
   // macOS: Finder Sync extension is bundled via bundle.macOS.files; build it with `npm run build:finder-sync`
   // (runs automatically on macOS from beforeBuildCommand).
   //
-  // Signing is ENV-DRIVEN, never committed. bundle.macOS.signingIdentity is deliberately ABSENT so that
-  // APPLE_SIGNING_IDENTITY governs: a value here would take precedence over the env var and silently pin
-  // whatever it names. Export both before a release build, using the same Apple team for app and .appex:
+  // Signing is ENV-DRIVEN. APPLE_SIGNING_IDENTITY WINS over the value below — tauri-cli reads the env var
+  // first and falls back to this key only when it is unset (interface/rust.rs, verified in 2.10.1). So
+  // exporting an identity is all it takes; nothing here has to change:
   //
   //   export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-  //   export APPLE_TEAM_ID=TEAMID     # xcodebuild reads it as DEVELOPMENT_TEAM; also used for notarization
+  //   export APPLE_TEAM_ID=TEAMID     # build-appex.sh passes it to xcodebuild as DEVELOPMENT_TEAM,
+  //                                   # and notarization uses it too
   //
-  // With neither exported the build is ad-hoc signed and unnotarizable — correct for CI, which has no
-  // certificate, and for local development. Do NOT hardcode an identity: besides breaking those unsigned
-  // paths, this machine may hold identities belonging to other organisations.
+  // signingIdentity is pinned to "-" (ad-hoc) ON PURPOSE, and must stay. It is the fallback for builds with
+  // no identity exported — CI, and ordinary local builds. Deleting it does NOT make them "unsigned but
+  // otherwise fine": tauri-bundler skips its whole signing block when no identity resolves, so the .app
+  // would come out with no signature and no CodeResources seal over Contents/PlugIns/*.appex at all. An
+  // unsealed host bundle is a plausible reason for Finder to refuse to load the extension.
+  //
+  // Never hardcode a real identity here. This machine also holds Developer ID identities owned by other
+  // organisations, and a committed value would make one of them selectable by accident.
   "productName": "DropboxSyncDesktop",
   "version": "0.1.0",
   "identifier": "com.mobsanchez.dropboxsyncdesktop",
@@ -55,6 +61,7 @@
     "macOS": {
       "minimumSystemVersion": "12.0",
       "infoPlist": "Info.plist",
+      "signingIdentity": "-",
       "files": {
         "PlugIns/DropboxSyncFinderSync.appex": "../native/macos/FinderSyncExtension/build/DropboxSyncFinderSync.appex"
       }
