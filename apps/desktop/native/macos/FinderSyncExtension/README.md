@@ -34,8 +34,11 @@ entitlements, and it reads `overlay_state.json` straight from `~/Library/Applica
 No App Group container is introduced and `db::app_data_dir()` is not changed.
 
 "Carries no entitlements" is a claim about the **shipped artifact**, not merely about the sources, and the two
-can diverge: `xcodebuild` injects `com.apple.security.get-task-allow` unless told not to. Check the product,
-never the project file — `codesign -d --entitlements - build/DropboxSyncFinderSync.appex` must print nothing.
+can diverge: `xcodebuild` injects `com.apple.security.get-task-allow` unless told not to, which is why
+`build-appex.sh` disables that injection on every path, signed or ad-hoc. Check the product, never the project
+file — `codesign -d --entitlements - build/DropboxSyncFinderSync.appex` must print nothing. If it prints
+`get-task-allow`, the appex was built by something other than that script (a plain `xcodebuild`, or Xcode.app)
+and must not be shipped.
 
 **Context.** The app is distributed with **Developer ID** (direct download), not through the Mac App Store.
 App Sandbox is mandatory only for the App Store; Developer ID requires Hardened Runtime plus notarization
@@ -95,11 +98,11 @@ Three things about `build-appex.sh` that are easy to get wrong:
    bundle. The script passes `OTHER_CODE_SIGN_FLAGS=--timestamp`.
 
 Points 2 and 3 are not optional polish, because **this signature is final**: Tauri does not re-sign the appex.
-`copy_custom_files_to_bundle()` places it into `Contents/PlugIns/` without adding it to the bundler's
-`sign_paths`, and the bundler's own `codesign` call carries no `--deep` (verified in `tauri-bundler` 2.8.1,
-the version behind `@tauri-apps/cli` 2.10.1). Whatever is wrong here reaches Apple unchanged — and the bundler
-auto-submits for notarization as soon as credentials are present, so a bad signature is submitted without
-anyone asking for it.
+`copy_custom_files_to_bundle()` (`tauri-bundler` 2.8.1, `bundle/macos/app.rs`) places it into
+`Contents/PlugIns/` without adding it to the bundler's `sign_paths`, and the `codesign` invocation itself —
+which lives in `tauri-macos-sign` 2.3.3, not in the bundler — carries no `--deep`. Whatever is wrong here
+reaches Apple unchanged. Worse, once an identity resolves *and* notarization credentials are present, the
+bundler submits automatically, so a bad signature goes to Apple without anyone asking for it.
 
 With neither variable exported the appex is ad-hoc signed (`Signature=adhoc`, `TeamIdentifier=not set`), which
 is correct for development and for CI, and cannot be notarized.

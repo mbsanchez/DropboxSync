@@ -32,18 +32,18 @@ echo "Building ${SCHEME}.appex (${CONFIG})…"
 #   error: No signing certificate "Mac Development" found
 # A Developer ID-only account (the distribution model for this app) never has that certificate. So whenever a
 # team is present we switch to manual signing and name the identity explicitly.
-# This signature is FINAL: Tauri does not re-sign it. `copy_custom_files_to_bundle()` places the appex from
-# bundle.macOS.files into Contents/PlugIns/ without adding it to the bundler's sign_paths, and the bundler's
-# codesign invocation carries no --deep (verified in tauri-bundler 2.8.1, the version behind @tauri-apps/cli
-# 2.10.1). Whatever is wrong here reaches notarization unchanged, so the two extra settings below are not
-# optional polish — without them Apple rejects the build:
+# This signature is FINAL: Tauri does not re-sign it. `copy_custom_files_to_bundle()` (tauri-bundler 2.8.1,
+# bundle/macos/app.rs) places the appex from bundle.macOS.files into Contents/PlugIns/ without adding it to
+# the bundler's sign_paths, and the codesign invocation itself — which lives in tauri-macos-sign 2.3.3, not
+# in the bundler — carries no --deep. Whatever is wrong here reaches Apple unchanged.
 #
-#   CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO   `xcodebuild build` otherwise injects
-#                                           com.apple.security.get-task-allow, a debugging entitlement that
-#                                           notarization refuses and that defeats part of Hardened Runtime.
-#   OTHER_CODE_SIGN_FLAGS=--timestamp       Xcode signs build products with --timestamp=none; notarization
-#                                           requires a secure TSA timestamp on every nested bundle.
-SIGN_ARGS=()
+# CODE_SIGN_INJECT_BASE_ENTITLEMENTS is set unconditionally, NOT only when signing for real: `xcodebuild
+# build` otherwise injects com.apple.security.get-task-allow, a debugger-attach entitlement that notarization
+# refuses and that defeats part of Hardened Runtime. Keeping it out of the ad-hoc path too means the appex
+# never carries it, whichever way it was built — otherwise exporting APPLE_SIGNING_IDENTITY without
+# APPLE_TEAM_ID would produce a Developer ID host wrapping an ad-hoc appex that still has it, and the
+# bundler's notarize_auth() accepts an ASC API key without APPLE_TEAM_ID, so that could be submitted.
+SIGN_ARGS=(CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO)
 TEAM="${APPLE_TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
 APPEX_IDENTITY="${APPEX_CODE_SIGN_IDENTITY:-Developer ID Application}"
 if [[ -n "$TEAM" ]]; then
@@ -51,11 +51,17 @@ if [[ -n "$TEAM" ]]; then
     DEVELOPMENT_TEAM="$TEAM"
     CODE_SIGN_STYLE=Manual
     CODE_SIGN_IDENTITY="$APPEX_IDENTITY"
-    CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
+    # Xcode signs build products with --timestamp=none; notarization requires a secure TSA timestamp on every
+    # nested bundle. Only meaningful with a real identity — an ad-hoc signature cannot be timestamped.
     OTHER_CODE_SIGN_FLAGS="--timestamp"
   )
   echo "Signing appex as '${APPEX_IDENTITY}' for team ${TEAM} (hardened runtime, secure timestamp, no injected entitlements)."
 else
+  if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    echo "WARNING: APPLE_SIGNING_IDENTITY is set but APPLE_TEAM_ID is not." >&2
+    echo "         The host app will be signed for real while this appex stays ad-hoc, which cannot be" >&2
+    echo "         notarized. Export APPLE_TEAM_ID as well." >&2
+  fi
   echo "No APPLE_TEAM_ID/DEVELOPMENT_TEAM set: ad-hoc signing (fine for development and CI, not notarizable)."
 fi
 
