@@ -79,6 +79,21 @@ xcodebuild \
 
 OUT="${DERIVED}/Build/Products/${CONFIG}/${SCHEME}.appex"
 echo "Built: $OUT"
+
+# Guard the coupling between SyncExtension.swift's @objc(...) name and the plist's principal class.
+# Nothing else catches a drift: removing the @objc attribute changes the emitted ObjC symbol to the
+# Swift-mangled form and the plist silently stops resolving, with no build error and no test failure.
+# This ran green on macos-latest in CI via `tauri build` -> beforeBuildCommand -> build:finder-sync.
+if [[ -d "$OUT" ]]; then
+  DECLARED=$(/usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPrincipalClass" "$OUT/Contents/Info.plist" 2>/dev/null || true)
+  EMITTED=$(nm -a "$OUT/Contents/MacOS/${SCHEME}" 2>/dev/null | sed -n 's/.*_OBJC_CLASS_\$_//p' | head -1)
+  if [[ -z "$EMITTED" || "$DECLARED" != "$EMITTED" ]]; then
+    echo "ERROR: NSExtensionPrincipalClass '${DECLARED}' does not match the ObjC class the binary exports ('${EMITTED:-none}')." >&2
+    echo "       NSClassFromString would return nil and the extension could never load. See DBSYNC-76." >&2
+    exit 1
+  fi
+  echo "Principal class OK: ${DECLARED}"
+fi
 if [[ -d "$OUT" ]]; then
   mkdir -p "${ROOT}/build"
   rm -rf "${ROOT}/build/${SCHEME}.appex"

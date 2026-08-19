@@ -20,12 +20,32 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!-- The extension host needs an AppKit run loop: SyncExtension.swift schedules a repeating
+	     Timer from init(), which never fires without one. Both Dropbox's garcon.appex and
+	     OneDrive's FinderSync.appex declare these two keys. -->
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSExtension</key>
 	<dict>
+		<!-- Empty on purpose. Apple's Finder Sync template emits it, and all three working
+		     extensions on a reference Mac carry it. Adding it alone was tested and does NOT fix
+		     registration (DBSYNC-76), but leaving it out would be the last structural difference
+		     between our NSExtension dict and every known-good one — an uncontrolled variable for
+		     the cross-swap experiment in Slice 2. -->
+		<key>NSExtensionAttributes</key>
+		<dict/>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.FinderSync</string>
+		<!-- BARE class name, not module-qualified. SyncExtension.swift declares
+		     @objc(DropboxSyncFinderSync), and @objc(...) REPLACES the Swift-mangled runtime name
+		     with that literal: the binary exports _OBJC_CLASS_$_DropboxSyncFinderSync and no _TtC
+		     symbol at all, so "$(PRODUCT_MODULE_NAME).DropboxSyncFinderSync" resolves to nil.
+		     Keep both in sync — verify with:
+		       nm -a build/DropboxSyncFinderSync.appex/Contents/MacOS/DropboxSyncFinderSync | grep OBJC_CLASS -->
 		<key>NSExtensionPrincipalClass</key>
-		<string>$(PRODUCT_MODULE_NAME).DropboxSyncFinderSync</string>
+		<string>DropboxSyncFinderSync</string>
 	</dict>
 </dict>
 </plist>
