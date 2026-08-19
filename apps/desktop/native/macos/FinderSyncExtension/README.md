@@ -2,7 +2,7 @@
 
 The Tauri app writes **`overlay_state.json`** next to the SQLite database:
 
-- Path: `~/Library/Applications/DropboxSyncDesktop/overlay_state.json`
+- Path: `~/Library/Application Support/DropboxSyncDesktop/overlay_state.json`
 - Schema: see `src-tauri/src/overlay_state.rs` (`version`, `updated_at`, `sync_folder`, `paths` map with tiers `synced`, `out_of_sync`, `syncing`).
 
 This folder contains a **Finder Sync** implementation (`SyncExtension.swift`) that registers three badge images and assigns them per file using `requestBadgeIdentifier(for:)`.

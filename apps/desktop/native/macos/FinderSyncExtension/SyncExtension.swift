@@ -28,10 +28,18 @@ final class DropboxSyncFinderSync: FIFinderSync {
         }
     }
 
+    /// Resolves the same path the Rust side writes in `db::app_data_dir()`:
+    /// `~/Library/Application Support/DropboxSyncDesktop/overlay_state.json`.
+    /// The extension is not sandboxed, so `.userDomainMask` yields the plain
+    /// per-user Application Support directory rather than a container path.
     private func overlayStateURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home
-            .appendingPathComponent("Library/Applications/DropboxSyncDesktop/overlay_state.json")
+        let appSupport = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support")
+        return appSupport
+            .appendingPathComponent("DropboxSyncDesktop/overlay_state.json")
     }
 
     private func monitoredDirectoryURLs() -> Set<URL> {
