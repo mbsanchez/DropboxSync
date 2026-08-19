@@ -6,3 +6,6 @@ artifacts/
 .DS_Store
 *.log
 *.tmp
+
+# Local Claude Code state (project .claude/settings.json IS committed)
+.claude/settings.local.json
