@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSExtension</key>
 	<dict>
+		<key>NSExtensionAttributes</key>
+		<dict/>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.FinderSync</string>
 		<!-- Bare class name: @objc(DropboxSyncFinderSync) replaces the mangled Swift name. -->

@@ -29,6 +29,13 @@
 	<true/>
 	<key>NSExtension</key>
 	<dict>
+		<!-- Empty on purpose. Apple's Finder Sync template emits it, and all three working
+		     extensions on a reference Mac carry it. Adding it alone was tested and does NOT fix
+		     registration (DBSYNC-76), but leaving it out would be the last structural difference
+		     between our NSExtension dict and every known-good one — an uncontrolled variable for
+		     the cross-swap experiment in Slice 2. -->
+		<key>NSExtensionAttributes</key>
+		<dict/>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.FinderSync</string>
 		<!-- BARE class name, not module-qualified. SyncExtension.swift declares
