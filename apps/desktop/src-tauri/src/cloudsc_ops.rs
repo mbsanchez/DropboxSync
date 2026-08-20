@@ -577,6 +577,46 @@ pub(crate) fn list_cloudsc_placeholders(
     Ok(out)
 }
 
+/// Relative paths of every `.cloudsc` sidecar under the sync root, spelled exactly as
+/// the file system spells them — suffix included.
+///
+/// A cheap sibling of [`list_cloudsc_placeholders`]. That one parses every placeholder
+/// file to recover its `tag` and `remote_path_display`; a badge needs neither, and the
+/// overlay refresh runs on every pass of the sync queue, so paying N file reads there
+/// would be N reads per refresh for data nobody looks at.
+///
+/// **The `.cloudsc` suffix stays on.** `requestBadgeIdentifier(for:)` in the Finder Sync
+/// extension derives the path relative to the sync root exactly as it appears on disk and
+/// looks it up verbatim, so a key without the suffix can never match (DBSYNC-80).
+///
+/// Folder placeholders are included: a dehydrated directory is itself a regular file on
+/// disk holding the placeholder record, so `is_file()` accepts both kinds.
+pub(crate) fn list_cloudsc_placeholder_rels(state: &AppState) -> AppResult<Vec<String>> {
+    // No sync folder configured yet means no placeholders, not an error — unlike
+    // `list_cloudsc_placeholders`, this runs unattended from the overlay refresh.
+    let Some(sync_folder_str) = state.db.get_sync_folder()? else {
+        return Ok(Vec::new());
+    };
+    let sync_folder = PathBuf::from(sync_folder_str);
+
+    let mut out: Vec<String> = Vec::new();
+    for entry in WalkDir::new(&sync_folder).min_depth(1) {
+        // One unreadable directory is an environment problem, not a reason to leave
+        // every badge in the folder unset: skip it and keep walking. A failure to make
+        // the path relative would instead be a broken invariant (the entry came from a
+        // walk rooted at `sync_folder`), so that one propagates.
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if !entry.file_name().to_string_lossy().ends_with(".cloudsc") {
+            continue;
+        }
+        out.push(relpath_under(&sync_folder, entry.path())?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn hydrate_cloudsc_placeholder_internal(
     state: &AppState,
     placeholder_local_rel_path: &str,
