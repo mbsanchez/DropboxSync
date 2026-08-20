@@ -244,7 +244,11 @@ fn clear_chunked_key(base: &str) -> Result<(), keyring::Error> {
 
 #[cfg(test)]
 mod chunking_tests {
-    use super::{split_utf16_chunks, utf16_payload_bytes, SAFE_UTF16_PAYLOAD_BYTES};
+    use super::{split_utf16_chunks, utf16_payload_bytes};
+    // Only the Windows test asserts against the ceiling; off Windows the constant is
+    // effectively unbounded and importing it unconditionally is a dead import.
+    #[cfg(windows)]
+    use super::SAFE_UTF16_PAYLOAD_BYTES;
 
     /// A Dropbox access token comfortably exceeds the Windows blob ceiling, which is why
     /// the chunking exists at all. Build one of that shape to test against.
