@@ -13,7 +13,22 @@ const SESSION_EXPIRES: &str = "dropbox-session-expires";
 
 /// Windows `CRED_MAX_CREDENTIAL_BLOB_SIZE` is 2560 bytes; keyring stores passwords as UTF-16 LE,
 /// so the check is `utf16_units * 2 <= 2560`. We stay under that per chunk.
+#[cfg(windows)]
 const SAFE_UTF16_PAYLOAD_BYTES: usize = 2400;
+
+/// **No equivalent ceiling exists off Windows** (DBSYNC-81). Chunking there bought
+/// nothing and cost a keychain prompt per part: macOS asks per ITEM, so a token split
+/// into a marker plus two chunks turned one authorization into three. Measured on the
+/// maintainer's Mac — five stored items, five dialogs on first run.
+///
+/// `MAX / 2` rather than `MAX` so the `cur_bytes + add` accumulator in
+/// [`split_utf16_chunks`] cannot overflow. Any real secret is astronomically below it,
+/// so the single-chunk path always wins — and that path is what migrates existing
+/// users: [`store_value_chunked`] inlines the value into the base key and calls
+/// `clear_overflow_parts(base, 0)`, deleting the `.0`/`.1` entries left by the old
+/// layout. No separate migration step, and no half-migrated state to reason about.
+#[cfg(not(windows))]
+const SAFE_UTF16_PAYLOAD_BYTES: usize = usize::MAX / 2;
 
 /// Marker in the primary entry when the secret is split across `name.0`, `name.1`, ...
 const CHUNK_MARKER: &str = "__KEYRING_CHUNKED_V1__:";
@@ -225,4 +240,55 @@ fn clear_chunked_key(base: &str) -> Result<(), keyring::Error> {
     let base_result = delete_credential_if_present(base);
     clear_overflow_parts(base, 0);
     base_result
+}
+
+#[cfg(test)]
+mod chunking_tests {
+    use super::{split_utf16_chunks, utf16_payload_bytes};
+    // Only the Windows test asserts against the ceiling; off Windows the constant is
+    // effectively unbounded and importing it unconditionally is a dead import.
+    #[cfg(windows)]
+    use super::SAFE_UTF16_PAYLOAD_BYTES;
+
+    /// A Dropbox access token comfortably exceeds the Windows blob ceiling, which is why
+    /// the chunking exists at all. Build one of that shape to test against.
+    fn oversized_secret() -> String {
+        "a".repeat(3000)
+    }
+
+    #[test]
+    fn the_test_secret_really_is_over_the_windows_ceiling() {
+        // Guards the two tests below: if this ever stops holding they would both pass
+        // vacuously, proving nothing about chunking on either platform.
+        assert!(utf16_payload_bytes(&oversized_secret()) > 2400);
+    }
+
+    /// DBSYNC-81. Off Windows the keychain has no blob-size ceiling, so a secret of any
+    /// size lives in ONE item. That is the whole fix: macOS prompts per item, and three
+    /// items for one token meant three dialogs.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_oversized_secret_is_not_split_off_windows() {
+        assert_eq!(split_utf16_chunks(&oversized_secret()).len(), 1);
+    }
+
+    /// Windows keeps its ceiling: `CRED_MAX_CREDENTIAL_BLOB_SIZE` is real and exceeding
+    /// it fails at runtime, not at compile time. Compiled only there, so it asserts
+    /// about the platform it describes rather than about a constant.
+    #[cfg(windows)]
+    #[test]
+    fn an_oversized_secret_is_still_split_on_windows() {
+        let chunks = split_utf16_chunks(&oversized_secret());
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(utf16_payload_bytes(c) <= SAFE_UTF16_PAYLOAD_BYTES);
+        }
+    }
+
+    /// Whatever the platform, splitting must never lose or reorder data.
+    #[test]
+    fn chunks_always_rejoin_to_the_original() {
+        let secret = oversized_secret();
+        assert_eq!(split_utf16_chunks(&secret).concat(), secret);
+    }
 }
