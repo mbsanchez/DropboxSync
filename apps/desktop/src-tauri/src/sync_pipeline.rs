@@ -567,7 +567,14 @@ pub(crate) fn mass_delete_pause_active(state: &AppState) -> AppResult<bool> {
     Ok(scan_paused || remote_paused)
 }
 
-pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
+/// The LOCAL half of a scan: walk the sync folder, decide what changed, and enqueue
+/// uploads and deletions. Returns how many jobs it enqueued.
+///
+/// Split out of [`scan_local_changes_internal`] because that function does two jobs and
+/// only the second needs credentials (DBSYNC-81). Keeping them apart lets the local
+/// decisions be exercised without an access token — which is what a test of the
+/// mass-deletion guard actually wants.
+fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     let folder = state
         .db
         .get_sync_folder()?
@@ -733,6 +740,15 @@ pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> 
         }
     }
 
+    Ok(enqueued_jobs)
+}
+
+/// A full scan: the local half, then the remote refresh, then the bookkeeping.
+///
+/// The remote half needs an access token, so this is the entry point for production and
+/// NOT the one to reach for from a test that only cares about local decisions.
+pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
+    let enqueued_jobs = scan_local_changes_only(state)?;
     let remote_enqueued = refresh_remote_index_and_enqueue_downloads_internal(state)?;
 
     {
@@ -1179,7 +1195,7 @@ mod tests {
     use super::{
         block_mass_deletion, cleanup_stale_upload_state, clear_mass_delete_blocked,
         is_mass_deletion, mass_delete_pause_active, process_changed_paths,
-        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_internal,
+        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_only,
         ConflictAction, MassDeleteSource, SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
@@ -1861,13 +1877,17 @@ mod tests {
         }
 
         // First scan: the batch is a mass deletion → BLOCKED. Nothing propagated,
-        // index rows kept, and a DURABLE pause flag persisted. (The scan's later
-        // remote-refresh step errors here with no token, but the deletion decision +
-        // the pause-flag write run BEFORE it, so those side effects are committed —
-        // ignore the Result and assert them. Asserting the DURABLE app_config flag,
-        // not the transient engine error, is what proves the pause survives a full
-        // scan in production — `refresh_queue_depth_internal` reads this flag.)
-        let _ = scan_local_changes_internal(&state);
+        // index rows kept, and a DURABLE pause flag persisted. Asserting the DURABLE
+        // app_config flag, not the transient engine error, is what proves the pause
+        // survives a full scan in production — `refresh_queue_depth_internal` reads it.
+        //
+        // DBSYNC-81: this calls the LOCAL half only. It used to call the full scan and
+        // discard the Result, on the assumption that the remote-refresh step "errors
+        // here with no token". That holds on a machine with an empty keychain and is
+        // FALSE on a developer's: there the step finds a real token, prompts for it and
+        // reads production credentials. Calling the local half means the Result can be
+        // asserted instead of swallowed.
+        scan_local_changes_only(&state).expect("local scan must succeed");
         assert!(
             job_targets(&state, "delete").is_empty(),
             "a mass deletion must be blocked — no remote deletes enqueued"
@@ -1892,7 +1912,7 @@ mod tests {
             .db
             .set_app_config("mass_delete_override_once", "1")
             .unwrap();
-        let _ = scan_local_changes_internal(&state);
+        scan_local_changes_only(&state).expect("local scan must succeed");
         assert_eq!(
             job_targets(&state, "delete").len(),
             30,
