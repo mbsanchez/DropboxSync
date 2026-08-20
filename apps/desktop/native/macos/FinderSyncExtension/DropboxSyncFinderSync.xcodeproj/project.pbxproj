@@ -14,6 +14,8 @@
 		DBFC00000000000000000025 /* cloud-check@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000007 /* cloud-check@2x.png */; };
 		DBFC00000000000000000026 /* cloud-alert@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000008 /* cloud-alert@2x.png */; };
 		DBFC00000000000000000027 /* cloud-sync@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000009 /* cloud-sync@2x.png */; };
+		DBFC00000000000000000028 /* cloud-only.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000010 /* cloud-only.png */; };
+		DBFC00000000000000000029 /* cloud-only@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000011 /* cloud-only@2x.png */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -24,6 +26,8 @@
 		DBFC00000000000000000007 /* cloud-check@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "cloud-check@2x.png"; sourceTree = "<group>"; };
 		DBFC00000000000000000008 /* cloud-alert@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "cloud-alert@2x.png"; sourceTree = "<group>"; };
 		DBFC00000000000000000009 /* cloud-sync@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "cloud-sync@2x.png"; sourceTree = "<group>"; };
+		DBFC00000000000000000010 /* cloud-only.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "cloud-only.png"; sourceTree = "<group>"; };
+		DBFC00000000000000000011 /* cloud-only@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "cloud-only@2x.png"; sourceTree = "<group>"; };
 		DBFC00000000000000000005 /* DropboxSyncFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = DropboxSyncFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		DBFC00000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -74,6 +78,8 @@
 				DBFC00000000000000000007 /* cloud-check@2x.png */,
 				DBFC00000000000000000008 /* cloud-alert@2x.png */,
 				DBFC00000000000000000009 /* cloud-sync@2x.png */,
+				DBFC00000000000000000010 /* cloud-only.png */,
+				DBFC00000000000000000011 /* cloud-only@2x.png */,
 			);
 			path = Assets;
 			sourceTree = "<group>";
@@ -142,6 +148,8 @@
 				DBFC00000000000000000025 /* cloud-check@2x.png in Resources */,
 				DBFC00000000000000000026 /* cloud-alert@2x.png in Resources */,
 				DBFC00000000000000000027 /* cloud-sync@2x.png in Resources */,
+				DBFC00000000000000000028 /* cloud-only.png in Resources */,
+				DBFC00000000000000000029 /* cloud-only@2x.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

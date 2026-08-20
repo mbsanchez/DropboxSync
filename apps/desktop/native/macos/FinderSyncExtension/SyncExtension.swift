@@ -70,6 +70,13 @@ final class DropboxSyncFinderSync: FIFinderSync {
             ("synced", "cloud-check", "Synced"),
             ("out_of_sync", "cloud-alert", "Out of sync"),
             ("syncing", "cloud-sync", "Syncing"),
+            // DBSYNC-80. Grey rather than a status colour: "online only" is not a
+            // problem to flag, it is a fact about where the bytes live, and it should not
+            // compete with the green/blue/red the other three carry. A download arrow
+            // rather than a cloud: Finder draws these at 16pt in list view, where a cloud
+            // silhouette collapses into an unreadable blob — and the arrow matches what
+            // iCloud Drive shows for a file that is not downloaded.
+            ("cloud_only", "cloud-only", "Online only"),
         ]
         for badge in badges {
             // `image(forResource:)`, not `NSImage(contentsOfFile:)`: only the former pairs
