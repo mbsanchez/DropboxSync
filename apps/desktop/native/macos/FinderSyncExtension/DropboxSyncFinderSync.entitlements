@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Sandbox is REQUIRED for macOS to register a Finder Sync extension at all. Without it the
+	     appex never appears in pluginkit and cannot be enabled (DBSYNC-76). Apple's Finder Sync
+	     template generates this file, and every working extension on a reference Mac is sandboxed. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.files.user-selected.read-only</key>
+	<true/>
+	<!-- The sandbox puts the extension in its own container, so it can no longer reach the host's
+	     Application Support directory where overlay_state.json lives. This temporary exception grants
+	     read-only access to exactly that directory and nothing else. Dropbox does the same for
+	     ~/.dropbox/. The alternative — an App Group shared container — needs an identifier registered
+	     with Apple and a provisioning profile, and would move the state file for every existing user. -->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>/Library/Application Support/DropboxSyncDesktop/</string>
+	</array>
+</dict>
+</plist>

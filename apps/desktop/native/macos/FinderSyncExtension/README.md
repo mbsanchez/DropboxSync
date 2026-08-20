@@ -25,41 +25,86 @@ Open `DropboxSyncFinderSync.xcodeproj` to edit Swift. Embedding into the main ap
 
 After install, the user may need to enable the extension under **System Settings → Privacy & Security → Extensions → Finder** (wording varies by macOS version).
 
-## ADR: no App Sandbox, Hardened Runtime on, no App Group
+### Replacing the appex during development
 
-**Status:** Accepted — 2026-08-19 (DBSYNC-72).
+Swapping the `.appex` inside an installed `.app` and re-signing is **not** enough. Finder keeps using the
+extension instance it already holds, so `init()` never re-runs, `directoryURLs` is never re-established, and
+`requestBadgeIdentifier(for:)` is never called again — the badges simply stop appearing, with no error and no
+log line. Restarting Finder alone does not clear it. Re-register instead:
 
-**Decision.** The extension is **not sandboxed**. It ships with Hardened Runtime enabled and carries no
-entitlements, and it reads `overlay_state.json` straight from `~/Library/Application Support/DropboxSyncDesktop/`.
-No App Group container is introduced and `db::app_data_dir()` is not changed.
+```bash
+pluginkit -e ignore -i com.mobsanchez.dropboxsyncdesktop.findersync
+pluginkit -e use    -i com.mobsanchez.dropboxsyncdesktop.findersync
+killall Finder
+```
 
-"Carries no entitlements" is a claim about the **shipped artifact**, not merely about the sources, and the two
-can diverge: `xcodebuild` injects `com.apple.security.get-task-allow` unless told not to, which is why
-`build-appex.sh` disables that injection on every path, signed or ad-hoc. Check the product, never the project
-file — `codesign -d --entitlements - build/DropboxSyncFinderSync.appex` must print nothing. If it prints
-`get-task-allow`, the appex was built by something other than that script (a plain `xcodebuild`, or Xcode.app)
-and must not be shipped.
+Note that `pluginkit -m -i <id> -vvv` keeps reporting the same UUID and timestamp across this cycle, so its
+output cannot be used to tell whether the toggle took effect. Confirm from the extension side instead: with a
+`Logger` call at the top of `requestBadgeIdentifier(for:)`, opening the sync folder should produce a burst of
+queries within a second.
 
-**Context.** The app is distributed with **Developer ID** (direct download), not through the Mac App Store.
-App Sandbox is mandatory only for the App Store; Developer ID requires Hardened Runtime plus notarization
-instead, and both are already in place — `ENABLE_HARDENED_RUNTIME = YES` in both build configurations, and no
-`CODE_SIGN_ENTITLEMENTS` key or `.entitlements` file exists anywhere under `apps/desktop`.
+## ADR: App Sandbox on, Hardened Runtime on, no App Group
 
-**Why it matters.** Sandboxing is the *only* reason this extension would need an App Group. A sandboxed
-extension cannot read the host app's Application Support directory, which would force the state file into
-`~/Library/Group Containers/<group-id>/`, force a rewrite of `db::app_data_dir()`, force a migration of every
-existing user's state, and require a provisioning profile carrying the App Group entitlement. Staying
-unsandboxed removes all four at no cost.
+**Status:** Accepted — 2026-08-19 (DBSYNC-76). **Supersedes** the original "no App Sandbox" decision
+taken the same day under DBSYNC-72, which was wrong and is recorded at the bottom of this section.
 
-Verified rather than assumed: running the resolution logic of `overlayStateURL()` outside a container yields
-the plain per-user directory, identical to what the Rust side writes.
+**Decision.** The extension **is sandboxed**. `DropboxSyncFinderSync.entitlements` declares
+`com.apple.security.app-sandbox` together with a read-only temporary exception for
+`/Library/Application Support/DropboxSyncDesktop/`, so it still reads `overlay_state.json` from the
+host's own directory. Hardened Runtime stays on. No App Group is introduced and `db::app_data_dir()`
+is unchanged.
 
-**Trade-off accepted.** The app cannot be submitted to the Mac App Store without reopening this decision.
+**Context — why the earlier decision failed.** Without `com.apple.security.app-sandbox`, macOS silently
+refuses to register the extension: it never appears in System Settings → Extensions → Finder, `pluginkit`
+lists no entry for it, and Finder never loads it. There is no error anywhere — not in Console, not from
+`codesign`, not from `pluginkit`. Every working Finder Sync extension on a reference Mac is sandboxed
+(Dropbox's `garcon.appex`, OneDrive's `FinderSync.appex`, odrive's), and Apple's own Xcode template for the
+target generates an entitlements file with the sandbox key. Adding the entitlement made registration work
+immediately.
 
-**Contingency — not a planned step.** If the extension cannot read the state file *and* Console.app shows a
-sandbox or TCC denial for the appex, reopen this ADR and cost the App Group migration separately. Badges
-merely being absent is **not** the trigger: likelier causes are a stale `overlay_state.json` (see DBSYNC-75)
-or the decoder key-conversion issue (DBSYNC-73).
+**Why no App Group.** Sandboxing normally forces the shared state file into
+`~/Library/Group Containers/<group-id>/`, which would mean rewriting `db::app_data_dir()`, migrating every
+existing user's state, registering the group with Apple, and shipping a provisioning profile. A read-only
+`com.apple.security.temporary-exception.files.home-relative-path.read-only` entitlement avoids all four —
+the same technique Dropbox uses for `~/.dropbox/`. The exception is read-only and scoped to one directory;
+the extension never writes.
+
+**The container trap.** Inside the sandbox, every Foundation home API — `homeDirectoryForCurrentUser`,
+`NSHomeDirectory()`, and `.userDomainMask` searches — is redirected to
+`~/Library/Containers/<bundle-id>/Data/`, whose `Library/Application Support` holds nothing but Apple's own
+symlinks. The temporary exception is relative to the **real** home, so `overlayStateURL()` must build the
+path from `getpwuid(getuid())`, which reads the passwd database and is not redirected. Resolving through
+`FileManager` yields a path that simply does not exist: `Data(contentsOf:)` fails, `state` stays `nil`,
+`directoryURLs` stays empty, and Finder never even asks for a badge — with no sandbox denial logged, because
+the protected path was never touched. `reloadState()` logs that failure for exactly this reason.
+
+**Entitlements are a property of the shipped artifact**, not of the sources, and the two can diverge:
+`xcodebuild` injects `com.apple.security.get-task-allow` unless told not to, which is why `build-appex.sh`
+disables that injection on every path, signed or ad-hoc. Check the product, never the project file:
+
+```bash
+codesign -d --entitlements - build/DropboxSyncFinderSync.appex
+```
+
+must print the sandbox key and the temporary exception, and **must not** print `get-task-allow` —
+notarization refuses that outright. If it appears, the appex was built by something other than that script
+(a plain `xcodebuild`, or Xcode.app) and must not be shipped.
+
+**Trade-off accepted.** The temporary-exception entitlement is not accepted on the Mac App Store. Submitting
+there would require reopening this decision and doing the App Group migration — but App Store distribution is
+not a goal; the app ships with Developer ID.
+
+---
+
+**Superseded — original ADR (DBSYNC-72, 2026-08-19): "no App Sandbox".** It held that the extension should
+carry no entitlements at all, on the grounds that App Sandbox is mandatory only for the App Store while
+Developer ID needs Hardened Runtime plus notarization. That reasoning is correct about *distribution* and
+irrelevant to *registration*, which is what actually broke. Its contingency clause said badges merely being
+absent was "not the trigger" for reopening the ADR, and pointed at a stale `overlay_state.json` (DBSYNC-75) or
+the decoder key-conversion issue (DBSYNC-73) as likelier causes; both were investigated and neither was the
+cause. It also claimed the choice was "verified rather than assumed" because the resolution logic of
+`overlayStateURL()` had been run outside a container — a test that could not fail, since it never exercised
+the sandboxed case.
 
 ## Signing: environment-driven, never committed
 
