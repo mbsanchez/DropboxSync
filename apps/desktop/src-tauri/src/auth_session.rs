@@ -283,27 +283,58 @@ pub(crate) fn current_tray_status_label(state: &AppState) -> String {
     "Idle".to_string()
 }
 
+/// Tray icon bytes for a sync-state label, and whether the platform should treat them as
+/// a template image.
+///
+/// **macOS wants a template** (DBSYNC-78). The system reads only the alpha channel and
+/// tints the shape itself, so the icon follows the light/dark menu bar, the accent colour
+/// and the highlighted state while the menu is open. A full-colour asset there adapts to
+/// none of that and reads as foreign next to every other item — Dropbox, OneDrive and
+/// odrive all ship templates. Because templating discards colour, the macOS set has to
+/// differ by **shape**: a cloud carrying a check, a circular arrow, or an exclamation.
+/// DBSYNC-32's state semantics are unchanged; only how the state is drawn is.
+///
+/// **Windows keeps the colour.** The notification area has no template convention and
+/// shows full-colour icons, so it stays on the brand asset. That is the whole reason for
+/// the split — not two ways of doing the same thing, but two platforms whose conventions
+/// genuinely differ.
+///
+/// Single source for both the builder in `lib.rs` and the live swap below, so the initial
+/// icon and the state icons cannot drift apart on either platform.
+pub(crate) fn tray_icon_for_label(label: &str) -> (&'static [u8], bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let bytes: &[u8] = match label {
+            "Syncing" => include_bytes!("icons/tray-sync-template.png"),
+            "Error" => include_bytes!("icons/tray-error-template.png"),
+            _ => include_bytes!("icons/tray-idle-template.png"),
+        };
+        (bytes, true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let bytes: &[u8] = match label {
+            "Syncing" => include_bytes!("icons/tray-sync.png"),
+            "Error" => include_bytes!("icons/tray-error.png"),
+            _ => include_bytes!("icons/tray-idle.png"),
+        };
+        (bytes, false)
+    }
+}
+
 /// Reflect the current sync state in BOTH the tray tooltip and the tray ICON
-/// (DBSYNC-32). Idle keeps the template-tinted brand icon; Syncing/Error swap to the
-/// colored cloud status icons (`icon_as_template(false)` so macOS doesn't flatten
-/// their colour to a menu-bar silhouette). Called at every `sync_running`/error
-/// transition via [`refresh_tray_tooltip`], so the icon tracks state live.
+/// (DBSYNC-32). Called at every `sync_running`/error transition via
+/// [`refresh_tray_tooltip`], so the icon tracks state live.
 pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, label: &str) {
     let Some(tray) = app.tray_by_id("main") else {
         return;
     };
     let _ = tray.set_tooltip(Some(format!("DropboxSyncDesktop - {label}")));
 
-    // Same blue brand icon in every state — only the inner glyph changes (check /
-    // sync-arrows / exclamation). `icon_as_template(false)` keeps the blue on macOS.
-    let bytes: &[u8] = match label {
-        "Syncing" => include_bytes!("icons/tray-sync.png"),
-        "Error" => include_bytes!("icons/tray-error.png"),
-        _ => include_bytes!("icons/tray-idle.png"),
-    };
+    let (bytes, as_template) = tray_icon_for_label(label);
     if let Ok(img) = tauri::image::Image::from_bytes(bytes) {
         let _ = tray.set_icon(Some(img));
-        let _ = tray.set_icon_as_template(false);
+        let _ = tray.set_icon_as_template(as_template);
     }
 }
 
@@ -374,5 +405,64 @@ mod tests {
             let session = r.expect("guarded refresh should succeed");
             assert_eq!(session.access_token.as_str(), "canned-access-token");
         }
+    }
+}
+
+#[cfg(test)]
+mod tray_icon_tests {
+    use super::tray_icon_for_label;
+
+    /// Templating throws colour away, so the three states have to be told apart by shape.
+    /// If two labels ever resolved to the same asset the tray would silently stop
+    /// reporting state on macOS — DBSYNC-32's whole point — with nothing to notice it.
+    #[test]
+    fn every_state_has_its_own_artwork() {
+        let (idle, _) = tray_icon_for_label("Idle");
+        let (syncing, _) = tray_icon_for_label("Syncing");
+        let (error, _) = tray_icon_for_label("Error");
+
+        assert_ne!(idle, syncing);
+        assert_ne!(idle, error);
+        assert_ne!(syncing, error);
+    }
+
+    /// The label comes from a status string, not an enum; anything unrecognised must land
+    /// on the idle icon rather than on whatever the match happened to list last.
+    #[test]
+    fn unknown_label_falls_back_to_idle() {
+        let (idle, _) = tray_icon_for_label("Idle");
+        let (unknown, _) = tray_icon_for_label("Paused");
+
+        assert_eq!(idle, unknown);
+    }
+
+    /// The flag has to be uniform across states: a template idle icon next to a
+    /// non-template syncing icon would visibly change weight and colour mid-sync.
+    #[test]
+    fn the_template_flag_is_the_same_for_every_state() {
+        let (_, idle) = tray_icon_for_label("Idle");
+        let (_, syncing) = tray_icon_for_label("Syncing");
+        let (_, error) = tray_icon_for_label("Error");
+
+        assert_eq!(idle, syncing);
+        assert_eq!(idle, error);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_asks_for_template_tinting() {
+        assert!(
+            tray_icon_for_label("Idle").1,
+            "menu-bar icons must be templates so macOS tints them (DBSYNC-78)"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn other_platforms_keep_their_colour_icons() {
+        assert!(
+            !tray_icon_for_label("Idle").1,
+            "the Windows notification area has no template convention; colour stays"
+        );
     }
 }
