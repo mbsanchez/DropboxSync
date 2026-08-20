@@ -252,13 +252,17 @@ pub fn run() {
             let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&settings, &quit])?;
-            // DBSYNC-32: start on the idle brand icon; update_tray_tooltip swaps the glyph
-            // (sync/error) live. Not a template — we keep the brand blue in every state.
-            let tray_image = Image::from_bytes(include_bytes!("icons/tray-idle.png"))
+            // DBSYNC-32: start on the idle icon; update_tray_tooltip swaps the glyph
+            // (sync/error) live. The asset and the template flag both come from
+            // `tray_icon_for_label` so this initial icon can never disagree with the ones
+            // the live swap installs — macOS gets a monochrome template, Windows the
+            // colour brand icon (DBSYNC-78).
+            let (idle_bytes, idle_as_template) = crate::auth_session::tray_icon_for_label("Idle");
+            let tray_image = Image::from_bytes(idle_bytes)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let tray_builder = TrayIconBuilder::with_id("main")
                 .icon(tray_image)
-                .icon_as_template(false)
+                .icon_as_template(idle_as_template)
                 .menu(&menu)
                 .tooltip("DropboxSyncDesktop - Idle")
                 .on_tray_icon_event(move |_tray, event| {
