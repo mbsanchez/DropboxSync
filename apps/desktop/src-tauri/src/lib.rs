@@ -264,10 +264,21 @@ pub fn run() {
                 .icon(tray_image)
                 .icon_as_template(idle_as_template)
                 .menu(&menu)
+                // DBSYNC-82. `tray-icon` defaults `menu_on_left_click` to TRUE, so without
+                // this the left click opened the menu as well as running the handler below,
+                // and the menu stealing focus made the flyout blur-hide itself. Three
+                // behaviours on one gesture; it took about three clicks to land the window.
+                // Off, the menu belongs to the right click — which `tray-icon` shows
+                // unconditionally, so nothing is lost and the handler needs no change.
+                .show_menu_on_left_click(false)
                 .tooltip("DropboxSyncDesktop - Idle")
                 .on_tray_icon_event(move |_tray, event| {
-                    // Single source of truth for the flyout: a left-click toggles it
-                    // (shows+positions if hidden, hides if visible). No more DoubleClick.
+                    // The flyout's only trigger — true because `show_menu_on_left_click`
+                    // above takes the menu off this gesture, not because nothing else
+                    // could claim it. A left-click toggles the window (shows+positions if
+                    // hidden, hides if visible). No DoubleClick. The right click also
+                    // arrives here carrying `MouseButton::Right` and is ignored by the
+                    // match below, so it opens the menu without touching the flyout.
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
