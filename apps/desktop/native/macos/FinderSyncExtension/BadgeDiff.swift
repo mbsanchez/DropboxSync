@@ -61,4 +61,56 @@ enum BadgeDiff {
             removed: changes.removed.filter { alreadyBadged.contains($0) }
         )
     }
+
+    /// Whether `path` is `root` itself or lives inside it.
+    ///
+    /// A plain `path.hasPrefix(root)` is **not** a containment test and was shipped as one
+    /// in the first version of this change: with a root of `/Users/x/DropboxSync`, the path
+    /// `/Users/x/DropboxSyncEvil/secret.txt` passes a string-prefix check while living in a
+    /// different directory entirely. Comparing against `root + "/"` is what makes the
+    /// sibling-with-a-longer-name case fail as it should.
+    ///
+    /// This lives in `BadgeDiff` rather than next to its callers so that it is reachable
+    /// from `Tests/BadgeDiffTests.swift`. That is the point: the string-prefix bug survived
+    /// review precisely because it sat in a file the test script cannot compile.
+    static func isContained(_ path: String, in root: String) -> Bool {
+        if path == root { return true }
+        let rootWithSeparator = root.hasSuffix("/") ? root : root + "/"
+        return path.hasPrefix(rootWithSeparator)
+    }
+
+    /// The portion of `path` below `root`, or `nil` if `path` is not inside `root`.
+    ///
+    /// Returns `""` for `root` itself. The old inline version sliced off `root.count`
+    /// characters after a bare prefix check, so `/Users/x/DropboxSyncEvil/f` yielded the
+    /// nonsensical relative path `Evil/f` and was then looked up in the state map.
+    static func relativePath(of path: String, under root: String) -> String? {
+        guard isContained(path, in: root) else { return nil }
+        if path == root { return "" }
+        let rootWithSeparator = root.hasSuffix("/") ? root : root + "/"
+        return String(path.dropFirst(rootWithSeparator.count))
+    }
+
+    /// What to push when the previous snapshot was lost but Finder is still showing badges.
+    ///
+    /// `reloadState()` drops its snapshot whenever the state file cannot be read. Without
+    /// this, the next successful read produces no diff — `changes(from: nil, …)` is empty by
+    /// design — and every visible badge stays frozen until the user leaves the directory and
+    /// comes back. Which is the exact bug this ticket exists to fix, reached through a
+    /// narrower door.
+    ///
+    /// `alreadyBadged` is not lost in that reset, so the displayed items can be refreshed
+    /// directly. Every path here has already received a badge, so pushing to it is
+    /// legitimate under Apple's rule.
+    static func resync(to new: [String: String], alreadyBadged: Set<String>) -> Changes {
+        var changed: [String: String] = [:]
+        for path in alreadyBadged {
+            if let tier = new[path] { changed[path] = tier }
+        }
+        return Changes(
+            changed: changed,
+            removed: alreadyBadged.filter { new[$0] == nil }.sorted()
+        )
+    }
 }
+

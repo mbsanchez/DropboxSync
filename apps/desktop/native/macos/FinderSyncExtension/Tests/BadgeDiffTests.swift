@@ -39,6 +39,24 @@ struct BadgeDiffTests {
         }
     }
 
+    static func checkBool(_ label: String, _ actual: Bool, _ expected: Bool) {
+        if actual == expected {
+            print("  ok   \(label)")
+        } else {
+            print("  FAIL \(label) — expected \(expected), got \(actual)")
+            failures += 1
+        }
+    }
+
+    static func checkOptional(_ label: String, _ actual: String?, _ expected: String?) {
+        if actual == expected {
+            print("  ok   \(label)")
+        } else {
+            print("  FAIL \(label) — expected \(expected as Any), got \(actual as Any)")
+            failures += 1
+        }
+    }
+
     static func main() {
         print("BadgeDiff")
 
@@ -116,6 +134,53 @@ struct BadgeDiffTests {
               BadgeDiff.pushable(
                   BadgeDiff.Changes(changed: [:], removed: ["never-seen.txt"]),
                   alreadyBadged: []),
+              changed: [:], removed: [])
+
+        print("BadgeDiff.isContained")
+
+        let root = "/Users/x/DropboxSync"
+
+        checkBool("a file inside the root is contained",
+                  BadgeDiff.isContained("/Users/x/DropboxSync/a.txt", in: root), true)
+        checkBool("the root itself is contained",
+                  BadgeDiff.isContained(root, in: root), true)
+        // The bug the first version of this change shipped: a plain hasPrefix passes this.
+        checkBool("a SIBLING whose name extends the root is NOT contained",
+                  BadgeDiff.isContained("/Users/x/DropboxSyncEvil/secret.txt", in: root), false)
+        checkBool("an unrelated absolute path is not contained",
+                  BadgeDiff.isContained("/etc/passwd", in: root), false)
+        checkBool("a trailing separator on the root does not change the answer",
+                  BadgeDiff.isContained("/Users/x/DropboxSync/a.txt", in: root + "/"), true)
+        checkBool("a prefix of the root is not contained",
+                  BadgeDiff.isContained("/Users/x", in: root), false)
+
+        print("BadgeDiff.relativePath")
+
+        checkOptional("strips the root and the separator",
+                      BadgeDiff.relativePath(of: "/Users/x/DropboxSync/sub/a.txt", under: root),
+                      "sub/a.txt")
+        checkOptional("the root itself is the empty relative path",
+                      BadgeDiff.relativePath(of: root, under: root), "")
+        // The old inline version returned "Evil/secret.txt" here and looked it up as if real.
+        checkOptional("a sibling yields nil, not a nonsense relative path",
+                      BadgeDiff.relativePath(of: "/Users/x/DropboxSyncEvil/secret.txt", under: root),
+                      nil)
+        checkOptional("an unrelated path yields nil",
+                      BadgeDiff.relativePath(of: "/etc/passwd", under: root), nil)
+
+        print("BadgeDiff.resync")
+
+        check("resync refreshes only the badged paths",
+              BadgeDiff.resync(to: ["a.txt": "synced", "b.txt": "cloud_only"],
+                               alreadyBadged: ["a.txt"]),
+              changed: ["a.txt": "synced"], removed: [])
+
+        check("resync clears badged paths that are gone from the new snapshot",
+              BadgeDiff.resync(to: ["a.txt": "synced"], alreadyBadged: ["a.txt", "gone.txt"]),
+              changed: ["a.txt": "synced"], removed: ["gone.txt"])
+
+        check("resync with nothing badged does nothing",
+              BadgeDiff.resync(to: ["a.txt": "synced"], alreadyBadged: []),
               changed: [:], removed: [])
 
         if failures == 0 {

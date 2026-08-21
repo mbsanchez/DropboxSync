@@ -144,7 +144,15 @@ final class DropboxSyncFinderSync: FIFinderSync {
         state = decoded
         lastUpdatedAt = decoded.updatedAt
 
-        pushBadgeChanges(BadgeDiff.changes(from: previousPaths, to: decoded.paths))
+        if previousPaths == nil && !badgedPaths.isEmpty {
+            // The snapshot was lost — the state file was unreadable for a moment — but
+            // Finder is still showing badges we know about. `changes(from: nil, …)` is
+            // empty by design, so without this every visible badge would stay frozen until
+            // the user left the directory and came back: this ticket's bug, narrower door.
+            pushBadgeChanges(BadgeDiff.resync(to: decoded.paths, alreadyBadged: badgedPaths))
+        } else {
+            pushBadgeChanges(BadgeDiff.changes(from: previousPaths, to: decoded.paths))
+        }
     }
 
     /// Tells Finder about badges that changed since the previous snapshot (DBSYNC-84).
@@ -185,11 +193,13 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// Builds the absolute URL for a relative path, refusing anything that escapes `root`.
     ///
     /// The state file is written by the app, but a relative path containing `..` would
-    /// otherwise let it badge arbitrary locations on disk, so the containment is enforced
-    /// here rather than assumed.
+    /// otherwise let it badge arbitrary locations on disk. The containment test lives in
+    /// [`BadgeDiff.isContained`] so that it is covered by `Tests/BadgeDiffTests.swift`: the
+    /// first version of this check used a bare `hasPrefix` and let a sibling directory
+    /// through, and it survived review because it sat where no test could reach it.
     private func url(forRelative relative: String, under root: URL) -> URL? {
         let url = root.appendingPathComponent(relative).standardizedFileURL
-        guard url.path.hasPrefix(root.path) else { return nil }
+        guard BadgeDiff.isContained(url.path, in: root.path) else { return nil }
         return url
     }
 
@@ -198,14 +208,9 @@ final class DropboxSyncFinderSync: FIFinderSync {
             return
         }
         let item = url.standardizedFileURL
-        guard item.path.hasPrefix(root.path) else {
+        guard let relative = BadgeDiff.relativePath(of: item.path, under: root.path),
+              !relative.isEmpty else {
             return
-        }
-
-        var relative = item.path
-        relative.removeFirst(root.path.count)
-        if relative.hasPrefix("/") {
-            relative.removeFirst()
         }
 
         guard let tier = state?.paths[relative] else {
