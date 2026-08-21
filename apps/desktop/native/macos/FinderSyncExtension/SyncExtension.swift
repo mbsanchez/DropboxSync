@@ -11,6 +11,18 @@ final class DropboxSyncFinderSync: FIFinderSync {
     private var state: OverlayState?
     private var reloadTimer: Timer?
 
+    /// Relative paths Finder has already been given a badge for.
+    ///
+    /// Apple's `FinderSync.h` says to "call this method only for items that have already
+    /// received a badge" when updating, so a push is only legitimate for a path in here.
+    /// Everything else is Finder's to ask about when it displays the item.
+    private var badgedPaths: Set<String> = []
+
+    /// `updated_at` of the snapshot currently in `state`. The Rust writer stamps every
+    /// snapshot (`overlay_state.rs`), so an unchanged value means an unchanged file and the
+    /// whole diff can be skipped — which matters because this runs every 2 seconds forever.
+    private var lastUpdatedAt: String?
+
     override init() {
         super.init()
         registerBadgeImages()
@@ -105,6 +117,10 @@ final class DropboxSyncFinderSync: FIFinderSync {
                 lastLoadFailed = true
             }
             state = nil
+            // Must clear alongside `state`: leaving a stale stamp here would make the
+            // short-circuit below skip the diff when the file comes back with the same
+            // `updated_at`, and no badge would ever be pushed again.
+            lastUpdatedAt = nil
             return
         }
         if lastLoadFailed {
@@ -113,32 +129,100 @@ final class DropboxSyncFinderSync: FIFinderSync {
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        state = try? decoder.decode(OverlayState.self, from: data)
+        guard let decoded = try? decoder.decode(OverlayState.self, from: data) else {
+            state = nil
+            lastUpdatedAt = nil
+            return
+        }
+
+        // Nothing was rewritten since the last tick: no diff, no pushes, no work.
+        if decoded.updatedAt == lastUpdatedAt {
+            return
+        }
+
+        let previousPaths = state?.paths
+        state = decoded
+        lastUpdatedAt = decoded.updatedAt
+
+        pushBadgeChanges(BadgeDiff.changes(from: previousPaths, to: decoded.paths))
+    }
+
+    /// Tells Finder about badges that changed since the previous snapshot (DBSYNC-84).
+    ///
+    /// Finder calls `requestBadgeIdentifier(for:)` **once** per item and then caches the
+    /// answer, so without this the badge a file was first drawn with is the badge it keeps
+    /// until the user leaves the directory and comes back. `setBadgeIdentifier` outside a
+    /// request is the documented way to push an update — `FinderSync.h` says so directly:
+    /// "When updating badges, call this method only for items that have already received a
+    /// badge." Hence the `pushable` filter rather than pushing everything that changed.
+    private func pushBadgeChanges(_ changes: BadgeDiff.Changes) {
+        let pushable = BadgeDiff.pushable(changes, alreadyBadged: badgedPaths)
+        guard !pushable.isEmpty, let root = syncFolderRoot() else {
+            return
+        }
+        let controller = FIFinderSyncController.default()
+
+        for (relative, tier) in pushable.changed {
+            guard let url = url(forRelative: relative, under: root) else { continue }
+            controller.setBadgeIdentifier(tier, for: url)
+        }
+
+        // Clearing a badge is `setBadgeIdentifier("")` — documented in `FinderSync.h`:
+        // "Setting the identifier to an empty string (@\"\") removes the badge."
+        // Checked against the SDK header rather than taken from folklore (GitHub #104).
+        for relative in pushable.removed {
+            guard let url = url(forRelative: relative, under: root) else { continue }
+            controller.setBadgeIdentifier("", for: url)
+            badgedPaths.remove(relative)
+        }
+    }
+
+    private func syncFolderRoot() -> URL? {
+        guard let folder = state?.syncFolder, !folder.isEmpty else { return nil }
+        return URL(fileURLWithPath: folder, isDirectory: true).standardizedFileURL
+    }
+
+    /// Builds the absolute URL for a relative path, refusing anything that escapes `root`.
+    ///
+    /// The state file is written by the app, but a relative path containing `..` would
+    /// otherwise let it badge arbitrary locations on disk, so the containment is enforced
+    /// here rather than assumed.
+    private func url(forRelative relative: String, under root: URL) -> URL? {
+        let url = root.appendingPathComponent(relative).standardizedFileURL
+        guard url.path.hasPrefix(root.path) else { return nil }
+        return url
     }
 
     override func requestBadgeIdentifier(for url: URL) {
-        guard let folder = state?.syncFolder, !folder.isEmpty else {
+        guard let root = syncFolderRoot() else {
             return
         }
-        let root = URL(fileURLWithPath: folder, isDirectory: true).standardizedFileURL
         let item = url.standardizedFileURL
         guard item.path.hasPrefix(root.path) else {
             return
         }
 
-        let rootPath = root.path
         var relative = item.path
-        if relative.hasPrefix(rootPath) {
-            relative.removeFirst(rootPath.count)
-            if relative.hasPrefix("/") {
-                relative.removeFirst()
-            }
+        relative.removeFirst(root.path.count)
+        if relative.hasPrefix("/") {
+            relative.removeFirst()
         }
 
         guard let tier = state?.paths[relative] else {
+            // Finder asked about something we do not track. Returning here used to leave
+            // whatever badge it already had in place forever (GitHub #104); clear it
+            // instead. `""` is the documented removal identifier, per `FinderSync.h`.
+            if badgedPaths.contains(relative) {
+                FIFinderSyncController.default().setBadgeIdentifier("", for: item)
+                badgedPaths.remove(relative)
+            }
             return
         }
+
         FIFinderSyncController.default().setBadgeIdentifier(tier, for: item)
+        // Record it: from now on this path is one Finder has displayed, so pushing updates
+        // for it is legitimate under Apple's rule.
+        badgedPaths.insert(relative)
     }
 }
 

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		DBFC00000000000000000021 /* SyncExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000001 /* SyncExtension.swift */; };
+		DBFC00000000000000000030 /* BadgeDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000012 /* BadgeDiff.swift */; };
 		DBFC00000000000000000022 /* cloud-check.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000002 /* cloud-check.png */; };
 		DBFC00000000000000000023 /* cloud-alert.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000003 /* cloud-alert.png */; };
 		DBFC00000000000000000024 /* cloud-sync.png in Resources */ = {isa = PBXBuildFile; fileRef = DBFC00000000000000000004 /* cloud-sync.png */; };
@@ -20,6 +21,7 @@
 
 /* Begin PBXFileReference section */
 		DBFC00000000000000000001 /* SyncExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncExtension.swift; sourceTree = "<group>"; };
+		DBFC00000000000000000012 /* BadgeDiff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BadgeDiff.swift; sourceTree = "<group>"; };
 		DBFC00000000000000000002 /* cloud-check.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = cloud-check.png; sourceTree = "<group>"; };
 		DBFC00000000000000000003 /* cloud-alert.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = cloud-alert.png; sourceTree = "<group>"; };
 		DBFC00000000000000000004 /* cloud-sync.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = cloud-sync.png; sourceTree = "<group>"; };
@@ -55,6 +57,7 @@
 			isa = PBXGroup;
 			children = (
 				DBFC00000000000000000001 /* SyncExtension.swift */,
+				DBFC00000000000000000012 /* BadgeDiff.swift */,
 				DBFC00000000000000000006 /* Info.plist */,
 				DBFC00000000000000000043 /* Assets */,
 			);
@@ -161,6 +164,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				DBFC00000000000000000021 /* SyncExtension.swift in Sources */,
+				DBFC00000000000000000030 /* BadgeDiff.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
