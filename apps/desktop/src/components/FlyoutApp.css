@@ -162,6 +162,33 @@ html, body, #root {
   font-size: 12px;
 }
 
+/* DBSYNC-86: the Finder extension is switched off, so no badges can appear. Warning palette
+   rather than error — nothing is broken or at risk, a feature is simply off. `.flyout-banner`
+   centres a single row, so the stacked text needs flex-start like the mass-delete banner. */
+.finder-extension-banner {
+  align-items: flex-start;
+}
+
+.finder-extension-banner-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.finder-extension-banner-body h3 {
+  margin: 0 0 4px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--flyout-text);
+}
+
+.finder-extension-banner-body p {
+  margin: 0 0 6px;
+}
+
+.finder-extension-banner-note {
+  opacity: 0.75;
+}
+
 /* DBSYNC-64: mass-delete circuit breaker — impossible-to-miss warning banner.
    Distinct from .flyout-banner (info) via the error palette + a left accent bar. */
 .mass-delete-banner {

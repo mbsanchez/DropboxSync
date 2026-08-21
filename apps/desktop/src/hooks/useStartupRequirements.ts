@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { StartupRequirements } from "../types";
+import type { FinderExtensionState, StartupRequirements } from "../types";
 
 /**
  * Tracks whether Dropbox auth + the local sync folder are configured. Refreshes on
@@ -14,6 +14,10 @@ export function useStartupRequirements(pushLog: (line: string) => void) {
   const [authOk, setAuthOk] = useState(false);
   const [syncFolderOk, setSyncFolderOk] = useState(false);
   const [syncFolder, setSyncFolder] = useState("");
+  // Starts as "notApplicable" so nothing is warned about before the first read lands
+  // (DBSYNC-86). Defaulting to "disabled" would flash a banner on every launch.
+  const [finderExtension, setFinderExtension] =
+    useState<FinderExtensionState>("notApplicable");
 
   const refreshStartupRequirements = useCallback(async () => {
     try {
@@ -23,6 +27,7 @@ export function useStartupRequirements(pushLog: (line: string) => void) {
       if (requirements.syncFolder) {
         setSyncFolder(requirements.syncFolder);
       }
+      setFinderExtension(requirements.finderExtension ?? "notApplicable");
     } catch (error) {
       pushLog(`Startup check failed: ${String(error)}`);
       setAuthOk(false);
@@ -48,6 +53,7 @@ export function useStartupRequirements(pushLog: (line: string) => void) {
     authOk,
     syncFolderOk,
     syncFolder,
+    finderExtension,
     setSyncFolder,
     setAuthOk,
     setSyncFolderOk,

@@ -7,6 +7,7 @@ mod cloudsc_ops;
 mod commands;
 mod dropbox_transfer;
 mod error;
+mod finder_extension;
 mod fs_watcher;
 mod logging;
 mod models;
@@ -410,6 +411,8 @@ pub fn run() {
             commands::complete_oauth_flow,
             commands::cancel_oauth_flow,
             commands::get_startup_requirements,
+            finder_extension::open_finder_extension_settings,
+            finder_extension::restart_finder,
             commands::pick_sync_folder_dialog,
             commands::start_background_scheduler,
             commands::hide_main_window,

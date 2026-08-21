@@ -41,6 +41,11 @@ zeroize = "1.9.0"
 [dev-dependencies]
 tempfile = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Already in Cargo.lock transitively via Tauri, but a transitive crate cannot be imported —
+# it has to be declared. Used only by `finder_extension.rs` (DBSYNC-86).
+objc2 = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 windows-sys = { version = "0.59", features = [

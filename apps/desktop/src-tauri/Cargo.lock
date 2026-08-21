@@ -947,6 +947,7 @@ dependencies = [
  "chrono",
  "keyring",
  "notify-debouncer-mini",
+ "objc2",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "rfd",
