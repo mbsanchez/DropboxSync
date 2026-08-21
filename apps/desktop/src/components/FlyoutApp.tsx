@@ -504,9 +504,16 @@ function FlyoutApp() {
                 The Finder extension is disabled, so files in your sync folder show no status
                 icons. macOS turns it off again after some app updates.
               </p>
+              {/*
+                Deliberately vague about the path. The first version named
+                "Privacy & Security -> Extensions -> Finder", which does not exist on
+                macOS 26: the button lands on General -> Login Items & Extensions, in a
+                sheet titled "File Providers". Apple has already moved this once, so the
+                button is the reliable route and the text only says where to look.
+              */}
               <p className="finder-extension-banner-note">
-                Enable it under System Settings &rarr; Privacy &amp; Security &rarr; Extensions
-                &rarr; Finder.
+                Use the button below, or find DropboxSyncDesktop under System Settings
+                &rarr; General &rarr; Login Items &amp; Extensions.
               </p>
               <div className="mass-delete-banner-actions">
                 <button
