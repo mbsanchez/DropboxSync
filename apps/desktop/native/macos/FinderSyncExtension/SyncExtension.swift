@@ -20,6 +20,16 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// the state file catches up, so it gets no badge on the first ask, and if it were left
     /// out of this set the tier arriving moments later would be filtered away and the file
     /// would never be badged at all. Finder does not ask twice.
+    ///
+    /// **This set only ever grows, and that is deliberate.** Clearing a badge does not mean
+    /// Finder stopped showing the item — the file is still on screen with no status to
+    /// display. Dropping a path here when its badge is cleared means a file that leaves the
+    /// state map and comes back is filtered out of the push and never badged again. The
+    /// only genuine "no longer displayed" signal is `endObservingDirectoryAtURL:`, which
+    /// this extension does not implement.
+    ///
+    /// The cost of never shrinking is one string per distinct path Finder has shown inside
+    /// the sync folder — a few MB at the 50,000 files DBSYNC-80 measured. Accepted.
     private var displayedPaths: Set<String> = []
 
     /// `updated_at` of the snapshot currently in `state`. The Rust writer stamps every
@@ -185,7 +195,6 @@ final class DropboxSyncFinderSync: FIFinderSync {
         for relative in pushable.removed {
             guard let url = url(forRelative: relative, under: root) else { continue }
             controller.setBadgeIdentifier("", for: url)
-            displayedPaths.remove(relative)
         }
     }
 

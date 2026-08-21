@@ -241,6 +241,28 @@ struct BadgeDiffTests {
                      BadgeDiff.requestOutcome(for: root, root: root, paths: tracked),
                      displayedPath: nil, badgeIdentifier: nil)
 
+        print("round trip: removed then tracked again")
+
+        // A file leaves the state map and comes back. Finder has shown it the whole time,
+        // so it must be pushable on the way out AND on the way back in.
+        //
+        // Honest about what this does and does not guard: it pins the composition of
+        // `changes` and `pushable`. It cannot catch someone dropping the path from the
+        // displayed set inside `SyncExtension.swift` — that is a property of a line that no
+        // longer exists, documented on `displayedPaths` instead. The reason `displayedPaths`
+        // never shrinks is written there, not enforced here.
+        let displayed: Set<String> = ["a.txt"]
+
+        let leaving = BadgeDiff.pushable(
+            BadgeDiff.changes(from: ["a.txt": "synced"], to: [:]), displayed: displayed)
+        check("on the way out, the badge is cleared",
+              leaving, changed: [:], removed: ["a.txt"])
+
+        let returning = BadgeDiff.pushable(
+            BadgeDiff.changes(from: [:], to: ["a.txt": "synced"]), displayed: displayed)
+        check("on the way back, the badge is set again",
+              returning, changed: ["a.txt": "synced"], removed: [])
+
         if failures == 0 {
             print("BadgeDiff: all checks passed")
             exit(0)
