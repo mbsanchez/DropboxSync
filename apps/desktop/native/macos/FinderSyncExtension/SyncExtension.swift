@@ -11,6 +11,32 @@ final class DropboxSyncFinderSync: FIFinderSync {
     private var state: OverlayState?
     private var reloadTimer: Timer?
 
+    /// Relative paths Finder is **displaying** — every path it has asked about, whether or
+    /// not we had a tier to give it at the time.
+    ///
+    /// Apple's `FinderSync.h` warns against badging "items that the Finder hasn't displayed
+    /// yet", so a push is only legitimate for a path in here. It deliberately holds
+    /// asked-about paths rather than badged ones: a `.cloudsc` placeholder is drawn before
+    /// the state file catches up, so it gets no badge on the first ask, and if it were left
+    /// out of this set the tier arriving moments later would be filtered away and the file
+    /// would never be badged at all. Finder does not ask twice.
+    ///
+    /// **This set only ever grows, and that is deliberate.** Clearing a badge does not mean
+    /// Finder stopped showing the item — the file is still on screen with no status to
+    /// display. Dropping a path here when its badge is cleared means a file that leaves the
+    /// state map and comes back is filtered out of the push and never badged again. The
+    /// only genuine "no longer displayed" signal is `endObservingDirectoryAtURL:`, which
+    /// this extension does not implement.
+    ///
+    /// The cost of never shrinking is one string per distinct path Finder has shown inside
+    /// the sync folder — a few MB at the 50,000 files DBSYNC-80 measured. Accepted.
+    private var displayedPaths: Set<String> = []
+
+    /// `updated_at` of the snapshot currently in `state`. The Rust writer stamps every
+    /// snapshot (`overlay_state.rs`), so an unchanged value means an unchanged file and the
+    /// whole diff can be skipped — which matters because this runs every 2 seconds forever.
+    private var lastUpdatedAt: String?
+
     override init() {
         super.init()
         registerBadgeImages()
@@ -105,6 +131,10 @@ final class DropboxSyncFinderSync: FIFinderSync {
                 lastLoadFailed = true
             }
             state = nil
+            // Must clear alongside `state`: leaving a stale stamp here would make the
+            // short-circuit below skip the diff when the file comes back with the same
+            // `updated_at`, and no badge would ever be pushed again.
+            lastUpdatedAt = nil
             return
         }
         if lastLoadFailed {
@@ -113,32 +143,93 @@ final class DropboxSyncFinderSync: FIFinderSync {
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        state = try? decoder.decode(OverlayState.self, from: data)
+        guard let decoded = try? decoder.decode(OverlayState.self, from: data) else {
+            state = nil
+            lastUpdatedAt = nil
+            return
+        }
+
+        // Nothing was rewritten since the last tick: no diff, no pushes, no work.
+        if decoded.updatedAt == lastUpdatedAt {
+            return
+        }
+
+        let previousPaths = state?.paths
+        state = decoded
+        lastUpdatedAt = decoded.updatedAt
+
+        if previousPaths == nil && !displayedPaths.isEmpty {
+            // The snapshot was lost — the state file was unreadable for a moment — but
+            // Finder is still showing badges we know about. `changes(from: nil, …)` is
+            // empty by design, so without this every visible badge would stay frozen until
+            // the user left the directory and came back: this ticket's bug, narrower door.
+            pushBadgeChanges(BadgeDiff.resync(to: decoded.paths, displayed: displayedPaths))
+        } else {
+            pushBadgeChanges(BadgeDiff.changes(from: previousPaths, to: decoded.paths))
+        }
+    }
+
+    /// Tells Finder about badges that changed since the previous snapshot (DBSYNC-84).
+    ///
+    /// Finder calls `requestBadgeIdentifier(for:)` **once** per item and then caches the
+    /// answer, so without this the badge a file was first drawn with is the badge it keeps
+    /// until the user leaves the directory and comes back. `setBadgeIdentifier` outside a
+    /// request is the documented way to push an update — `FinderSync.h` says so directly:
+    /// "When updating badges, call this method only for items that have already received a
+    /// badge." Hence the `pushable` filter rather than pushing everything that changed.
+    private func pushBadgeChanges(_ changes: BadgeDiff.Changes) {
+        let pushable = BadgeDiff.pushable(changes, displayed: displayedPaths)
+        guard !pushable.isEmpty, let root = syncFolderRoot() else {
+            return
+        }
+        let controller = FIFinderSyncController.default()
+
+        for (relative, tier) in pushable.changed {
+            guard let url = url(forRelative: relative, under: root) else { continue }
+            controller.setBadgeIdentifier(tier, for: url)
+        }
+
+        // Clearing a badge is `setBadgeIdentifier("")` — documented in `FinderSync.h`:
+        // "Setting the identifier to an empty string (@\"\") removes the badge."
+        // Checked against the SDK header rather than taken from folklore (GitHub #104).
+        for relative in pushable.removed {
+            guard let url = url(forRelative: relative, under: root) else { continue }
+            controller.setBadgeIdentifier("", for: url)
+        }
+    }
+
+    private func syncFolderRoot() -> URL? {
+        guard let folder = state?.syncFolder, !folder.isEmpty else { return nil }
+        return URL(fileURLWithPath: folder, isDirectory: true).standardizedFileURL
+    }
+
+    /// Builds the absolute URL for a relative path, refusing anything that escapes `root`.
+    ///
+    /// The state file is written by the app, but a relative path containing `..` would
+    /// otherwise let it badge arbitrary locations on disk. The containment test lives in
+    /// [`BadgeDiff.isContained`] so that it is covered by `Tests/BadgeDiffTests.swift`: the
+    /// first version of this check used a bare `hasPrefix` and let a sibling directory
+    /// through, and it survived review because it sat where no test could reach it.
+    private func url(forRelative relative: String, under root: URL) -> URL? {
+        let url = root.appendingPathComponent(relative).standardizedFileURL
+        guard BadgeDiff.isContained(url.path, in: root.path) else { return nil }
+        return url
     }
 
     override func requestBadgeIdentifier(for url: URL) {
-        guard let folder = state?.syncFolder, !folder.isEmpty else {
+        guard let root = syncFolderRoot() else {
             return
         }
-        let root = URL(fileURLWithPath: folder, isDirectory: true).standardizedFileURL
         let item = url.standardizedFileURL
-        guard item.path.hasPrefix(root.path) else {
-            return
+        let outcome = BadgeDiff.requestOutcome(
+            for: item.path, root: root.path, paths: state?.paths
+        )
+        if let displayed = outcome.displayedPath {
+            displayedPaths.insert(displayed)
         }
-
-        let rootPath = root.path
-        var relative = item.path
-        if relative.hasPrefix(rootPath) {
-            relative.removeFirst(rootPath.count)
-            if relative.hasPrefix("/") {
-                relative.removeFirst()
-            }
+        if let identifier = outcome.badgeIdentifier {
+            FIFinderSyncController.default().setBadgeIdentifier(identifier, for: item)
         }
-
-        guard let tier = state?.paths[relative] else {
-            return
-        }
-        FIFinderSyncController.default().setBadgeIdentifier(tier, for: item)
     }
 }
 
