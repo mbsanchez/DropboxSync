@@ -70,6 +70,52 @@ pub(crate) fn recently_toggled(within: Duration) -> bool {
     }
 }
 
+/// Every display, primary first.
+///
+/// The ordering is load-bearing: [`flyout_geometry::monitor_for_point`] falls back to `[0]`
+/// when a point lands outside every display, which is exactly what a coordinate-space mismatch
+/// produces — so the fallback should be the primary rather than whichever display the OS
+/// happened to enumerate first.
+fn collect_monitor_boxes(app: &AppHandle) -> Vec<flyout_geometry::MonitorBox> {
+    use flyout_geometry::MonitorBox;
+    let mut boxes: Vec<MonitorBox> = Vec::new();
+    let mut push = |m: &tauri::Monitor| {
+        let b = MonitorBox {
+            x: m.position().x as f64,
+            y: m.position().y as f64,
+            width: m.size().width as f64,
+            height: m.size().height as f64,
+        };
+        if !boxes.contains(&b) {
+            boxes.push(b);
+        }
+    };
+    if let Ok(Some(m)) = app.primary_monitor() {
+        push(&m);
+    }
+    if let Ok(all) = app.available_monitors() {
+        for m in all {
+            push(&m);
+        }
+    }
+    boxes
+}
+
+/// Logs the display layout once, at startup (DBSYNC-85).
+///
+/// The click-time line in [`position_flyout`] is the one that answers GitHub #112, but it only
+/// appears when someone clicks the tray icon — and the icon can be invisible when the menu bar
+/// overflows, which is exactly what happened while trying to verify this. Logging the layout at
+/// launch means the plumbing is provably alive without depending on a click, and it gives the
+/// measurement half its context for free.
+pub(crate) fn log_display_layout(app: &AppHandle) {
+    tracing::info!(
+        target: "dbsync85",
+        monitors = ?collect_monitor_boxes(app),
+        "display layout at startup"
+    );
+}
+
 /// Positions the `main` flyout window just above the tray icon, right-aligned to
 /// it — anchored to the primary/tray monitor's bottom-right corner (bottom taskbar
 /// assumption; no multi-monitor/taskbar-edge detection). All math is done in
@@ -83,31 +129,8 @@ fn position_flyout(
 ) {
     use flyout_geometry::{flyout_origin, monitor_for_point, MonitorBox, TrayRect};
 
-    // Primary first: `monitor_for_point` falls back to `[0]` when the click lands outside every
-    // display, which is exactly what a coordinate-space mismatch produces.
-    let mut boxes: Vec<MonitorBox> = Vec::new();
     let primary = app.primary_monitor().ok().flatten();
-    if let Some(m) = primary.as_ref() {
-        boxes.push(MonitorBox {
-            x: m.position().x as f64,
-            y: m.position().y as f64,
-            width: m.size().width as f64,
-            height: m.size().height as f64,
-        });
-    }
-    if let Ok(all) = app.available_monitors() {
-        for m in all {
-            let b = MonitorBox {
-                x: m.position().x as f64,
-                y: m.position().y as f64,
-                width: m.size().width as f64,
-                height: m.size().height as f64,
-            };
-            if !boxes.contains(&b) {
-                boxes.push(b);
-            }
-        }
-    }
+    let boxes = collect_monitor_boxes(app);
 
     // DBSYNC-85 instrumentation. One line per click, not per frame. It prints the raw tray
     // position, the tray rect and every display together so the coordinate space can be named
@@ -214,6 +237,8 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_dock_visibility(false);
+
+            log_display_layout(app.handle());
 
             #[cfg(windows)]
             {
