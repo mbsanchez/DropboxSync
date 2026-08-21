@@ -1,9 +1,19 @@
 import type { SyncHealth } from "@dropbox-sync/shared";
 
+/**
+ * Whether the user has switched the Finder Sync extension on (DBSYNC-86).
+ *
+ * Three states rather than a boolean on purpose: `notApplicable` means "not macOS, or we could
+ * not tell", and must never be treated as `disabled` — a Windows user has no Finder extension
+ * to configure and must not be warned about one.
+ */
+export type FinderExtensionState = "enabled" | "disabled" | "notApplicable";
+
 export type StartupRequirements = {
   authOk: boolean;
   syncFolderOk: boolean;
   syncFolder?: string;
+  finderExtension: FinderExtensionState;
 };
 
 export type SyncStatus = {

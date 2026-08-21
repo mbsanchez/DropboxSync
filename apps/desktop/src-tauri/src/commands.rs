@@ -190,6 +190,7 @@ pub(crate) fn compute_startup_requirements(
                 auth_ok: true,
                 sync_folder_ok,
                 sync_folder,
+                finder_extension: crate::finder_extension::finder_extension_state(),
             });
         }
     }
@@ -208,6 +209,7 @@ pub(crate) fn compute_startup_requirements(
         auth_ok,
         sync_folder_ok,
         sync_folder,
+        finder_extension: crate::finder_extension::finder_extension_state(),
     })
 }
 

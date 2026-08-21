@@ -6,7 +6,7 @@ import { useSyncDashboard } from "../hooks/useSyncDashboard";
 import { useTransferProgress } from "../hooks/useTransferProgress";
 import { usePlaceholderEvents } from "../hooks/usePlaceholderEvents";
 import { formatBytes, formatSpeed } from "../format";
-import type { ActiveTransfer, ActivityEntry, SyncConflict, SyncJob, TriggerSyncResponse } from "../types";
+import type { ActiveTransfer, ActivityEntry, FinderExtensionState, SyncConflict, SyncJob, TriggerSyncResponse } from "../types";
 import "./FlyoutApp.css";
 
 type Section = "home" | "folders" | "activity";
@@ -283,7 +283,26 @@ function buildActivityFeed(jobs: SyncJob[], activity: ActivityEntry[]): Activity
  * the `.cloudsc` placeholder in the OS file manager. */
 function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
-  const { startupLoading, authOk, syncFolderOk, syncFolder } = useStartupRequirements(pushLog);
+  const { startupLoading, authOk, syncFolderOk, syncFolder, finderExtension } =
+    useStartupRequirements(pushLog);
+
+  /*
+    DBSYNC-86. Enabling the extension is not enough on its own — Finder has to reload the
+    plug-in, and until it does the badges stay absent and the user concludes it did not work.
+    There is no supported way to ask whether Finder has loaded it, so this infers the moment
+    from the disabled -> enabled transition the focus refresh already observes.
+
+    Deliberately a heuristic: it will occasionally suggest a restart that was not needed. That
+    costs one click. Staying silent costs a user who believes the app is broken.
+  */
+  const previousExtensionRef = useRef<FinderExtensionState>(finderExtension);
+  const [suggestFinderRestart, setSuggestFinderRestart] = useState(false);
+  useEffect(() => {
+    if (previousExtensionRef.current === "disabled" && finderExtension === "enabled") {
+      setSuggestFinderRestart(true);
+    }
+    previousExtensionRef.current = finderExtension;
+  }, [finderExtension]);
   const {
     status,
     jobs,
@@ -471,6 +490,69 @@ function FlyoutApp() {
       </nav>
 
       <div className="flyout-body">
+        {/*
+          DBSYNC-86. Only "disabled" warns: "notApplicable" means non-macOS or undetermined, and
+          a Windows user has no Finder extension to be told about. macOS re-registers the
+          plug-in disabled on every reinstall, so without this an app update silently switches
+          badges off and the app looks broken.
+        */}
+        {finderExtension === "disabled" && (
+          <div className="flyout-banner finder-extension-banner" role="alert">
+            <div className="finder-extension-banner-body">
+              <h3>Finder badges are switched off</h3>
+              <p>
+                The Finder extension is disabled, so files in your sync folder show no status
+                icons. macOS turns it off again after some app updates.
+              </p>
+              <p className="finder-extension-banner-note">
+                Enable it under System Settings &rarr; Privacy &amp; Security &rarr; Extensions
+                &rarr; Finder.
+              </p>
+              <div className="mass-delete-banner-actions">
+                <button
+                  type="button"
+                  className="flyout-btn"
+                  onClick={() => void invoke("open_finder_extension_settings")}
+                >
+                  Open settings
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* The extension is on, but Finder may still be running the old plug-in. */}
+        {suggestFinderRestart && finderExtension === "enabled" && (
+          <div className="flyout-banner finder-extension-banner" role="alert">
+            <div className="finder-extension-banner-body">
+              <h3>Extension enabled &mdash; Finder may need restarting</h3>
+              <p>
+                Finder keeps the previous plug-in until it restarts, so badges can stay missing
+                for a moment. Restarting closes your open Finder windows.
+              </p>
+              <div className="mass-delete-banner-actions">
+                <button
+                  type="button"
+                  className="flyout-btn"
+                  onClick={() => {
+                    void invoke("restart_finder");
+                    setSuggestFinderRestart(false);
+                  }}
+                >
+                  Restart Finder
+                </button>
+                <button
+                  type="button"
+                  className="flyout-btn"
+                  onClick={() => setSuggestFinderRestart(false)}
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {massDeletePaused && (
           <div className="flyout-banner mass-delete-banner" role="alert">
             <div className="mass-delete-banner-icon" aria-hidden="true">

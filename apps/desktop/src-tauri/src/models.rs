@@ -106,6 +106,10 @@ pub(crate) struct StartupRequirementsResponse {
     pub auth_ok: bool,
     pub sync_folder_ok: bool,
     pub sync_folder: Option<String>,
+    /// Whether the Finder Sync extension is switched on (DBSYNC-86). Rides here rather than in
+    /// its own command because the UI already re-reads this shape on window focus, which is
+    /// exactly when `FinderSync.h` says to re-check.
+    pub finder_extension: crate::finder_extension::FinderExtensionState,
 }
 
 /// Emitted to the webview after the localhost OAuth redirect is handled (success or failure).
