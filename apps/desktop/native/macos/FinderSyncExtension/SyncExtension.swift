@@ -11,12 +11,16 @@ final class DropboxSyncFinderSync: FIFinderSync {
     private var state: OverlayState?
     private var reloadTimer: Timer?
 
-    /// Relative paths Finder has already been given a badge for.
+    /// Relative paths Finder is **displaying** — every path it has asked about, whether or
+    /// not we had a tier to give it at the time.
     ///
-    /// Apple's `FinderSync.h` says to "call this method only for items that have already
-    /// received a badge" when updating, so a push is only legitimate for a path in here.
-    /// Everything else is Finder's to ask about when it displays the item.
-    private var badgedPaths: Set<String> = []
+    /// Apple's `FinderSync.h` warns against badging "items that the Finder hasn't displayed
+    /// yet", so a push is only legitimate for a path in here. It deliberately holds
+    /// asked-about paths rather than badged ones: a `.cloudsc` placeholder is drawn before
+    /// the state file catches up, so it gets no badge on the first ask, and if it were left
+    /// out of this set the tier arriving moments later would be filtered away and the file
+    /// would never be badged at all. Finder does not ask twice.
+    private var displayedPaths: Set<String> = []
 
     /// `updated_at` of the snapshot currently in `state`. The Rust writer stamps every
     /// snapshot (`overlay_state.rs`), so an unchanged value means an unchanged file and the
@@ -144,12 +148,12 @@ final class DropboxSyncFinderSync: FIFinderSync {
         state = decoded
         lastUpdatedAt = decoded.updatedAt
 
-        if previousPaths == nil && !badgedPaths.isEmpty {
+        if previousPaths == nil && !displayedPaths.isEmpty {
             // The snapshot was lost — the state file was unreadable for a moment — but
             // Finder is still showing badges we know about. `changes(from: nil, …)` is
             // empty by design, so without this every visible badge would stay frozen until
             // the user left the directory and came back: this ticket's bug, narrower door.
-            pushBadgeChanges(BadgeDiff.resync(to: decoded.paths, alreadyBadged: badgedPaths))
+            pushBadgeChanges(BadgeDiff.resync(to: decoded.paths, displayed: displayedPaths))
         } else {
             pushBadgeChanges(BadgeDiff.changes(from: previousPaths, to: decoded.paths))
         }
@@ -164,7 +168,7 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// "When updating badges, call this method only for items that have already received a
     /// badge." Hence the `pushable` filter rather than pushing everything that changed.
     private func pushBadgeChanges(_ changes: BadgeDiff.Changes) {
-        let pushable = BadgeDiff.pushable(changes, alreadyBadged: badgedPaths)
+        let pushable = BadgeDiff.pushable(changes, displayed: displayedPaths)
         guard !pushable.isEmpty, let root = syncFolderRoot() else {
             return
         }
@@ -181,7 +185,7 @@ final class DropboxSyncFinderSync: FIFinderSync {
         for relative in pushable.removed {
             guard let url = url(forRelative: relative, under: root) else { continue }
             controller.setBadgeIdentifier("", for: url)
-            badgedPaths.remove(relative)
+            displayedPaths.remove(relative)
         }
     }
 
@@ -208,26 +212,15 @@ final class DropboxSyncFinderSync: FIFinderSync {
             return
         }
         let item = url.standardizedFileURL
-        guard let relative = BadgeDiff.relativePath(of: item.path, under: root.path),
-              !relative.isEmpty else {
-            return
+        let outcome = BadgeDiff.requestOutcome(
+            for: item.path, root: root.path, paths: state?.paths
+        )
+        if let displayed = outcome.displayedPath {
+            displayedPaths.insert(displayed)
         }
-
-        guard let tier = state?.paths[relative] else {
-            // Finder asked about something we do not track. Returning here used to leave
-            // whatever badge it already had in place forever (GitHub #104); clear it
-            // instead. `""` is the documented removal identifier, per `FinderSync.h`.
-            if badgedPaths.contains(relative) {
-                FIFinderSyncController.default().setBadgeIdentifier("", for: item)
-                badgedPaths.remove(relative)
-            }
-            return
+        if let identifier = outcome.badgeIdentifier {
+            FIFinderSyncController.default().setBadgeIdentifier(identifier, for: item)
         }
-
-        FIFinderSyncController.default().setBadgeIdentifier(tier, for: item)
-        // Record it: from now on this path is one Finder has displayed, so pushing updates
-        // for it is legitimate under Apple's rule.
-        badgedPaths.insert(relative)
     }
 }
 

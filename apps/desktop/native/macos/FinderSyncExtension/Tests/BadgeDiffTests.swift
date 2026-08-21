@@ -57,6 +57,24 @@ struct BadgeDiffTests {
         }
     }
 
+    static func checkOutcome(
+        _ label: String,
+        _ actual: BadgeDiff.RequestOutcome,
+        displayedPath: String?,
+        badgeIdentifier: String?
+    ) {
+        let expected = BadgeDiff.RequestOutcome(
+            displayedPath: displayedPath, badgeIdentifier: badgeIdentifier)
+        if actual == expected {
+            print("  ok   \(label)")
+        } else {
+            print("  FAIL \(label)")
+            print("       expected \(expected)")
+            print("       actual   \(actual)")
+            failures += 1
+        }
+    }
+
     static func main() {
         print("BadgeDiff")
 
@@ -111,29 +129,39 @@ struct BadgeDiffTests {
 
         // Apple's header: "call this method only for items that have already received a
         // badge". A tier change in a folder Finder never opened must NOT be pushed.
-        check("an unbadged path is not pushable",
+        check("a path Finder has never displayed is not pushable",
               BadgeDiff.pushable(
                   BadgeDiff.Changes(changed: ["never-seen.txt": "synced"], removed: []),
-                  alreadyBadged: []),
+                  displayed: []),
               changed: [:], removed: [])
 
-        check("a badged path is pushable",
+        check("a displayed path is pushable",
               BadgeDiff.pushable(
                   BadgeDiff.Changes(changed: ["seen.txt": "synced"], removed: []),
-                  alreadyBadged: ["seen.txt"]),
+                  displayed: ["seen.txt"]),
               changed: ["seen.txt": "synced"], removed: [])
 
-        check("mixed badged and unbadged keeps only the badged",
+        // DBSYNC-84 symptom 1, and the case whose absence let a green run hide the hole.
+        // A `.cloudsc` placeholder is drawn before the state file catches up: Finder asks,
+        // there is no tier yet, so nothing is badged — but the path IS displayed. When the
+        // tier arrives it must be pushed, because Finder will not ask a second time.
+        check("a DISPLAYED but never-badged path is still pushable",
+              BadgeDiff.pushable(
+                  BadgeDiff.Changes(changed: ["new.cloudsc": "cloud_only"], removed: []),
+                  displayed: ["new.cloudsc"]),
+              changed: ["new.cloudsc": "cloud_only"], removed: [])
+
+        check("mixed displayed and undisplayed keeps only the displayed",
               BadgeDiff.pushable(
                   BadgeDiff.Changes(changed: ["seen.txt": "synced", "never.txt": "syncing"],
                                     removed: ["gone-seen.txt", "gone-never.txt"]),
-                  alreadyBadged: ["seen.txt", "gone-seen.txt"]),
+                  displayed: ["seen.txt", "gone-seen.txt"]),
               changed: ["seen.txt": "synced"], removed: ["gone-seen.txt"])
 
         check("removals are filtered too",
               BadgeDiff.pushable(
                   BadgeDiff.Changes(changed: [:], removed: ["never-seen.txt"]),
-                  alreadyBadged: []),
+                  displayed: []),
               changed: [:], removed: [])
 
         print("BadgeDiff.isContained")
@@ -170,18 +198,48 @@ struct BadgeDiffTests {
 
         print("BadgeDiff.resync")
 
-        check("resync refreshes only the badged paths",
+        check("resync refreshes only the displayed paths",
               BadgeDiff.resync(to: ["a.txt": "synced", "b.txt": "cloud_only"],
-                               alreadyBadged: ["a.txt"]),
+                               displayed: ["a.txt"]),
               changed: ["a.txt": "synced"], removed: [])
 
-        check("resync clears badged paths that are gone from the new snapshot",
-              BadgeDiff.resync(to: ["a.txt": "synced"], alreadyBadged: ["a.txt", "gone.txt"]),
+        check("resync clears displayed paths that are gone from the new snapshot",
+              BadgeDiff.resync(to: ["a.txt": "synced"], displayed: ["a.txt", "gone.txt"]),
               changed: ["a.txt": "synced"], removed: ["gone.txt"])
 
-        check("resync with nothing badged does nothing",
-              BadgeDiff.resync(to: ["a.txt": "synced"], alreadyBadged: []),
+        check("resync with nothing displayed does nothing",
+              BadgeDiff.resync(to: ["a.txt": "synced"], displayed: []),
               changed: [:], removed: [])
+
+        print("BadgeDiff.requestOutcome")
+
+        let tracked = ["a.txt": "synced"]
+
+        checkOutcome("a tracked file is displayed and badged with its tier",
+                     BadgeDiff.requestOutcome(for: "/Users/x/DropboxSync/a.txt",
+                                              root: root, paths: tracked),
+                     displayedPath: "a.txt", badgeIdentifier: "synced")
+
+        // THE REGRESSION GUARD. Recording the path only after a tier was found passed 27
+        // green checks and a clean build; this is the check that would have failed.
+        checkOutcome("an UNTRACKED file inside the root still counts as displayed",
+                     BadgeDiff.requestOutcome(for: "/Users/x/DropboxSync/new.cloudsc",
+                                              root: root, paths: tracked),
+                     displayedPath: "new.cloudsc", badgeIdentifier: "")
+
+        checkOutcome("with no state at all, the path is still displayed",
+                     BadgeDiff.requestOutcome(for: "/Users/x/DropboxSync/a.txt",
+                                              root: root, paths: nil),
+                     displayedPath: "a.txt", badgeIdentifier: "")
+
+        checkOutcome("a sibling directory is neither displayed nor badged",
+                     BadgeDiff.requestOutcome(for: "/Users/x/DropboxSyncEvil/secret.txt",
+                                              root: root, paths: tracked),
+                     displayedPath: nil, badgeIdentifier: nil)
+
+        checkOutcome("the sync folder itself is not an item",
+                     BadgeDiff.requestOutcome(for: root, root: root, paths: tracked),
+                     displayedPath: nil, badgeIdentifier: nil)
 
         if failures == 0 {
             print("BadgeDiff: all checks passed")

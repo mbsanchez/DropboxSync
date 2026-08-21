@@ -42,7 +42,7 @@ enum BadgeDiff {
         return Changes(changed: changed, removed: removed)
     }
 
-    /// Narrows `changes` to the items Finder has **already badged**.
+    /// Narrows `changes` to the items Finder is **displaying**.
     ///
     /// Apple's own guidance, in `FinderSync.h` alongside `setBadgeIdentifier:forURL:`:
     ///
@@ -51,14 +51,19 @@ enum BadgeDiff {
     /// > `requestBadgeIdentifierForURL:` method. When updating badges, call this method only
     /// > for items that have already received a badge.
     ///
-    /// So a push is only legitimate for a path Finder previously asked about. Anything else
-    /// is handled by `requestBadgeIdentifier(for:)` when Finder gets round to displaying it.
-    /// Without this filter a file that changes tier while its folder is closed would be
-    /// pushed at Finder for an item it has never drawn.
-    static func pushable(_ changes: Changes, alreadyBadged: Set<String>) -> Changes {
+    /// The operative constraint is the first sentence: **displayed**. `displayed` therefore
+    /// holds every path Finder has asked about, not only the ones that came back with a
+    /// badge.
+    ///
+    /// Reading "already received a badge" literally is a trap, and this filter fell into it
+    /// once: a `.cloudsc` placeholder appears, Finder asks about it before the state file
+    /// has caught up, so nothing is badged — and when the tier arrives moments later the
+    /// path is filtered out and never badged at all. Finder does not ask twice. That is
+    /// symptom 1 of DBSYNC-84, reintroduced by the very filter meant to respect Apple's rule.
+    static func pushable(_ changes: Changes, displayed: Set<String>) -> Changes {
         Changes(
-            changed: changes.changed.filter { alreadyBadged.contains($0.key) },
-            removed: changes.removed.filter { alreadyBadged.contains($0) }
+            changed: changes.changed.filter { displayed.contains($0.key) },
+            removed: changes.removed.filter { displayed.contains($0) }
         )
     }
 
@@ -99,18 +104,51 @@ enum BadgeDiff {
     /// comes back. Which is the exact bug this ticket exists to fix, reached through a
     /// narrower door.
     ///
-    /// `alreadyBadged` is not lost in that reset, so the displayed items can be refreshed
-    /// directly. Every path here has already received a badge, so pushing to it is
-    /// legitimate under Apple's rule.
-    static func resync(to new: [String: String], alreadyBadged: Set<String>) -> Changes {
+    /// `displayed` is not lost in that reset, so those items can be refreshed directly.
+    /// Every path here is one Finder is showing, so pushing to it is legitimate.
+    static func resync(to new: [String: String], displayed: Set<String>) -> Changes {
         var changed: [String: String] = [:]
-        for path in alreadyBadged {
+        for path in displayed {
             if let tier = new[path] { changed[path] = tier }
         }
         return Changes(
             changed: changed,
-            removed: alreadyBadged.filter { new[$0] == nil }.sorted()
+            removed: displayed.filter { new[$0] == nil }.sorted()
         )
+    }
+
+    /// What to do when Finder asks about `path`.
+    ///
+    /// This exists because the placement of a single line was load-bearing and untestable.
+    /// Twice now a defect has lived in `SyncExtension.swift` where the check script cannot
+    /// reach it: the string-prefix containment bug, and then recording a path as displayed
+    /// only *after* a tier was found. The second one passed 27 green checks and a clean
+    /// build. Moving the decision here is what makes it a fact under test rather than a
+    /// property of where a statement happens to sit.
+    struct RequestOutcome: Equatable {
+        /// The relative path Finder is now displaying, or `nil` if it is outside the root.
+        ///
+        /// **Non-nil even when there is no tier to set.** Finder asking about an item means
+        /// it is on screen, and it will not ask twice — so a `.cloudsc` drawn before the
+        /// state file catches up must still count as displayed, or the tier arriving a
+        /// moment later is filtered out of the push and the file stays bare forever.
+        let displayedPath: String?
+        /// The identifier to hand to `setBadgeIdentifier`: a tier, or `""` to clear.
+        /// `nil` means do nothing at all.
+        let badgeIdentifier: String?
+    }
+
+    static func requestOutcome(
+        for path: String,
+        root: String,
+        paths: [String: String]?
+    ) -> RequestOutcome {
+        guard let relative = relativePath(of: path, under: root), !relative.isEmpty else {
+            return RequestOutcome(displayedPath: nil, badgeIdentifier: nil)
+        }
+        // `""` clears the badge — documented in `FinderSync.h`. An item we do not track
+        // must not keep a badge from a previous state.
+        return RequestOutcome(displayedPath: relative, badgeIdentifier: paths?[relative] ?? "")
     }
 }
 
