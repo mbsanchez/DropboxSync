@@ -186,3 +186,36 @@ Schema summary:
 - `npm run bundle:win` / `npm run dev:win` (Windows: release `.exe` only, no NSIS/MSI installer; `dev:win` also launches it)
 - `npm run tauri:before-build`
 - `npm run build:finder-sync`
+
+## macOS release architecture: arm64 only (DBSYNC-72 Slice 4)
+
+**Decision (2026-08-20): the shipped macOS build is arm64-only.** Intel support is deferred,
+not refused — see the trigger below.
+
+Measured on the signed release bundle:
+
+```
+host  (Contents/MacOS/dropbox_sync_desktop)  -> arm64
+appex (DropboxSyncFinderSync)                -> x86_64 arm64
+```
+
+The asymmetry is real and sits on the Rust/Tauri side. `build-appex.sh` builds the Finder Sync
+extension universal because that is what `xcodebuild` does by default here; `tauri build`
+produces a host binary for the build machine's architecture only.
+
+**Why arm64-only.** GitHub's `macos-latest` runner is arm64, so the CI release workflow
+(Slice 5, GitHub #85) reproduces this build with no extra configuration and no cross-target
+toolchain. Shipping universal would mean passing `--target universal-apple-darwin` to
+`tauri build`, which requires the x86_64 Rust target installed, roughly doubles the Rust link
+step, and enlarges the bundle — for a user base this project does not yet have.
+
+**Consequence to keep in mind.** The appex carries x86_64 slices the host can never load. That
+is dead weight, not a bug: a universal appex inside an arm64 host is valid and notarizes
+normally. Do not "fix" it by forcing the appex to arm64 unless the bundle size actually
+matters — keeping it universal is what makes a later switch to a universal host cheap.
+
+**When to revisit.** Ship universal if any of these becomes true: a real user reports an Intel
+Mac; the project starts distributing publicly rather than to the maintainer; or the CI runner
+image changes architecture. At that point the change is one flag on the Tauri build plus the
+x86_64 Rust target — Slice 5's workflow must then request the target explicitly rather than
+inheriting whatever the runner happens to be.
