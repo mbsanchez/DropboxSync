@@ -9,6 +9,8 @@ jobs:
   desktop-build:
     runs-on: macos-latest
     env:
+      # Literals, not secrets. The app reads these through `option_env!` with fallbacks
+      # (auth/oauth.rs), so CI only needs them to be present, never to be real.
       DROPBOX_APP_KEY: dummy
       DROPBOX_REDIRECT_URI: http://localhost:53682/callback
     steps:
@@ -19,9 +21,36 @@ jobs:
           cache: 'npm'
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
       - name: Install dependencies
         run: npm install
-      - name: Test frontend build
+
+      # The four steps below are the reason this workflow is worth running at all.
+      # Until 2026-08-22 it only compiled and bundled: 214 Rust tests and the Swift
+      # checks had never run in CI once. Of the defects that reached code review on
+      # 2026-08-21, a compile-only pipeline would have caught none of them.
+
+      - name: Rust tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Rust lints
+        # Not `-D warnings`: main currently carries 4 pre-existing warnings, and failing
+        # the build on them would put this workflow straight back to permanently red —
+        # which is how it got switched off in the first place. Clearing them is its own
+        # change; making them visible is this one.
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
+
+      - name: Finder Sync extension checks
+        run: apps/desktop/native/macos/FinderSyncExtension/Tests/run-badge-diff-tests.sh
+
+      - name: Frontend build and typecheck
         run: npm --workspace apps/desktop run build
-      - name: Build macOS alpha bundle
-        run: npm --workspace apps/desktop run tauri build
+
+      - name: Build macOS app bundle
+        # `bundle:dev` (--bundles app), not `tauri build`. The full build also produces a
+        # DMG, a stage that has never executed in CI even once because every run died
+        # earlier. Producing an installer belongs to the release workflow (GitHub #85);
+        # a PR check only needs to prove the app links.
+        run: npm --workspace apps/desktop run bundle:dev

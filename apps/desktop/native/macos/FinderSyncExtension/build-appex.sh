@@ -93,7 +93,11 @@ echo "Built: $OUT"
 # Guard the coupling between SyncExtension.swift's @objc(...) name and the plist's principal class.
 # Nothing else catches a drift: removing the @objc attribute changes the emitted ObjC symbol to the
 # Swift-mangled form and the plist silently stops resolving, with no build error and no test failure.
-# This ran green on macos-latest in CI via `tauri build` -> beforeBuildCommand -> build:finder-sync.
+# NOTE: an earlier version of this comment claimed this guard "ran green on macos-latest in CI".
+# That was false. CI was added 2026-04-02 and switched off 2026-07-12 after 28 runs, all of them
+# failures — it has never been green, and this guard was added five weeks after it was disabled,
+# so it had never run in CI at all. DBSYNC-74 restores the pipeline; until a run is actually
+# green, this guard is verified locally and nowhere else.
 if [[ -d "$OUT" ]]; then
   DECLARED=$(/usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPrincipalClass" "$OUT/Contents/Info.plist" 2>/dev/null || true)
   EMITTED=$(nm -a "$OUT/Contents/MacOS/${SCHEME}" 2>/dev/null | sed -n 's/.*_OBJC_CLASS_\$_//p' | head -1)
