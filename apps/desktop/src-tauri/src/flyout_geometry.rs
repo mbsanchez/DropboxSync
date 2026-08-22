@@ -5,11 +5,15 @@
 //! one display, and the bug being chased only appears with two. Once a layout is four numbers
 //! in a parameter, the arrangements nobody here owns become ordinary test data.
 //!
-//! **What this module deliberately does NOT do** is correct the reported multi-monitor
-//! inversion. The suspicion is that `tray-icon` reports clicks in Cocoa coordinates (origin
-//! bottom-left) while `monitor_from_point` expects winit's top-left space — but that is
-//! unmeasured, and a coordinate flip has roughly a coin-flip chance of looking correct on one
-//! arrangement while being wrong on another. Measurement is GitHub #112, the fix is #113.
+//! **The inversion turned out not to be a coordinate flip.** The original suspicion was that
+//! `tray-icon` reports clicks in Cocoa coordinates (origin bottom-left) while the monitor lookup
+//! expects winit's top-left space. Measured on 2026-08-22 with both displays connected (GitHub
+//! #112): it does not. Both are the same top-left-origin, physical-pixel global space, and each
+//! click landed ~35px below the top edge of *its own* display. No sign was ever flipped.
+//!
+//! What actually resolved the symptom was replacing `AppHandle::monitor_from_point` with the
+//! plain containment test in [`monitor_for_point`] — so on this project, do not reach back for
+//! that lookup. `maintainer_layout` in the tests below pins the arrangement that was broken.
 
 /// A display, as far as placement is concerned. Physical pixels, top-left origin — the space
 /// Tauri's `Monitor` reports in.
@@ -192,6 +196,128 @@ mod tests {
         let tray = TrayRect { x: 300.0, y: 0.0, width: 44.0, height: 48.0 };
         let (x, y) = flyout_origin(tray, tiny, 720.0, 1200.0, 16.0);
         assert_eq!((x, y), (0.0, 0.0));
+    }
+
+    // ---- Characterization: the maintainer's real arrangement (DBSYNC-85 Slice 3, #113) ----
+    //
+    // Characterization, NOT regression: these pin what the shipped code does on the hardware the
+    // bug was reported on. They do not guard the Y axis, and the doc comments below say why.
+
+    /// The arrangement that actually produced the reported inversion, measured 2026-08-22.
+    ///
+    /// Physical pixels, taken verbatim from the `dbsync85` log line (GitHub #112). The built-in
+    /// panel is the primary at the origin; the external display sits to its **left** and slightly
+    /// **above**, which is why both of its coordinates are negative. Every other test in this
+    /// module uses invented layouts — this one is the hardware the bug was reported on.
+    fn maintainer_layout() -> Vec<MonitorBox> {
+        vec![
+            MonitorBox { x: 0.0, y: 0.0, width: 3360.0, height: 2100.0 },
+            MonitorBox { x: -6016.0, y: -1076.0, width: 6016.0, height: 3384.0 },
+        ]
+    }
+
+    /// Both clicks verbatim from the log — not rounded, not reconstructed.
+    const CLICK_ON_BUILT_IN: (f64, f64) = (1898.28125, 34.1484375);
+    const CLICK_ON_EXTERNAL: (f64, f64) = (-1456.9453125, -1040.0);
+
+    /// Each measured click falls inside its own display and outside the other.
+    ///
+    /// This exercises [`MonitorBox::contains`], the predicate the whole lookup is built on, and it
+    /// fails if that predicate breaks — verified by mutation, not assumed.
+    ///
+    /// **What it does not do is guard the Y axis**, and it would be dishonest to imply otherwise:
+    /// the two displays have zero horizontal overlap, so X alone separates them. A sign flip on Y
+    /// leaves this green. The layouts that catch one are the invented stacked fixtures above,
+    /// which share an X range.
+    ///
+    /// The offsets below are recorded measurement, not a check that can fail — 34px on the
+    /// built-in (top edge 0), 36px on the external (top edge -1076). They are the evidence that Y
+    /// grows downward from one shared origin, kept here beside the data they describe.
+    #[test]
+    fn each_measured_click_falls_inside_its_own_display_and_no_other() {
+        let layout = maintainer_layout();
+        let built_in = layout[0];
+        let external = layout[1];
+
+        assert!(
+            built_in.contains(CLICK_ON_BUILT_IN.0, CLICK_ON_BUILT_IN.1),
+            "the built-in click must be inside the built-in panel"
+        );
+        assert!(
+            !external.contains(CLICK_ON_BUILT_IN.0, CLICK_ON_BUILT_IN.1),
+            "the built-in click must NOT also be inside the external display"
+        );
+
+        assert!(
+            external.contains(CLICK_ON_EXTERNAL.0, CLICK_ON_EXTERNAL.1),
+            "the external click must be inside the external display"
+        );
+        assert!(
+            !built_in.contains(CLICK_ON_EXTERNAL.0, CLICK_ON_EXTERNAL.1),
+            "the external click must NOT also be inside the built-in panel"
+        );
+    }
+
+    /// Click a screen, get that screen — both directions, against the real layout.
+    ///
+    /// **This is a characterization test, not a regression test, and the difference matters.**
+    /// Mutation-tested while writing it: flipping the sign of `py` in [`monitor_for_point`] — the
+    /// exact "fix" this ticket forbade guessing — leaves it **green**. The two displays have zero
+    /// horizontal overlap, so X alone identifies them and Y never gets a vote; the built-in click
+    /// then resolves through the fallback and still arrives at the right answer.
+    ///
+    /// So the maintainer's own arrangement cannot detect a Y-axis defect at all. What catches one
+    /// is `stacked()` above, where the displays share an X range — under the same mutation those
+    /// tests go red. Both kinds are kept deliberately: this one pins what the hardware does, that
+    /// one has the teeth.
+    #[test]
+    fn each_measured_click_resolves_to_the_display_it_was_made_on() {
+        let layout = maintainer_layout();
+
+        let m = monitor_for_point(&layout, CLICK_ON_BUILT_IN.0, CLICK_ON_BUILT_IN.1).unwrap();
+        assert_eq!((m.x, m.y), (0.0, 0.0), "click on the built-in must pick the built-in");
+
+        let m = monitor_for_point(&layout, CLICK_ON_EXTERNAL.0, CLICK_ON_EXTERNAL.1).unwrap();
+        assert_eq!(
+            (m.x, m.y),
+            (-6016.0, -1076.0),
+            "click on the external must pick the external"
+        );
+    }
+
+    /// And the window itself stays wholly on the clicked display, both ways.
+    ///
+    /// Same caveat as the test above: green under a `py` sign flip, for the same reason. It pins
+    /// behaviour on the real hardware; it does not guard the Y axis.
+    ///
+    /// The tray *rect* was not captured — the Slice 1 instrumentation logs the click position and
+    /// the monitor list but emits the line before the rect is converted (noted on #112). The rects
+    /// below are therefore reconstructed from each click plus a standard Retina menu-bar height,
+    /// not measured. The assertion is containment, which does not turn on their exact values.
+    #[test]
+    fn the_flyout_stays_on_the_clicked_display_in_both_directions() {
+        let layout = maintainer_layout();
+        let (win_w, win_h, gap) = (720.0, 1200.0, 16.0);
+
+        for (click, expected) in [
+            (CLICK_ON_BUILT_IN, layout[0]),
+            (CLICK_ON_EXTERNAL, layout[1]),
+        ] {
+            let monitor = monitor_for_point(&layout, click.0, click.1).unwrap();
+            assert_eq!((monitor.x, monitor.y), (expected.x, expected.y));
+
+            let tray = TrayRect { x: click.0, y: expected.y, width: 44.0, height: 48.0 };
+            let (x, y) = flyout_origin(tray, monitor, win_w, win_h, gap);
+
+            assert!(
+                x >= monitor.x && x + win_w <= monitor.x + monitor.width,
+                "window spilled horizontally off the clicked display: x={x}"
+            );
+            assert!(
+                y >= monitor.y && y + win_h <= monitor.y + monitor.height,
+                "window spilled vertically off the clicked display: y={y}"
+            );
+        }
     }
 
     /// Scale factors differ between a Retina laptop and an external display, so the numbers
