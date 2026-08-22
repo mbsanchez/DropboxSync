@@ -198,7 +198,10 @@ mod tests {
         assert_eq!((x, y), (0.0, 0.0));
     }
 
-    // ---- Regression: the maintainer's real arrangement (DBSYNC-85 Slice 3, GitHub #113) ----
+    // ---- Characterization: the maintainer's real arrangement (DBSYNC-85 Slice 3, #113) ----
+    //
+    // Characterization, NOT regression: these pin what the shipped code does on the hardware the
+    // bug was reported on. They do not guard the Y axis, and the doc comments below say why.
 
     /// The arrangement that actually produced the reported inversion, measured 2026-08-22.
     ///
@@ -217,28 +220,41 @@ mod tests {
     const CLICK_ON_BUILT_IN: (f64, f64) = (1898.28125, 34.1484375);
     const CLICK_ON_EXTERNAL: (f64, f64) = (-1456.9453125, -1040.0);
 
-    /// The measurement that killed the Cocoa-flip hypothesis, as an executable assertion.
+    /// Each measured click falls inside its own display and outside the other.
     ///
-    /// Each click lands just below the top edge of the display it was made on — 34px on the
-    /// built-in (top edge 0), 36px on the external (top edge -1076). That is only possible if Y
-    /// grows *downward* from one shared origin. If anyone ever "fixes" a sign on the tray
-    /// position, this is the test that should go red first.
+    /// This exercises [`MonitorBox::contains`], the predicate the whole lookup is built on, and it
+    /// fails if that predicate breaks — verified by mutation, not assumed.
+    ///
+    /// **What it does not do is guard the Y axis**, and it would be dishonest to imply otherwise:
+    /// the two displays have zero horizontal overlap, so X alone separates them. A sign flip on Y
+    /// leaves this green. The layouts that catch one are the invented stacked fixtures above,
+    /// which share an X range.
+    ///
+    /// The offsets below are recorded measurement, not a check that can fail — 34px on the
+    /// built-in (top edge 0), 36px on the external (top edge -1076). They are the evidence that Y
+    /// grows downward from one shared origin, kept here beside the data they describe.
     #[test]
-    fn measured_clicks_sit_in_each_displays_own_menu_bar_band() {
+    fn each_measured_click_falls_inside_its_own_display_and_no_other() {
         let layout = maintainer_layout();
         let built_in = layout[0];
         let external = layout[1];
 
-        let built_in_offset = CLICK_ON_BUILT_IN.1 - built_in.y;
-        let external_offset = CLICK_ON_EXTERNAL.1 - external.y;
-
         assert!(
-            (0.0..=60.0).contains(&built_in_offset),
-            "built-in click was {built_in_offset}px below its top edge, expected a menu-bar band"
+            built_in.contains(CLICK_ON_BUILT_IN.0, CLICK_ON_BUILT_IN.1),
+            "the built-in click must be inside the built-in panel"
         );
         assert!(
-            (0.0..=60.0).contains(&external_offset),
-            "external click was {external_offset}px below its top edge, expected a menu-bar band"
+            !external.contains(CLICK_ON_BUILT_IN.0, CLICK_ON_BUILT_IN.1),
+            "the built-in click must NOT also be inside the external display"
+        );
+
+        assert!(
+            external.contains(CLICK_ON_EXTERNAL.0, CLICK_ON_EXTERNAL.1),
+            "the external click must be inside the external display"
+        );
+        assert!(
+            !built_in.contains(CLICK_ON_EXTERNAL.0, CLICK_ON_EXTERNAL.1),
+            "the external click must NOT also be inside the built-in panel"
         );
     }
 
