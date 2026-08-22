@@ -127,7 +127,7 @@ fn position_flyout(
     position: PhysicalPosition<f64>,
     rect: Rect,
 ) {
-    use flyout_geometry::{flyout_origin, monitor_for_point, MonitorBox, TrayRect};
+    use flyout_geometry::{flyout_origin, monitor_for_point, TrayRect};
 
     let primary = app.primary_monitor().ok().flatten();
     let boxes = collect_monitor_boxes(app);
