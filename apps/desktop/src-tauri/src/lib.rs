@@ -8,6 +8,7 @@ mod commands;
 mod dropbox_transfer;
 mod error;
 mod finder_extension;
+mod flyout_geometry;
 mod fs_watcher;
 mod logging;
 mod models;
@@ -69,6 +70,52 @@ pub(crate) fn recently_toggled(within: Duration) -> bool {
     }
 }
 
+/// Every display, primary first.
+///
+/// The ordering is load-bearing: [`flyout_geometry::monitor_for_point`] falls back to `[0]`
+/// when a point lands outside every display, which is exactly what a coordinate-space mismatch
+/// produces — so the fallback should be the primary rather than whichever display the OS
+/// happened to enumerate first.
+fn collect_monitor_boxes(app: &AppHandle) -> Vec<flyout_geometry::MonitorBox> {
+    use flyout_geometry::MonitorBox;
+    let mut boxes: Vec<MonitorBox> = Vec::new();
+    let mut push = |m: &tauri::Monitor| {
+        let b = MonitorBox {
+            x: m.position().x as f64,
+            y: m.position().y as f64,
+            width: m.size().width as f64,
+            height: m.size().height as f64,
+        };
+        if !boxes.contains(&b) {
+            boxes.push(b);
+        }
+    };
+    if let Ok(Some(m)) = app.primary_monitor() {
+        push(&m);
+    }
+    if let Ok(all) = app.available_monitors() {
+        for m in all {
+            push(&m);
+        }
+    }
+    boxes
+}
+
+/// Logs the display layout once, at startup (DBSYNC-85).
+///
+/// The click-time line in [`position_flyout`] is the one that answers GitHub #112, but it only
+/// appears when someone clicks the tray icon — and the icon can be invisible when the menu bar
+/// overflows, which is exactly what happened while trying to verify this. Logging the layout at
+/// launch means the plumbing is provably alive without depending on a click, and it gives the
+/// measurement half its context for free.
+pub(crate) fn log_display_layout(app: &AppHandle) {
+    tracing::info!(
+        target: "dbsync85",
+        monitors = ?collect_monitor_boxes(app),
+        "display layout at startup"
+    );
+}
+
 /// Positions the `main` flyout window just above the tray icon, right-aligned to
 /// it — anchored to the primary/tray monitor's bottom-right corner (bottom taskbar
 /// assumption; no multi-monitor/taskbar-edge detection). All math is done in
@@ -80,47 +127,41 @@ fn position_flyout(
     position: PhysicalPosition<f64>,
     rect: Rect,
 ) {
-    let monitor = app
-        .monitor_from_point(position.x, position.y)
-        .ok()
-        .flatten()
-        .or_else(|| app.primary_monitor().ok().flatten());
+    use flyout_geometry::{flyout_origin, monitor_for_point, MonitorBox, TrayRect};
 
-    let Some(monitor) = monitor else {
+    let primary = app.primary_monitor().ok().flatten();
+    let boxes = collect_monitor_boxes(app);
+
+    // DBSYNC-85 instrumentation. One line per click, not per frame. It prints the raw tray
+    // position, the tray rect and every display together so the coordinate space can be named
+    // from a SINGLE line rather than reconstructed from three — see GitHub #112. The reported
+    // multi-monitor inversion is deliberately NOT corrected until this has been read on a
+    // two-display machine; guessing the sign would look right on one arrangement half the time.
+    tracing::info!(
+        target: "dbsync85",
+        tray_click_x = position.x,
+        tray_click_y = position.y,
+        monitors = ?boxes,
+        "tray click geometry"
+    );
+
+    let scale = primary.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+    let rect_pos = rect.position.to_physical::<f64>(scale);
+    let rect_size = rect.size.to_physical::<f64>(scale);
+
+    let Some(monitor) = monitor_for_point(&boxes, position.x, position.y) else {
         let _ = window.show();
         return;
     };
 
-    let scale = monitor.scale_factor();
-    let mon_pos = monitor.position();
-    let mon_size = monitor.size();
-
-    let rect_pos = rect.position.to_physical::<f64>(scale);
-    let rect_size = rect.size.to_physical::<f64>(scale);
-
-    // `main` window is a fixed LOGICAL 360x600 (tauri.conf.json); convert to physical.
-    let win_w = 360.0 * scale;
-    let win_h = 600.0 * scale;
-    let gap = 8.0 * scale;
-
-    let mut x = rect_pos.x + rect_size.width - win_w;
-    let mut y = rect_pos.y - win_h - gap;
-
-    let min_x = mon_pos.x as f64;
-    let max_x = min_x + mon_size.width as f64 - win_w;
-    let min_y = mon_pos.y as f64;
-    let max_y = min_y + mon_size.height as f64 - win_h;
-
-    x = if max_x >= min_x {
-        x.clamp(min_x, max_x)
-    } else {
-        min_x
+    let tray = TrayRect {
+        x: rect_pos.x,
+        y: rect_pos.y,
+        width: rect_size.width,
+        height: rect_size.height,
     };
-    y = if max_y >= min_y {
-        y.clamp(min_y, max_y)
-    } else {
-        min_y
-    };
+    // `main` is a fixed LOGICAL 360x600 (tauri.conf.json); convert to physical.
+    let (x, y) = flyout_origin(tray, monitor, 360.0 * scale, 600.0 * scale, 8.0 * scale);
 
     let _ = window.set_position(PhysicalPosition::new(x, y));
     let _ = window.show();
@@ -196,6 +237,8 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_dock_visibility(false);
+
+            log_display_layout(app.handle());
 
             #[cfg(windows)]
             {
