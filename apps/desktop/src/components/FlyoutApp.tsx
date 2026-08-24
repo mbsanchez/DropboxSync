@@ -533,9 +533,15 @@ function FlyoutApp() {
           <div className="flyout-banner finder-extension-banner" role="alert">
             <div className="finder-extension-banner-body">
               <h3>Extension enabled &mdash; Finder may need restarting</h3>
+              {/*
+                Do not promise that windows close. macOS relaunches Finder and restores them,
+                so the old copy described something the user would never see — and when they
+                saw their windows still open, the honest conclusion was that nothing happened
+                (DBSYNC-88). Say what they WILL see instead.
+              */}
               <p>
                 Finder keeps the previous plug-in until it restarts, so badges can stay missing
-                for a moment. Restarting closes your open Finder windows.
+                for a moment. Your open windows reopen by themselves.
               </p>
               <div className="mass-delete-banner-actions">
                 <button
