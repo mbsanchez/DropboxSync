@@ -60,11 +60,45 @@ enum BadgeDiff {
     /// has caught up, so nothing is badged — and when the tier arrives moments later the
     /// path is filtered out and never badged at all. Finder does not ask twice. That is
     /// symptom 1 of DBSYNC-84, reintroduced by the very filter meant to respect Apple's rule.
-    static func pushable(_ changes: Changes, displayed: Set<String>) -> Changes {
-        Changes(
-            changed: changes.changed.filter { displayed.contains($0.key) },
-            removed: changes.removed.filter { displayed.contains($0) }
+    ///
+    /// `observedDirectories` closes a second hole in the same idea (DBSYNC-87). Finder only
+    /// asks about an item while **enumerating** a directory, so a file that is *created*
+    /// while its folder is already open is never asked about and never enters `displayed`.
+    /// Hydration does exactly that: it downloads `foo.txt` and deletes `foo.txt.cloudsc`, so
+    /// the tier arrives against a path Finder has never named. Every push for it was dropped
+    /// here, and only re-entering the directory — which forces a fresh enumeration — showed
+    /// the badge.
+    ///
+    /// An item in a directory Finder is currently observing **is** displayed, which is the
+    /// condition Apple's first sentence actually states. Widening to "asked about, or sitting
+    /// in a folder on screen" is therefore closer to the documented rule than the narrower
+    /// test it replaces, not a relaxation of it.
+    static func pushable(
+        _ changes: Changes,
+        displayed: Set<String>,
+        observedDirectories: Set<String>
+    ) -> Changes {
+        func isPushable(_ path: String) -> Bool {
+            displayed.contains(path) || observedDirectories.contains(parentDirectory(of: path))
+        }
+        return Changes(
+            changed: changes.changed.filter { isPushable($0.key) },
+            removed: changes.removed.filter(isPushable)
         )
+    }
+
+    /// The directory part of a relative path: `"sub/a.txt"` → `"sub"`, `"a.txt"` → `""`.
+    ///
+    /// `""` is the sync folder itself, which is a real answer rather than a missing one —
+    /// files sitting directly in the sync root are the common case, and their parent has to
+    /// compare equal to the relative path of the root that [`relativePath`] produces.
+    ///
+    /// Only the LAST separator is cut, so a file in a subfolder of an observed directory does
+    /// not match that directory. `"sub/deep/a.txt"` yields `"sub/deep"`, not `"sub"` — and it
+    /// should, because Finder showing `sub` does not put the contents of `sub/deep` on screen.
+    static func parentDirectory(of relative: String) -> String {
+        guard let separator = relative.lastIndex(of: "/") else { return "" }
+        return String(relative[relative.startIndex..<separator])
     }
 
     /// Whether `path` is `root` itself or lives inside it.

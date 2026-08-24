@@ -24,13 +24,27 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// **This set only ever grows, and that is deliberate.** Clearing a badge does not mean
     /// Finder stopped showing the item — the file is still on screen with no status to
     /// display. Dropping a path here when its badge is cleared means a file that leaves the
-    /// state map and comes back is filtered out of the push and never badged again. The
-    /// only genuine "no longer displayed" signal is `endObservingDirectoryAtURL:`, which
-    /// this extension does not implement.
+    /// state map and comes back is filtered out of the push and never badged again.
     ///
     /// The cost of never shrinking is one string per distinct path Finder has shown inside
     /// the sync folder — a few MB at the 50,000 files DBSYNC-80 measured. Accepted.
+    ///
+    /// It is not the whole story on its own: Finder only asks while enumerating, so a file
+    /// created in an already-open folder never appears here. [`observedDirectories`] covers
+    /// that case (DBSYNC-87).
     private var displayedPaths: Set<String> = []
+
+    /// Absolute paths of the directories Finder is showing right now (DBSYNC-87).
+    ///
+    /// Unlike [`displayedPaths`] this one shrinks, because `endObservingDirectory(at:)` is a
+    /// genuine "no longer on screen" signal — the only one this API provides.
+    ///
+    /// **Absolute rather than relative on purpose.** These callbacks can fire before the
+    /// first `overlay_state.json` read lands, and at that moment there is no sync root to
+    /// make a path relative to. Storing what Finder actually hands us keeps the record
+    /// correct regardless of when state arrives; the conversion to relative paths happens at
+    /// push time, when the root is known or the push is skipped anyway.
+    private var observedDirectories: Set<String> = []
 
     /// `updated_at` of the snapshot currently in `state`. The Rust writer stamps every
     /// snapshot (`overlay_state.rs`), so an unchanged value means an unchanged file and the
@@ -178,8 +192,18 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// "When updating badges, call this method only for items that have already received a
     /// badge." Hence the `pushable` filter rather than pushing everything that changed.
     private func pushBadgeChanges(_ changes: BadgeDiff.Changes) {
-        let pushable = BadgeDiff.pushable(changes, displayed: displayedPaths)
-        guard !pushable.isEmpty, let root = syncFolderRoot() else {
+        guard let root = syncFolderRoot() else {
+            return
+        }
+        // Converted here rather than stored relative: see `observedDirectories`. Anything
+        // outside the root drops out, which is also the containment guard for this input.
+        let observedRelatives = Set(
+            observedDirectories.compactMap { BadgeDiff.relativePath(of: $0, under: root.path) }
+        )
+        let pushable = BadgeDiff.pushable(
+            changes, displayed: displayedPaths, observedDirectories: observedRelatives
+        )
+        guard !pushable.isEmpty else {
             return
         }
         let controller = FIFinderSyncController.default()
@@ -214,6 +238,21 @@ final class DropboxSyncFinderSync: FIFinderSync {
         let url = root.appendingPathComponent(relative).standardizedFileURL
         guard BadgeDiff.isContained(url.path, in: root.path) else { return nil }
         return url
+    }
+
+    /// Finder started showing a directory inside the sync folder (DBSYNC-87).
+    ///
+    /// This is what makes a badge reach a file that did not exist when the folder was opened.
+    /// Hydration creates such a file every time — `foo.txt` appears while `foo.txt.cloudsc`
+    /// disappears — and Finder never asks about it, because it only asks while enumerating.
+    override func beginObservingDirectory(at url: URL) {
+        observedDirectories.insert(url.standardizedFileURL.path)
+    }
+
+    /// Finder stopped showing a directory. Pushing into it from here on would be badging
+    /// items that are no longer on screen, which is the thing `FinderSync.h` warns against.
+    override func endObservingDirectory(at url: URL) {
+        observedDirectories.remove(url.standardizedFileURL.path)
     }
 
     override func requestBadgeIdentifier(for url: URL) {
