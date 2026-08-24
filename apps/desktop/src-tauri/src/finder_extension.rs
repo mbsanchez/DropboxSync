@@ -338,6 +338,22 @@ mod tests {
         assert!(!warns(FinderExtensionState::Translocated));
     }
 
+    /// Pins the wire format against `FinderExtensionState` in `apps/desktop/src/types.ts`.
+    ///
+    /// Nothing else checks this seam. The frontend compares these values as string literals,
+    /// so renaming a variant here — or changing the serde casing — would make every comparison
+    /// silently false: no banner, no error, no failing build, in either language. That is the
+    /// same shape of defect as the one this ticket exists for, so it gets a test rather than a
+    /// convention.
+    #[test]
+    fn serialized_names_match_the_typescript_union() {
+        let wire = |s: FinderExtensionState| serde_json::to_string(&s).unwrap();
+        assert_eq!(wire(FinderExtensionState::Enabled), "\"enabled\"");
+        assert_eq!(wire(FinderExtensionState::Disabled), "\"disabled\"");
+        assert_eq!(wire(FinderExtensionState::Translocated), "\"translocated\"");
+        assert_eq!(wire(FinderExtensionState::NotApplicable), "\"notApplicable\"");
+    }
+
     /// The exact path the instrumented build logged on the machine that reproduced DBSYNC-88.
     /// Pinned verbatim: this is the observation the whole fix rests on, and a predicate that
     /// stopped matching it would silently restore the false "extension is off" banner.
