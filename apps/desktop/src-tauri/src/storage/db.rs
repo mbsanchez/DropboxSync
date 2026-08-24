@@ -59,6 +59,19 @@ pub struct ConflictRow {
 pub struct Db {
     write: Mutex<Connection>,
     read: Mutex<Connection>,
+    /// The directory this database lives in, and therefore the directory every other
+    /// per-instance artefact belongs in (DBSYNC-75).
+    ///
+    /// Recorded so that writers of sibling files do not have to reach for the global
+    /// [`app_data_dir`]. `overlay_state.json` did exactly that, which meant `cargo test` —
+    /// whose `AppState` is built against a `tempdir()` — overwrote the **running user's**
+    /// real overlay file with a sync folder that the test then deleted. The Finder Sync
+    /// extension reads that file every two seconds, so the user's badges stopped rendering
+    /// until it was repaired by hand.
+    ///
+    /// `new_at`'s own doc already promised that "running `cargo test` never touches a
+    /// user's real DB". This extends the same promise to everything written beside it.
+    data_dir: PathBuf,
 }
 
 impl Db {
@@ -88,7 +101,16 @@ impl Db {
         Ok(Self {
             write: Mutex::new(write),
             read: Mutex::new(read),
+            // A database path always has a parent in practice; `.` keeps the type total
+            // without inventing a location, and is only reachable for a bare filename.
+            data_dir: path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
         })
+    }
+
+    /// The directory this database lives in. See the field's documentation for why sibling
+    /// files must be resolved from here rather than from [`app_data_dir`] (DBSYNC-75).
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 
     pub fn set_sync_folder(&self, folder: &str) -> AppResult<()> {
