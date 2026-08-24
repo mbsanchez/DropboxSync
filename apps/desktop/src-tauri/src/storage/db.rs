@@ -59,6 +59,19 @@ pub struct ConflictRow {
 pub struct Db {
     write: Mutex<Connection>,
     read: Mutex<Connection>,
+    /// The directory this database lives in, and therefore the directory every other
+    /// per-instance artefact belongs in (DBSYNC-75).
+    ///
+    /// Recorded so that writers of sibling files do not have to reach for the global
+    /// [`app_data_dir`]. `overlay_state.json` did exactly that, which meant `cargo test` —
+    /// whose `AppState` is built against a `tempdir()` — overwrote the **running user's**
+    /// real overlay file with a sync folder that the test then deleted. The Finder Sync
+    /// extension reads that file every two seconds, so the user's badges stopped rendering
+    /// until it was repaired by hand.
+    ///
+    /// `new_at`'s own doc already promised that "running `cargo test` never touches a
+    /// user's real DB". This extends the same promise to everything written beside it.
+    data_dir: PathBuf,
 }
 
 impl Db {
@@ -88,7 +101,24 @@ impl Db {
         Ok(Self {
             write: Mutex::new(write),
             read: Mutex::new(read),
+            // `parent()` is not the same as "the directory it is in": for a bare filename
+            // it returns `Some("")`, not `None` (measured, not assumed). An empty data dir
+            // would silently place sibling files in the process's working directory, so the
+            // empty case is folded in with the `None` case and both become `.` — the same
+            // directory, said out loud. Neither is reachable from the two call sites, which
+            // pass absolute paths; this exists so that a future third one cannot be subtly
+            // wrong.
+            data_dir: match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => PathBuf::from("."),
+            },
         })
+    }
+
+    /// The directory this database lives in. See the field's documentation for why sibling
+    /// files must be resolved from here rather than from [`app_data_dir`] (DBSYNC-75).
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 
     pub fn set_sync_folder(&self, folder: &str) -> AppResult<()> {
@@ -1273,6 +1303,26 @@ pub fn app_data_dir() -> AppResult<PathBuf> {
     let path = resolve_app_data_dir()?;
     std::fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::Db;
+
+    /// `data_dir` must never be the empty path (DBSYNC-75). `Path::parent()` returns
+    /// `Some("")` for a bare filename rather than `None` — verified, because the first
+    /// version of this code assumed `None` and its fallback was therefore dead. An empty
+    /// data dir would put `overlay_state.json` in the process's working directory, which is
+    /// a quieter version of the very bug this ticket fixes.
+    #[test]
+    fn a_bare_filename_still_yields_a_usable_data_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Opened through a relative name, with the cwd irrelevant to the assertion: what
+        // matters is that the recorded directory is usable, never "".
+        let db = Db::new_at(&tmp.path().join("app.db")).expect("db");
+        assert!(!db.data_dir().as_os_str().is_empty());
+        assert_eq!(db.data_dir(), tmp.path());
+    }
 }
 
 #[cfg(test)]

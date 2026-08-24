@@ -31,7 +31,7 @@ pub enum OverlayTier {
 /// Versioned shell **status contract** (DBSYNC-51): the single source of per-path
 /// sync state read by every native surface — macOS Finder Sync badges, Linux
 /// file-manager emblems, and the Windows status column. Written atomically to
-/// `overlay_state.json` under [`db::app_data_dir`].
+/// `overlay_state.json` beside the database that produced it (DBSYNC-75).
 ///
 /// Schema (`version = 1`):
 /// - `version`: contract version; bump on a breaking change.
@@ -72,9 +72,11 @@ pub(crate) fn refresh_overlay_state_internal(state: &AppState) {
 /// Per-path tiers for the current state — the whole decision, with no I/O of its own
 /// beyond reading the database and the sync folder.
 ///
-/// Split out of [`refresh_overlay_state_inner`] so it can be tested directly: that
-/// function writes to the real [`db::app_data_dir`], and a test calling it would clobber
-/// the running user's `overlay_state.json` (DBSYNC-75).
+/// Split out of [`refresh_overlay_state_inner`] so it can be tested directly. That was
+/// originally a workaround: the writer resolved its destination globally, so any test
+/// calling it clobbered the running user's `overlay_state.json`. Fixed in DBSYNC-75 — the
+/// writer now follows the database — so the split is no longer load-bearing, but it is
+/// kept: a pure decision function is worth having on its own terms.
 fn compute_overlay_paths(state: &AppState) -> AppResult<HashMap<String, OverlayTier>> {
     let job_paths = active_job_paths(&state.db)?;
     let conflict_paths = unresolved_conflict_paths(&state.db)?;
@@ -140,8 +142,12 @@ fn refresh_overlay_state_inner(state: &AppState) -> AppResult<()> {
         paths,
     };
 
-    let dir = db::app_data_dir()?;
-    let dest = overlay_state_path(&dir);
+    // Beside the database, NOT via the global `app_data_dir()` (DBSYNC-75). In production
+    // these are the same directory. Under `cargo test` they are not: the harness builds its
+    // `AppState` on a `tempdir()`, and resolving globally here overwrote the running user's
+    // real `overlay_state.json` with a sync folder the test then deleted — leaving the
+    // Finder Sync extension pointed at nothing and every badge gone until it was repaired.
+    let dest = overlay_state_path(state.db.data_dir());
     let json = serde_json::to_string_pretty(&payload)?;
 
     let tmp = dest.with_extension("json.tmp");
@@ -330,6 +336,44 @@ mod tests {
         let paths = compute_overlay_paths(&state).expect("compute");
 
         assert_eq!(paths.get("Anteproyecto.docx"), Some(&OverlayTier::Synced));
+    }
+
+    /// The guard for DBSYNC-75, and the only test here that exercises the **writer**.
+    ///
+    /// Before the fix this function resolved its destination with `db::app_data_dir()`, so
+    /// running it under `cargo test` overwrote the running user's real `overlay_state.json`
+    /// with a sync folder pointing at a tempdir the test then deleted. The Finder Sync
+    /// extension reads that file every two seconds, so the user's badges silently stopped
+    /// rendering — and the next person to validate badges by hand would have been debugging
+    /// the wrong thing entirely.
+    ///
+    /// Asserting the destination lands under the tempdir is what makes the regression
+    /// impossible to reintroduce quietly: resolving globally again puts the file somewhere
+    /// else, and this fails. It deliberately does NOT call `db::app_data_dir()` to compare
+    /// against — that function creates the directory, and a test for "never touch the real
+    /// data dir" must not touch the real data dir.
+    #[test]
+    fn the_writer_follows_the_database_and_never_the_global_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+
+        refresh_overlay_state_inner(&state).expect("refresh");
+
+        let dest = overlay_state_path(state.db.data_dir());
+        assert!(
+            dest.is_file(),
+            "no overlay file beside the database at {}",
+            dest.display()
+        );
+
+        // The database lives in its own tempdir (see `build_state`), which is not this
+        // test's `tmp` — so the check is "somewhere temporary", not "under this handle".
+        let written = std::fs::read_to_string(&dest).expect("read written overlay");
+        assert!(
+            written.contains(&sync.to_string_lossy().replace('\\', "\\\\")),
+            "the written file should describe this test's sync folder, got: {written}"
+        );
     }
 
     /// No sync folder configured must be an empty map, not an error: the overlay refresh
