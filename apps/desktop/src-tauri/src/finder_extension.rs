@@ -102,6 +102,68 @@ fn is_main_thread() -> bool {
     unsafe { msg_send![cls, isMainThread] }
 }
 
+/// Logs, once per process, everything that could plausibly explain a wrong answer.
+///
+/// Added because the first fix for DBSYNC-88 was a reasoned guess — the main thread — and the
+/// machine falsified it. The property is bundle-scoped and cannot be exercised from a test or a
+/// spike, so the only instrument available is the shipped app describing its own conditions.
+/// Every fact here is one that was assumed at some point in this ticket and never checked.
+///
+/// Runs on the main thread: it is called from inside [`read_extension_enabled`].
+#[cfg(target_os = "macos")]
+fn log_diagnostics_once(enabled: bool) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Which binary is actually running — the copy question, answered by the process itself
+        // rather than by asking the user to look for stray bundles.
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+
+        // Whose extension the property is reporting on. `isExtensionEnabled` answers for the
+        // appex inside the CALLING bundle, so if this identifier is not ours, `false` is a
+        // truthful answer about the wrong thing.
+        let bundle_id = unsafe {
+            AnyClass::get(c"NSBundle").map(|cls| {
+                let bundle: *mut objc2::runtime::AnyObject = msg_send![cls, mainBundle];
+                let ident: *mut objc2::runtime::AnyObject = msg_send![bundle, bundleIdentifier];
+                if ident.is_null() {
+                    "<none>".to_string()
+                } else {
+                    let utf8: *const std::ffi::c_char = msg_send![ident, UTF8String];
+                    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                }
+            })
+        }
+        .unwrap_or_else(|| "<no NSBundle>".to_string());
+
+        // A menu-bar app runs as an Accessory (no Dock icon). Apple's own header says to check
+        // "when the application becomes active" — an app that never activates in the AppKit
+        // sense is the next hypothesis if the bundle identifier turns out to be correct.
+        let activation_policy = unsafe {
+            AnyClass::get(c"NSApplication").map(|cls| {
+                let app: *mut objc2::runtime::AnyObject = msg_send![cls, sharedApplication];
+                let policy: isize = msg_send![app, activationPolicy];
+                let active: bool = msg_send![app, isActive];
+                (policy, active)
+            })
+        };
+
+        tracing::info!(
+            target: "finder_extension",
+            enabled,
+            exe = %exe,
+            bundle_id = %bundle_id,
+            activation_policy = ?activation_policy.map(|(p, _)| p),
+            app_is_active = ?activation_policy.map(|(_, a)| a),
+            "finder extension state read (DBSYNC-88 diagnostics)"
+        );
+    });
+}
+
 /// The raw read. Only ever called on the main thread — see [`finder_extension_state`].
 #[cfg(target_os = "macos")]
 fn read_extension_enabled() -> FinderExtensionState {
@@ -120,6 +182,8 @@ fn read_extension_enabled() -> FinderExtensionState {
     // arguments and returning `BOOL`. The selector is sent to the class object, which is
     // what a class property requires. Nothing is retained, so there is nothing to release.
     let enabled: bool = unsafe { msg_send![cls, isExtensionEnabled] };
+
+    log_diagnostics_once(enabled);
 
     if enabled {
         FinderExtensionState::Enabled
