@@ -496,6 +496,29 @@ function FlyoutApp() {
           plug-in disabled on every reinstall, so without this an app update silently switches
           badges off and the app looks broken.
         */}
+        {/*
+          Translocation (DBSYNC-88). Deliberately NOT folded into the "switched off" banner:
+          the extension is very probably fine, and sending the user to a settings checkbox
+          that is already ticked is what made this bug expensive. No "Open settings" button
+          here either, for the same reason — the fix is moving the app, nothing else.
+        */}
+        {finderExtension === "translocated" && (
+          <div className="flyout-banner finder-extension-banner" role="alert">
+            <div className="finder-extension-banner-body">
+              <h3>Move DropboxSync to your Applications folder</h3>
+              <p>
+                macOS is running this app from a temporary copy, which stops Finder badges from
+                working. Quit it, drag DropboxSyncDesktop into Applications, and open it from
+                there.
+              </p>
+              <p className="finder-extension-banner-note">
+                This happens when an app is opened straight from a download. Moving it is a
+                one-time fix.
+              </p>
+            </div>
+          </div>
+        )}
+
         {finderExtension === "disabled" && (
           <div className="flyout-banner finder-extension-banner" role="alert">
             <div className="finder-extension-banner-body">

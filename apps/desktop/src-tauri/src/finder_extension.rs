@@ -27,8 +27,36 @@ pub(crate) enum FinderExtensionState {
     Enabled,
     /// Registered but switched off — badges will not appear. This is the one that warns.
     Disabled,
+    /// The app is running under **App Translocation** (DBSYNC-88), so the question cannot be
+    /// answered at all: `isExtensionEnabled` reports on the appex inside the *calling* bundle,
+    /// and under translocation that bundle is a randomised read-only copy rather than the
+    /// installed app whose extension the user actually enabled.
+    ///
+    /// Distinct from both [`Disabled`](Self::Disabled) and [`NotApplicable`](Self::NotApplicable)
+    /// on purpose. `Disabled` would be a lie — this is exactly the false alarm that made this
+    /// ticket — and `NotApplicable` would be silence, leaving the user with no badges and no
+    /// explanation. The user has a real problem and a one-gesture fix, so it gets its own state.
+    Translocated,
     /// Not macOS, or the state could not be determined. Say nothing.
     NotApplicable,
+}
+
+/// Whether `exe_path` is an executable macOS relocated into a translocation mount.
+///
+/// A pure predicate on the path so it is unit-testable. The condition it encodes was measured,
+/// not assumed — the instrumented build on the affected Mac logged this executable path while
+/// the app insisted the extension was off:
+///
+/// ```text
+/// /private/var/folders/x3/…/T/AppTranslocation/71877875-…/d/DropboxSyncDesktop.app/Contents/MacOS/dropbox_sync_desktop
+/// ```
+///
+/// `Security.framework` exposes `SecTranslocateIsTranslocatedURL`, which would be the documented
+/// route. It is a C API needing CFURL bridging for one boolean, and the path marker is stable,
+/// observable and already in the logs. Recorded as the alternative in case this ever proves
+/// insufficient — not dismissed for convenience.
+pub(crate) fn is_translocated_path(exe_path: &str) -> bool {
+    exe_path.contains("/AppTranslocation/")
 }
 
 /// Reads `FIFinderSyncController.isExtensionEnabled`.
@@ -52,6 +80,17 @@ pub(crate) enum FinderExtensionState {
 pub(crate) fn finder_extension_state() -> FinderExtensionState {
     #[cfg(target_os = "macos")]
     {
+        // Answered before the read, because under translocation the read is meaningless rather
+        // than merely inconvenient: it would report on the appex inside the temporary copy and
+        // return `false` truthfully about the wrong bundle. Asking anyway and then overriding
+        // the answer would leave `Disabled` reachable from a state that can never justify it.
+        if std::env::current_exe()
+            .map(|p| is_translocated_path(&p.display().to_string()))
+            .unwrap_or(false)
+        {
+            return FinderExtensionState::Translocated;
+        }
+
         // Already on the main thread: read directly. Dispatching instead would deadlock —
         // `run_on_main_thread` queues the closure for a thread that is currently blocked
         // waiting for it.
@@ -282,16 +321,48 @@ mod tests {
             state,
             FinderExtensionState::Enabled
                 | FinderExtensionState::Disabled
+                | FinderExtensionState::Translocated
                 | FinderExtensionState::NotApplicable
         ));
     }
 
-    /// Guards the contract the UI depends on: exactly one state warns.
+    /// Guards the contract the UI depends on: exactly one state raises the "switched off"
+    /// warning. `Translocated` must not, which is the whole point of DBSYNC-88 — it gets its
+    /// own message because the extension is very probably fine.
     #[test]
-    fn only_disabled_warrants_a_banner() {
+    fn only_disabled_warrants_the_switched_off_banner() {
         let warns = |s: FinderExtensionState| s == FinderExtensionState::Disabled;
         assert!(warns(FinderExtensionState::Disabled));
         assert!(!warns(FinderExtensionState::Enabled));
         assert!(!warns(FinderExtensionState::NotApplicable));
+        assert!(!warns(FinderExtensionState::Translocated));
+    }
+
+    /// The exact path the instrumented build logged on the machine that reproduced DBSYNC-88.
+    /// Pinned verbatim: this is the observation the whole fix rests on, and a predicate that
+    /// stopped matching it would silently restore the false "extension is off" banner.
+    #[test]
+    fn the_measured_translocated_path_is_detected() {
+        assert!(super::is_translocated_path(
+            "/private/var/folders/x3/q_hpnkb90ml773pg2cc4lvd80000gn/T/AppTranslocation/\
+             71877875-BD67-4094-8873-AED79F8EF913/d/DropboxSyncDesktop.app/Contents/MacOS/\
+             dropbox_sync_desktop"
+        ));
+    }
+
+    /// Ordinary install locations must NOT be mistaken for translocation. Without this the fix
+    /// could pass as "no banner ever", which is the failure mode the ticket calls out.
+    #[test]
+    fn normal_install_locations_are_not_translocated() {
+        for path in [
+            "/Applications/DropboxSyncDesktop.app/Contents/MacOS/dropbox_sync_desktop",
+            "/Users/someone/Applications/DropboxSyncDesktop.app/Contents/MacOS/dropbox_sync_desktop",
+            "/Users/someone/Work/DropboxSync/apps/desktop/src-tauri/target/release/dropbox_sync_desktop",
+            // A folder a user happened to name after the mechanism is still not a translocation
+            // mount: the marker is a path COMPONENT, and this one is not.
+            "/Users/someone/AppTranslocationNotes/DropboxSyncDesktop.app/Contents/MacOS/app",
+        ] {
+            assert!(!super::is_translocated_path(path), "misdetected: {path}");
+        }
     }
 }

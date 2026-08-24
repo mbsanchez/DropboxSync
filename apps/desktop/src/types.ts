@@ -7,7 +7,17 @@ import type { SyncHealth } from "@dropbox-sync/shared";
  * not tell", and must never be treated as `disabled` — a Windows user has no Finder extension
  * to configure and must not be warned about one.
  */
-export type FinderExtensionState = "enabled" | "disabled" | "notApplicable";
+export type FinderExtensionState =
+  | "enabled"
+  | "disabled"
+  /**
+   * The app is running from a macOS App Translocation mount, so it cannot know the
+   * extension's real state — it would be asking about a temporary copy of itself
+   * (DBSYNC-88). Kept separate from "disabled", which would be a false alarm, and from
+   * "notApplicable", which would say nothing while the user has a real, fixable problem.
+   */
+  | "translocated"
+  | "notApplicable";
 
 export type StartupRequirements = {
   authOk: boolean;
