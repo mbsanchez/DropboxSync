@@ -180,8 +180,61 @@ jobs:
       - name: Frontend build and typecheck
         # `npm run build` is `tsc && vite build`, so this is the typecheck too.
         #
-        # It is knowingly duplicated: `tauri-before-build.mjs` runs the same build
-        # unconditionally, so `bundle:dev` above repeats it (and `bundle:win` will, in
-        # #122). At roughly half a second it is not worth engineering away — recorded here
-        # so it is not later mistaken for a defect.
+        # It is knowingly duplicated three times: `tauri-before-build.mjs` runs the same
+        # build unconditionally, so `bundle:dev` and `bundle:win` each repeat it. At
+        # roughly half a second it is not worth engineering away — recorded here so it is
+        # not later mistaken for a defect.
         run: npm --workspace apps/desktop run build
+
+  # Windows artefacts: the app links, and the Explorer shell extension type-checks
+  # (DBSYNC-38, GitHub #122).
+  windows-app:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct from the `rust` job's Windows leg: that one builds the debug profile
+          # for tests, this one builds release through `tauri build`. They share almost no
+          # artefacts, so a shared key would mean two jobs overwriting each other's cache
+          # for no benefit.
+          prefix-key: windows-app
+          # Two workspaces. `shell-menu` is a SEPARATE cargo project — its own Cargo.toml
+          # and Cargo.lock, referenced by no workspace — so rust-cache has to be told about
+          # it explicitly or its target dir is never cached.
+          workspaces: |
+            apps/desktop/src-tauri
+            apps/desktop/native/windows/shell-menu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+          env-vars: DROPBOX
+
+      - name: Install dependencies
+        # First time npm runs on a Windows runner in this pipeline. The risk worth naming
+        # is pruned platform-specific optional dependencies — `npm ci` installs strictly
+        # from the lockfile, and package-lock.json does carry the full matrix, including
+        # @rollup/rollup-win32-x64-msvc and @tauri-apps/cli-win32-x64-msvc.
+        run: npm ci
+
+      - name: Build Windows app
+        # `bundle:win` is `tauri build --no-bundle`: it proves the app links, and
+        # deliberately produces no installer. Mirrors the macOS choice — packaging belongs
+        # to the release workflow (DBSYNC-72 Slice 5), never to a PR check.
+        run: npm --workspace apps/desktop run bundle:win
+
+      - name: Check the Explorer shell-menu crate
+        # An independent cargo project that NO CI step has ever built, while
+        # `windows_shell_menu.rs` registers its output at runtime. One `check` covers both
+        # of its targets: the cdylib/rlib and the `dropbox_sync_cloudmenu` COM ExeServer
+        # binary (DBSYNC-62).
+        #
+        # `check`, not `build`: nothing here consumes the DLL, so type-checking is the
+        # signal and linking would be pure cost.
+        run: cargo check --manifest-path apps/desktop/native/windows/shell-menu/Cargo.toml
