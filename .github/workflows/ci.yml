@@ -5,14 +5,62 @@ on:
     branches: [main, master]
   pull_request:
 
+# Literals, not secrets. The app reads these through `option_env!` with fallbacks
+# (auth/oauth.rs), so CI only needs them to be present, never to be real. Hoisted to the
+# workflow level in DBSYNC-38 so every job inherits them and none can be forgotten.
+env:
+  DROPBOX_APP_KEY: dummy
+  DROPBOX_REDIRECT_URI: http://localhost:53682/callback
+
+# Split into one job per kind of check (DBSYNC-38, GitHub #120). It was a single
+# `desktop-build` job until 2026-08-25.
+#
+# The split is not cosmetic: it is what makes a Windows leg possible at all. Three of the
+# old job's steps cannot run on Windows — the Finder Sync checks shell out to `xcrun
+# swiftc`, and `bundle:dev` produces a macOS `.app`. Adding `strategy.matrix.os` to the
+# monolith would have broken all three. Slices #121 and #122 add Windows on top of this
+# shape; this change deliberately adds no platform of its own, so that a later red build
+# on Windows is attributable to Windows rather than to the restructuring.
+#
+# Everything runs on macOS for now. The frontend job is platform-independent and would be
+# roughly ten times cheaper on `ubuntu-latest`, but moving it is an optimisation with its
+# own risk (npm's platform-specific optional packages) and does not belong in a change
+# whose whole point is to be provably green first.
 jobs:
-  desktop-build:
+  # Portable Rust. Becomes a macOS + Windows matrix in #121 — the reason this ticket exists.
+  rust:
     runs-on: macos-latest
-    env:
-      # Literals, not secrets. The app reads these through `option_env!` with fallbacks
-      # (auth/oauth.rs), so CI only needs them to be present, never to be real.
-      DROPBOX_APP_KEY: dummy
-      DROPBOX_REDIRECT_URI: http://localhost:53682/callback
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct per job, or `rust` and `macos-app` evict each other and the cache
+          # buys nothing. The runner OS is part of the key by default, which is what keeps
+          # the Windows leg from thrashing against this one later.
+          prefix-key: rust-checks
+          workspaces: apps/desktop/src-tauri
+
+      # No `npm install` here: `cargo test` compiles the crate and runs its unit tests,
+      # and `tauri-build` does not need `dist/` to exist for that — the old single job
+      # proved it by running these tests before the frontend build step.
+      - name: Rust tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Rust lints
+        # Not `-D warnings`: main currently carries pre-existing warnings, and failing the
+        # build on them would put this workflow straight back to permanently red — which is
+        # how it got switched off in the first place. Clearing them is its own change;
+        # making them visible is this one. The same reasoning will apply, harder, to the
+        # Windows leg: those modules have never been linted by anything.
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
+
+  # macOS-only artefacts: the Swift appex and the `.app` bundle.
+  macos-app:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,36 +69,48 @@ jobs:
           cache: 'npm'
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: clippy
+          prefix-key: macos-app
+          workspaces: apps/desktop/src-tauri
 
       - name: Install dependencies
         run: npm install
 
-      # The four steps below are the reason this workflow is worth running at all.
-      # Until 2026-08-22 it only compiled and bundled: 214 Rust tests and the Swift
-      # checks had never run in CI once. Of the defects that reached code review on
-      # 2026-08-21, a compile-only pipeline would have caught none of them.
-
-      - name: Rust tests
-        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
-
-      - name: Rust lints
-        # Not `-D warnings`: main currently carries 4 pre-existing warnings, and failing
-        # the build on them would put this workflow straight back to permanently red —
-        # which is how it got switched off in the first place. Clearing them is its own
-        # change; making them visible is this one.
-        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets
-
       - name: Finder Sync extension checks
+        # Compiles the real BadgeDiff.swift with `swiftc` and runs its checks. macOS-only
+        # by construction, and the only automated coverage the extension has.
         run: apps/desktop/native/macos/FinderSyncExtension/Tests/run-badge-diff-tests.sh
-
-      - name: Frontend build and typecheck
-        run: npm --workspace apps/desktop run build
 
       - name: Build macOS app bundle
         # `bundle:dev` (--bundles app), not `tauri build`. The full build also produces a
         # DMG, a stage that has never executed in CI even once because every run died
         # earlier. Producing an installer belongs to the release workflow (GitHub #85);
         # a PR check only needs to prove the app links.
+        #
+        # This step also builds the Swift appex: `beforeBuildCommand` runs
+        # `scripts/tauri-before-build.mjs`, which calls `build:finder-sync` on darwin.
+        # That is why it must never be matrixed onto another OS.
         run: npm --workspace apps/desktop run bundle:dev
+
+  # TypeScript typecheck + production bundle. Portable, so it runs exactly once.
+  frontend:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Frontend build and typecheck
+        # `npm run build` is `tsc && vite build`, so this is the typecheck too.
+        #
+        # It is knowingly duplicated: `tauri-before-build.mjs` runs the same build
+        # unconditionally, so `bundle:dev` above repeats it (and `bundle:win` will, in
+        # #122). At roughly half a second it is not worth engineering away — recorded here
+        # so it is not later mistaken for a defect.
+        run: npm --workspace apps/desktop run build
