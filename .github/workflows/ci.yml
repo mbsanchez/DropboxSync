@@ -44,9 +44,18 @@ jobs:
           prefix-key: rust-checks
           workspaces: apps/desktop/src-tauri
 
-      # No `npm install` here: `cargo test` compiles the crate and runs its unit tests,
-      # and `tauri-build` does not need `dist/` to exist for that — the old single job
-      # proved it by running these tests before the frontend build step.
+      # No `npm install` here, and the reason is narrower than "the Rust tests don't need
+      # the frontend" — it is conditional, so read this before changing the command.
+      #
+      # `generate_context!` DOES embed `frontendDist`, but only outside dev mode:
+      # `tauri-build` sets `dev = !has_feature("custom-protocol")` (build.rs), and
+      # `tauri-codegen`'s `else if dev && config.build.dev_url.is_some()` branch then skips
+      # the embed entirely. So this job compiles without `dist/` because two config facts
+      # happen to hold: `custom-protocol` is off, and `devUrl` is set in tauri.conf.json.
+      #
+      # Change either — add `--all-features`, or drop `devUrl` — and this step fails with an
+      # error about a missing frontend directory that never mentions npm. Restore
+      # `npm install` and the frontend build here if that day comes.
       - name: Rust tests
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 
