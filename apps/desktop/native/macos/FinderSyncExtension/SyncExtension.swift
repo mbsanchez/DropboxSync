@@ -136,6 +136,11 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// expensive to find — an unreadable state file looks exactly like "no files tracked yet".
     private var lastLoadFailed = false
 
+    /// Same transition-logging discipline as [`lastLoadFailed`], for the decode step
+    /// (DBSYNC-73). Separate flag: the file can be readable and undecodable, and conflating
+    /// them would swallow one of the two messages.
+    private var lastDecodeFailed = false
+
     private func reloadState() {
         let url = overlayStateURL()
         guard let data = try? Data(contentsOf: url) else {
@@ -155,12 +160,32 @@ final class DropboxSyncFinderSync: FIFinderSync {
             NSLog("DropboxSync FinderSync: reading %@ again.", url.path)
             lastLoadFailed = false
         }
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        guard let decoded = try? decoder.decode(OverlayState.self, from: data) else {
+        // Decoding lives in `BadgeDiff.OverlayState` so the check script can reach it, and
+        // it throws so this failure can be reported (DBSYNC-73).
+        let decoded: OverlayState
+        do {
+            decoded = try OverlayState.decode(from: data)
+        } catch {
+            // NOT silent. This used to be a bare `try?` with no log, while the read above
+            // it logged carefully — and the consequence is worse than the read failing:
+            // `state = nil` drops `syncFolder`, so `monitoredDirectoryURLs()` returns [],
+            // so Finder deregisters the extension's directories and stops calling it. Every
+            // badge vanishes with nothing written anywhere. That is the shape of DBSYNC-76,
+            // which this file's own comments record as expensive to find.
+            //
+            // Logged on the transition only, like the read path: this runs every 2 seconds.
+            if !lastDecodeFailed {
+                NSLog("DropboxSync FinderSync: cannot decode %@ — no badges will be shown. %@",
+                      url.path, String(describing: error))
+                lastDecodeFailed = true
+            }
             state = nil
             lastUpdatedAt = nil
             return
+        }
+        if lastDecodeFailed {
+            NSLog("DropboxSync FinderSync: decoding %@ again.", url.path)
+            lastDecodeFailed = false
         }
 
         // Nothing was rewritten since the last tick: no diff, no pushes, no work.
@@ -270,12 +295,4 @@ final class DropboxSyncFinderSync: FIFinderSync {
             FIFinderSyncController.default().setBadgeIdentifier(identifier, for: item)
         }
     }
-}
-
-private struct OverlayState: Decodable {
-    let version: Int
-    let updatedAt: String
-    let syncFolder: String?
-    /// Relative path (POSIX, no leading slash) → tier id matching registered badge ids.
-    let paths: [String: String]
 }

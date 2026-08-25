@@ -370,6 +370,52 @@ struct BadgeDiffTests {
                   observedDirectories: []),
               changed: [:], removed: ["report.pdf.cloudsc"])
 
+        print("OverlayState.decode (DBSYNC-73)")
+
+        // The payload the ticket was written against, with the underscores that matter.
+        let json = Data("""
+        {
+          "version": 1,
+          "updated_at": "2026-08-25T12:00:00Z",
+          "sync_folder": "/Users/x/DropboxSync",
+          "paths": {
+            "docs/my_report.pdf": "synced",
+            "a_b_c/x_y.md": "cloud_only",
+            "plain.txt": "syncing"
+          }
+        }
+        """.utf8)
+
+        // `try?` with a named failure rather than `try!`: a trap reports as
+        // "Trace/BPT trap: 5" with no indication of which check died.
+        guard let decoded = try? OverlayState.decode(from: json) else {
+            print("  FAIL OverlayState.decode threw on a valid payload")
+            failures += 1
+            exit(1)
+        }
+
+        // THE BUG. `.convertFromSnakeCase` applied to every key the decoder saw, including
+        // the keys of `paths` — which are file paths. On macOS 12-14 Foundation,
+        // "docs/my_report.pdf" arrived as "docs/myReport.pdf", matched nothing, and that
+        // file silently rendered no badge.
+        checkBool("underscored path keys survive decoding",
+                  decoded.paths["docs/my_report.pdf"] == "synced", true)
+        checkBool("underscored path keys are not camel-cased",
+                  decoded.paths["docs/myReport.pdf"] == nil, true)
+        checkBool("a path with several underscores survives too",
+                  decoded.paths["a_b_c/x_y.md"] == "cloud_only", true)
+
+        // The two properties that DO need mapping. If these regress, the decode throws
+        // rather than silently yielding a wrong value — which is the point of naming them.
+        checkOptional("updated_at maps to updatedAt", decoded.updatedAt, "2026-08-25T12:00:00Z")
+        checkOptional("sync_folder maps to syncFolder", decoded.syncFolder, "/Users/x/DropboxSync")
+
+        // A tier value that contains an underscore, in the VALUE position rather than the
+        // key. Values were never at risk, but `cloud_only` reaching the lookup intact is
+        // what makes a badge render, so it is worth pinning.
+        checkOptional("an underscored tier value is untouched",
+                      decoded.paths["a_b_c/x_y.md"], "cloud_only")
+
         if failures == 0 {
             print("BadgeDiff: all checks passed")
             exit(0)

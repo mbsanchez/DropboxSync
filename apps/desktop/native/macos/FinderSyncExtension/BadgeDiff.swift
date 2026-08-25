@@ -186,3 +186,49 @@ enum BadgeDiff {
     }
 }
 
+/// The shape of `overlay_state.json`, and the only place it is decoded (DBSYNC-73).
+///
+/// **It lives here rather than in `SyncExtension.swift` for one reason: this file is
+/// Foundation-only, so `Tests/run-badge-diff-tests.sh` can compile it with `swiftc` and CI
+/// already runs that script.** The original ticket recorded this decode as impossible to
+/// test; it was not, and two defects have already survived review in this project by
+/// sitting where the check script could not reach them.
+struct OverlayState: Decodable, Equatable {
+    let version: Int
+    let updatedAt: String
+    let syncFolder: String?
+    /// Relative path (POSIX, no leading slash) → tier id matching registered badge ids.
+    let paths: [String: String]
+
+    /// Explicit, and never `keyDecodingStrategy = .convertFromSnakeCase`.
+    ///
+    /// That strategy applies to **every** key the decoder sees, and on the Foundation
+    /// shipped with macOS 12-14 that included the keys of a `[String: T]` dictionary.
+    /// `paths` is exactly such a dictionary and its keys are file paths, so
+    /// `docs/my_report.pdf` decoded as `docs/myReport.pdf`, matched nothing in
+    /// `requestBadgeIdentifier(for:)`, and that file silently rendered no badge.
+    ///
+    /// It does not reproduce on macOS 26 — the swift-foundation rewrite stopped converting
+    /// dictionary keys — but `JSONDecoder` comes from the USER's Foundation, and
+    /// `minimumSystemVersion` is 12.0. Correct for the developer, silently wrong for a
+    /// subset of users on a subset of their files.
+    ///
+    /// **These keys do more than avoid the strategy: they make it unreachable.** With the
+    /// wire names spelled out, `.convertFromSnakeCase` rewrites `updated_at` to
+    /// `updatedAt`, then looks for a `CodingKey` whose `stringValue` is `"updated_at"`,
+    /// and throws `keyNotFound` — on every Foundation and every OS. Reintroducing it fails
+    /// loudly here and in CI instead of quietly on someone else's machine.
+    enum CodingKeys: String, CodingKey {
+        case version
+        case updatedAt = "updated_at"
+        case syncFolder = "sync_folder"
+        case paths
+    }
+
+    /// Decodes with a plain `JSONDecoder`. Throws rather than returning `nil` so the caller
+    /// can log what went wrong — a silent decode failure deregisters the extension's
+    /// directories and every badge disappears with nothing written anywhere.
+    static func decode(from data: Data) throws -> OverlayState {
+        try JSONDecoder().decode(OverlayState.self, from: data)
+    }
+}
