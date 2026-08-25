@@ -5,6 +5,22 @@ on:
     branches: [main, master]
   pull_request:
 
+# Read-only by default: nothing in this workflow writes to the repo, and a token that
+# cannot write is one that cannot be abused by a compromised action.
+permissions:
+  contents: read
+
+# One run per ref, but cancellation ONLY on pull requests. Pushing twice to a PR should
+# not leave the first run burning a Windows runner nobody will read.
+#
+# On a push to main, cancelling would discard the only automated verification a merged
+# commit ever gets: two merges inside six minutes and the first commit is never tested on
+# any platform, silently. With a manual QA strategy this pipeline is the sole automated
+# gate, so a merged commit must always finish its run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Literals, not secrets. The app reads these through `option_env!` with fallbacks
 # (auth/oauth.rs), so CI only needs them to be present, never to be real. Hoisted to the
 # workflow level in DBSYNC-38 so every job inherits them and none can be forgotten.
@@ -19,17 +35,32 @@ env:
 # old job's steps cannot run on Windows — the Finder Sync checks shell out to `xcrun
 # swiftc`, and `bundle:dev` produces a macOS `.app`. Adding `strategy.matrix.os` to the
 # monolith would have broken all three. Slices #121 and #122 add Windows on top of this
-# shape; this change deliberately adds no platform of its own, so that a later red build
-# on Windows is attributable to Windows rather than to the restructuring.
+# shape. Splitting first is what made a later red build on Windows attributable to
+# Windows rather than to the restructuring.
 #
-# Everything runs on macOS for now. The frontend job is platform-independent and would be
-# roughly ten times cheaper on `ubuntu-latest`, but moving it is an optimisation with its
-# own risk (npm's platform-specific optional packages) and does not belong in a change
-# whose whole point is to be provably green first.
+# `rust` now runs on both platforms (#121). `macos-app` and `frontend` stay on macOS:
+# the first is macOS-only by construction, the second is platform-independent and would
+# be cheaper on `ubuntu-latest` — an optimisation with its own risk (npm's
+# platform-specific optional packages), worth doing on its own and not here.
 jobs:
-  # Portable Rust. Becomes a macOS + Windows matrix in #121 — the reason this ticket exists.
+  # Portable Rust, on every platform that ships.
   rust:
-    runs-on: macos-latest
+    # THE POINT OF DBSYNC-38 (GitHub #121). Until this leg existed, everything behind
+    # `#[cfg(windows)]` — five modules, ~4000 lines, `cloud_filter.rs` alone at 2024 —
+    # had never been compiled by any pipeline, and the ~22 unit tests inside them had
+    # only ever run on the maintainer's own machine. A PR could delete a function
+    # `cloud_filter.rs` calls and CI would report green.
+    strategy:
+      # NOT the default. With fail-fast on, a macOS failure cancels the Windows job —
+      # cancelling precisely the signal this leg exists to buy. Load-bearing, not taste.
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # A hang, not an assertion, is the characteristic failure of Win32 I/O-callback code
+    # under test — and the default here is 360 minutes on a runner billed at 2x. Twenty is
+    # generous against a 6m25s cold Windows run.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -39,10 +70,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Distinct per job, or `rust` and `macos-app` evict each other and the cache
-          # buys nothing. The runner OS is part of the key by default, which is what keeps
-          # the Windows leg from thrashing against this one later.
+          # buys nothing. rust-cache appends the runner OS and arch to the key, so the
+          # two matrix legs get separate caches without any help from us.
           prefix-key: rust-checks
           workspaces: apps/desktop/src-tauri
+          # Only the default branch writes. A 10 GB budget shared by every open PR would
+          # evict main's cache — the one every new PR starts from — to store caches that
+          # no other branch can even read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Two things, and NOT the one the first draft of this comment claimed. It does
+          # not rescue red PR runs: `save-if` gates the save body outright, so on a PR
+          # branch nothing is written whatever this says. What it does do is let main keep
+          # a cache from a failed run, and — because it drives the action's `post-if` — let
+          # the save step run at all when a job is cancelled.
+          cache-on-failure: true
+          # Both values `auth/oauth.rs` reads through `option_env!` — DROPBOX_APP_KEY and
+          # DROPBOX_REDIRECT_URI. `option_env!` does not force a rebuild when they change,
+          # so without them in the key a cached artifact can embed a stale value and
+          # nothing reports it. Harmless at `dummy`; a green-but-wrong binary the day the
+          # release workflow wires a real key.
+          #
+          # The prefix is enough: rust-cache matches with `startsWith`, and this list is
+          # ADDED to its built-ins (CARGO CC CFLAGS CXX CMAKE RUST) rather than replacing
+          # them.
+          env-vars: DROPBOX
 
       # No `npm install` here, and the reason is narrower than "the Rust tests don't need
       # the frontend" — it is conditional, so read this before changing the command.
@@ -70,6 +121,7 @@ jobs:
   # macOS-only artefacts: the Swift appex and the `.app` bundle.
   macos-app:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -82,9 +134,15 @@ jobs:
         with:
           prefix-key: macos-app
           workspaces: apps/desktop/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+          env-vars: DROPBOX
 
       - name: Install dependencies
-        run: npm install
+        # `ci`, not `install`: it fails when package-lock.json disagrees with package.json
+        # instead of quietly resolving something new. A check that cannot fail is not a
+        # check, and on a runner the lockfile is the whole point.
+        run: npm ci
 
       - name: Finder Sync extension checks
         # Compiles the real BadgeDiff.swift with `swiftc` and runs its checks. macOS-only
@@ -105,6 +163,7 @@ jobs:
   # TypeScript typecheck + production bundle. Portable, so it runs exactly once.
   frontend:
     runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -113,7 +172,10 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install
+        # `ci`, not `install`: it fails when package-lock.json disagrees with package.json
+        # instead of quietly resolving something new. A check that cannot fail is not a
+        # check, and on a runner the lockfile is the whole point.
+        run: npm ci
 
       - name: Frontend build and typecheck
         # `npm run build` is `tsc && vite build`, so this is the typecheck too.
