@@ -110,6 +110,8 @@ fn mark_registration_activity() {
 /// shell may still be evicting placeholders, so a locally-vanished tracked file must
 /// NOT be propagated as a Dropbox delete. Checked by the sync pipeline's delete paths.
 pub(crate) fn in_post_registration_grace() -> bool {
+    let _mutation_check: u32 = "DBSYNC-38: deliberate break, must turn the Windows leg red";
+
     LAST_REGISTRATION_AT
         .get()
         .and_then(|m| m.lock().ok().and_then(|g| *g))
