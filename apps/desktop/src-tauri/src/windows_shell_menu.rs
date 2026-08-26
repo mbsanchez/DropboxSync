@@ -72,8 +72,9 @@ fn register_com_handler(dll: &Path, exe: &Path) -> io::Result<()> {
     // 1) COM server (in-proc, apartment-threaded).
     let (clsid_key, _) = hkcu.create_subkey(format!(r"Software\Classes\CLSID\{CLSID_STR}"))?;
     clsid_key.set_value("", &"DropboxSync Explorer Command")?;
-    let (inproc, _) =
-        hkcu.create_subkey(format!(r"Software\Classes\CLSID\{CLSID_STR}\InprocServer32"))?;
+    let (inproc, _) = hkcu.create_subkey(format!(
+        r"Software\Classes\CLSID\{CLSID_STR}\InprocServer32"
+    ))?;
     inproc.set_value("", &dll.to_string_lossy().as_ref())?;
     inproc.set_value("ThreadingModel", &"Apartment")?;
 
@@ -86,8 +87,9 @@ fn register_com_handler(dll: &Path, exe: &Path) -> io::Result<()> {
     k.set_value("ExplorerCommandHandler", &CLSID_STR)?;
     // `command` subkey is required for the verb to appear on Win11; the parent
     // never executes directly (it has subcommands), so DelegateExecute is inert.
-    let (cmd, _) =
-        hkcu.create_subkey(format!(r"Software\Classes\{TARGET_CLASS}\shell\{VERB}\command"))?;
+    let (cmd, _) = hkcu.create_subkey(format!(
+        r"Software\Classes\{TARGET_CLASS}\shell\{VERB}\command"
+    ))?;
     cmd.set_value("", &"")?;
     cmd.set_value("DelegateExecute", &CLSID_STR)?;
 

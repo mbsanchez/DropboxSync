@@ -467,9 +467,7 @@ pub fn resolve_conflict(
 /// deletion and confirmed it is an intentional bulk delete.
 #[tauri::command]
 pub fn confirm_pending_deletions(state: tauri::State<AppState>) -> Result<(), String> {
-    state
-        .db
-        .set_app_config("mass_delete_override_once", "1")?;
+    state.db.set_app_config("mass_delete_override_once", "1")?;
     Ok(())
 }
 

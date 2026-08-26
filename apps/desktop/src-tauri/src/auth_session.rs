@@ -353,9 +353,9 @@ pub(crate) fn refresh_tray_tooltip(state: &AppState) {
 mod tests {
     use super::{refresh_token_guarded, TokenSession};
     use chrono::{Duration, Utc};
-    use zeroize::Zeroizing;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use zeroize::Zeroizing;
 
     fn fresh_session() -> TokenSession {
         TokenSession {

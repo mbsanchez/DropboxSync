@@ -1438,12 +1438,19 @@ mod tests {
 
         // DBSYNC-31: two enqueues of the same (job_type, target_path) collapse into ONE
         // active job (partial-unique index + ON CONFLICT), instead of two rows.
-        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
-        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
-        assert_eq!(db.count_active_jobs().unwrap(), 1, "duplicate active upload collapsed");
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt"))
+            .unwrap();
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt"))
+            .unwrap();
+        assert_eq!(
+            db.count_active_jobs().unwrap(),
+            1,
+            "duplicate active upload collapsed"
+        );
 
         // A different job_type for the same path is a distinct active job.
-        db.enqueue_job("delete", Some("a.txt"), Some("a.txt")).unwrap();
+        db.enqueue_job("delete", Some("a.txt"), Some("a.txt"))
+            .unwrap();
         assert_eq!(db.count_active_jobs().unwrap(), 2);
 
         // active_job_paths reports the path (used for dedup / conflict routing).
@@ -1459,20 +1466,25 @@ mod tests {
             .unwrap()
             .id;
         db.mark_job_completed(upload_id).unwrap();
-        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt"))
+            .unwrap();
         let uploads = db
             .list_recent_jobs(50)
             .unwrap()
             .into_iter()
             .filter(|j| j.job_type == "upload")
             .count();
-        assert_eq!(uploads, 2, "a new active upload coexists with the completed one");
+        assert_eq!(
+            uploads, 2,
+            "a new active upload coexists with the completed one"
+        );
     }
 
     #[test]
     fn enqueue_delete_job_persists_parent_rev() {
         let db = Db::new_at(&unique_db_path()).expect("db init");
-        db.enqueue_delete_job("a.txt", Some("rev123")).expect("enqueue");
+        db.enqueue_delete_job("a.txt", Some("rev123"))
+            .expect("enqueue");
 
         let jobs = db.list_recent_jobs(10).expect("jobs");
         assert_eq!(jobs.len(), 1);
@@ -1487,8 +1499,10 @@ mod tests {
         // DBSYNC-65 (Slice 1) crux regression: re-enqueuing an already-active delete
         // for the same target must refresh `delete_parent_rev`, not keep the stale
         // value captured by the first enqueue.
-        db.enqueue_delete_job("a.txt", Some("old_rev")).expect("first enqueue");
-        db.enqueue_delete_job("a.txt", Some("new_rev")).expect("second enqueue");
+        db.enqueue_delete_job("a.txt", Some("old_rev"))
+            .expect("first enqueue");
+        db.enqueue_delete_job("a.txt", Some("new_rev"))
+            .expect("second enqueue");
 
         assert_eq!(
             db.count_active_jobs().unwrap(),
@@ -1505,11 +1519,13 @@ mod tests {
         let db = Db::new_at(&unique_db_path()).expect("db init");
         // DBSYNC-31 AC4: the CHECK constraint rejects an unknown job_type at the DB layer.
         assert!(
-            db.enqueue_job("bogus_type", Some("a.txt"), Some("a.txt")).is_err(),
+            db.enqueue_job("bogus_type", Some("a.txt"), Some("a.txt"))
+                .is_err(),
             "an out-of-set job_type must be rejected"
         );
         // A valid job_type still enqueues.
-        db.enqueue_job("upload", Some("a.txt"), Some("a.txt")).unwrap();
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt"))
+            .unwrap();
         assert_eq!(db.count_active_jobs().unwrap(), 1);
     }
 
@@ -1657,7 +1673,10 @@ mod tests {
             .expect("g2")
             .is_none());
         // Boundary-collision sibling and unrelated tree survive.
-        assert!(db.get_remote_file("UNET-other/keep.txt").expect("g3").is_some());
+        assert!(db
+            .get_remote_file("UNET-other/keep.txt")
+            .expect("g3")
+            .is_some());
         assert!(db.get_remote_file("Otra/keep.txt").expect("g4").is_some());
     }
 
@@ -1688,7 +1707,8 @@ mod tests {
 
         assert_eq!(db.get_sync_folder().expect("get after clear"), None);
         assert_eq!(
-            db.get_include_prefixes_csv().expect("get prefixes after clear"),
+            db.get_include_prefixes_csv()
+                .expect("get prefixes after clear"),
             Some("Fotos,Videos/2024".to_string()),
             "local prefs must survive disconnect"
         );

@@ -11,13 +11,12 @@ use crate::dropbox_transfer::{
 };
 use crate::error::{AppError, AppResult};
 use crate::models::SyncTickResult;
+use crate::overlay_state;
 use crate::path_util::{
     backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
-    is_editor_temp_path, is_ignored_local_path,
-    normalize_dropbox_path, safe_join,
+    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, safe_join,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
-use crate::overlay_state;
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
 
@@ -127,7 +126,9 @@ fn process_local_file_change(
 
     match known {
         None => {
-            state.db.enqueue_job("upload", Some(relative), Some(relative))?;
+            state
+                .db
+                .enqueue_job("upload", Some(relative), Some(relative))?;
             state
                 .db
                 .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
@@ -161,7 +162,9 @@ fn process_local_file_change(
                 crate::sharing::notify_conflict(relative);
                 Ok(1)
             } else {
-                state.db.enqueue_job("upload", Some(relative), Some(relative))?;
+                state
+                    .db
+                    .enqueue_job("upload", Some(relative), Some(relative))?;
                 state
                     .db
                     .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
@@ -198,7 +201,9 @@ fn process_local_file_deletion(
     // (Slice 2) can detect whether the remote copy changed since this delete was
     // observed. Not yet read/enforced — plumbing only.
     let parent_rev = state.db.get_remote_file(prev_rel)?.map(|r| r.rev);
-    state.db.enqueue_delete_job(prev_rel, parent_rev.as_deref())?;
+    state
+        .db
+        .enqueue_delete_job(prev_rel, parent_rev.as_deref())?;
     state.db.remove_local_file(prev_rel)?;
     Ok(1)
 }
@@ -488,7 +493,12 @@ pub(crate) fn is_mass_deletion(candidates: usize, tracked: usize) -> bool {
 /// remote→local extension) so both directions consume the same one-shot flag
 /// instead of each keeping their own.
 pub(crate) fn consume_mass_delete_override(state: &AppState) -> AppResult<bool> {
-    if state.db.get_app_config(MASS_DELETE_OVERRIDE_KEY)?.as_deref() == Some("1") {
+    if state
+        .db
+        .get_app_config(MASS_DELETE_OVERRIDE_KEY)?
+        .as_deref()
+        == Some("1")
+    {
         state.db.set_app_config(MASS_DELETE_OVERRIDE_KEY, "0")?;
         tracing::warn!("mass-deletion override consumed: allowing this deletion batch");
         return Ok(true);
@@ -1060,7 +1070,9 @@ pub(crate) fn resolve_conflict_internal(
                 .db
                 .enqueue_job("upload", Some(primary_rel), Some(primary_rel))?;
             if state.db.get_remote_file(copy_rel)?.is_some() {
-                state.db.enqueue_job("delete", Some(copy_rel), Some(copy_rel))?;
+                state
+                    .db
+                    .enqueue_job("delete", Some(copy_rel), Some(copy_rel))?;
             }
         }
         // No copy (remote-deleted scenario): the local primary IS the version to keep
@@ -1082,7 +1094,9 @@ pub(crate) fn resolve_conflict_internal(
                     .map_err(|e| AppError::Io(format!("failed removing conflicted copy: {e}")))?;
             }
             if state.db.get_remote_file(copy_rel)?.is_some() {
-                state.db.enqueue_job("delete", Some(copy_rel), Some(copy_rel))?;
+                state
+                    .db
+                    .enqueue_job("delete", Some(copy_rel), Some(copy_rel))?;
             }
         }
         // Remote was deleted and there is no copy: "follow remote" means discarding the
@@ -1105,7 +1119,9 @@ pub(crate) fn resolve_conflict_internal(
         // Dropbox promptly (the scan would eventually do this anyway).
         (ConflictAction::KeepBoth, Some(copy_rel), _) => {
             if safe_join(root, copy_rel)?.exists() {
-                state.db.enqueue_job("upload", Some(copy_rel), Some(copy_rel))?;
+                state
+                    .db
+                    .enqueue_job("upload", Some(copy_rel), Some(copy_rel))?;
             }
         }
         // Remote deleted, no copy: there is no second version to keep — restore the
@@ -1195,8 +1211,8 @@ mod tests {
     use super::{
         block_mass_deletion, cleanup_stale_upload_state, clear_mass_delete_blocked,
         is_mass_deletion, mass_delete_pause_active, process_changed_paths,
-        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_only,
-        ConflictAction, MassDeleteSource, SYNC_BATCH_CAP,
+        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_only, ConflictAction,
+        MassDeleteSource, SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
     use crate::storage::db::Db;
@@ -1363,7 +1379,10 @@ mod tests {
         let state = build_state(tmp.path());
         std::fs::write(sync_root(&state).join("m.txt"), b"new-content").unwrap();
         // Index an out-of-date hash so the on-disk content is a "modification".
-        state.db.upsert_local_file("m.txt", "stale-hash", 3, 0).unwrap();
+        state
+            .db
+            .upsert_local_file("m.txt", "stale-hash", 3, 0)
+            .unwrap();
 
         let n = process_changed_paths(&state, &["m.txt".to_string()]).expect("process");
         assert_eq!(n, 1);
@@ -1606,8 +1625,14 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
         // A real synced file (present on remote) whose upload source is absent.
-        state.db.upsert_local_file("report.docx", "h2", 1, 0).unwrap();
-        state.db.upsert_remote_file("report.docx", "h1", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_local_file("report.docx", "h2", 1, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("report.docx", "h1", "rev", 0)
+            .unwrap();
 
         crate::dropbox_transfer::upload_local_file_internal(&state, "report.docx", 1)
             .expect("must not error");
@@ -1661,7 +1686,10 @@ mod tests {
         // one that still exists on disk (a genuine failure — must be left alone).
         std::fs::write(sync.join("real.txt"), b"x").unwrap();
         for src in ["~$doc.docx", "gone.txt", "real.txt"] {
-            state.db.enqueue_job("upload", Some(src), Some(src)).unwrap();
+            state
+                .db
+                .enqueue_job("upload", Some(src), Some(src))
+                .unwrap();
             let id = state
                 .db
                 .list_recent_jobs(50)
@@ -1735,13 +1763,20 @@ mod tests {
             "LOCAL_EDIT",
             "the local edit must win at the primary path"
         );
-        assert!(!copy.exists(), "the conflicted copy is consumed by the promotion");
+        assert!(
+            !copy.exists(),
+            "the conflicted copy is consumed by the promotion"
+        );
         assert_eq!(job_targets(&state, "upload"), vec!["doc.txt".to_string()]);
         assert!(
             job_targets(&state, "delete").is_empty(),
             "copy was never on the remote → no remote delete"
         );
-        assert_eq!(unresolved_count(&state), 0, "conflict must be marked resolved");
+        assert_eq!(
+            unresolved_count(&state),
+            0,
+            "conflict must be marked resolved"
+        );
     }
 
     #[test]
@@ -1750,7 +1785,10 @@ mod tests {
         let state = build_state(tmp.path());
         write_synced(&state, "doc.txt", "REMOTE");
         write_synced(&state, COPY_REL, "LOCAL_EDIT");
-        state.db.upsert_remote_file(COPY_REL, "h", "rev1", 1).unwrap();
+        state
+            .db
+            .upsert_remote_file(COPY_REL, "h", "rev1", 1)
+            .unwrap();
         state
             .db
             .add_conflict("doc.txt", "doc.txt", "r", Some(COPY_REL), false)
@@ -1804,7 +1842,10 @@ mod tests {
         resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::UseRemote)
             .unwrap();
 
-        assert!(!primary.exists(), "following the deleted remote removes the local file");
+        assert!(
+            !primary.exists(),
+            "following the deleted remote removes the local file"
+        );
         assert!(
             state.db.get_local_file("doc.txt").unwrap().is_none(),
             "the local index row must be untracked so the scan sees no tracked-file deletion"
@@ -1826,7 +1867,10 @@ mod tests {
         resolve_conflict_internal(&state, first_conflict_id(&state), ConflictAction::KeepBoth)
             .unwrap();
 
-        assert!(primary.exists() && copy.exists(), "both versions are kept on disk");
+        assert!(
+            primary.exists() && copy.exists(),
+            "both versions are kept on disk"
+        );
         assert_eq!(
             job_targets(&state, "upload"),
             vec![COPY_REL.to_string()],
@@ -1857,7 +1901,10 @@ mod tests {
 
     #[test]
     fn is_mass_deletion_thresholds() {
-        assert!(is_mass_deletion(200, 100_000), "absolute limit trips regardless of fraction");
+        assert!(
+            is_mass_deletion(200, 100_000),
+            "absolute limit trips regardless of fraction"
+        );
         assert!(is_mass_deletion(30, 100), ">= floor and >= 10% of tracked");
         assert!(!is_mass_deletion(24, 100), "below the absolute floor");
         assert!(!is_mass_deletion(30, 1000), "3% is under the 10% fraction");

@@ -94,12 +94,14 @@ pub(crate) fn fetch_remote_file_metadata(
             "include_deleted": false
         }))
         .send()
-        .map_err(|e| AppError::Network(format!("get_metadata request failed for {relative}: {e}")))?;
+        .map_err(|e| {
+            AppError::Network(format!("get_metadata request failed for {relative}: {e}"))
+        })?;
 
     if response.status().is_success() {
-        let entry: DropboxEntry = response
-            .json()
-            .map_err(|e| AppError::Other(format!("get_metadata parse failed for {relative}: {e}")))?;
+        let entry: DropboxEntry = response.json().map_err(|e| {
+            AppError::Other(format!("get_metadata parse failed for {relative}: {e}"))
+        })?;
         if entry.tag != "file" {
             return Ok(None);
         }
@@ -121,7 +123,9 @@ pub(crate) fn fetch_remote_file_metadata(
     }
 
     let status = response.status();
-    let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "<unreadable body>".to_string());
     if status.as_u16() == 409 && (body.contains("not_found") || body.contains("path")) {
         return Ok(None);
     }
@@ -193,7 +197,9 @@ pub(crate) fn fetch_all_remote_file_metadata(
             .map_err(|e| AppError::Network(format!("list_folder request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
             return Err(AppError::Dropbox {
                 status: status.as_u16(),
                 message: format!("list_folder for account root: {body}"),
@@ -228,7 +234,9 @@ pub(crate) fn fetch_all_remote_file_metadata(
             .map_err(|e| AppError::Network(format!("list_folder/continue request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
             return Err(AppError::Dropbox {
                 status: status.as_u16(),
                 message: format!("list_folder/continue for account root: {body}"),
@@ -491,9 +499,7 @@ pub(crate) fn seed_remote_delta_cursor(state: &AppState) -> AppResult<String> {
         )?;
     }
 
-    state
-        .db
-        .set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
+    state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
     Ok(cursor)
 }
 
@@ -636,7 +642,10 @@ mod tests {
         assert_eq!(key, "/docs/report.txt");
         assert_eq!(meta.content_hash, "hash123");
         assert_eq!(meta.rev, "rev1");
-        assert_eq!(meta.modified_ts, parse_rfc3339_ts_to_unix("2024-01-02T03:04:05Z"));
+        assert_eq!(
+            meta.modified_ts,
+            parse_rfc3339_ts_to_unix("2024-01-02T03:04:05Z")
+        );
     }
 
     #[test]
@@ -737,7 +746,10 @@ mod tests {
             409,
             r#"{"error_summary":"reset/...","error":{".tag":"reset"}}"#
         ));
-        assert!(!is_reset_error(409, r#"{"error_summary":"path/not_found/.."}"#));
+        assert!(!is_reset_error(
+            409,
+            r#"{"error_summary":"path/not_found/.."}"#
+        ));
         assert!(!is_reset_error(200, "reset/whatever"));
     }
 
@@ -749,14 +761,20 @@ mod tests {
 
         let n = reconcile_remote_absent(&state, "a.txt").unwrap();
         assert_eq!(n, 1);
-        assert_eq!(job_targets(&state, "local_delete"), vec!["a.txt".to_string()]);
+        assert_eq!(
+            job_targets(&state, "local_delete"),
+            vec!["a.txt".to_string()]
+        );
     }
 
     #[test]
     fn reconcile_remote_absent_keeps_diverged_local_as_conflict() {
         let state = build_state();
         state.db.upsert_remote_file("b.txt", "H", "rev", 0).unwrap();
-        state.db.upsert_local_file("b.txt", "DIFFERENT", 3, 0).unwrap();
+        state
+            .db
+            .upsert_local_file("b.txt", "DIFFERENT", 3, 0)
+            .unwrap();
 
         let n = reconcile_remote_absent(&state, "b.txt").unwrap();
         assert_eq!(n, 0, "a diverged local file must NOT be deleted");
@@ -786,7 +804,10 @@ mod tests {
     #[test]
     fn reconcile_remote_present_enqueues_download_on_remote_change() {
         let state = build_state();
-        state.db.upsert_remote_file("e.txt", "OLD", "rev0", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("e.txt", "OLD", "rev0", 0)
+            .unwrap();
         state.db.upsert_local_file("e.txt", "OLD", 3, 0).unwrap();
 
         let meta = RemoteFileMeta {
@@ -798,7 +819,12 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(job_targets(&state, "download"), vec!["e.txt".to_string()]);
         assert_eq!(
-            state.db.get_remote_file("e.txt").unwrap().unwrap().content_hash,
+            state
+                .db
+                .get_remote_file("e.txt")
+                .unwrap()
+                .unwrap()
+                .content_hash,
             "NEW"
         );
     }
@@ -806,7 +832,10 @@ mod tests {
     #[test]
     fn reconcile_remote_present_no_download_when_unchanged() {
         let state = build_state();
-        state.db.upsert_remote_file("f.txt", "SAME", "rev0", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("f.txt", "SAME", "rev0", 0)
+            .unwrap();
         state.db.upsert_local_file("f.txt", "SAME", 3, 0).unwrap();
 
         let meta = RemoteFileMeta {
@@ -842,8 +871,15 @@ mod tests {
             remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
                 .unwrap();
 
-        assert_eq!(absent.len(), 30, "every tracked file is absent from the snapshot");
-        assert_eq!(delete_candidates, 30, "every absent file matches its last-synced hash");
+        assert_eq!(
+            absent.len(),
+            30,
+            "every tracked file is absent from the snapshot"
+        );
+        assert_eq!(
+            delete_candidates, 30,
+            "every absent file matches its last-synced hash"
+        );
         assert!(
             is_mass_deletion(delete_candidates, local_files.len()),
             "30/30 candidates must trip the breaker"
@@ -869,21 +905,42 @@ mod tests {
         // Diverged local copy: absent from remote, but local hash no longer matches
         // the last-synced remote hash → NOT a delete candidate (becomes a conflict
         // via reconcile_remote_absent, never counted toward the breaker).
-        state.db.upsert_remote_file("diverged.txt", "H", "rev", 0).unwrap();
-        state.db.upsert_local_file("diverged.txt", "DIFFERENT", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("diverged.txt", "H", "rev", 0)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("diverged.txt", "DIFFERENT", 3, 0)
+            .unwrap();
 
         // Never indexed remotely: absent from the snapshot, but there's no prior
         // remote row, so it can't be a remote-wins delete either.
-        state.db.upsert_local_file("never_indexed.txt", "H", 3, 0).unwrap();
+        state
+            .db
+            .upsert_local_file("never_indexed.txt", "H", 3, 0)
+            .unwrap();
 
         // Present in this sweep's snapshot: excluded from `absent` entirely.
-        state.db.upsert_remote_file("present.txt", "H", "rev", 0).unwrap();
-        state.db.upsert_local_file("present.txt", "H", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("present.txt", "H", "rev", 0)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("present.txt", "H", 3, 0)
+            .unwrap();
 
         // Pending job: skipped like `.cloudsc` files, even though it would
         // otherwise be a clean delete candidate.
-        state.db.upsert_remote_file("pending.txt", "H", "rev", 0).unwrap();
-        state.db.upsert_local_file("pending.txt", "H", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("pending.txt", "H", "rev", 0)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("pending.txt", "H", 3, 0)
+            .unwrap();
 
         let local_files = state.db.list_local_files().unwrap();
         let mut remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
@@ -985,7 +1042,10 @@ mod tests {
             &pending_targets,
         )
         .unwrap();
-        assert_eq!(enqueued, 30, "an explicit override lets the reviewed batch through");
+        assert_eq!(
+            enqueued, 30,
+            "an explicit override lets the reviewed batch through"
+        );
         assert_eq!(job_targets(&state, "local_delete").len(), 30);
         assert!(
             state

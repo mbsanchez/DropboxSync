@@ -10,8 +10,8 @@
 //! always queries live.
 #![cfg(windows)]
 
-use windows::ApplicationModel::{StartupTask, StartupTaskState};
 use windows::core::HSTRING;
+use windows::ApplicationModel::{StartupTask, StartupTaskState};
 
 /// Must equal the `TaskId` of the `uap5:StartupTask` extension in
 /// `native/windows/sparse-package/AppxManifest.xml`. Never change once shipped

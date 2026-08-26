@@ -29,18 +29,13 @@ fn register_user_cloudsc_association_for_exe(exe: &Path) -> io::Result<()> {
     dot_key.set_value("", &PROG_ID)?;
 
     let (prog_key, _) = hkcu.create_subkey(format!(r"Software\Classes\{PROG_ID}"))?;
-    prog_key.set_value(
-        "",
-        &"Cloudsc placeholder (Dropbox Sync Desktop)",
-    )?;
+    prog_key.set_value("", &"Cloudsc placeholder (Dropbox Sync Desktop)")?;
 
-    let (icon_key, _) =
-        hkcu.create_subkey(format!(r"Software\Classes\{PROG_ID}\DefaultIcon"))?;
+    let (icon_key, _) = hkcu.create_subkey(format!(r"Software\Classes\{PROG_ID}\DefaultIcon"))?;
     icon_key.set_value("", &icon_ref)?;
 
-    let (cmd_key, _) = hkcu.create_subkey(format!(
-        r"Software\Classes\{PROG_ID}\shell\open\command"
-    ))?;
+    let (cmd_key, _) =
+        hkcu.create_subkey(format!(r"Software\Classes\{PROG_ID}\shell\open\command"))?;
     cmd_key.set_value("", &open_cmd)?;
 
     register_cloudsc_context_menu(&hkcu, &exe_str, &icon_ref)?;
@@ -57,11 +52,7 @@ pub(crate) const CLOUDSC_MENU_PROG_ID: &str = "DropboxSyncDesktop.CloudscMenu";
 /// (`--action/--path`). Labels are written in the system UI language (no resource
 /// DLL — the app localizes at registration). More children (Desincronizar,
 /// Créer un lien) are appended by their own tickets (DBSYNC-33 / DBSYNC-52).
-fn register_cloudsc_context_menu(
-    hkcu: &RegKey,
-    exe_str: &str,
-    icon_ref: &str,
-) -> io::Result<()> {
+fn register_cloudsc_context_menu(hkcu: &RegKey, exe_str: &str, icon_ref: &str) -> io::Result<()> {
     // Remove the previous flat verb from earlier builds, if present.
     let _ = hkcu.delete_subkey_all(format!(
         r"Software\Classes\{PROG_ID}\shell\dropboxsync_hydrate"
@@ -97,11 +88,7 @@ fn system_ui_language() -> String {
         .open_subkey(r"Control Panel\International")
         .and_then(|k| k.get_value::<String, _>("LocaleName"))
         .ok()
-        .and_then(|s| {
-            s.split(['-', '_'])
-                .next()
-                .map(|p| p.to_ascii_lowercase())
-        })
+        .and_then(|s| s.split(['-', '_']).next().map(|p| p.to_ascii_lowercase()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "en".to_string())
 }

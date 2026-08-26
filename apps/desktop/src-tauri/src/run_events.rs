@@ -37,7 +37,11 @@ pub(crate) fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
                 }
             }
         }
-        RunEvent::WindowEvent { label, event: win_evt, .. } => {
+        RunEvent::WindowEvent {
+            label,
+            event: win_evt,
+            ..
+        } => {
             match win_evt {
                 // `main` is a tray flyout, not the app: closing it (e.g. Alt+F4) just
                 // hides it, it never quits the app.

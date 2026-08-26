@@ -37,7 +37,7 @@ use windows::Storage::Provider::{
     StorageProviderPopulationPolicy, StorageProviderSyncRootInfo, StorageProviderSyncRootManager,
 };
 use windows::Storage::StorageFolder;
-use windows::Win32::Foundation::{CloseHandle, E_ABORT, HANDLE, HLOCAL, LocalFree, NTSTATUS};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, E_ABORT, HANDLE, HLOCAL, NTSTATUS};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Storage::CloudFilters::{
@@ -55,7 +55,7 @@ use windows::Win32::Storage::CloudFilters::{
     CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_0, CF_OPERATION_PARAMETERS_0_6,
     CF_OPERATION_PARAMETERS_0_7, CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
     CF_OPERATION_TYPE_ACK_DELETE, CF_OPERATION_TYPE_ACK_RENAME, CF_OPERATION_TYPE_TRANSFER_DATA,
-    CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO, CF_PIN_STATE_PINNED,
+    CF_PIN_STATE_PINNED, CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO,
     CF_REVERT_FLAG_NONE, CF_SET_IN_SYNC_FLAG_NONE, CF_SET_PIN_FLAG_NONE,
 };
 use windows::Win32::Storage::FileSystem::{
@@ -98,10 +98,7 @@ const POST_REGISTRATION_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// Record that a sync-root (un)registration just happened (starts the grace window).
 fn mark_registration_activity() {
-    if let Ok(mut g) = LAST_REGISTRATION_AT
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-    {
+    if let Ok(mut g) = LAST_REGISTRATION_AT.get_or_init(|| Mutex::new(None)).lock() {
         *g = Some(Instant::now());
     }
 }
@@ -135,7 +132,10 @@ const MATERIALIZATION_GRACE_WINDOW: Duration = Duration::from_secs(120);
 /// any already-expired entries so the map doesn't grow unbounded across a long-running
 /// session (no separate GC needed).
 pub(crate) fn mark_materialization(prefix: &str) {
-    if let Ok(mut m) = MATERIALIZATION_IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+    if let Ok(mut m) = MATERIALIZATION_IN_FLIGHT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
         let now = Instant::now();
         m.retain(|_, at| {
             now.checked_duration_since(*at)
@@ -158,7 +158,10 @@ fn materialization_grace_contains(
     window: Duration,
 ) -> bool {
     entries.iter().any(|(prefix, at)| {
-        let in_window = now.checked_duration_since(*at).map(|d| d < window).unwrap_or(true);
+        let in_window = now
+            .checked_duration_since(*at)
+            .map(|d| d < window)
+            .unwrap_or(true);
         in_window && (rel == prefix || rel.starts_with(&format!("{prefix}/")))
     })
 }
@@ -290,8 +293,14 @@ pub(crate) fn apply_folder_state(abs: &Path) -> bool {
         };
         // Convert to a placeholder (ignore "already a placeholder") + mark in-sync.
         // NEVER pin: pinning a directory would force-hydrate every child.
-        let conv = CfConvertToPlaceholder(handle, None, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None);
-        let sync = CfSetInSyncState(handle, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None);
+        let conv =
+            CfConvertToPlaceholder(handle, None, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None);
+        let sync = CfSetInSyncState(
+            handle,
+            CF_IN_SYNC_STATE_IN_SYNC,
+            CF_SET_IN_SYNC_FLAG_NONE,
+            None,
+        );
         let _ = CloseHandle(handle);
         // DBSYNC-67: CfConvertToPlaceholder only succeeds on an EMPTY directory —
         // once the folder holds placeholder children it returns 0x8007017C
@@ -328,7 +337,10 @@ pub(crate) fn notify_shell_folders_changed(sync_folder: Option<&str>, folder_rel
         return;
     };
     let root = Path::new(folder);
-    tracing::debug!(count = folder_rels.len(), "SHChangeNotify(SHCNE_UPDATEITEM) refreshing folder overlays");
+    tracing::debug!(
+        count = folder_rels.len(),
+        "SHChangeNotify(SHCNE_UPDATEITEM) refreshing folder overlays"
+    );
     for rel in folder_rels {
         if rel.is_empty() {
             continue;
@@ -487,7 +499,10 @@ fn connect_provider(folder: &str) {
         Ok(key) => {
             *guard = Some(key.0);
             set_connected_root(folder);
-            tracing::info!(folder, "cfapi provider connected (on-demand hydration + event-driven deletes)");
+            tracing::info!(
+                folder,
+                "cfapi provider connected (on-demand hydration + event-driven deletes)"
+            );
         }
         Err(e) => {
             tracing::warn!(folder, error = %e, "CfConnectSyncRoot failed; on-demand hydration disabled");
@@ -524,7 +539,12 @@ fn clear_cancel(transfer_key: i64) {
 fn app_state() -> Option<crate::state::AppState> {
     use tauri::Manager;
     let handle = crate::state::APP_HANDLE.get()?;
-    Some(handle.try_state::<crate::state::AppState>()?.inner().clone())
+    Some(
+        handle
+            .try_state::<crate::state::AppState>()?
+            .inner()
+            .clone(),
+    )
 }
 
 /// Join a CfAPI-normalized, DRIVE-LESS path (e.g. `\Users\me\Dropbox\file.txt`) with
@@ -595,7 +615,14 @@ unsafe extern "system" fn on_fetch_data(
         }
         Err(e) => {
             tracing::warn!(error = %e, "cfapi fetch-data failed; failing the open");
-            let _ = cf_transfer(conn, transfer, std::ptr::null(), offset, length, STATUS_UNSUCCESSFUL);
+            let _ = cf_transfer(
+                conn,
+                transfer,
+                std::ptr::null(),
+                offset,
+                length,
+                STATUS_UNSUCCESSFUL,
+            );
         }
     }
 }
@@ -657,7 +684,10 @@ fn mark_in_flight(slot: &'static OnceLock<Mutex<HashMap<String, bool>>>, rel: &s
     }
 }
 
-fn take_in_flight(slot: &'static OnceLock<Mutex<HashMap<String, bool>>>, rel: &str) -> Option<bool> {
+fn take_in_flight(
+    slot: &'static OnceLock<Mutex<HashMap<String, bool>>>,
+    rel: &str,
+) -> Option<bool> {
     slot.get()?.lock().ok()?.remove(rel)
 }
 
@@ -741,7 +771,11 @@ unsafe extern "system" fn on_notify_delete(
     let is_dir = if params.is_null() {
         false
     } else {
-        (*params).Anonymous.Delete.Flags.contains(CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY)
+        (*params)
+            .Anonymous
+            .Delete
+            .Flags
+            .contains(CF_CALLBACK_DELETE_FLAG_IS_DIRECTORY)
     };
     let _: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let rel = full_local_path(info).and_then(|abs| rel_under_connected_root(&abs))?;
@@ -810,7 +844,11 @@ unsafe extern "system" fn on_notify_rename(
     let is_dir = if params.is_null() {
         false
     } else {
-        (*params).Anonymous.Rename.Flags.contains(CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY)
+        (*params)
+            .Anonymous
+            .Rename
+            .Flags
+            .contains(CF_CALLBACK_RENAME_FLAG_IS_DIRECTORY)
     };
     let _: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let rel = full_local_path(info).and_then(|abs| rel_under_connected_root(&abs))?;
@@ -863,11 +901,13 @@ unsafe extern "system" fn on_notify_rename_completion(
     let outcome: Option<(String, Option<String>)> =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let root = connected_root()?;
-            let source_abs =
-                full_path_from(info.VolumeDosName, params.Anonymous.RenameCompletion.SourcePath)?;
+            let source_abs = full_path_from(
+                info.VolumeDosName,
+                params.Anonymous.RenameCompletion.SourcePath,
+            )?;
             let source_rel = crate::path_util::relpath_under(&root, &source_abs).ok()?;
-            let target_rel =
-                full_local_path(info).and_then(|target_abs| classify_rename_target(&root, &target_abs));
+            let target_rel = full_local_path(info)
+                .and_then(|target_abs| classify_rename_target(&root, &target_abs));
             Some((source_rel, target_rel))
         }))
         .unwrap_or(None);
@@ -899,7 +939,11 @@ unsafe extern "system" fn on_notify_rename_completion(
 /// One `CfExecute(CF_OPERATION_TYPE_ACK_DELETE)` — unconditionally lets the
 /// platform's delete proceed (we never veto). Mirrors `cf_transfer`'s
 /// `CF_OPERATION_INFO` / `CF_OPERATION_PARAMETERS` construction.
-unsafe fn ack_delete(conn: CF_CONNECTION_KEY, transfer: i64, status: NTSTATUS) -> windows::core::Result<()> {
+unsafe fn ack_delete(
+    conn: CF_CONNECTION_KEY,
+    transfer: i64,
+    status: NTSTATUS,
+) -> windows::core::Result<()> {
     let op_info = CF_OPERATION_INFO {
         StructSize: std::mem::size_of::<CF_OPERATION_INFO>() as u32,
         Type: CF_OPERATION_TYPE_ACK_DELETE,
@@ -925,7 +969,11 @@ unsafe fn ack_delete(conn: CF_CONNECTION_KEY, transfer: i64, status: NTSTATUS) -
 /// One `CfExecute(CF_OPERATION_TYPE_ACK_RENAME)` — unconditionally lets the
 /// platform's rename/move proceed (we never veto). Mirrors `cf_transfer`'s
 /// `CF_OPERATION_INFO` / `CF_OPERATION_PARAMETERS` construction.
-unsafe fn ack_rename(conn: CF_CONNECTION_KEY, transfer: i64, status: NTSTATUS) -> windows::core::Result<()> {
+unsafe fn ack_rename(
+    conn: CF_CONNECTION_KEY,
+    transfer: i64,
+    status: NTSTATUS,
+) -> windows::core::Result<()> {
     let op_info = CF_OPERATION_INFO {
         StructSize: std::mem::size_of::<CF_OPERATION_INFO>() as u32,
         Type: CF_OPERATION_TYPE_ACK_RENAME,
@@ -982,7 +1030,8 @@ static PENDING_DELETES_LAST_ACTIVITY: OnceLock<Mutex<Option<Instant>>> = OnceLoc
 /// cleared by the worker itself once the buffer has been empty for a couple of
 /// polls (with a re-check to avoid dropping a push that lands in that exact
 /// window — see `run_delete_flush_worker`).
-static DELETE_FLUSH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DELETE_FLUSH_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// How long the buffer must be quiet (no new pushes) before it is flushed.
 /// Comfortably longer than the gap between consecutive descendant
@@ -1139,8 +1188,7 @@ fn flush_pending_deletes(state: &crate::state::AppState, batch: Vec<PendingDelet
     }
     // DBSYNC-70: measure where a coalesced folder-delete flush spends its time.
     let flush_start = std::time::Instant::now();
-    let entries: Vec<(String, bool)> =
-        batch.iter().map(|p| (p.rel.clone(), p.is_dir)).collect();
+    let entries: Vec<(String, bool)> = batch.iter().map(|p| (p.rel.clone(), p.is_dir)).collect();
     let roots = minimal_delete_roots(&entries);
 
     for (rel, is_dir) in &roots {
@@ -1297,8 +1345,15 @@ fn stream_range(
             break;
         }
         unsafe {
-            cf_transfer(conn, transfer, buf.as_ptr() as *const _, pos, filled as i64, STATUS_SUCCESS)
-                .map_err(|e| AppError::Other(format!("CfExecute(TRANSFER_DATA): {e}")))?;
+            cf_transfer(
+                conn,
+                transfer,
+                buf.as_ptr() as *const _,
+                pos,
+                filled as i64,
+                STATUS_SUCCESS,
+            )
+            .map_err(|e| AppError::Other(format!("CfExecute(TRANSFER_DATA): {e}")))?;
         }
         pos += filled as i64;
         remaining -= filled as i64;
@@ -1423,7 +1478,9 @@ pub(crate) fn hydrate_folder(abs: &Path) -> usize {
             continue;
         }
         // Stat only — is_dehydrated_placeholder uses symlink_metadata, no open/recall.
-        if crate::path_util::is_dehydrated_placeholder(entry.path()) && hydrate_placeholder(entry.path()) {
+        if crate::path_util::is_dehydrated_placeholder(entry.path())
+            && hydrate_placeholder(entry.path())
+        {
             n += 1;
         }
     }
@@ -1461,7 +1518,12 @@ fn reconcile_after_hydration(abs: &Path) {
             FILE_FLAG_BACKUP_SEMANTICS,
             None,
         ) {
-            let r = CfSetInSyncState(handle, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, None);
+            let r = CfSetInSyncState(
+                handle,
+                CF_IN_SYNC_STATE_IN_SYNC,
+                CF_SET_IN_SYNC_FLAG_NONE,
+                None,
+            );
             let _ = CloseHandle(handle);
             tracing::debug!(file = %abs.display(), result = ?r, "cfapi reconcile after hydration (mark in-sync)");
         }
@@ -1644,27 +1706,47 @@ fn register_winrt(folder: &str) -> windows::core::Result<()> {
     tracing::info!(sync_root_id = %id, folder, "cfapi register: begin");
     let info = step!("new", StorageProviderSyncRootInfo::new());
     step!("SetId", info.SetId(&HSTRING::from(&id)));
-    let op = step!("GetFolderFromPathAsync", StorageFolder::GetFolderFromPathAsync(&HSTRING::from(folder)));
+    let op = step!(
+        "GetFolderFromPathAsync",
+        StorageFolder::GetFolderFromPathAsync(&HSTRING::from(folder))
+    );
     let hfolder = step!("GetFolder.get", op.get());
     step!("SetPath", info.SetPath(&hfolder));
-    step!("SetDisplayNameResource", info.SetDisplayNameResource(&HSTRING::from("DropboxSync")));
+    step!(
+        "SetDisplayNameResource",
+        info.SetDisplayNameResource(&HSTRING::from("DropboxSync"))
+    );
     if let Some(icon) = icon_spec() {
-        step!("SetIconResource", info.SetIconResource(&HSTRING::from(icon)));
+        step!(
+            "SetIconResource",
+            info.SetIconResource(&HSTRING::from(icon))
+        );
     }
-    step!("SetHydrationPolicy", info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full));
+    step!(
+        "SetHydrationPolicy",
+        info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full)
+    );
     // Let the platform dehydrate unpinned in-sync files (and let us call
     // CfDehydratePlaceholder directly) — required for on-demand / the cloud icon
     // (DBSYNC-59). Only affects UNPINNED files, so DBSYNC-41's pinned files (and the
     // status column) are unchanged.
     step!(
         "SetHydrationPolicyModifier",
-        info.SetHydrationPolicyModifier(StorageProviderHydrationPolicyModifier::AutoDehydrationAllowed)
+        info.SetHydrationPolicyModifier(
+            StorageProviderHydrationPolicyModifier::AutoDehydrationAllowed
+        )
     );
-    step!("SetPopulationPolicy", info.SetPopulationPolicy(StorageProviderPopulationPolicy::AlwaysFull));
+    step!(
+        "SetPopulationPolicy",
+        info.SetPopulationPolicy(StorageProviderPopulationPolicy::AlwaysFull)
+    );
     step!("SetProviderId", info.SetProviderId(PROVIDER_ID));
     step!("SetVersion", info.SetVersion(&HSTRING::from("1.0.0.0")));
     // Context is a required provider-defined blob; a small non-empty buffer suffices.
-    let ctx = step!("CreateContext", CryptographicBuffer::CreateFromByteArray(b"DropboxSync"));
+    let ctx = step!(
+        "CreateContext",
+        CryptographicBuffer::CreateFromByteArray(b"DropboxSync")
+    );
     step!("SetContext", info.SetContext(&ctx));
     // Clear any stale/partial registration for this id first, so a leftover entry
     // (e.g. one whose nav-pane node was stripped by `enable-status-column`, or a
@@ -1758,13 +1840,17 @@ fn apply_file_state(abs: &Path, is_synced: bool, reconvert: bool) -> bool {
         let revert = if reconvert {
             // Best-effort: strips a stale/orphaned placeholder identity. Errors
             // (e.g. plain file, or already ours) are harmless — we convert next.
-            format!("{:?}", CfRevertPlaceholder(handle, CF_REVERT_FLAG_NONE, None))
+            format!(
+                "{:?}",
+                CfRevertPlaceholder(handle, CF_REVERT_FLAG_NONE, None)
+            )
         } else {
             "skip".into()
         };
         // Convert if not already a placeholder (ignore "already a placeholder").
         // Keeps the file's bytes — no download.
-        let conv = CfConvertToPlaceholder(handle, None, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None);
+        let conv =
+            CfConvertToPlaceholder(handle, None, 0, CF_CONVERT_FLAG_MARK_IN_SYNC, None, None);
         // Pin so the platform never dehydrates it — our `.cloudsc` menu owns freeing
         // space, and we keep NO live provider connection, so a dehydrated placeholder
         // here would be UNRECOVERABLE (no fetch handler to re-download it). If pinning

@@ -210,7 +210,10 @@ mod tests {
     fn missing_action_or_path_is_none() {
         assert_eq!(parse_action_args(&v(&["exe", "--path=/x/y"])), None);
         assert_eq!(parse_action_args(&v(&["exe", "--action=hydrate"])), None);
-        assert_eq!(parse_action_args(&v(&["exe", "--action=", "--path=/x"])), None);
+        assert_eq!(
+            parse_action_args(&v(&["exe", "--action=", "--path=/x"])),
+            None
+        );
         assert_eq!(parse_action_args(&v(&["exe"])), None);
     }
 
@@ -231,7 +234,8 @@ mod tests {
         let db_path = dir.path().join("app.db");
         std::mem::forget(dir); // keep the DB file alive for the test body
         let db = crate::storage::db::Db::new_at(&db_path).expect("db");
-        db.set_sync_folder(&folder.to_string_lossy()).expect("set folder");
+        db.set_sync_folder(&folder.to_string_lossy())
+            .expect("set folder");
         AppState {
             secure_store: crate::storage::secure_store::SecureStore::new(),
             db: Arc::new(db),

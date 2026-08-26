@@ -89,8 +89,16 @@ fn clamp_into(x: f64, y: f64, m: MonitorBox, win_w: f64, win_h: f64) -> (f64, f6
     let min_y = m.y;
     let max_y = m.y + m.height - win_h;
 
-    let cx = if max_x >= min_x { x.clamp(min_x, max_x) } else { min_x };
-    let cy = if max_y >= min_y { y.clamp(min_y, max_y) } else { min_y };
+    let cx = if max_x >= min_x {
+        x.clamp(min_x, max_x)
+    } else {
+        min_x
+    };
+    let cy = if max_y >= min_y {
+        y.clamp(min_y, max_y)
+    } else {
+        min_y
+    };
     (cx, cy)
 }
 
@@ -101,8 +109,18 @@ mod tests {
     // Two 1440x900@2x displays side by side, primary on the left. Physical pixels.
     fn side_by_side() -> Vec<MonitorBox> {
         vec![
-            MonitorBox { x: 0.0, y: 0.0, width: 2880.0, height: 1800.0 },
-            MonitorBox { x: 2880.0, y: 0.0, width: 2880.0, height: 1800.0 },
+            MonitorBox {
+                x: 0.0,
+                y: 0.0,
+                width: 2880.0,
+                height: 1800.0,
+            },
+            MonitorBox {
+                x: 2880.0,
+                y: 0.0,
+                width: 2880.0,
+                height: 1800.0,
+            },
         ]
     }
 
@@ -111,8 +129,18 @@ mod tests {
     // is testable on a machine with one display.
     fn stacked() -> Vec<MonitorBox> {
         vec![
-            MonitorBox { x: 0.0, y: 0.0, width: 2880.0, height: 1800.0 },
-            MonitorBox { x: 0.0, y: -1800.0, width: 2880.0, height: 1800.0 },
+            MonitorBox {
+                x: 0.0,
+                y: 0.0,
+                width: 2880.0,
+                height: 1800.0,
+            },
+            MonitorBox {
+                x: 0.0,
+                y: -1800.0,
+                width: 2880.0,
+                height: 1800.0,
+            },
         ]
     }
 
@@ -153,7 +181,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_hangs_the_flyout_below_the_menu_bar() {
-        let tray = TrayRect { x: 1400.0, y: 0.0, width: 44.0, height: 48.0 };
+        let tray = TrayRect {
+            x: 1400.0,
+            y: 0.0,
+            width: 44.0,
+            height: 48.0,
+        };
         let m = side_by_side()[0];
         let (_, y) = flyout_origin(tray, m, 720.0, 1200.0, 16.0);
         assert_eq!(y, 64.0, "below the 48px tray rect plus the 16px gap");
@@ -162,7 +195,12 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn other_platforms_keep_the_bottom_taskbar_anchor() {
-        let tray = TrayRect { x: 1400.0, y: 1752.0, width: 44.0, height: 48.0 };
+        let tray = TrayRect {
+            x: 1400.0,
+            y: 1752.0,
+            width: 44.0,
+            height: 48.0,
+        };
         let m = side_by_side()[0];
         let (_, y) = flyout_origin(tray, m, 720.0, 1200.0, 16.0);
         assert!(y < 1752.0, "the window sits above a bottom taskbar");
@@ -170,7 +208,12 @@ mod tests {
 
     #[test]
     fn the_flyout_is_right_aligned_to_the_icon() {
-        let tray = TrayRect { x: 1400.0, y: 0.0, width: 44.0, height: 48.0 };
+        let tray = TrayRect {
+            x: 1400.0,
+            y: 0.0,
+            width: 44.0,
+            height: 48.0,
+        };
         let m = side_by_side()[0];
         let (x, _) = flyout_origin(tray, m, 720.0, 1200.0, 16.0);
         assert_eq!(x, 1400.0 + 44.0 - 720.0);
@@ -181,7 +224,12 @@ mod tests {
     #[test]
     fn clamping_keeps_the_window_on_the_second_screen() {
         let monitors = side_by_side();
-        let tray = TrayRect { x: 5700.0, y: 0.0, width: 44.0, height: 48.0 };
+        let tray = TrayRect {
+            x: 5700.0,
+            y: 0.0,
+            width: 44.0,
+            height: 48.0,
+        };
         let m = monitor_for_point(&monitors, 5720.0, 20.0).unwrap();
         let (x, _) = flyout_origin(tray, m, 720.0, 1200.0, 16.0);
         assert!(x >= 2880.0, "must not spill onto the primary");
@@ -192,8 +240,18 @@ mod tests {
     /// A crash in the click handler is worse than an awkwardly placed window.
     #[test]
     fn a_window_larger_than_the_display_does_not_panic() {
-        let tiny = MonitorBox { x: 0.0, y: 0.0, width: 400.0, height: 300.0 };
-        let tray = TrayRect { x: 300.0, y: 0.0, width: 44.0, height: 48.0 };
+        let tiny = MonitorBox {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let tray = TrayRect {
+            x: 300.0,
+            y: 0.0,
+            width: 44.0,
+            height: 48.0,
+        };
         let (x, y) = flyout_origin(tray, tiny, 720.0, 1200.0, 16.0);
         assert_eq!((x, y), (0.0, 0.0));
     }
@@ -211,8 +269,18 @@ mod tests {
     /// module uses invented layouts — this one is the hardware the bug was reported on.
     fn maintainer_layout() -> Vec<MonitorBox> {
         vec![
-            MonitorBox { x: 0.0, y: 0.0, width: 3360.0, height: 2100.0 },
-            MonitorBox { x: -6016.0, y: -1076.0, width: 6016.0, height: 3384.0 },
+            MonitorBox {
+                x: 0.0,
+                y: 0.0,
+                width: 3360.0,
+                height: 2100.0,
+            },
+            MonitorBox {
+                x: -6016.0,
+                y: -1076.0,
+                width: 6016.0,
+                height: 3384.0,
+            },
         ]
     }
 
@@ -275,7 +343,11 @@ mod tests {
         let layout = maintainer_layout();
 
         let m = monitor_for_point(&layout, CLICK_ON_BUILT_IN.0, CLICK_ON_BUILT_IN.1).unwrap();
-        assert_eq!((m.x, m.y), (0.0, 0.0), "click on the built-in must pick the built-in");
+        assert_eq!(
+            (m.x, m.y),
+            (0.0, 0.0),
+            "click on the built-in must pick the built-in"
+        );
 
         let m = monitor_for_point(&layout, CLICK_ON_EXTERNAL.0, CLICK_ON_EXTERNAL.1).unwrap();
         assert_eq!(
@@ -306,7 +378,12 @@ mod tests {
             let monitor = monitor_for_point(&layout, click.0, click.1).unwrap();
             assert_eq!((monitor.x, monitor.y), (expected.x, expected.y));
 
-            let tray = TrayRect { x: click.0, y: expected.y, width: 44.0, height: 48.0 };
+            let tray = TrayRect {
+                x: click.0,
+                y: expected.y,
+                width: 44.0,
+                height: 48.0,
+            };
             let (x, y) = flyout_origin(tray, monitor, win_w, win_h, gap);
 
             assert!(
@@ -325,11 +402,26 @@ mod tests {
     #[test]
     fn a_non_retina_second_display_is_handled_by_its_own_geometry() {
         let monitors = vec![
-            MonitorBox { x: 0.0, y: 0.0, width: 2880.0, height: 1800.0 },
-            MonitorBox { x: 2880.0, y: 0.0, width: 1920.0, height: 1080.0 },
+            MonitorBox {
+                x: 0.0,
+                y: 0.0,
+                width: 2880.0,
+                height: 1800.0,
+            },
+            MonitorBox {
+                x: 2880.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
         ];
         let m = monitor_for_point(&monitors, 3000.0, 10.0).unwrap();
-        let tray = TrayRect { x: 4700.0, y: 0.0, width: 22.0, height: 24.0 };
+        let tray = TrayRect {
+            x: 4700.0,
+            y: 0.0,
+            width: 22.0,
+            height: 24.0,
+        };
         let (x, _) = flyout_origin(tray, m, 360.0, 600.0, 8.0);
         assert!(x >= 2880.0 && x + 360.0 <= 4800.0);
     }

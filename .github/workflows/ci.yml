@@ -110,6 +110,17 @@ jobs:
       - name: Rust tests
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 
+      - name: Rust formatting
+        # Added by DBSYNC-90, after `cargo fmt` was applied to the tree. Deliberately NOT
+        # part of DBSYNC-38: turning this on before formatting would have made every job
+        # red on layout rather than on defects, which is how this workflow earned being
+        # switched off for six weeks.
+        #
+        # Runs on both matrix legs. rustfmt is deterministic, so the Windows leg is
+        # redundant in principle — but a divergence there would be a real finding about the
+        # toolchain, and it costs a second.
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+
       - name: Rust lints
         # Not `-D warnings`: main currently carries pre-existing warnings, and failing the
         # build on them would put this workflow straight back to permanently red — which is

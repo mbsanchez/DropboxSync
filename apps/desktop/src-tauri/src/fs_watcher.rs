@@ -192,10 +192,7 @@ mod tests {
     #[test]
     fn path_outside_root_maps_to_none() {
         let root = Path::new("/sync/root");
-        assert_eq!(
-            map_event_path(root, root, Path::new("/etc/passwd")),
-            None
-        );
+        assert_eq!(map_event_path(root, root, Path::new("/etc/passwd")), None);
     }
 
     #[test]
