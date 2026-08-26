@@ -213,11 +213,7 @@ pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
 /// NUL byte, and not absolute (no leading `/` or `\`, no drive/UNC prefix).
 /// Used before joining any remote-derived path onto the local sync folder.
 pub(crate) fn validate_relative(rel: &str) -> AppResult<()> {
-    if has_traversal(rel)
-        || is_os_absolute(rel)
-        || rel.starts_with('/')
-        || rel.starts_with('\\')
-    {
+    if has_traversal(rel) || is_os_absolute(rel) || rel.starts_with('/') || rel.starts_with('\\') {
         return Err(AppError::Sync(format!(
             "rejected unsafe relative path: {rel:?}"
         )));
@@ -534,8 +530,7 @@ mod tests {
         let tmp = NamedTempFile::new().expect("tempfile");
         let (hash, size, mtime) = hash_file(tmp.path()).expect("hash_file");
         assert_eq!(
-            hash,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "empty file must match SHA-256 of empty bytes"
         );
         assert_eq!(size, 0);
@@ -616,11 +611,17 @@ mod tests {
     #[test]
     fn normalize_accepts_legit_paths() {
         assert_eq!(normalize_dropbox_path("").unwrap(), "");
-        assert_eq!(normalize_dropbox_path("Cocina/Pizza").unwrap(), "/Cocina/Pizza");
+        assert_eq!(
+            normalize_dropbox_path("Cocina/Pizza").unwrap(),
+            "/Cocina/Pizza"
+        );
         // A leading '/' is the Dropbox root convention and must be preserved.
         assert_eq!(normalize_dropbox_path("/Cocina").unwrap(), "/Cocina");
         // Windows separators are canonicalised to '/'.
-        assert_eq!(normalize_dropbox_path("Cocina\\Pizza").unwrap(), "/Cocina/Pizza");
+        assert_eq!(
+            normalize_dropbox_path("Cocina\\Pizza").unwrap(),
+            "/Cocina/Pizza"
+        );
     }
 
     #[test]
@@ -657,7 +658,10 @@ mod tests {
             "\\\\unc\\x",
             "x\0y",
         ] {
-            assert!(validate_relative(bad).is_err(), "expected rejection for {bad:?}");
+            assert!(
+                validate_relative(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
         }
     }
 
@@ -719,6 +723,9 @@ mod tests {
 
         let (_hash, size, mtime) = hash_file(tmp.path()).expect("hash_file");
         assert_eq!(size, content.len() as i64);
-        assert!(mtime > 0, "modified timestamp must be non-zero for a newly created file");
+        assert!(
+            mtime > 0,
+            "modified timestamp must be non-zero for a newly created file"
+        );
     }
 }

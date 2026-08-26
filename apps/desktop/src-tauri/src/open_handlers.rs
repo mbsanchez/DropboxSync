@@ -94,9 +94,10 @@ pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<Pa
     for path in paths {
         match resolve_cloudsc_rel_path(&app_state, &path) {
             Ok(rel) => {
-                if let Err(e) = app_state
-                    .db
-                    .enqueue_job("hydrate_cloudsc", Some(rel.as_str()), None)
+                if let Err(e) =
+                    app_state
+                        .db
+                        .enqueue_job("hydrate_cloudsc", Some(rel.as_str()), None)
                 {
                     tracing::error!(file_path = %rel, error = %e, "enqueue hydrate_cloudsc failed");
                     continue;

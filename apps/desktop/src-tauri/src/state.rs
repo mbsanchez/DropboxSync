@@ -91,12 +91,7 @@ mod tests {
                 let successes = Arc::clone(&successes);
                 std::thread::spawn(move || {
                     if flag
-                        .compare_exchange(
-                            false,
-                            true,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         successes.fetch_add(1, Ordering::AcqRel);

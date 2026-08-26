@@ -59,7 +59,10 @@ fn active_job_paths(db: &db::Db) -> AppResult<HashSet<String>> {
 }
 
 fn unresolved_conflict_paths(db: &db::Db) -> AppResult<HashSet<String>> {
-    Ok(db.list_unresolved_conflict_local_paths()?.into_iter().collect())
+    Ok(db
+        .list_unresolved_conflict_local_paths()?
+        .into_iter()
+        .collect())
 }
 
 /// Recomputes per-file overlay tiers and atomically writes `overlay_state.json` under [`db::app_data_dir`].

@@ -119,10 +119,7 @@ pub fn start_oauth() -> AppResult<(String, String, String)> {
     Ok((auth_url, state, verifier))
 }
 
-pub async fn complete_oauth(
-    code: String,
-    verifier: Zeroizing<String>,
-) -> AppResult<TokenResponse> {
+pub async fn complete_oauth(code: String, verifier: Zeroizing<String>) -> AppResult<TokenResponse> {
     let app_key = resolve_app_key()?;
     let redirect_uri = resolve_redirect_uri();
     let client = Client::builder()

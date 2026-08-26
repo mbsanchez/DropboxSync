@@ -11,9 +11,7 @@ use crate::cloudsc::{
 };
 use crate::dropbox_transfer::{delete_remote_file_internal, download_remote_file_internal};
 use crate::error::{AppError, AppResult};
-use crate::models::{
-    CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse,
-};
+use crate::models::{CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse};
 use crate::path_util::{
     hash_file, is_ignored_local_path, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
     relpath_under, safe_join,
@@ -88,7 +86,9 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             .map_err(|e| AppError::Network(format!("list_folder request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
             // A local directory with no Dropbox counterpart (e.g. a local-only
             // folder pending upload) is not an error for this indexer — it simply
             // has nothing to placeholder. Don't spam the log or fail the sweep.
@@ -192,8 +192,15 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
                                 .map(crate::remote_index::parse_rfc3339_ts_to_unix)
                                 .unwrap_or(0);
                             if create_remote_only_placeholder(
-                                state, local_dir, &child_name, &relative, &path_display, ch, rv,
-                                sz, mts,
+                                state,
+                                local_dir,
+                                &child_name,
+                                &relative,
+                                &path_display,
+                                ch,
+                                rv,
+                                sz,
+                                mts,
                             ) {
                                 created += 1;
                                 created_names.push(child_name.clone());
@@ -273,7 +280,9 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             .map_err(|e| AppError::Network(format!("list_folder/continue request failed: {e}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_else(|_| "<unreadable body>".to_string());
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unreadable body>".to_string());
             return Err(AppError::Dropbox {
                 status: status.as_u16(),
                 message: format!("list_folder/continue for {remote_folder_path_display}: {body}"),
@@ -290,8 +299,8 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     // (any list error returns earlier), so a failed/partial listing never deletes
     // placeholders. Hydrated content (real files/dirs) is untouched — only
     // `.cloudsc` files are considered.
-    for dir_entry in
-        fs::read_dir(local_dir).map_err(|e| AppError::Io(format!("failed reading local dir: {e}")))?
+    for dir_entry in fs::read_dir(local_dir)
+        .map_err(|e| AppError::Io(format!("failed reading local dir: {e}")))?
     {
         let dir_entry = match dir_entry {
             Ok(e) => e,
@@ -352,10 +361,16 @@ fn create_remote_only_placeholder(
     ) {
         return false;
     }
-    if let Err(e) = state.db.upsert_local_file(rel, content_hash, size, modified_ts) {
+    if let Err(e) = state
+        .db
+        .upsert_local_file(rel, content_hash, size, modified_ts)
+    {
         tracing::warn!(rel, error = %e, "remote-only placeholder: local index upsert failed");
     }
-    if let Err(e) = state.db.upsert_remote_file(rel, content_hash, rev, modified_ts) {
+    if let Err(e) = state
+        .db
+        .upsert_remote_file(rel, content_hash, rev, modified_ts)
+    {
         tracing::warn!(rel, error = %e, "remote-only placeholder: remote index upsert failed");
     }
     true
@@ -503,13 +518,16 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
         .map_err(|e| AppError::Io(format!("failed creating sync folder: {e}")))?;
 
     let mut created = 0usize;
-    for entry in WalkDir::new(&sync_folder).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&sync_folder)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_dir() {
             continue;
         }
         let dir = entry.path();
         let rel = relpath_under(&sync_folder, dir)?; // "" for the sync root itself
-        // "" for root, "/Cocina", ...; a malformed path skips this folder only.
+                                                     // "" for root, "/Cocina", ...; a malformed path skips this folder only.
         let remote_path = match normalize_dropbox_path(&rel) {
             Ok(p) => p,
             Err(e) => {
@@ -517,11 +535,16 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
                 continue;
             }
         };
-        match index_remote_folder_children_as_cloudsc_placeholders_internal(state, &remote_path, dir)
-        {
+        match index_remote_folder_children_as_cloudsc_placeholders_internal(
+            state,
+            &remote_path,
+            dir,
+        ) {
             Ok(n) => created += n,
             // One unreadable folder must not abort the whole sweep.
-            Err(e) => tracing::error!(remote_path = %remote_path, error = %e, "index remote folder failed"),
+            Err(e) => {
+                tracing::error!(remote_path = %remote_path, error = %e, "index remote folder failed")
+            }
         }
     }
 
@@ -848,7 +871,12 @@ fn dehydrate_one_file_cfapi(state: &AppState, root: &Path, rel: &str) -> AppResu
     let name = name.to_string_lossy().to_string();
 
     dehydrate_file_atomic(state, rel, &abs, &row, || {
-        crate::cloud_filter::create_dehydrated_placeholder(parent, &name, &remote_path, row.size_bytes)
+        crate::cloud_filter::create_dehydrated_placeholder(
+            parent,
+            &name,
+            &remote_path,
+            row.size_bytes,
+        )
     })
 }
 
@@ -1007,7 +1035,11 @@ pub(crate) fn recover_stray_dehydrate_asides(state: &AppState) -> AppResult<usiz
 /// on a partial enumeration). The full subtree is enumerated BEFORE any mutation so a
 /// remove+recreate never perturbs the in-flight walk. Returns the freed rels.
 #[cfg(windows)]
-fn dehydrate_folder_cfapi(state: &AppState, root: &Path, folder_rel: &str) -> AppResult<Vec<String>> {
+fn dehydrate_folder_cfapi(
+    state: &AppState,
+    root: &Path,
+    folder_rel: &str,
+) -> AppResult<Vec<String>> {
     if folder_rel.is_empty() {
         return Err(AppError::Sync(
             "cannot free up space on the sync root itself".to_string(),
@@ -1283,9 +1315,7 @@ fn probe_remote_folder_empty(state: &AppState, rel: &str) -> AppResult<RemoteFol
             "include_deleted": false
         }))
         .send()
-        .map_err(|e| {
-            AppError::Network(format!("list_folder (prune probe) request failed: {e}"))
-        })?;
+        .map_err(|e| AppError::Network(format!("list_folder (prune probe) request failed: {e}")))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1549,9 +1579,15 @@ mod tests {
         let sync = tmp.path().join("synced");
         let state = build_state(&sync);
         std::fs::write(sync.join("b.txt"), b"local edit").unwrap();
-        state.db.upsert_local_file("b.txt", "LOCALHASH", 10, 0).unwrap();
+        state
+            .db
+            .upsert_local_file("b.txt", "LOCALHASH", 10, 0)
+            .unwrap();
         // Remote hash differs → the local copy has unsynced changes.
-        state.db.upsert_remote_file("b.txt", "REMOTEHASH", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("b.txt", "REMOTEHASH", "rev", 0)
+            .unwrap();
 
         let err = dehydrate_path_internal(&state, "b.txt").unwrap_err();
         assert!(format!("{err}").contains("not fully synced"), "got: {err}");
@@ -1569,8 +1605,14 @@ mod tests {
         // bytes were edited after the last index (watcher hasn't caught up). The
         // authoritative re-hash must catch this and refuse — never lose the edit.
         std::fs::write(sync.join("d.txt"), b"edited after the last index update").unwrap();
-        state.db.upsert_local_file("d.txt", "STALE_SYNCED", 5, 0).unwrap();
-        state.db.upsert_remote_file("d.txt", "STALE_SYNCED", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_local_file("d.txt", "STALE_SYNCED", 5, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d.txt", "STALE_SYNCED", "rev", 0)
+            .unwrap();
 
         let err = dehydrate_path_internal(&state, "d.txt").unwrap_err();
         assert!(format!("{err}").contains("not fully synced"), "got: {err}");
@@ -1613,7 +1655,10 @@ mod tests {
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, bytes).unwrap();
         let (h, _, _) = hash_file(&abs).unwrap();
-        state.db.upsert_local_file(rel, &h, bytes.len() as i64, 0).unwrap();
+        state
+            .db
+            .upsert_local_file(rel, &h, bytes.len() as i64, 0)
+            .unwrap();
         state.db.upsert_remote_file(rel, &h, "rev", 0).unwrap();
     }
 
@@ -1629,7 +1674,10 @@ mod tests {
 
         let n = dehydrate_path_internal(&state, "dir").unwrap();
         assert_eq!(n, 1);
-        assert!(!sync.join("dir").exists(), "the whole local subtree is freed");
+        assert!(
+            !sync.join("dir").exists(),
+            "the whole local subtree is freed"
+        );
         assert!(
             sync.join("dir.cloudsc").exists(),
             "one folder-level placeholder written"
@@ -1653,8 +1701,14 @@ mod tests {
         track_synced_file(&state, &sync, "dir/ok.txt", b"ok");
         // An unsynced sibling (on-disk bytes hash != remote hash).
         std::fs::write(sync.join("dir/edited.txt"), b"local only").unwrap();
-        state.db.upsert_local_file("dir/edited.txt", "LOCAL", 10, 0).unwrap();
-        state.db.upsert_remote_file("dir/edited.txt", "REMOTE", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_local_file("dir/edited.txt", "LOCAL", 10, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("dir/edited.txt", "REMOTE", "rev", 0)
+            .unwrap();
 
         let err = dehydrate_path_internal(&state, "dir").unwrap_err();
         assert!(format!("{err}").contains("unsynced"), "got: {err}");
@@ -1780,9 +1834,15 @@ mod tests {
             "must not collapse while an ignored file remains"
         );
         assert!(sync.join("dir").is_dir(), "folder kept");
-        assert!(sync.join("dir/.DS_Store").exists(), "ignored file preserved");
+        assert!(
+            sync.join("dir/.DS_Store").exists(),
+            "ignored file preserved"
+        );
         assert!(!sync.join("dir/a.txt").exists());
-        assert!(sync.join("dir/a.txt.cloudsc").exists(), "freed file → per-file placeholder");
+        assert!(
+            sync.join("dir/a.txt.cloudsc").exists(),
+            "freed file → per-file placeholder"
+        );
     }
 
     #[test]
@@ -1798,8 +1858,14 @@ mod tests {
         let n = dehydrate_path_internal(&state, "dir").unwrap();
 
         assert_eq!(n, 1);
-        assert!(!sync.join("dir").exists(), "subtree freed incl. the .cloudsc child");
-        assert!(sync.join("dir.cloudsc").exists(), "collapsed to one folder placeholder");
+        assert!(
+            !sync.join("dir").exists(),
+            "subtree freed incl. the .cloudsc child"
+        );
+        assert!(
+            sync.join("dir.cloudsc").exists(),
+            "collapsed to one folder placeholder"
+        );
         let meta = read_cloudsc_placeholder_file(&sync.join("dir.cloudsc")).unwrap();
         assert_eq!(meta.tag, "folder");
     }
@@ -1862,7 +1928,10 @@ mod tests {
             !sync.join("gone.txt.dbsync-dehydrate.tmp").exists(),
             "aside copy must be dropped on success"
         );
-        assert!(abs.exists(), "the placeholder file (created by the closure) is present");
+        assert!(
+            abs.exists(),
+            "the placeholder file (created by the closure) is present"
+        );
         assert!(
             state.db.get_local_file("gone.txt").unwrap().is_some(),
             "row must be re-tracked with the original hash on success"
@@ -1884,7 +1953,11 @@ mod tests {
         let sync = tmp.path().join("synced");
         let state = build_state(&sync);
         let content = b"only surviving copy, crash happened before placeholder create";
-        std::fs::write(sync.join(format!("foo.txt{DEHYDRATE_ASIDE_SUFFIX}")), content).unwrap();
+        std::fs::write(
+            sync.join(format!("foo.txt{DEHYDRATE_ASIDE_SUFFIX}")),
+            content,
+        )
+        .unwrap();
 
         let n = recover_stray_dehydrate_asides(&state).unwrap();
 
@@ -1896,7 +1969,9 @@ mod tests {
             "recovered file must have the aside's content"
         );
         assert!(
-            !sync.join(format!("foo.txt{DEHYDRATE_ASIDE_SUFFIX}")).exists(),
+            !sync
+                .join(format!("foo.txt{DEHYDRATE_ASIDE_SUFFIX}"))
+                .exists(),
             "aside must be gone after recovery"
         );
     }
@@ -1924,7 +1999,9 @@ mod tests {
             "the existing original must be left untouched"
         );
         assert!(
-            !sync.join(format!("bar.txt{DEHYDRATE_ASIDE_SUFFIX}")).exists(),
+            !sync
+                .join(format!("bar.txt{DEHYDRATE_ASIDE_SUFFIX}"))
+                .exists(),
             "stale aside must be removed"
         );
     }

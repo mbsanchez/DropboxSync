@@ -140,7 +140,10 @@ mod tests {
 
     #[test]
     fn cloudsc_item_maps_to_its_remote_path() {
-        assert_eq!(remote_rel_from_item("dir/report.docx.cloudsc"), "dir/report.docx");
+        assert_eq!(
+            remote_rel_from_item("dir/report.docx.cloudsc"),
+            "dir/report.docx"
+        );
         assert_eq!(remote_rel_from_item("report.docx"), "report.docx");
         assert_eq!(remote_rel_from_item("folder.cloudsc"), "folder");
         // Only a trailing suffix is stripped.

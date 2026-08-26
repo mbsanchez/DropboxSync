@@ -173,7 +173,9 @@ fn log_diagnostics_once(enabled: bool) {
                     "<none>".to_string()
                 } else {
                     let utf8: *const std::ffi::c_char = msg_send![ident, UTF8String];
-                    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(utf8)
+                        .to_string_lossy()
+                        .into_owned()
                 }
             })
         }
@@ -303,7 +305,10 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn non_macos_is_not_applicable_never_disabled() {
-        assert_eq!(finder_extension_state(), FinderExtensionState::NotApplicable);
+        assert_eq!(
+            finder_extension_state(),
+            FinderExtensionState::NotApplicable
+        );
     }
 
     /// On macOS the call must return *something* without panicking, whatever the user's
@@ -351,7 +356,10 @@ mod tests {
         assert_eq!(wire(FinderExtensionState::Enabled), "\"enabled\"");
         assert_eq!(wire(FinderExtensionState::Disabled), "\"disabled\"");
         assert_eq!(wire(FinderExtensionState::Translocated), "\"translocated\"");
-        assert_eq!(wire(FinderExtensionState::NotApplicable), "\"notApplicable\"");
+        assert_eq!(
+            wire(FinderExtensionState::NotApplicable),
+            "\"notApplicable\""
+        );
     }
 
     /// The exact path the instrumented build logged on the machine that reproduced DBSYNC-88.
