@@ -7,14 +7,22 @@
 # mechanical — a reformat, a mass rename — never one that changes behaviour, or blame
 # will hide the change that actually broke something.
 #
-# MEASURED, and smaller than expected: of the 720 lines the reformat below touched, only
-# 14 end up attributed to it, because most were line splits whose first fragment keeps its
-# original author. Ignoring the commit does not move those 14 either — they are genuinely
-# new text with no predecessor line to fall back to, so `blame` has nowhere to send them.
+# WRITE THE SHA AFTER MERGING, NOT BEFORE. This repo squash-merges, so the commit you
+# reformat on does not survive: its SHA is gone from main and git silently ignores an
+# entry it cannot resolve. The first version of this file listed the pre-squash SHA and
+# was therefore inert — it took a fresh look to notice, because nothing errors.
 #
-# So this file changes nothing measurable for the commit it lists. It is kept as policy
-# for the next mass change rather than as a repair of this one; DBSYNC-90 originally
-# called blame damage "the main cost of doing it at all", and that was wrong.
+# MEASURED, and smaller than expected: of the 720 lines the reformat touched, only 14 end
+# up attributed to it — most were line splits whose first fragment keeps its original
+# author. Ignoring the commit does not move those 14 either, with the config or with an
+# explicit --ignore-rev: they are new text with no predecessor line, so blame has nowhere
+# to send them.
+#
+# So this file changes nothing measurable for the entry below. It is kept as policy for
+# the next mass change. DBSYNC-90 originally called blame damage "the main cost of doing
+# it at all"; the real cost was 14 lines.
 
-# style(#DBSYNC-90): apply cargo fmt — 22 files, rustfmt defaults, zero logic change
-36b3af1b380ec369d1e8dab8325a27d91682cd11
+# style(#DBSYNC-90): format the Rust tree and enforce cargo fmt in CI (#129)
+# Squashed, so this also carries the ci.yml step and this file — two non-mechanical files
+# whose blame is not precious. Named here rather than quietly ignored.
+65403789e6ceac9f03a0d15f778f362eb831bbc7
