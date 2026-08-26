@@ -410,11 +410,60 @@ struct BadgeDiffTests {
         checkOptional("updated_at maps to updatedAt", decoded.updatedAt, "2026-08-25T12:00:00Z")
         checkOptional("sync_folder maps to syncFolder", decoded.syncFolder, "/Users/x/DropboxSync")
 
-        // A tier value that contains an underscore, in the VALUE position rather than the
-        // key. Values were never at risk, but `cloud_only` reaching the lookup intact is
-        // what makes a badge render, so it is worth pinning.
-        checkOptional("an underscored tier value is untouched",
-                      decoded.paths["a_b_c/x_y.md"], "cloud_only")
+        // A tier VALUE, on a key with no underscores at all. The previous version of this
+        // check asserted the same key/value pair as the one three lines above, so no input
+        // could redden one without the other — six checks over five properties. Pointing it
+        // at `plain.txt` makes it earn its name: it isolates the value position from the
+        // key position entirely.
+        checkOptional("a tier value on an underscore-free key is untouched",
+                      decoded.paths["plain.txt"], "syncing")
+
+        print("logSafeDescription (DBSYNC-73)")
+
+        // THE LEAK THIS EXISTS TO PREVENT. `DecodingError.codingPath` inside `paths`
+        // contains the user's relative file paths, and NSLog writes to the PUBLIC unified
+        // log. `String(describing:)` on this error yields:
+        //     typeMismatch … Path: paths.`Clients/AcmeCorp_NDA_signed.pdf`
+        // Making the decode failure audible must not make it a privacy leak.
+        let leaky = Data("""
+        {
+          "version": 1,
+          "updated_at": "2026-08-26T00:00:00Z",
+          "sync_folder": "/Users/x/DropboxSync",
+          "paths": { "Clients/AcmeCorp_NDA_signed.pdf": 42 }
+        }
+        """.utf8)
+
+        do {
+            _ = try OverlayState.decode(from: leaky)
+            print("  FAIL a type-mismatched tier should not decode")
+            failures += 1
+        } catch {
+            let safe = logSafeDescription(of: error)
+            checkBool("a decode error never names the user's file",
+                      safe.contains("AcmeCorp_NDA_signed"), false)
+            checkBool("a decode error never leaks the coding path",
+                      safe.lowercased().contains("clients/"), false)
+            checkBool("but it still says what kind of failure it was",
+                      safe.contains("typeMismatch"), true)
+            // The naive version this replaced would fail the first two.
+            checkBool("the raw description WOULD have leaked it (guard is load-bearing)",
+                      String(describing: error).contains("AcmeCorp_NDA_signed"), true)
+        }
+
+        // The failure both DBSYNC-73 mutations produce. Its key comes from our own schema,
+        // never from `paths`, so keeping it is safe and is what makes the log useful.
+        let missingKey = Data("""
+        {"version": 1, "sync_folder": null, "paths": {}}
+        """.utf8)
+        do {
+            _ = try OverlayState.decode(from: missingKey)
+            print("  FAIL a payload missing updated_at should not decode")
+            failures += 1
+        } catch {
+            checkBool("a missing schema key is named, because it is ours",
+                      logSafeDescription(of: error).contains("updated_at"), true)
+        }
 
         if failures == 0 {
             print("BadgeDiff: all checks passed")

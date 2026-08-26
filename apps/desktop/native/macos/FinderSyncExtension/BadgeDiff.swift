@@ -193,7 +193,7 @@ enum BadgeDiff {
 /// already runs that script.** The original ticket recorded this decode as impossible to
 /// test; it was not, and two defects have already survived review in this project by
 /// sitting where the check script could not reach them.
-struct OverlayState: Decodable, Equatable {
+struct OverlayState: Decodable {
     let version: Int
     let updatedAt: String
     let syncFolder: String?
@@ -230,5 +230,54 @@ struct OverlayState: Decodable, Equatable {
     /// directories and every badge disappears with nothing written anywhere.
     static func decode(from data: Data) throws -> OverlayState {
         try JSONDecoder().decode(OverlayState.self, from: data)
+    }
+}
+
+/// A description of a decoding failure that is safe to put in the system log (DBSYNC-73).
+///
+/// **`String(describing:)` on a `DecodingError` leaks the user's file paths.** The error
+/// carries a `codingPath`, and inside `OverlayState.paths` those components ARE relative
+/// paths from the sync folder:
+///
+///     typeMismatch … Path: paths.`Clients/AcmeCorp_NDA_signed.pdf`
+///
+/// `NSLog` writes to the public unified log, readable via `log show` and captured in any
+/// sysdiagnose. Making the decode failure audible — which is the other half of this ticket
+/// — must not turn it into a privacy leak.
+///
+/// So this reports the *kind* of failure and, at most, a key name from the struct's own
+/// schema. It never emits `codingPath`, and never a value. What is lost is which entry
+/// failed; what is kept is enough to tell a schema mismatch from malformed bytes, which is
+/// the distinction anyone debugging actually needs.
+///
+/// Not reachable from today's writer — `HashMap<String, OverlayTier>` can only emit strings,
+/// and truncation fails earlier as `dataCorrupted`. It is guarded anyway because
+/// `overlay_state.json` is a versioned contract with two readers, and DBSYNC-91 records that
+/// `version` is decoded and never checked: a newer writer reshaping `paths` against an
+/// installed older appex is precisely the gap.
+func logSafeDescription(of error: Error) -> String {
+    guard let decoding = error as? DecodingError else {
+        // Not a decoding failure — a read error, already scoped to a path we logged
+        // ourselves. Still summarised rather than dumped.
+        return "\(type(of: error))"
+    }
+    switch decoding {
+    case .keyNotFound(let key, _):
+        // A key name from OUR schema (`updated_at`, `sync_folder`), never a dictionary key
+        // from `paths`: a missing-key failure is raised against the struct's keyed
+        // container. This is also what both DBSYNC-73 mutations produce, so it is the one
+        // detail worth keeping.
+        return "keyNotFound(\(key.stringValue))"
+    case .typeMismatch(let expected, _):
+        return "typeMismatch(expected \(expected))"
+    case .valueNotFound(let expected, _):
+        return "valueNotFound(expected \(expected))"
+    case .dataCorrupted:
+        // Malformed or truncated JSON. The context here describes the syntax problem, not
+        // the content, but it is dropped anyway — "the bytes are not JSON" is the whole
+        // actionable message.
+        return "dataCorrupted (not valid JSON)"
+    @unknown default:
+        return "DecodingError (unrecognised case)"
     }
 }

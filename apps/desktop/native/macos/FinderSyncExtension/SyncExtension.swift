@@ -160,8 +160,9 @@ final class DropboxSyncFinderSync: FIFinderSync {
             NSLog("DropboxSync FinderSync: reading %@ again.", url.path)
             lastLoadFailed = false
         }
-        // Decoding lives in `BadgeDiff.OverlayState` so the check script can reach it, and
-        // it throws so this failure can be reported (DBSYNC-73).
+        // Decoding lives in `OverlayState`, declared in the Foundation-only BadgeDiff.swift
+        // so the check script can reach it, and it throws so this failure can be reported
+        // (DBSYNC-73).
         let decoded: OverlayState
         do {
             decoded = try OverlayState.decode(from: data)
@@ -176,7 +177,7 @@ final class DropboxSyncFinderSync: FIFinderSync {
             // Logged on the transition only, like the read path: this runs every 2 seconds.
             if !lastDecodeFailed {
                 NSLog("DropboxSync FinderSync: cannot decode %@ — no badges will be shown. %@",
-                      url.path, String(describing: error))
+                      url.path, logSafeDescription(of: error))
                 lastDecodeFailed = true
             }
             state = nil
