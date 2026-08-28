@@ -321,6 +321,32 @@ enum OverlayStateError: Error {
     case unsupportedVersion(Int)
 }
 
+/// How the log line should describe what happened: `"refusing"` or `"cannot decode"`.
+///
+/// A refused file parsed perfectly — nothing failed, the reader declined it — and calling
+/// that "cannot decode" points whoever reads the log at corruption, or at the sandbox
+/// problems of DBSYNC-76, which are debugged in a completely different direction. Telling
+/// the two apart is the whole reason [`OverlayStateError`] is its own type.
+///
+/// **It lives here, and not inline at the one call site, for the same reason the decode
+/// does: `SyncExtension.swift` cannot be compiled by `Tests/run-badge-diff-tests.sh`.** A
+/// first draft put this branch there, where no check could reach it — in a change whose own
+/// argument is that unreachable code is where this project's defects survive review.
+///
+/// `switch` rather than `error is OverlayStateError`, for the same reason
+/// [`logSafeDescription`] uses one: a bare `is` check would absorb every future case into
+/// `"refusing"` silently. A future case describing a genuine parse failure would then be
+/// logged as a refusal — the precise confusion this function exists to prevent. A first
+/// draft of this function did exactly that, in the same commit that removed the pattern
+/// from `logSafeDescription`.
+func logVerb(for error: Error) -> String {
+    guard let refusal = error as? OverlayStateError else { return "cannot decode" }
+    switch refusal {
+    case .unsupportedVersion:
+        return "refusing"
+    }
+}
+
 /// A description of a decoding failure that is safe to put in the system log (DBSYNC-73).
 ///
 /// **`String(describing:)` on a `DecodingError` leaks the user's file paths.** The error
@@ -343,23 +369,10 @@ enum OverlayStateError: Error {
 /// version check does NOT make that redundant: the case that still reaches the
 /// `typeMismatch` branch is a **same-version** reshape — a writer that changes the shape of
 /// `paths` and forgets to bump `version`. That is a human mistake rather than a contract
-/// event, so no version guard can ever catch it, which is exactly why the redaction has to
-/// survive independently of one.
-/// How the log line should describe what happened: `"refusing"` or `"cannot decode"`.
-///
-/// A refused file parsed perfectly — nothing failed, the reader declined it — and calling
-/// that "cannot decode" points whoever reads the log at corruption, or at the sandbox
-/// problems of DBSYNC-76, which are debugged in a completely different direction. Telling
-/// the two apart is the whole reason [`OverlayStateError`] is its own type.
-///
-/// **It lives here, and not inline at the one call site, for the same reason the decode
-/// does: `SyncExtension.swift` cannot be compiled by `Tests/run-badge-diff-tests.sh`.** A
-/// first draft put this branch there, where no check could reach it — in a change whose own
-/// argument is that unreachable code is where this project's defects survive review.
-func logVerb(for error: Error) -> String {
-    error is OverlayStateError ? "refusing" : "cannot decode"
-}
-
+/// event, so no version guard can ever catch it. The retype route documented on
+/// [`VersionHeader.version`] lands here too, though its `codingPath` is `version` and holds
+/// nothing of the user's. Either way the redaction has to survive independently of the
+/// version check.
 func logSafeDescription(of error: Error) -> String {
     // Handled BEFORE the `DecodingError` cast below, which would otherwise fall through to
     // the type-name branch and report a bare "OverlayStateError" — losing the one detail

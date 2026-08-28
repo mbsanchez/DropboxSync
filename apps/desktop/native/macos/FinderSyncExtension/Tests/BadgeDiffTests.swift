@@ -481,8 +481,18 @@ struct BadgeDiffTests {
         // leaked it". No such control is possible here; a first draft of this section
         // claimed the two cleared the same bar, and review caught that they do not.
         //
-        // Kept anyway, for the one thing it can catch: a future `OverlayStateError` case
-        // that carries a String — a path, a key, a `sync_folder` — reaching the log.
+        // Kept for what it can actually catch, which is narrower than the first two attempts
+        // at this comment claimed: a String added to `.unsupportedVersion` itself, or to its
+        // branch in `logSafeDescription` — say a "near <path>" context that seemed helpful.
+        // That reddens.
+        //
+        // It does NOT catch a future `OverlayStateError` case carrying a path, which is what
+        // the previous version of this comment promised: nothing in this suite constructs
+        // such a case, so adding one leaves every check green. If a case like that is added,
+        // it needs its own check; this one will not notice.
+        //
+        // Nor is it independent even within its own scope — a leak added to
+        // `.unsupportedVersion` reddens the exact `checkOptional` below it too.
         let futureVersion = Data("""
         {
           "version": 2,
@@ -508,6 +518,14 @@ struct BadgeDiffTests {
                           safe, "unsupportedVersion(2)")
             checkBool("a refusal never names the user's file (tripwire — see above)",
                       safe.contains("AcmeCorp_NDA_signed"), false)
+            // The verb the caller logs, on the error `decode` ACTUALLY threw rather than a
+            // hand-built literal — which is what this checked in its first draft, sitting
+            // orphaned between two unrelated blocks. A refused file parsed fine, so "cannot
+            // decode" would send the reader after corruption or after DBSYNC-76's sandbox
+            // problems. The other direction is checked at the malformed-bytes control below;
+            // both are needed, because a `logVerb` stuck on either constant passes one.
+            checkOptional("a refusal is called a refusal, not a decode failure",
+                          logVerb(for: error), "refusing")
         }
 
         // NO CHECK HERE FOR THE ACCEPT DIRECTION, and the omission is deliberate.
@@ -523,8 +541,10 @@ struct BadgeDiffTests {
         //       FAIL OverlayState.decode threw on a valid payload
         //
         // and the run exits before this section prints at all. So the accept direction IS
-        // covered, by that fatal guard, and a check here could never add to it — anything
-        // placed after line ~391 is unreachable when the accept direction breaks.
+        // covered, by that `guard let decoded = try? OverlayState.decode(from: json)`, and a
+        // check on THAT payload after it can never add anything — the guard has already
+        // proved the decode succeeded. A check using a DIFFERENT v1 payload would be live;
+        // it is omitted as redundant rather than as impossible.
         //
         // Recorded rather than silently deleted because "a check that cannot fail is not
         // evidence" is this project's rule, and this file shipped a violation of it in a
@@ -557,9 +577,11 @@ struct BadgeDiffTests {
             // both strings. It earns its line by naming the wrong answer explicitly.
             checkBool("and not as the parse failure that happened first (diagnostic)",
                       safe.contains("typeMismatch"), false)
-            // The privacy tripwire that stood here was a duplicate: same error type, same
-            // `logSafeDescription` branch as the one in the section above, so no input could
-            // redden one without the other. One tripwire for `OverlayStateError` is enough.
+            // The privacy tripwire that stood here was a duplicate: both paths throw
+            // `.unsupportedVersion` and hit the same `logSafeDescription` branch, so no
+            // input could redden one without the other. Worth knowing that this holds only
+            // while `OverlayStateError` has one case — if the fallback ever throws a
+            // different case from the guard, this path needs its own assertion back.
         }
 
         // NEGATIVE CONTROL. Bytes with no readable version at all must not acquire one.
@@ -580,8 +602,6 @@ struct BadgeDiffTests {
             checkOptional("a real parse failure is still called a decode failure",
                           logVerb(for: error), "cannot decode")
         }
-        checkOptional("a refusal is called a refusal, not a decode failure",
-                      logVerb(for: OverlayStateError.unsupportedVersion(2)), "refusing")
 
         // SECOND NEGATIVE CONTROL, and it costs nothing: the `leaky` payload above is
         // `version: 1` with a type-mismatched tier — a genuine v1 failure. Its DBSYNC-73
