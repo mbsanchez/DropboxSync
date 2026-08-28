@@ -288,14 +288,27 @@ struct OverlayState: Decodable {
 /// read better — but `JSONDecoder` parses the whole document to extract one field, so
 /// header-first means two full parses of a file that can hold thousands of path entries, on
 /// every tick of `reloadState()`'s 2-second timer, in the case where nothing is wrong.
-/// Retrying inside the `catch` keeps the healthy path at one parse and pays the second only
-/// when something has already failed.
+/// Retrying inside the `catch` keeps the healthy path at one parse.
+///
+/// The second parse is **not** rare in the case this exists for, and it would be dishonest
+/// to imply otherwise: a mismatched pair (DBSYNC-86) persists until the user reinstalls, and
+/// the `updatedAt` short-circuit in `reloadState()` only guards the success path — so a
+/// refused file is parsed twice every 2 seconds for as long as the mismatch lasts. The trade
+/// is still the right way round, because it moves the cost onto the broken case instead of
+/// the healthy one, but it is a trade rather than a free lunch.
 ///
 /// Private so that nothing outside the decoder starts using it as a cheap way to peek at the
 /// file: it is not cheap, and it answers only one question.
 private struct VersionHeader: Decodable {
     /// No `CodingKeys` needed — `version` is the one key in this contract that was never
     /// snake-cased. See `OverlayState.CodingKeys` for why that matters here.
+    ///
+    /// **`Int` bounds what the retry can rescue, and the bound is worth knowing.** A v2 that
+    /// keeps the key but changes its TYPE — a semver string, say — fails this decode too,
+    /// and the log falls back to `typeMismatch(expected Int)` with no indication that
+    /// `version` is the field in question. A v2 that *renames* the key degrades better:
+    /// `keyNotFound(version)`, because that branch keeps the key name. So this covers
+    /// "unparseable against the v1 schema", not "unparseable in any way".
     let version: Int
 }
 
@@ -326,17 +339,43 @@ enum OverlayStateError: Error {
 /// the distinction anyone debugging actually needs.
 ///
 /// Not reachable from today's writer — `HashMap<String, OverlayTier>` can only emit strings,
-/// and truncation fails earlier as `dataCorrupted`. It is guarded anyway because
-/// `overlay_state.json` is a versioned contract with two readers, and a newer writer
-/// reshaping `paths` against an installed older appex is precisely the gap that
-/// [`OverlayState.supportedVersion`] now closes.
+/// and truncation fails earlier as `dataCorrupted`. It is guarded anyway, and DBSYNC-91's
+/// version check does NOT make that redundant: the case that still reaches the
+/// `typeMismatch` branch is a **same-version** reshape — a writer that changes the shape of
+/// `paths` and forgets to bump `version`. That is a human mistake rather than a contract
+/// event, so no version guard can ever catch it, which is exactly why the redaction has to
+/// survive independently of one.
+/// How the log line should describe what happened: `"refusing"` or `"cannot decode"`.
+///
+/// A refused file parsed perfectly — nothing failed, the reader declined it — and calling
+/// that "cannot decode" points whoever reads the log at corruption, or at the sandbox
+/// problems of DBSYNC-76, which are debugged in a completely different direction. Telling
+/// the two apart is the whole reason [`OverlayStateError`] is its own type.
+///
+/// **It lives here, and not inline at the one call site, for the same reason the decode
+/// does: `SyncExtension.swift` cannot be compiled by `Tests/run-badge-diff-tests.sh`.** A
+/// first draft put this branch there, where no check could reach it — in a change whose own
+/// argument is that unreachable code is where this project's defects survive review.
+func logVerb(for error: Error) -> String {
+    error is OverlayStateError ? "refusing" : "cannot decode"
+}
+
 func logSafeDescription(of error: Error) -> String {
     // Handled BEFORE the `DecodingError` cast below, which would otherwise fall through to
     // the type-name branch and report a bare "OverlayStateError" — losing the one detail
     // this error exists to carry (DBSYNC-91). A schema version is an integer from our own
     // contract, so unlike a `codingPath` there is nothing here to redact.
-    if case .unsupportedVersion(let found)? = error as? OverlayStateError {
-        return "unsupportedVersion(\(found))"
+    //
+    // `switch` rather than `if case`, deliberately. With `if case`, adding a second
+    // `OverlayStateError` case would compile clean and fall through to the type-name branch
+    // below — reporting the bare "OverlayStateError" this block exists to prevent, and
+    // leaking whatever the new case carries if it carries a path. This way that mistake is
+    // a compile error.
+    if let refusal = error as? OverlayStateError {
+        switch refusal {
+        case .unsupportedVersion(let found):
+            return "unsupportedVersion(\(found))"
+        }
     }
     guard let decoding = error as? DecodingError else {
         // Not a decoding failure — a read error, already scoped to a path we logged

@@ -471,8 +471,18 @@ struct BadgeDiffTests {
         // version. Same shape as the payload at the top of this section, same keys, same
         // tiers — so nothing but `version` can be responsible for the outcome.
         //
-        // The sensitive-looking key is deliberate. This is a new error type on a new path,
-        // and it has to clear the same privacy bar as the DecodingError one above.
+        // The sensitive-looking key is a TRIPWIRE, and it is worth being precise about what
+        // it is and is not. `OverlayStateError` carries an `Int` and nothing else, so
+        // `String(describing:)` on it is "unsupportedVersion(2)" — there is no path in the
+        // type to leak, and no mutation of today's code can redden the check below.
+        //
+        // That makes it weaker evidence than the DecodingError privacy check above, which
+        // earns its keep through the paired control at "the raw description WOULD have
+        // leaked it". No such control is possible here; a first draft of this section
+        // claimed the two cleared the same bar, and review caught that they do not.
+        //
+        // Kept anyway, for the one thing it can catch: a future `OverlayStateError` case
+        // that carries a String — a path, a key, a `sync_folder` — reaching the log.
         let futureVersion = Data("""
         {
           "version": 2,
@@ -490,18 +500,35 @@ struct BadgeDiffTests {
             // Reaching this branch at all IS the refusal check — the `do` side above
             // increments `failures` if the decode succeeds. A `checkBool(true, true)` here
             // would print an extra "ok" line that no input could ever redden.
+            // Exact, not `contains("2")`: that also passes on `unsupportedVersion(12)` and
+            // on `unsupportedVersion(-2)`, so it was looser than its own label. Exact is no
+            // weaker against any mutation.
             let safe = logSafeDescription(of: error)
-            checkBool("the refusal names the version found", safe.contains("2"), true)
-            checkBool("and says it was a version problem",
-                      safe.contains("unsupportedVersion"), true)
-            checkBool("a refusal never names the user's file",
+            checkOptional("the refusal is reported exactly, naming the version found",
+                          safe, "unsupportedVersion(2)")
+            checkBool("a refusal never names the user's file (tripwire — see above)",
                       safe.contains("AcmeCorp_NDA_signed"), false)
         }
 
-        // The other direction, and not a formality: a guard written the wrong way round
-        // refuses the only version that exists, and every check above would still pass.
-        checkBool("the supported version is still accepted",
-                  (try? OverlayState.decode(from: json)) != nil, true)
+        // NO CHECK HERE FOR THE ACCEPT DIRECTION, and the omission is deliberate.
+        //
+        // A `checkBool("the supported version is still accepted", decode(json) != nil)`
+        // stood here and was green by construction: `json` is decoded at the top of the
+        // DBSYNC-73 section by a `guard` that calls `exit(1)`, so merely reaching this line
+        // proves the decode succeeded. Its comment claimed the opposite — that a guard
+        // written the wrong way round would leave "every check above" passing. Inverting the
+        // guard shows what actually happens:
+        //
+        //     OverlayState.decode (DBSYNC-73)
+        //       FAIL OverlayState.decode threw on a valid payload
+        //
+        // and the run exits before this section prints at all. So the accept direction IS
+        // covered, by that fatal guard, and a check here could never add to it — anything
+        // placed after line ~391 is unreachable when the accept direction breaks.
+        //
+        // Recorded rather than silently deleted because "a check that cannot fail is not
+        // evidence" is this project's rule, and this file shipped a violation of it in a
+        // change whose entire argument was mutation-tested evidence.
 
         // THE CASE THE GUARD ABOVE CANNOT REACH (DBSYNC-91 slice 2). `paths` is an object
         // where v1 expects a string, so the decode throws before any version is available
@@ -525,10 +552,14 @@ struct BadgeDiffTests {
             let safe = logSafeDescription(of: error)
             checkBool("an unreadable v2 is reported as a version problem",
                       safe.contains("unsupportedVersion"), true)
-            checkBool("and not as the parse failure that happened first",
+            // Diagnostic, not independent coverage: nothing can redden this without also
+            // reddening the check above it, since that would need a description containing
+            // both strings. It earns its line by naming the wrong answer explicitly.
+            checkBool("and not as the parse failure that happened first (diagnostic)",
                       safe.contains("typeMismatch"), false)
-            checkBool("the fallback path never names the user's file either",
-                      safe.contains("AcmeCorp_NDA_signed"), false)
+            // The privacy tripwire that stood here was a duplicate: same error type, same
+            // `logSafeDescription` branch as the one in the section above, so no input could
+            // redden one without the other. One tripwire for `OverlayStateError` is enough.
         }
 
         // NEGATIVE CONTROL. Bytes with no readable version at all must not acquire one.
@@ -541,7 +572,16 @@ struct BadgeDiffTests {
         } catch {
             checkBool("malformed bytes are still reported as corruption",
                       logSafeDescription(of: error).contains("dataCorrupted"), true)
+            // The verb the caller will log. A refusal parsed fine, so calling it "cannot
+            // decode" sends the reader after corruption or after DBSYNC-76's sandbox
+            // problems; a genuine parse failure IS a decode failure and must keep saying so.
+            // Both directions checked, because a `logVerb` stuck on either value passes one
+            // of them.
+            checkOptional("a real parse failure is still called a decode failure",
+                          logVerb(for: error), "cannot decode")
         }
+        checkOptional("a refusal is called a refusal, not a decode failure",
+                      logVerb(for: OverlayStateError.unsupportedVersion(2)), "refusing")
 
         // SECOND NEGATIVE CONTROL, and it costs nothing: the `leaky` payload above is
         // `version: 1` with a type-mismatched tier — a genuine v1 failure. Its DBSYNC-73

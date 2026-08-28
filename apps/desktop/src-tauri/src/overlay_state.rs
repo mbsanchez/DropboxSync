@@ -46,7 +46,10 @@ pub enum OverlayTier {
 /// and renders nothing — exactly what it did before the value existed. The bump rule
 /// above is for changes that would make an existing reader wrong, not merely incomplete.
 ///
-/// **Bumping `version` means changing both readers in the same commit (DBSYNC-91):**
+/// **Bumping `version` means changing both readers that exist today, in the same commit
+/// (DBSYNC-91)** — "both", not the three surfaces listed above: the Linux emblems and the
+/// Windows status column are still aspirational, and `native/windows/shell-overlay/` holds a
+/// README and no code.
 /// - `native/macos/FinderSyncExtension/BadgeDiff.swift` — `OverlayState.supportedVersion`.
 ///   It refuses anything else outright: no badges, one log line. Leaving it behind does not
 ///   degrade macOS, it turns macOS off.
