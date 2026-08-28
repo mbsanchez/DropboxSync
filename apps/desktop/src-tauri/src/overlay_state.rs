@@ -45,6 +45,15 @@ pub enum OverlayTier {
 /// additive, and a reader that does not know the value finds no badge registered for it
 /// and renders nothing — exactly what it did before the value existed. The bump rule
 /// above is for changes that would make an existing reader wrong, not merely incomplete.
+///
+/// **Bumping `version` means changing both readers in the same commit (DBSYNC-91):**
+/// - `native/macos/FinderSyncExtension/BadgeDiff.swift` — `OverlayState.supportedVersion`.
+///   It refuses anything else outright: no badges, one log line. Leaving it behind does not
+///   degrade macOS, it turns macOS off.
+/// - `native/windows/shell-menu/src/scope.rs` — reads only `sync_folder`, draws no badges,
+///   and has no version guard by decision, not by oversight. It cannot show a wrong badge,
+///   and a `sync_folder` it fails to find already costs nothing worse than a missing
+///   context menu. If a bump moves or renames that field, this is where it bites, silently.
 #[derive(Serialize)]
 struct OverlayStateFile {
     version: u32,

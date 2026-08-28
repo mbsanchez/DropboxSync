@@ -465,6 +465,44 @@ struct BadgeDiffTests {
                       logSafeDescription(of: error).contains("updated_at"), true)
         }
 
+        print("OverlayState version guard (DBSYNC-91)")
+
+        // The case a best-effort reader accepts happily: EVERYTHING is valid except the
+        // version. Same shape as the payload at the top of this section, same keys, same
+        // tiers — so nothing but `version` can be responsible for the outcome.
+        //
+        // The sensitive-looking key is deliberate. This is a new error type on a new path,
+        // and it has to clear the same privacy bar as the DecodingError one above.
+        let futureVersion = Data("""
+        {
+          "version": 2,
+          "updated_at": "2026-08-27T12:00:00Z",
+          "sync_folder": "/Users/x/DropboxSync",
+          "paths": { "Clients/AcmeCorp_NDA_signed.pdf": "synced" }
+        }
+        """.utf8)
+
+        do {
+            _ = try OverlayState.decode(from: futureVersion)
+            print("  FAIL an unknown version should be refused, not applied as v1")
+            failures += 1
+        } catch {
+            // Reaching this branch at all IS the refusal check — the `do` side above
+            // increments `failures` if the decode succeeds. A `checkBool(true, true)` here
+            // would print an extra "ok" line that no input could ever redden.
+            let safe = logSafeDescription(of: error)
+            checkBool("the refusal names the version found", safe.contains("2"), true)
+            checkBool("and says it was a version problem",
+                      safe.contains("unsupportedVersion"), true)
+            checkBool("a refusal never names the user's file",
+                      safe.contains("AcmeCorp_NDA_signed"), false)
+        }
+
+        // The other direction, and not a formality: a guard written the wrong way round
+        // refuses the only version that exists, and every check above would still pass.
+        checkBool("the supported version is still accepted",
+                  (try? OverlayState.decode(from: json)) != nil, true)
+
         if failures == 0 {
             print("BadgeDiff: all checks passed")
             exit(0)
