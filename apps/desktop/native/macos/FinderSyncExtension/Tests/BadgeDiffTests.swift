@@ -482,9 +482,9 @@ struct BadgeDiffTests {
         // claimed the two cleared the same bar, and review caught that they do not.
         //
         // Kept for what it can actually catch, which is narrower than the first two attempts
-        // at this comment claimed: a String added to `.unsupportedVersion` itself, or to its
-        // branch in `logSafeDescription` — say a "near <path>" context that seemed helpful.
-        // That reddens.
+        // at this comment claimed: a String added to the `.unsupportedVersion` case, then
+        // logged by its branch — say a "near <path>" context that looked helpful. That
+        // reddens. The branch alone cannot do it: all it has in scope is `found: Int`.
         //
         // It does NOT catch a future `OverlayStateError` case carrying a path, which is what
         // the previous version of this comment promised: nothing in this suite constructs
@@ -492,7 +492,8 @@ struct BadgeDiffTests {
         // it needs its own check; this one will not notice.
         //
         // Nor is it independent even within its own scope — a leak added to
-        // `.unsupportedVersion` reddens the exact `checkOptional` below it too.
+        // `.unsupportedVersion` also reddens the exact-match `checkOptional` two lines below,
+        // the one asserting "unsupportedVersion(2)". The verb check beside it stays green.
         let futureVersion = Data("""
         {
           "version": 2,
