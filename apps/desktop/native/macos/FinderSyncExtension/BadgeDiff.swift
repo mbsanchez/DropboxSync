@@ -251,12 +251,52 @@ struct OverlayState: Decodable {
     /// a NEW plug-in instance and the old ones linger, so an old appex can genuinely be the
     /// one Finder has loaded while a newer app writes the file.
     static func decode(from data: Data) throws -> OverlayState {
-        let decoded = try JSONDecoder().decode(OverlayState.self, from: data)
+        let decoded: OverlayState
+        do {
+            decoded = try JSONDecoder().decode(OverlayState.self, from: data)
+        } catch {
+            // The version check below is unreachable when the decode itself fails, and the
+            // most plausible breaking change is exactly that case: reshape `paths` and a v1
+            // decoder throws `typeMismatch` long before it has a version to look at. A
+            // guard that only fires when the rest of the document still parses is the same
+            // half-mechanism this ticket exists to remove, moved one step later.
+            //
+            // So: if the bytes are still readable enough to yield a version, and that
+            // version is not ours, say so. Otherwise rethrow untouched.
+            //
+            // `version != supportedVersion` is not a formality. Without it, every ordinary
+            // v1 failure — the type-mismatched tier from DBSYNC-73 included — would be
+            // relabelled a version problem, which is a worse lie than the silence this
+            // ticket started from.
+            if let header = try? JSONDecoder().decode(VersionHeader.self, from: data),
+               header.version != supportedVersion {
+                throw OverlayStateError.unsupportedVersion(header.version)
+            }
+            throw error
+        }
         guard decoded.version == supportedVersion else {
             throw OverlayStateError.unsupportedVersion(decoded.version)
         }
         return decoded
     }
+}
+
+/// Just enough of `overlay_state.json` to read its version when the rest will not parse
+/// (DBSYNC-91).
+///
+/// **Only used from the failure path.** Decoding this first, then the full struct, would
+/// read better — but `JSONDecoder` parses the whole document to extract one field, so
+/// header-first means two full parses of a file that can hold thousands of path entries, on
+/// every tick of `reloadState()`'s 2-second timer, in the case where nothing is wrong.
+/// Retrying inside the `catch` keeps the healthy path at one parse and pays the second only
+/// when something has already failed.
+///
+/// Private so that nothing outside the decoder starts using it as a cheap way to peek at the
+/// file: it is not cheap, and it answers only one question.
+private struct VersionHeader: Decodable {
+    /// No `CodingKeys` needed — `version` is the one key in this contract that was never
+    /// snake-cased. See `OverlayState.CodingKeys` for why that matters here.
+    let version: Int
 }
 
 /// A refusal to use `overlay_state.json`, distinct from a failure to parse it (DBSYNC-91).

@@ -503,6 +503,52 @@ struct BadgeDiffTests {
         checkBool("the supported version is still accepted",
                   (try? OverlayState.decode(from: json)) != nil, true)
 
+        // THE CASE THE GUARD ABOVE CANNOT REACH (DBSYNC-91 slice 2). `paths` is an object
+        // where v1 expects a string, so the decode throws before any version is available
+        // to check — and this is the SHAPE a real breaking change would most likely take.
+        // Reported as `typeMismatch` before the fallback existed, which sends whoever reads
+        // the log looking for corruption instead of a mismatched install.
+        let reshapedFuture = Data("""
+        {
+          "version": 2,
+          "updated_at": "2026-08-27T12:00:00Z",
+          "sync_folder": "/Users/x/DropboxSync",
+          "paths": { "Clients/AcmeCorp_NDA_signed.pdf": { "tier": "synced" } }
+        }
+        """.utf8)
+
+        do {
+            _ = try OverlayState.decode(from: reshapedFuture)
+            print("  FAIL a v2 payload should be refused even when v1 cannot parse it")
+            failures += 1
+        } catch {
+            let safe = logSafeDescription(of: error)
+            checkBool("an unreadable v2 is reported as a version problem",
+                      safe.contains("unsupportedVersion"), true)
+            checkBool("and not as the parse failure that happened first",
+                      safe.contains("typeMismatch"), false)
+            checkBool("the fallback path never names the user's file either",
+                      safe.contains("AcmeCorp_NDA_signed"), false)
+        }
+
+        // NEGATIVE CONTROL. Bytes with no readable version at all must not acquire one.
+        // Without this, a fallback that fired unconditionally would look green on every
+        // check above it.
+        do {
+            _ = try OverlayState.decode(from: Data("{ not json at all".utf8))
+            print("  FAIL malformed bytes should not decode")
+            failures += 1
+        } catch {
+            checkBool("malformed bytes are still reported as corruption",
+                      logSafeDescription(of: error).contains("dataCorrupted"), true)
+        }
+
+        // SECOND NEGATIVE CONTROL, and it costs nothing: the `leaky` payload above is
+        // `version: 1` with a type-mismatched tier — a genuine v1 failure. Its DBSYNC-73
+        // check ("but it still says what kind of failure it was") asserts `typeMismatch`,
+        // and it is what goes red if the fallback stops checking `version != supported`.
+        // Recorded here so the next reader knows that check is doing double duty.
+
         if failures == 0 {
             print("BadgeDiff: all checks passed")
             exit(0)
