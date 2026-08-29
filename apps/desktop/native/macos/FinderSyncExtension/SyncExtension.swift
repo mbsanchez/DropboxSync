@@ -175,9 +175,14 @@ final class DropboxSyncFinderSync: FIFinderSync {
             // which this file's own comments record as expensive to find.
             //
             // Logged on the transition only, like the read path: this runs every 2 seconds.
+            //
+            // The verb is chosen by `logVerb(for:)` rather than hardcoded: a refusal and a
+            // parse failure are different events, and "cannot decode" on a file that parsed
+            // perfectly sends the reader after corruption (DBSYNC-91). That choice lives in
+            // BadgeDiff.swift because nothing here is reachable from a check.
             if !lastDecodeFailed {
-                NSLog("DropboxSync FinderSync: cannot decode %@ — no badges will be shown. %@",
-                      url.path, logSafeDescription(of: error))
+                NSLog("DropboxSync FinderSync: %@ %@ — no badges will be shown. %@",
+                      logVerb(for: error), url.path, logSafeDescription(of: error))
                 lastDecodeFailed = true
             }
             state = nil

@@ -225,11 +225,125 @@ struct OverlayState: Decodable {
         case paths
     }
 
+    /// The only contract version this reader understands (DBSYNC-91).
+    ///
+    /// Named rather than written inline so that it is greppable from the writer's end:
+    /// `overlay_state.rs` documents the bump rule, and this is the constant that rule is
+    /// actually talking about.
+    static let supportedVersion = 1
+
     /// Decodes with a plain `JSONDecoder`. Throws rather than returning `nil` so the caller
     /// can log what went wrong — a silent decode failure deregisters the extension's
     /// directories and every badge disappears with nothing written anywhere.
+    ///
+    /// **Refuses any version other than [`supportedVersion`] (DBSYNC-91.)** Before this,
+    /// `version` was decoded and never read: a file written with a bumped version and an
+    /// incompatible schema was applied exactly as if it were v1, using whatever fields
+    /// still lined up and ignoring the rest. That made the field documentation rather than
+    /// a mechanism.
+    ///
+    /// Refusing rather than best-effort follows this project's own rule, settled in
+    /// DBSYNC-84: a badge that is confidently wrong is worse than no badge. A user on a
+    /// mismatched pair sees badges missing — which they report — instead of badges that
+    /// state a sync status nobody checked.
+    ///
+    /// It is not a hypothetical pairing. DBSYNC-86 measured that every reinstall registers
+    /// a NEW plug-in instance and the old ones linger, so an old appex can genuinely be the
+    /// one Finder has loaded while a newer app writes the file.
     static func decode(from data: Data) throws -> OverlayState {
-        try JSONDecoder().decode(OverlayState.self, from: data)
+        let decoded: OverlayState
+        do {
+            decoded = try JSONDecoder().decode(OverlayState.self, from: data)
+        } catch {
+            // The version check below is unreachable when the decode itself fails, and the
+            // most plausible breaking change is exactly that case: reshape `paths` and a v1
+            // decoder throws `typeMismatch` long before it has a version to look at. A
+            // guard that only fires when the rest of the document still parses is the same
+            // half-mechanism this ticket exists to remove, moved one step later.
+            //
+            // So: if the bytes are still readable enough to yield a version, and that
+            // version is not ours, say so. Otherwise rethrow untouched.
+            //
+            // `version != supportedVersion` is not a formality. Without it, every ordinary
+            // v1 failure — the type-mismatched tier from DBSYNC-73 included — would be
+            // relabelled a version problem, which is a worse lie than the silence this
+            // ticket started from.
+            if let header = try? JSONDecoder().decode(VersionHeader.self, from: data),
+               header.version != supportedVersion {
+                throw OverlayStateError.unsupportedVersion(header.version)
+            }
+            throw error
+        }
+        guard decoded.version == supportedVersion else {
+            throw OverlayStateError.unsupportedVersion(decoded.version)
+        }
+        return decoded
+    }
+}
+
+/// Just enough of `overlay_state.json` to read its version when the rest will not parse
+/// (DBSYNC-91).
+///
+/// **Only used from the failure path.** Decoding this first, then the full struct, would
+/// read better — but `JSONDecoder` parses the whole document to extract one field, so
+/// header-first means two full parses of a file that can hold thousands of path entries, on
+/// every tick of `reloadState()`'s 2-second timer, in the case where nothing is wrong.
+/// Retrying inside the `catch` keeps the healthy path at one parse.
+///
+/// The second parse is **not** rare in the case this exists for, and it would be dishonest
+/// to imply otherwise: a mismatched pair (DBSYNC-86) persists until the user reinstalls, and
+/// the `updatedAt` short-circuit in `reloadState()` only guards the success path — so a
+/// refused file is parsed twice every 2 seconds for as long as the mismatch lasts. The trade
+/// is still the right way round, because it moves the cost onto the broken case instead of
+/// the healthy one, but it is a trade rather than a free lunch.
+///
+/// Private so that nothing outside the decoder starts using it as a cheap way to peek at the
+/// file: it is not cheap, and it answers only one question.
+private struct VersionHeader: Decodable {
+    /// No `CodingKeys` needed — `version` is the one key in this contract that was never
+    /// snake-cased. See `OverlayState.CodingKeys` for why that matters here.
+    ///
+    /// **`Int` bounds what the retry can rescue, and the bound is worth knowing.** A v2 that
+    /// keeps the key but changes its TYPE — a semver string, say — fails this decode too,
+    /// and the log falls back to `typeMismatch(expected Int)` with no indication that
+    /// `version` is the field in question. A v2 that *renames* the key degrades better:
+    /// `keyNotFound(version)`, because that branch keeps the key name. So this covers
+    /// "unparseable against the v1 schema", not "unparseable in any way".
+    let version: Int
+}
+
+/// A refusal to use `overlay_state.json`, distinct from a failure to parse it (DBSYNC-91).
+///
+/// Carries the version found because the log line is required to name it: "no badges" with
+/// no reason reads to a user like the sandbox or permissions problems this extension has
+/// already had (DBSYNC-76), and those are debugged in a completely different direction.
+enum OverlayStateError: Error {
+    case unsupportedVersion(Int)
+}
+
+/// How the log line should describe what happened: `"refusing"` or `"cannot decode"`.
+///
+/// A refused file parsed perfectly — nothing failed, the reader declined it — and calling
+/// that "cannot decode" points whoever reads the log at corruption, or at the sandbox
+/// problems of DBSYNC-76, which are debugged in a completely different direction. Telling
+/// the two apart is the whole reason [`OverlayStateError`] is its own type.
+///
+/// **It lives here, and not inline at the one call site, for the same reason the decode
+/// does: `SyncExtension.swift` cannot be compiled by `Tests/run-badge-diff-tests.sh`.** A
+/// first draft put this branch there, where no check could reach it — in a change whose own
+/// argument is that unreachable code is where this project's defects survive review.
+///
+/// `switch` rather than `error is OverlayStateError`, for the same reason
+/// [`logSafeDescription`] uses one: a bare `is` check would absorb every future case into
+/// `"refusing"` silently. A future case describing a genuine parse failure would then be
+/// logged as a refusal — the precise confusion this function exists to prevent. A first
+/// draft of this function did exactly that, in the same commit that removed the pattern
+/// from `logSafeDescription`.
+func logVerb(for error: Error) -> String {
+    guard let refusal = error as? OverlayStateError else { return "cannot decode" }
+    switch refusal {
+    case .unsupportedVersion:
+        return "refusing"
     }
 }
 
@@ -251,11 +365,31 @@ struct OverlayState: Decodable {
 /// the distinction anyone debugging actually needs.
 ///
 /// Not reachable from today's writer — `HashMap<String, OverlayTier>` can only emit strings,
-/// and truncation fails earlier as `dataCorrupted`. It is guarded anyway because
-/// `overlay_state.json` is a versioned contract with two readers, and DBSYNC-91 records that
-/// `version` is decoded and never checked: a newer writer reshaping `paths` against an
-/// installed older appex is precisely the gap.
+/// and truncation fails earlier as `dataCorrupted`. It is guarded anyway, and DBSYNC-91's
+/// version check does NOT make that redundant: the case that still reaches the
+/// `typeMismatch` branch is a **same-version** reshape — a writer that changes the shape of
+/// `paths` and forgets to bump `version`. That is a human mistake rather than a contract
+/// event, so no version guard can ever catch it. The retype route documented on
+/// [`VersionHeader.version`] lands here too, though its `codingPath` is `version` and holds
+/// nothing of the user's. Either way the redaction has to survive independently of the
+/// version check.
 func logSafeDescription(of error: Error) -> String {
+    // Handled BEFORE the `DecodingError` cast below, which would otherwise fall through to
+    // the type-name branch and report a bare "OverlayStateError" — losing the one detail
+    // this error exists to carry (DBSYNC-91). A schema version is an integer from our own
+    // contract, so unlike a `codingPath` there is nothing here to redact.
+    //
+    // `switch` rather than `if case`, deliberately. With `if case`, adding a second
+    // `OverlayStateError` case would compile clean and fall through to the type-name branch
+    // below — reporting the bare "OverlayStateError" this block exists to prevent, and
+    // leaking whatever the new case carries if it carries a path. This way that mistake is
+    // a compile error.
+    if let refusal = error as? OverlayStateError {
+        switch refusal {
+        case .unsupportedVersion(let found):
+            return "unsupportedVersion(\(found))"
+        }
+    }
     guard let decoding = error as? DecodingError else {
         // Not a decoding failure — a read error, already scoped to a path we logged
         // ourselves. Still summarised rather than dumped.
