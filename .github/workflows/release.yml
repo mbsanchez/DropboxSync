@@ -26,7 +26,8 @@
 #   APPLE_CERTIFICATE            base64 of a .p12 export of the Developer ID Application cert
 #   APPLE_CERTIFICATE_PASSWORD   password used when exporting that .p12
 #   APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: NAME (TEAMID)"
-#   APPLE_TEAM_ID                the 10-character team id
+#   APPLE_TEAM_ID                the 10-character team id — a repository VARIABLE, not a
+#                                secret; see the comment on the env block below
 #   APPLE_API_KEY_P8             base64 of the AuthKey_XXXXXXXXXX.p8 from App Store Connect
 #   APPLE_API_KEY_ID             the key id, i.e. the XXXXXXXXXX in that filename
 #   APPLE_API_ISSUER             App Store Connect issuer id (a UUID)
@@ -69,7 +70,12 @@ jobs:
       # host bundle ships with no CodeResources seal over Contents/PlugIns/*.appex.
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
       # build-appex.sh passes this to xcodebuild as DEVELOPMENT_TEAM.
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # A repository VARIABLE, not a secret. A team id is not confidential — it is
+      # stamped into every signed binary and `codesign -dv` prints it for anyone who
+      # downloads the app. Making it a secret cost real evidence: GitHub masked it in
+      # the log, so the host-vs-appex comparison below printed `TeamIdentifier=***`
+      # twice and nobody could confirm by eye that the two matched.
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
 
     steps:
       - uses: actions/checkout@v4
