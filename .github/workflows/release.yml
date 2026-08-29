@@ -1,0 +1,255 @@
+# Tag-triggered macOS release: build, sign, notarize, staple, verify, publish.
+#
+# Separate from ci.yml on purpose (GitHub #85). `ci.yml` builds UNSIGNED on every PR with
+# `DROPBOX_APP_KEY: dummy` and must stay that way — pull requests from a fork cannot read
+# secrets, and a PR check that needs an Apple identity is a PR check that fails for everyone
+# but the maintainer.
+#
+# This workflow automates ONLY what DBSYNC-72 Slice 4 (#84) proved by hand first. It
+# introduces no new signing approach: the notarization sequence below is the same
+# ditto -> notarytool submit --wait -> stapler staple -> verify that was run manually, in
+# that order, for exactly that reason. When this workflow fails, the cause is the pipeline —
+# the signing configuration is already known to work.
+#
+# Two deliberate departures from the original slice spec, both recorded on #85:
+#
+#  1. Notarization authenticates with an App Store Connect API KEY, not APPLE_ID plus an
+#     app-specific password. An app-specific password is account-wide; an API key is scoped
+#     and can be revoked on its own without touching the Apple ID. The key already existed
+#     and was used for the manual runs.
+#  2. Tauri only SIGNS here. Notarization is done explicitly in the steps below rather than
+#     by the bundler, so that what runs in CI is visibly the same sequence a human ran, and
+#     so a notarization failure is attributable to a named step.
+#
+# Required repository secrets — names only, never values:
+#
+#   APPLE_CERTIFICATE            base64 of a .p12 export of the Developer ID Application cert
+#   APPLE_CERTIFICATE_PASSWORD   password used when exporting that .p12
+#   APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: NAME (TEAMID)"
+#   APPLE_TEAM_ID                the 10-character team id
+#   APPLE_API_KEY_P8             base64 of the AuthKey_XXXXXXXXXX.p8 from App Store Connect
+#   APPLE_API_KEY_ID             the key id, i.e. the XXXXXXXXXX in that filename
+#   APPLE_API_ISSUER             App Store Connect issuer id (a UUID)
+#   DROPBOX_APP_KEY              real value; `option_env!` bakes it into the binary at build
+#   DROPBOX_REDIRECT_URI         real value; same mechanism
+#
+# The last two matter more than they look. `auth/oauth.rs` reads both through `option_env!`,
+# so a release built with ci.yml's `dummy` compiles, signs and notarizes perfectly and then
+# cannot authenticate against Dropbox at all.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual runs are allowed so the pipeline can be exercised without minting a public tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the GitHub release
+
+concurrency:
+  # Never cancel a release in flight: a half-finished run can leave a notarization submitted
+  # with nothing stapled, and the tag would look released when it is not.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    env:
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_REDIRECT_URI: ${{ secrets.DROPBOX_REDIRECT_URI }}
+      # Read by tauri-cli, which prefers this over `bundle.macOS.signingIdentity` in
+      # tauri.conf.json — that key is pinned to "-" (ad-hoc) and must stay pinned, because
+      # with no identity resolving at all the bundler skips its whole signing block and the
+      # host bundle ships with no CodeResources seal over Contents/PlugIns/*.appex.
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      # build-appex.sh passes this to xcodebuild as DEVELOPMENT_TEAM.
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-macos
+          workspaces: apps/desktop/src-tauri
+          # Never populate the cache from a release run. A release is rare and its cache
+          # would evict the entries the PR jobs actually use.
+          save-if: false
+          env-vars: DROPBOX
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create a temporary keychain and import the signing identity
+        # A dedicated keychain, deleted unconditionally at the end of the job. The runner is
+        # ephemeral, but a keychain that outlives the job on a self-hosted runner would leave
+        # a usable Developer ID sitting on disk.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=$RUNNER_TEMP/release.keychain-db
+          KEYCHAIN_PASSWORD=$(uuidgen)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # The .p12 never reaches the log: base64 is decoded straight to a file.
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/certificate.p12"
+
+          # Without this, codesign blocks on a UI prompt that no one can answer and the job
+          # hangs until the timeout rather than failing.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          echo "Identities available to this job:"
+          security find-identity -v -p codesigning "$KEYCHAIN" | sed 's/[0-9A-F]\{40\}/<hash>/'
+
+      - name: Verify the expected identity is the one that will be used
+        # This machine's local keychain holds Developer ID identities belonging to other
+        # organisations; the runner's does not, but the check costs nothing and states the
+        # invariant where it can fail rather than in a comment.
+        run: |
+          set -euo pipefail
+          if ! security find-identity -v -p codesigning "$RUNNER_TEMP/release.keychain-db" \
+               | grep -qF "$APPLE_SIGNING_IDENTITY"; then
+            echo "::error::APPLE_SIGNING_IDENTITY is not present in the imported keychain."
+            exit 1
+          fi
+
+      - name: Build and sign the app bundle
+        # Signing only. Notarization is the next step, on purpose — see the header.
+        run: npm --workspace apps/desktop run tauri -- build --bundles app,dmg
+
+      - name: Notarize and staple
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          BUNDLE=apps/desktop/src-tauri/target/release/bundle
+          APP="$BUNDLE/macos/DropboxSyncDesktop.app"
+
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          echo "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+
+          # `ditto -c -k --keepParent`, not `zip`: zip does not preserve the symlinks and
+          # extended attributes inside a bundle, and notarization of a mangled bundle fails
+          # for reasons that read like a signing problem.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/DropboxSyncDesktop.zip"
+
+          xcrun notarytool submit "$RUNNER_TEMP/DropboxSyncDesktop.zip" \
+            --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m
+
+          # Staple the .app, then the .dmg separately. Stapling the app does not staple the
+          # disk image that contains it, and an unstapled dmg makes Gatekeeper reach the
+          # network on first open — which fails on a machine that is offline.
+          xcrun stapler staple "$APP"
+          DMG=$(find "$BUNDLE/dmg" -name '*.dmg' -maxdepth 1 | head -1)
+          if [ -n "$DMG" ]; then
+            xcrun notarytool submit "$DMG" \
+              --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --wait --timeout 30m
+            xcrun stapler staple "$DMG"
+          fi
+
+          rm -f "$KEY"
+
+      - name: Verify the artifacts the way a user's machine will
+        # The same four checks that passed by hand on #84, run here so that a release which
+        # would be rejected on arrival fails the pipeline instead.
+        run: |
+          set -euo pipefail
+          BUNDLE=apps/desktop/src-tauri/target/release/bundle
+          APP="$BUNDLE/macos/DropboxSyncDesktop.app"
+          APPEX="$APP/Contents/PlugIns/DropboxSyncFinderSync.appex"
+
+          echo "--- host"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Authority=Developer|TeamIdentifier'
+          echo "--- nested appex (F4: this is the one that was unverified before #84)"
+          codesign -dv --verbose=4 "$APPEX" 2>&1 | grep -E 'Authority=Developer|TeamIdentifier'
+
+          HOST_TEAM=$(codesign -dv --verbose=4 "$APP"   2>&1 | sed -n 's/^TeamIdentifier=//p')
+          APPEX_TEAM=$(codesign -dv --verbose=4 "$APPEX" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          if [ "$HOST_TEAM" != "$APPEX_TEAM" ]; then
+            echo "::error::host team $HOST_TEAM != appex team $APPEX_TEAM"
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          # The check that actually predicts what happens on the user's Mac.
+          spctl --assess --type execute --verbose=4 "$APP"
+
+          DMG=$(find "$BUNDLE/dmg" -name '*.dmg' -maxdepth 1 | head -1)
+          if [ -n "$DMG" ]; then
+            xcrun stapler validate "$DMG"
+          fi
+
+      - name: Package the app for upload
+        run: |
+          set -euo pipefail
+          BUNDLE=apps/desktop/src-tauri/target/release/bundle
+          # Zipped with ditto again so the stapled ticket and the bundle structure survive
+          # the round trip through GitHub's release assets.
+          ditto -c -k --keepParent "$BUNDLE/macos/DropboxSyncDesktop.app" \
+            "$RUNNER_TEMP/DropboxSyncDesktop-macos-arm64.zip"
+
+      - name: Publish the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BUNDLE=apps/desktop/src-tauri/target/release/bundle
+          ASSETS=("$RUNNER_TEMP/DropboxSyncDesktop-macos-arm64.zip")
+          DMG=$(find "$BUNDLE/dmg" -name '*.dmg' -maxdepth 1 | head -1)
+          [ -n "$DMG" ] && ASSETS+=("$DMG")
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --draft \
+            "${ASSETS[@]}"
+
+      - name: Upload artifacts for a manual run
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-artifacts
+          path: |
+            ${{ runner.temp }}/DropboxSyncDesktop-macos-arm64.zip
+            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: Delete the temporary keychain
+        # `always()`: the keychain must go even when signing, notarization or verification
+        # failed, which are precisely the runs where it still holds a usable identity.
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/release.keychain-db" || true
+          security list-keychain -d user -s login.keychain-db || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/certificate.p12" || true
