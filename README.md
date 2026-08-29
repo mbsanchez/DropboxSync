@@ -56,7 +56,7 @@ Names only. Never commit a value, and never echo one into a job log.
 | `APPLE_CERTIFICATE` | base64 of a `.p12` export of the Developer ID Application certificate |
 | `APPLE_CERTIFICATE_PASSWORD` | the password used when exporting that `.p12` |
 | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: NAME (TEAMID)` |
-| `APPLE_TEAM_ID` | the 10-character team id |
+| `APPLE_TEAM_ID` | the 10-character team id — a repository **variable**, not a secret |
 | `APPLE_API_KEY_P8` | base64 of `AuthKey_XXXXXXXXXX.p8` from App Store Connect |
 | `APPLE_API_KEY_ID` | the key id — the `XXXXXXXXXX` in that filename |
 | `APPLE_API_ISSUER` | App Store Connect issuer id (a UUID) |
