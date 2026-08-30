@@ -140,7 +140,6 @@ impl Db {
         Ok(())
     }
 
-    /// Clears local sync state to avoid stale jobs when the sync folder changes.
     /// Clears every trace of the previous sync folder, **atomically** (DBSYNC-40).
     ///
     /// The transaction is the point. These six deletions used to run as six independent
@@ -155,6 +154,14 @@ impl Db {
     /// `rusqlite::Transaction` rather than literal `BEGIN`/`COMMIT`: it rolls back when
     /// dropped, so an early `?` return between the statements cannot leave a transaction
     /// open — which would be this function's own failure mode, one level up.
+    ///
+    /// **The atomic boundary is this function, not the folder switch.** `commands.rs` sets
+    /// the new sync folder in its own transaction and *then* calls this one, so a failure
+    /// here still leaves `app_config` pointing at the new folder while the index describes
+    /// the old one. That is better than the torn index this replaces — coherent-but-stale
+    /// beats half-cleared — but it is not the same as the whole operation being atomic, and
+    /// this comment should not be read as claiming it is. Closing it means one method doing
+    /// the config write and these deletions together: **DBSYNC-94**.
     pub fn reset_sync_state(&self) -> AppResult<()> {
         let mut conn = self
             .write
@@ -1115,8 +1122,10 @@ impl Db {
 ///
 /// **If it is revisited, the mechanism is `PRAGMA user_version`, not a row in `app_config`.**
 /// That table is created by this very function, so reading a version out of it before
-/// migrating is circular on a fresh database. `user_version` lives in the file header and
-/// participates in the transaction below.
+/// migrating needs its own bootstrap step on a fresh database — solvable in a line, but one
+/// more thing to get right for no benefit. (An earlier draft of this comment called it
+/// "circular", which overstated it.) `user_version` lives in the file header and
+/// participates in the transaction below, which is the real argument.
 ///
 /// ## The transaction
 ///
@@ -1136,7 +1145,7 @@ fn migrate(conn: &mut Connection) -> AppResult<()> {
 
 /// The migration steps themselves. Split out so [`migrate`] owns the transaction and this
 /// owns the schema — and so a failure anywhere below unwinds through one `?` to a rollback.
-fn migrate_in_tx(conn: &Connection) -> AppResult<()> {
+fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS app_config (
@@ -1451,7 +1460,6 @@ pub fn app_data_dir() -> AppResult<PathBuf> {
 #[cfg(test)]
 mod data_dir_tests {
     use super::Db;
-    use rusqlite::Connection;
 
     /// `data_dir` must never be the empty path (DBSYNC-75). `Path::parent()` returns
     /// `Some("")` for a bare filename rather than `None` — verified, because the first
@@ -1910,11 +1918,17 @@ mod tests {
         conn.execute_batch("CREATE TABLE idx_sync_jobs_status_retry (x)")
             .expect("plant the collision");
 
-        let result = super::migrate(&mut conn);
+        let err = super::migrate(&mut conn).expect_err("the collision must fail the migration");
 
+        // Pin WHERE it failed. Without this the test passes vacuously: if some future edit
+        // makes an EARLIER step fail — a new first statement, a reordering, a typo in the
+        // opening batch — then `app_config` was never created, its absence is trivially
+        // true, and this becomes a check that cannot fail while looking green. Verified by
+        // forcing exactly that (a stray VIEW named `sync_jobs` breaks the first
+        // `execute_batch`): both assertions below held with no atomicity involved at all.
         assert!(
-            result.is_err(),
-            "the colliding index must fail the migration"
+            err.to_string().contains("idx_sync_jobs_status_retry"),
+            "the migration must fail at the planted collision, not earlier: {err}"
         );
         let app_config_exists: i64 = conn
             .query_row(
@@ -1961,6 +1975,74 @@ mod tests {
             after_first.iter().any(|s| s.contains("app_config")),
             "sanity: the schema comparison must be comparing something"
         );
+    }
+
+    /// DBSYNC-40. The `sync_jobs` rebuild is the one migration step that only ever runs on
+    /// **existing installations** — a fresh database gets the CHECK constraints from the
+    /// `CREATE TABLE`, so `sync_jobs_has_check` is true and the DROP/RENAME never executes.
+    ///
+    /// That means the other migration tests, which all start from an empty file, never
+    /// touch it. The branch most likely to break someone's database was the one with no
+    /// coverage, which is the wrong way round — and it is now the branch running inside a
+    /// transaction for the first time.
+    #[test]
+    fn migrate_rebuilds_a_legacy_sync_jobs_table_inside_the_transaction() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+        // A pre-DBSYNC-31 `sync_jobs`: no CHECK constraints, and carrying rows whose values
+        // are outside the sets the CHECKs will impose.
+        conn.execute_batch(
+            "CREATE TABLE sync_jobs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 job_type TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 source_path TEXT,
+                 target_path TEXT,
+                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                 next_retry_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO sync_jobs (job_type, status, created_at, updated_at)
+                 VALUES ('upload', 'queued', 't', 't'),
+                        ('bogus_type', 'queued', 't', 't');",
+        )
+        .expect("plant a legacy table");
+
+        super::migrate(&mut conn).expect("migrate must rebuild it");
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert!(
+            sql.contains("CHECK"),
+            "the rebuild must add the constraints"
+        );
+
+        // The valid row survives; the out-of-set one is dropped rather than aborting the
+        // copy, which is what the migration's own comment promises.
+        let surviving: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_jobs", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(surviving, 1);
+
+        // Indexes must land on the REBUILT table: `DROP TABLE` takes the old ones with it,
+        // so the `CREATE INDEX` block has to run after the rebuild, not before.
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count indexes");
+        assert!(indexes >= 2, "expected the idx_ indexes, found {indexes}");
+
+        // And it is still idempotent over the rebuilt shape.
+        super::migrate(&mut conn).expect("second migrate must be a no-op");
     }
 
     /// DBSYNC-56. The marker is the empty string, so an accidentally-blank hash written
