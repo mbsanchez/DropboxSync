@@ -427,7 +427,8 @@ pub(crate) fn reconcile_remote_present(
             // wasteful but CORRECT, and deferring here would be a bug: `upsert_remote_file`
             // above has already advanced the row, so `should_download` would be false on
             // every subsequent sweep and the download would be lost outright. The redundant
-            // case is caught at the download site, where the bytes can actually be compared.
+            // case is caught at the download site, which compares the on-disk hash against the
+            // recorded remote hash — not the fetched bytes, which are not in hand at that point.
             if local.hash != remote_meta.content_hash {
                 state.db.enqueue_job("download", Some(rel), Some(rel))?;
                 return Ok(1);
@@ -455,11 +456,22 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
     };
 
     // DBSYNC-56: a row marked for rescan cannot answer the question this function asks.
-    // Both arms below would be a guess — propagating the delete could destroy an edit that
-    // never reached Dropbox, and taking the conflict arm would hand the user a conflict
-    // record for an event they never saw. Do nothing instead: the next scan re-hashes the
-    // file and this resolves with real data one tick later. The remote row is deliberately
-    // left in place, so the next sweep asks again rather than forgetting the path.
+    // Propagating the delete could destroy an edit that never reached Dropbox, so the safe
+    // move is to do nothing this tick and leave the remote row in place, so the next sweep
+    // asks again rather than forgetting the path.
+    //
+    // **What happens next is a race, and an earlier version of this comment claimed it was
+    // a resolution.** It said the next scan "resolves with real data one tick later". It
+    // does not. The scan clears the marker and enqueues an upload; at drain time the remote
+    // row is still present while the file is gone from Dropbox, so the skip-if-identical
+    // check does not fire and the upload can RESURRECT a file the user deleted remotely.
+    // Only if the next remote sweep wins the race does the conflict arm below run instead.
+    //
+    // Deferring is still better than the alternatives — both other arms act on a hash we
+    // know is untrustworthy — but it trades a guaranteed wrong answer for a likely one, and
+    // that is worth knowing rather than being told it resolves cleanly. Making the
+    // re-detected upload check remote-absence before running would close it properly; that
+    // is a change to the upload path and belongs in its own ticket, not smuggled in here.
     if local.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
         return Ok(0);
     }

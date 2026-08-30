@@ -136,14 +136,25 @@ fn process_local_file_change(
             Ok(1)
         }
         Some(prev) if prev.hash != hash => {
-            // DBSYNC-56: a marked row always lands in this arm — that is the design — but it
-            // is a MARKER, not observed content. It is not evidence of a new local edit
-            // racing a pending job, so it must not route to a conflicted copy: doing so
-            // manufactures litter out of a bookkeeping value whenever any job happens to be
-            // active on the path. Take the plain re-upload arm below instead.
-            if pending_targets.contains(relative)
-                && prev.hash != crate::storage::db::Db::HASH_NEEDS_RESCAN
-            {
+            // A marked row (DBSYNC-56) lands in this arm by design, and it MUST still take
+            // the conflicted-copy path when a job is pending. An earlier version of this
+            // change excluded it, on the reasoning that a marker is bookkeeping rather than
+            // a new edit and so should not manufacture a copy. That reasoning was wrong in
+            // a way worth recording, because it re-created the very loss this ticket fixes:
+            //
+            // The only job that can be active on a MARKED path is one the remote side
+            // queued — a download or a delete. It cannot be an upload: the upload that sets
+            // the marker is completed the moment it returns, and the only other producer is
+            // this function, which clears the marker in the same call. So a pending job here
+            // means "remote content is about to land on top of local bytes Dropbox has never
+            // received" — exactly the bytes the marker exists to protect.
+            //
+            // Taking the plain arm instead writes the real hash back, clearing the marker
+            // BEFORE that download drains. `download_would_conflict` then sees a baseline
+            // equal to the on-disk hash, returns false, and the download overwrites the
+            // unuploaded edit with nothing logged. The C1 guard is disarmed by the very act
+            // of skipping this branch.
+            if pending_targets.contains(relative) {
                 let conflicted_path = create_conflicted_copy(absolute)?;
                 let conflicted_rel = conflicted_path
                     .strip_prefix(tracked_root)
@@ -1342,29 +1353,37 @@ mod tests {
         std::fs::write(&hidden, b"x").expect("write");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        // Root ignores directory permissions, so the premise would not hold there and the
-        // check would pass vacuously. Skip rather than assert something meaningless.
+        // Both observations happen BEFORE any assertion, and permissions are restored before
+        // any of them can panic: an early unwind would leave a 0o000 directory that
+        // `TempDir::drop` cannot clean up.
         let unreadable = std::fs::symlink_metadata(&hidden).is_err();
-        if unreadable {
-            assert!(
-                !super::is_confirmed_absent(&hidden),
-                "a path that cannot be stat'd is NOT confirmed absent"
-            );
-        }
-
+        let verdict = super::is_confirmed_absent(&hidden);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        // Root ignores directory permissions, so under root the premise does not hold and
+        // the real assertion below would pass vacuously. Fail loudly rather than prove
+        // nothing quietly.
         assert!(
             unreadable,
             "premise failed: the path was readable (running as root?)"
         );
+        assert!(
+            !verdict,
+            "a path that cannot be stat'd is NOT confirmed absent"
+        );
     }
 
-    /// DBSYNC-56 / review finding C2. A marked row always lands in the changed-arm, so
-    /// without an explicit exclusion any concurrently-active job on the path routes it to
-    /// the conflicted-copy sub-arm — turning a bookkeeping value into filesystem litter.
-    /// Pre-change this could not happen: index and disk agreed, nothing was detected.
+    /// DBSYNC-56. A marked row with a job pending MUST produce a conflicted copy, and this
+    /// test asserts the opposite of what an earlier version of this change shipped.
+    ///
+    /// That version excluded the marker from the conflicted-copy arm, calling the copy
+    /// "litter". It is not litter: the only job that can be active on a marked path is one
+    /// the remote side queued, so the copy is the protection. Excluding it cleared the
+    /// marker before the download drained, which disarmed `download_would_conflict` and let
+    /// remote content overwrite an edit Dropbox had never received — the exact loss this
+    /// ticket exists to fix, re-created by a fix for a review finding that was itself wrong.
     #[test]
-    fn a_marked_row_does_not_manufacture_a_conflicted_copy_when_a_job_is_pending() {
+    fn a_marked_row_makes_a_conflicted_copy_when_a_job_is_pending() {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
         let folder = state.db.get_sync_folder().unwrap().unwrap();
@@ -1394,9 +1413,18 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains("conflicted copy"))
             .collect();
-        assert!(
-            copies.is_empty(),
-            "the marker is bookkeeping, not a concurrent edit: {copies:?}"
+        assert_eq!(
+            copies.len(),
+            1,
+            "the unuploaded bytes must be preserved before the queued download lands: {copies:?}"
+        );
+
+        // And the copy carries the content that was at risk, not an empty placeholder —
+        // preserving the wrong bytes would satisfy the count and lose the edit anyway.
+        let copy = std::path::Path::new(&folder).join(&copies[0]);
+        assert_eq!(
+            std::fs::read(&copy).expect("read copy"),
+            b"the edit that must not be lost"
         );
     }
 

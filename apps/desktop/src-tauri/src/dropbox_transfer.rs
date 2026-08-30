@@ -529,6 +529,30 @@ fn download_would_conflict(
     }
 }
 
+/// Would writing the remote copy over `on_disk_hash` destroy local bytes Dropbox does not
+/// have? The whole decision, in one place, so it can be tested (DBSYNC-56).
+///
+/// [`download_would_conflict`] answers only half of it. This composes that with the check
+/// that matters most and is easiest to get wrong: **if the recorded remote hash already
+/// equals the on-disk hash, those exact bytes are on Dropbox**, so overwriting them cannot
+/// destroy anything — whatever the baseline says, and regardless of which call site we came
+/// from or whether the remote row was freshly advanced.
+///
+/// That last part is why the guard is expressed this way rather than as "the sweep just
+/// updated the row": `download_remote_file_internal` also runs from `.cloudsc` hydration and
+/// from a manual IPC download, where no sweep advanced anything. The identical-bytes
+/// argument holds for all three; a freshness argument would hold for only one.
+fn download_would_destroy_local(
+    remote_hash: Option<&str>,
+    on_disk_hash: &str,
+    baseline_hash: Option<&str>,
+) -> bool {
+    if remote_hash == Some(on_disk_hash) {
+        return false;
+    }
+    download_would_conflict(true, on_disk_hash, baseline_hash)
+}
+
 /// Does a conflicted-copy sibling of `target` already hold exactly `content_hash`?
 ///
 /// Dedupe guard for the download-conflict path: a `download` job that fails its
@@ -1134,19 +1158,13 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         let (on_disk_hash, _size, _mtime) = hash_file(&target)?;
         let baseline_hash = state.db.get_local_file(&relative)?.map(|row| row.hash);
 
-        // Nothing can be lost by overwriting bytes with identical bytes, whatever the
-        // baseline says (DBSYNC-56). The remote row was advanced by the sweep that enqueued
-        // this job, so it holds the content about to be fetched. Without this, a row marked
-        // for rescan — which the guard below now correctly treats as a conflict — would
-        // manufacture a conflicted copy of content that already matches the remote exactly.
-        let remote_matches_disk = state
-            .db
-            .get_remote_file(&relative)?
-            .is_some_and(|r| r.content_hash == on_disk_hash);
+        let remote_hash = state.db.get_remote_file(&relative)?.map(|r| r.content_hash);
 
-        if !remote_matches_disk
-            && download_would_conflict(true, &on_disk_hash, baseline_hash.as_deref())
-            && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
+        if download_would_destroy_local(
+            remote_hash.as_deref(),
+            &on_disk_hash,
+            baseline_hash.as_deref(),
+        ) && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
         {
             let conflicted_path = create_conflicted_copy(&target)?;
             let conflicted_rel = relpath_under(Path::new(&folder), &conflicted_path)?;
@@ -1422,9 +1440,9 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 mod tests {
     use super::{
         atomic_replace, choose_upload_strategy, classify_delete_response,
-        conflict_copy_with_content_exists, download_would_conflict, emit_sync_conflict,
-        emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome, UploadStrategy,
-        UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        conflict_copy_with_content_exists, download_would_conflict, download_would_destroy_local,
+        emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome,
+        UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
@@ -1823,6 +1841,53 @@ mod tests {
             "on-disk-hash",
             Some(crate::storage::db::Db::HASH_NEEDS_RESCAN)
         ));
+    }
+
+    /// The composed guard, which is what the call site actually asks (DBSYNC-56). Review
+    /// caught that the previous version of this change tested only the helper: two separate
+    /// mutations to the composition — forcing it off, and inverting it — both left the suite
+    /// green. The most safety-critical line in the change had no coverage at all.
+    #[test]
+    fn download_would_destroy_local_protects_a_marked_row_from_different_remote_content() {
+        const MARKER: &str = crate::storage::db::Db::HASH_NEEDS_RESCAN;
+        // The DBSYNC-56 case: unuploaded local bytes, remote holds something else.
+        assert!(download_would_destroy_local(
+            Some("H3"),
+            "on-disk",
+            Some(MARKER)
+        ));
+    }
+
+    #[test]
+    fn download_would_destroy_local_allows_an_overwrite_with_identical_bytes() {
+        const MARKER: &str = crate::storage::db::Db::HASH_NEEDS_RESCAN;
+        // Remote already holds exactly what is on disk: nothing can be destroyed, so this
+        // must NOT take the conflict path even with the marker set. Without it, the marker
+        // would copy content that matches the remote exactly.
+        assert!(!download_would_destroy_local(
+            Some("same"),
+            "same",
+            Some(MARKER)
+        ));
+        // Same reasoning with an ordinary diverged baseline.
+        assert!(!download_would_destroy_local(
+            Some("same"),
+            "same",
+            Some("old-baseline")
+        ));
+    }
+
+    #[test]
+    fn download_would_destroy_local_falls_back_to_the_baseline_when_the_remote_is_unknown() {
+        // No remote row (hydration / manual download call sites): the identical-bytes
+        // shortcut cannot apply, so the baseline decides exactly as before.
+        assert!(download_would_destroy_local(None, "on-disk", Some("old")));
+        assert!(!download_would_destroy_local(
+            None,
+            "on-disk",
+            Some("on-disk")
+        ));
+        assert!(!download_would_destroy_local(None, "on-disk", None));
     }
 
     #[test]
