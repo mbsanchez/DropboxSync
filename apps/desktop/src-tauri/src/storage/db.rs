@@ -1576,12 +1576,23 @@ mod tests {
     }
 
     /// A unique temp DB file path so tests never touch the production database.
+    ///
+    /// The counter is not decoration. `as_nanos()` has **microsecond** resolution on macOS
+    /// — measured: 192393 of 200000 consecutive readings were duplicates, smallest non-zero
+    /// gap 1000ns — so two tests entering this function in the same microsecond got the
+    /// same directory and shared one database file. Most callers survived that because
+    /// `Db::new_at` is all `CREATE TABLE IF NOT EXISTS`; `migrate_rebuilds_a_legacy_...`
+    /// plants a bare `CREATE TABLE` and dies on the collision. The bug is older than that
+    /// test — the test is just the first caller intolerant enough to expose it, at roughly
+    /// one failed run in ten under the default parallel harness, and none single-threaded.
     fn unique_db_path() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dropbox-sync-test-{ts}"));
+        let dir = std::env::temp_dir().join(format!("dropbox-sync-test-{ts}-{n}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join("app.db")
     }
@@ -1968,37 +1979,66 @@ mod tests {
     #[test]
     fn reset_sync_state_clears_every_table_it_names() {
         let db = Db::new_at(&unique_db_path()).expect("db init");
-        db.upsert_local_file("a.txt", "H", 1, 0)
-            .expect("seed local");
-        db.upsert_remote_file("a.txt", "H", "rev", 0)
-            .expect("seed remote");
-        db.enqueue_job("upload", Some("a.txt"), Some("a.txt"))
-            .expect("seed job");
-        db.add_conflict("a.txt", "a.txt", "seeded", None, false)
-            .expect("seed conflict");
-        db.upsert_known_folder("sub").expect("seed folder");
+
+        // Seeded through raw SQL, and deliberately including rows the application's own
+        // readers cannot see: a `done` and a `failed` job (`count_active_jobs` counts only
+        // queued/retry_wait/running), a resolved conflict (`list_recent_conflicts` filters
+        // `resolved = 0`), and a rescan-marked index row (DBSYNC-56 stores `hash = ''`, and
+        // `get_local_file` is queried here by a different path).
+        //
+        // That is the whole point. A first version of this test asserted through those
+        // readers, and every deletion could then be narrowed to exactly what its reader
+        // shows — `DELETE FROM sync_jobs WHERE status IN ('queued','retry_wait','running')`
+        // left the suite green, and so did the equivalents for conflicts and the index.
+        // Each is a plausible edit someone makes on purpose ("keep the history"), and the
+        // assertion messages would still have read "jobs", "conflicts", "local".
+        {
+            let conn = db.write.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO local_file_index VALUES ('a.txt','H',1,0,'t');
+                 INSERT INTO local_file_index VALUES ('marked.txt','',1,0,'t');
+                 INSERT INTO remote_file_index VALUES ('a.txt','H','rev',0,'t');
+                 INSERT INTO sync_jobs (job_type,status,created_at,updated_at)
+                     VALUES ('upload','queued','t','t'),
+                            ('upload','done','t','t'),
+                            ('upload','failed','t','t');
+                 INSERT INTO sync_conflicts (local_path,remote_path,reason,resolved,created_at)
+                     VALUES ('a.txt','a.txt','unresolved',0,'t'),
+                            ('b.txt','b.txt','resolved',1,'t');
+                 INSERT INTO known_folders VALUES ('sub','t');",
+            )
+            .expect("seed");
+        }
         db.set_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY, "cursor")
             .expect("seed cursor");
 
         db.reset_sync_state().expect("reset");
 
-        assert!(db.get_local_file("a.txt").expect("q").is_none(), "local");
-        assert!(db.get_remote_file("a.txt").expect("q").is_none(), "remote");
-        assert_eq!(db.count_active_jobs().expect("q"), 0, "jobs");
-        assert!(
-            db.list_recent_conflicts(10).expect("q").is_empty(),
-            "conflicts"
-        );
-        assert!(
-            db.list_known_folders().expect("q").is_empty(),
-            "known folders"
-        );
-        assert!(
-            db.get_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY)
-                .expect("q")
-                .is_none(),
-            "delta cursor"
-        );
+        // Raw COUNT(*) per table, for the same reason: a filtered reader would let a
+        // narrowed deletion pass.
+        let conn = db.write.lock().expect("lock");
+        for table in [
+            "local_file_index",
+            "remote_file_index",
+            "sync_jobs",
+            "sync_conflicts",
+            "known_folders",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(n, 0, "{table} must be empty after a reset");
+        }
+        // The cursor goes; other app_config keys stay — that distinction is deliberate in
+        // the production code, so assert both halves.
+        let cursor: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_config WHERE key = ?1",
+                [crate::remote_index::REMOTE_DELTA_CURSOR_KEY],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(cursor, 0, "the delta cursor must be dropped");
     }
 
     /// DBSYNC-40. Same requirement for the schema: a failure partway leaves nothing behind.
@@ -2013,7 +2053,9 @@ mod tests {
     /// the index block and the assertion passes vacuously. The reset test solves the same
     /// problem with a trigger that fires only after an earlier statement ran, but SQLite has
     /// no DDL trigger hook, and the failing statement here is a `CREATE INDEX` — so there is
-    /// no way to make this failure conditional on `app_config` already existing. The
+    /// no way *in SQL* to make this failure conditional on `app_config` already existing —
+    /// a `sqlite3_set_authorizer` hook could, at far more cost than this residual is worth.
+    /// The
     /// ordering is verified by reading `migrate`, not by this test. Accepted knowingly:
     /// it would take reordering a `CREATE TABLE` behind an index creation to break it.
     #[test]
