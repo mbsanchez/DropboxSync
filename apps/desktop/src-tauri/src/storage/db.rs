@@ -1123,9 +1123,8 @@ impl Db {
 /// **If it is revisited, the mechanism is `PRAGMA user_version`, not a row in `app_config`.**
 /// That table is created by this very function, so reading a version out of it before
 /// migrating needs its own bootstrap step on a fresh database — solvable in a line, but one
-/// more thing to get right for no benefit. (An earlier draft of this comment called it
-/// "circular", which overstated it.) `user_version` lives in the file header and
-/// participates in the transaction below, which is the real argument.
+/// more thing to get right for no benefit. The real argument is the other one:
+/// `user_version` lives in the file header and participates in the transaction below.
 ///
 /// ## The transaction
 ///
@@ -1554,6 +1553,22 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// The whole schema as comparable rows — every object, its name and its DDL. Used to
+    /// assert that a second `migrate` changes nothing, which is what "idempotent" means and
+    /// what a bare `expect` on the second call does not check.
+    fn schema_rows(c: &Connection) -> Vec<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') \
+                 FROM sqlite_master ORDER BY type, name",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query");
+        rows.collect::<Result<Vec<_>, _>>().expect("collect")
+    }
+
     /// A unique temp DB file path so tests never touch the production database.
     fn unique_db_path() -> PathBuf {
         let ts = SystemTime::now()
@@ -1952,23 +1967,10 @@ mod tests {
         let path = unique_db_path();
         let mut conn = Connection::open(&path).expect("open");
 
-        let schema_of = |c: &Connection| -> Vec<String> {
-            let mut stmt = c
-                .prepare(
-                    "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') \
-                     FROM sqlite_master ORDER BY type, name",
-                )
-                .expect("prepare");
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .expect("query");
-            rows.collect::<Result<Vec<_>, _>>().expect("collect")
-        };
-
         super::migrate(&mut conn).expect("first migrate");
-        let after_first = schema_of(&conn);
+        let after_first = schema_rows(&conn);
         super::migrate(&mut conn).expect("second migrate must be a no-op");
-        let after_second = schema_of(&conn);
+        let after_second = schema_rows(&conn);
 
         assert_eq!(after_first, after_second);
         assert!(
@@ -2023,6 +2025,21 @@ mod tests {
             "the rebuild must add the constraints"
         );
 
+        // ...and the constraint must actually BITE. The assertion above shares its oracle
+        // with the production code: `sync_jobs_has_check` decides whether to rebuild by
+        // grepping the same stored SQL for the same word, so a test using that heuristic
+        // cannot detect the heuristic being wrong. A legacy table with `-- CHECK` in a
+        // comment satisfies both and skips the rebuild entirely. This asks the database.
+        let violated = conn.execute(
+            "INSERT INTO sync_jobs (job_type, status, created_at, updated_at) \
+             VALUES ('bogus_type', 'queued', 't', 't')",
+            [],
+        );
+        assert!(
+            violated.is_err(),
+            "the rebuilt table must ENFORCE the job_type CHECK, not merely contain the word"
+        );
+
         // The valid row survives; the out-of-set one is dropped rather than aborting the
         // copy, which is what the migration's own comment promises.
         let surviving: i64 = conn
@@ -2032,17 +2049,36 @@ mod tests {
 
         // Indexes must land on the REBUILT table: `DROP TABLE` takes the old ones with it,
         // so the `CREATE INDEX` block has to run after the rebuild, not before.
+        //
+        // Scoped to `tbl_name` and an exact count, both deliberately. A first version
+        // counted every `idx_%` in the schema with `>= 2`, and that was blind to the exact
+        // bug this comment names: moving the index block before the rebuild destroys
+        // `idx_sync_jobs_status_retry`, but the unscoped count still reached 2 via
+        // `idx_sync_conflicts_resolved` (a different table, untouched) and
+        // `idx_sync_jobs_active_unique` (created later, so it survives the reordering).
+        // The whole suite stayed green with that bug present — measured, not supposed.
         let indexes: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND tbl_name='sync_jobs' AND name LIKE 'idx_%'",
                 [],
                 |r| r.get(0),
             )
             .expect("count indexes");
-        assert!(indexes >= 2, "expected the idx_ indexes, found {indexes}");
+        assert_eq!(
+            indexes, 2,
+            "both sync_jobs indexes must land on the REBUILT table"
+        );
 
-        // And it is still idempotent over the rebuilt shape.
-        super::migrate(&mut conn).expect("second migrate must be a no-op");
+        // And it is still idempotent over the rebuilt shape. `expect` alone would prove
+        // only that the second run does not error, which is not what "no-op" means.
+        let before = schema_rows(&conn);
+        super::migrate(&mut conn).expect("second migrate must not fail");
+        assert_eq!(
+            schema_rows(&conn),
+            before,
+            "a second migrate over a rebuilt table must change nothing"
+        );
     }
 
     /// DBSYNC-56. The marker is the empty string, so an accidentally-blank hash written
