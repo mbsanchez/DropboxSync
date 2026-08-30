@@ -422,6 +422,13 @@ pub(crate) fn reconcile_remote_present(
 
     if should_download {
         if let Some(local) = state.db.get_local_file(rel)? {
+            // DBSYNC-56: a marked row makes this comparison trivially true, so a download is
+            // enqueued even when the disk may already hold the new remote content. That is
+            // wasteful but CORRECT, and deferring here would be a bug: `upsert_remote_file`
+            // above has already advanced the row, so `should_download` would be false on
+            // every subsequent sweep and the download would be lost outright. The redundant
+            // case is caught at the download site, which compares the on-disk hash against the
+            // recorded remote hash — not the fetched bytes, which are not in hand at that point.
             if local.hash != remote_meta.content_hash {
                 state.db.enqueue_job("download", Some(rel), Some(rel))?;
                 return Ok(1);
@@ -447,6 +454,32 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
         state.db.remove_remote_file(rel)?;
         return Ok(0);
     };
+
+    // DBSYNC-56: a row marked for rescan cannot answer the question this function asks.
+    // Propagating the delete could destroy an edit that never reached Dropbox, so the safe
+    // move is to do nothing this tick and leave the remote row in place, so the next sweep
+    // asks again rather than forgetting the path.
+    //
+    // **What happens next is a race, and an earlier version of this comment claimed it was
+    // a resolution.** It said the next scan "resolves with real data one tick later". It
+    // does not. The scan clears the marker and enqueues an upload, and that upload's
+    // skip-if-identical check does a LIVE `fetch_remote_file_metadata` request, which
+    // returns `None` for a deleted file — so the skip does not fire and the upload can
+    // RESURRECT a file the user deleted remotely. Only if the next remote sweep wins the
+    // race does the conflict arm below run instead.
+    //
+    // (The remote row is kept for a different reason than that check: so the next sweep
+    // still asks about the path rather than forgetting it. A second version of this comment
+    // wrongly linked the two.)
+    //
+    // Deferring is still better than the alternatives — both other arms act on a hash we
+    // know is untrustworthy — but it trades a guaranteed wrong answer for a likely one, and
+    // that is worth knowing rather than being told it resolves cleanly. Closing it properly
+    // means teaching the upload path to check remote-absence first, which is a different
+    // module with its own blast radius: **DBSYNC-93**.
+    if local.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
+        return Ok(0);
+    }
 
     if local.hash == prev.content_hash {
         // Local matches the last-synced remote content: safe remote-wins delete.
@@ -764,6 +797,36 @@ mod tests {
         assert_eq!(
             job_targets(&state, "local_delete"),
             vec!["a.txt".to_string()]
+        );
+    }
+
+    /// DBSYNC-56. With the row marked for rescan, neither arm of this function can answer
+    /// honestly: propagating the delete could destroy an edit that never reached Dropbox,
+    /// and the conflict arm would hand the user a conflict record for an event they never
+    /// saw. So it does nothing and lets the next scan resolve it with real data.
+    ///
+    /// Note what is asserted alongside: the REMOTE row survives. Dropping it would make the
+    /// next sweep forget the path entirely, which is how "do nothing for now" quietly turns
+    /// into "do nothing ever".
+    #[test]
+    fn reconcile_remote_absent_does_nothing_while_the_row_is_marked_for_rescan() {
+        let state = build_state();
+        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        // Seeded the way production does it: a real row, then marked. `upsert_local_file`
+        // now refuses an empty hash in debug, so this is the only route.
+        state.db.upsert_local_file("c.txt", "H2", 3, 0).unwrap();
+        state.db.mark_local_file_for_rescan("c.txt").unwrap();
+
+        let n = reconcile_remote_absent(&state, "c.txt").unwrap();
+
+        assert_eq!(n, 0);
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "must not propagate a delete on a hash it cannot trust"
+        );
+        assert!(
+            state.db.get_remote_file("c.txt").unwrap().is_some(),
+            "the remote row must survive so the next sweep asks again"
         );
     }
 

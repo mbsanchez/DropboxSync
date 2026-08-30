@@ -136,6 +136,24 @@ fn process_local_file_change(
             Ok(1)
         }
         Some(prev) if prev.hash != hash => {
+            // A marked row (DBSYNC-56) lands in this arm by design, and it MUST still take
+            // the conflicted-copy path when a job is pending. An earlier version of this
+            // change excluded it, on the reasoning that a marker is bookkeeping rather than
+            // a new edit and so should not manufacture a copy. That reasoning was wrong in
+            // a way worth recording, because it re-created the very loss this ticket fixes:
+            //
+            // The only job that can be active on a MARKED path is one the remote side
+            // queued — a download or a delete. It cannot be an upload: the upload that sets
+            // the marker is completed the moment it returns, and the only other producer is
+            // this function, which clears the marker in the same call. So a pending job here
+            // means "remote content is about to land on top of local bytes Dropbox has never
+            // received" — exactly the bytes the marker exists to protect.
+            //
+            // Taking the plain arm instead writes the real hash back, clearing the marker
+            // BEFORE that download drains. `download_would_conflict` then sees a baseline
+            // equal to the on-disk hash, returns false, and the download overwrites the
+            // unuploaded edit with nothing logged. The C1 guard is disarmed by the very act
+            // of skipping this branch.
             if pending_targets.contains(relative) {
                 let conflicted_path = create_conflicted_copy(absolute)?;
                 let conflicted_rel = conflicted_path
@@ -925,6 +943,23 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     Ok(true)
 }
 
+/// Whether `p` is **confirmed** absent, as opposed to merely unreadable (DBSYNC-56).
+///
+/// `Path::exists()` collapses every error into `false`, so a permission denial, a Windows
+/// sharing violation, or an editor's atomic save caught mid-rename all read as "gone". This
+/// is the same distinction `classify_path` and the upload path already make for exactly that
+/// reason (DBSYNC-55): only a confirmed `NotFound` means gone.
+///
+/// The consequence here is milder than in the sync paths — the worst case is resolving a
+/// failed job that should have stayed failed, at startup only — but there is no reason for
+/// two answers to the same question to live in one codebase.
+fn is_confirmed_absent(p: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Startup cleanup (DBSYNC-55): forget editor-temp files a previous build tracked,
 /// and resolve failed `upload` jobs whose source is a temp file or no longer
 /// exists, so a phantom "Error" clears without a manual reset. Returns the number
@@ -974,7 +1009,7 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
             && folder
                 .as_deref()
                 .and_then(|f| safe_join(Path::new(f), src).ok())
-                .map(|p| !p.exists())
+                .map(|p| is_confirmed_absent(&p))
                 .unwrap_or(false);
         if is_editor_temp_path(src) || missing {
             state.db.mark_job_completed(job.id)?;
@@ -1000,7 +1035,7 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
             && folder
                 .as_deref()
                 .and_then(|f| safe_join(Path::new(f), src).ok())
-                .map(|p| !p.exists())
+                .map(|p| is_confirmed_absent(&p))
                 .unwrap_or(false);
         if missing {
             state.db.mark_job_completed(job.id)?;
@@ -1248,6 +1283,164 @@ mod tests {
             token_refresh_lock: Arc::new(Mutex::new(())),
             http_client: crate::state::build_http_client(),
         }
+    }
+
+    /// DBSYNC-56, the half that matters: marking the row must actually cause a re-upload.
+    ///
+    /// This is the recovery, seen from the scan's side. Without the marker the row would
+    /// hold the same hash the file on disk has, `prev.hash != hash` would be false, and the
+    /// scan would walk straight past a file whose content Dropbox has never received.
+    #[test]
+    fn a_row_marked_for_rescan_is_re_detected_and_re_uploaded() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let folder = state.db.get_sync_folder().unwrap().unwrap();
+        let target = std::path::Path::new(&folder).join("report.docx");
+        std::fs::write(&target, b"the edit that must not be lost").expect("write");
+
+        // The state the cancelled upload leaves behind: the row exists, its hash is
+        // unusable, and the file on disk is the content nobody has uploaded.
+        state
+            .db
+            .upsert_local_file("report.docx", "H2", 30, 0)
+            .expect("seed row");
+        state
+            .db
+            .mark_local_file_for_rescan("report.docx")
+            .expect("mark it");
+
+        let enqueued = scan_local_changes_only(&state).expect("scan");
+
+        assert_eq!(enqueued, 1, "the marked row must be re-detected");
+        let uploads: Vec<String> = state
+            .db
+            .list_recent_jobs(100)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.job_type == "upload")
+            .filter_map(|j| j.target_path)
+            .collect();
+        assert_eq!(uploads, vec!["report.docx".to_string()]);
+
+        // And the marker is gone afterwards: the scan wrote the real hash back, so the
+        // next tick does not re-upload the same file forever.
+        let row = state.db.get_local_file("report.docx").unwrap().unwrap();
+        assert_ne!(row.hash, Db::HASH_NEEDS_RESCAN);
+    }
+
+    #[test]
+    fn is_confirmed_absent_distinguishes_missing_from_present() {
+        let tmp = tempdir().expect("tempdir");
+        let present = tmp.path().join("here.txt");
+        std::fs::write(&present, b"x").expect("write");
+        assert!(!super::is_confirmed_absent(&present));
+        assert!(super::is_confirmed_absent(&tmp.path().join("nope.txt")));
+    }
+
+    /// **This is the test the NIT actually needed**, and the first version of this change
+    /// did not have it. `Path::exists()` already answers present-vs-absent correctly, so a
+    /// test covering only those two cases passes just as happily with `!p.exists()` — it
+    /// certifies nothing. The distinction that matters is **absent vs unreadable**, and it
+    /// takes a path that exists but cannot be stat'd to exercise it.
+    #[cfg(unix)]
+    #[test]
+    fn is_confirmed_absent_is_false_for_a_path_it_cannot_stat() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().expect("tempdir");
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let hidden = locked.join("file.txt");
+        std::fs::write(&hidden, b"x").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        // Both observations happen BEFORE any assertion, and permissions are restored before
+        // any of them can panic: an early unwind would leave a 0o000 directory that
+        // `TempDir::drop` cannot clean up.
+        let unreadable = std::fs::symlink_metadata(&hidden).is_err();
+        let verdict = super::is_confirmed_absent(&hidden);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        // Root ignores directory permissions, so under root the premise does not hold and
+        // the real assertion below would pass vacuously. Fail loudly rather than prove
+        // nothing quietly.
+        assert!(
+            unreadable,
+            "premise failed: the path was readable (running as root?)"
+        );
+        assert!(
+            !verdict,
+            "a path that cannot be stat'd is NOT confirmed absent"
+        );
+    }
+
+    /// DBSYNC-56. A marked row with a job pending MUST produce a conflicted copy, and this
+    /// test asserts the opposite of what an earlier version of this change shipped.
+    ///
+    /// That version excluded the marker from the conflicted-copy arm, calling the copy
+    /// "litter". It is not litter: the only job that can be active on a marked path is one
+    /// the remote side queued, so the copy is the protection. Excluding it cleared the
+    /// marker before the download drained, which disarmed `download_would_conflict` and let
+    /// remote content overwrite an edit Dropbox had never received — the exact loss this
+    /// ticket exists to fix, re-created by a fix for a review finding that was itself wrong.
+    #[test]
+    fn a_marked_row_makes_a_conflicted_copy_when_a_job_is_pending() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let folder = state.db.get_sync_folder().unwrap().unwrap();
+        let target = std::path::Path::new(&folder).join("report.docx");
+        std::fs::write(&target, b"the edit that must not be lost").expect("write");
+
+        state
+            .db
+            .upsert_local_file("report.docx", "H2", 30, 0)
+            .expect("seed row");
+        state
+            .db
+            .mark_local_file_for_rescan("report.docx")
+            .expect("mark it");
+        // Anything active on the path is enough — a download queued by the remote sweep, or
+        // an upload sitting in retry_wait after a network blip.
+        state
+            .db
+            .enqueue_job("download", Some("report.docx"), Some("report.docx"))
+            .expect("enqueue");
+
+        scan_local_changes_only(&state).expect("scan");
+
+        let copies: Vec<String> = std::fs::read_dir(&folder)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("conflicted copy"))
+            .collect();
+        assert_eq!(
+            copies.len(),
+            1,
+            "the unuploaded bytes must be preserved before the queued download lands: {copies:?}"
+        );
+
+        // And the copy carries the content that was at risk, not an empty placeholder —
+        // preserving the wrong bytes would satisfy the count and lose the edit anyway.
+        let copy = std::path::Path::new(&folder).join(&copies[0]);
+        assert_eq!(
+            std::fs::read(&copy).expect("read copy"),
+            b"the edit that must not be lost"
+        );
+
+        // The upload must target the COPY, never the original. An upload on the original
+        // races the download already queued there, and whichever drains first discards the
+        // other side — that was the second half of the loss the previous version of this
+        // test asserted as correct. Without this assertion a one-word edit reintroduces it
+        // with the whole suite green.
+        let upload_targets: Vec<String> = state
+            .db
+            .list_recent_jobs(100)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.job_type == "upload")
+            .filter_map(|j| j.target_path)
+            .collect();
+        assert_eq!(upload_targets, vec![copies[0].clone()]);
     }
 
     #[test]

@@ -495,12 +495,24 @@ fn is_final_chunk(offset: u64, bytes_read: usize, total_len: u64) -> bool {
     offset + bytes_read as u64 >= total_len
 }
 
-/// Would writing the freshly-downloaded remote content over `target` destroy
-/// local changes that were never synced? True only when the file exists on
-/// disk, we have a previously-synced baseline hash for it, and the current
-/// on-disk hash differs from that baseline (i.e. the user edited the file
-/// locally since the last sync, and the remote copy is not simply
-/// re-affirming what we already have).
+/// Half of the download-conflict decision: does the **baseline** say these local bytes were
+/// never synced? The call site uses [`download_would_destroy_local`], which also
+/// short-circuits when the remote already holds exactly what is on disk.
+///
+/// True when the file exists on disk **and** either:
+///
+/// - the on-disk hash differs from a real previously-synced baseline — the user edited it
+///   since the last sync; or
+/// - the baseline is [`crate::storage::db::Db::HASH_NEEDS_RESCAN`] (DBSYNC-56) — there are
+///   unuploaded local bytes and no trustworthy record of what they were.
+///
+/// A `None` baseline is **not** a conflict: nothing was ever recorded, so nothing proves a
+/// local modification. That is the opposite of the marker, which is a row that WAS advanced
+/// for a real edit — a distinction an earlier version of this change got backwards.
+///
+/// (This doc block said "true only when we have a previously-synced baseline hash" for three
+/// rounds after the marker arm was added, because every correction edited the comments
+/// *inside* the match and never looked above the signature.)
 fn download_would_conflict(
     target_exists: bool,
     on_disk_hash: &str,
@@ -511,8 +523,54 @@ fn download_would_conflict(
     }
     match baseline_hash {
         None => false, // never indexed locally — nothing to protect against
+        // A row marked for rescan (DBSYNC-56) is CONFLICT, and it is worth being exact
+        // about why, because a first version of this got it backwards and would have lost
+        // bytes.
+        //
+        // `None` and the marker look alike — neither gives a usable baseline — but they
+        // carry opposite information. `None` means there is no row at all: nothing was ever
+        // recorded, so nothing proves a local modification. The marker means a row that WAS
+        // advanced for a real local edit whose upload was then cancelled, so these bytes may
+        // be content Dropbox has never received. Overwriting them is precisely the loss this
+        // ticket exists to prevent.
+        //
+        // The cost is bounded: `conflict_copy_with_content_exists` at the call site dedupes
+        // by content, so this is one copy per distinct on-disk content, not one per download.
+        Some(baseline) if baseline == crate::storage::db::Db::HASH_NEEDS_RESCAN => true,
         Some(baseline) => on_disk_hash != baseline,
     }
+}
+
+/// Would writing the remote copy over `on_disk_hash` destroy local bytes Dropbox does not
+/// have? The whole decision, in one place, so it can be tested (DBSYNC-56).
+///
+/// [`download_would_conflict`] answers only half of it. This composes that with the check
+/// that matters most and is easiest to get wrong: **if the recorded remote hash already
+/// equals the on-disk hash, those exact bytes WERE on Dropbox when that row was recorded**
+/// — so overwriting them cannot
+/// destroy anything — whatever the baseline says, and regardless of which call site we came
+/// from or whether the remote row was freshly advanced.
+///
+/// Past tense on purpose: the row can be stale (the remote moved on, and those bytes now
+/// live only in Dropbox's version history) or deliberately retained for a path Dropbox no
+/// longer has at all, which `reconcile_remote_absent` now does on purpose for a marked row.
+/// The guard holds anyway — it is no weaker than the pre-existing baseline arm, which
+/// accepts exactly the same standard — but "are on Dropbox" would be a present-tense
+/// invariant the code elsewhere intentionally violates.
+///
+/// That last part is why the guard is expressed this way rather than as "the sweep just
+/// updated the row": `download_remote_file_internal` also runs from `.cloudsc` hydration and
+/// from a manual IPC download, where no sweep advanced anything. The identical-bytes
+/// argument holds for all three; a freshness argument would hold for only one.
+fn download_would_destroy_local(
+    remote_hash: Option<&str>,
+    on_disk_hash: &str,
+    baseline_hash: Option<&str>,
+) -> bool {
+    if remote_hash == Some(on_disk_hash) {
+        return false;
+    }
+    download_would_conflict(true, on_disk_hash, baseline_hash)
 }
 
 /// Does a conflicted-copy sibling of `target` already hold exactly `content_hash`?
@@ -881,6 +939,23 @@ pub(crate) fn upload_local_file_internal(
             let had_remote = state.db.get_remote_file(relative)?.is_some();
             if !had_remote || is_ignored_local_path(relative) {
                 state.db.remove_local_file(relative)?;
+            } else {
+                // DBSYNC-56. The row is kept — deletion detection needs it — but its hash is
+                // marked for rescan, because leaving it intact loses the edit outright.
+                //
+                // The index row was already optimistically advanced to the new content when
+                // the change was detected. If the file comes back BYTE-IDENTICAL (a backup
+                // agent or an atomic re-save round-tripping it), index and disk agree on
+                // content the remote has never received, and nothing notices: the local scan
+                // compares index against disk, and `reconcile_remote_present` only fires when
+                // the REMOTE moves. The file stays diverged for as long as nobody touches it
+                // on Dropbox again — while the badge reads `synced`, because it is computed
+                // from this same row.
+                //
+                // Bounded retries were considered and rejected: they only cover a time
+                // window, and a file returning after the budget lands in exactly this state.
+                // Marking the row closes it regardless of timing.
+                state.db.mark_local_file_for_rescan(relative)?;
             }
             return Ok(());
         }
@@ -1103,8 +1178,13 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         let (on_disk_hash, _size, _mtime) = hash_file(&target)?;
         let baseline_hash = state.db.get_local_file(&relative)?.map(|row| row.hash);
 
-        if download_would_conflict(true, &on_disk_hash, baseline_hash.as_deref())
-            && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
+        let remote_hash = state.db.get_remote_file(&relative)?.map(|r| r.content_hash);
+
+        if download_would_destroy_local(
+            remote_hash.as_deref(),
+            &on_disk_hash,
+            baseline_hash.as_deref(),
+        ) && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
         {
             let conflicted_path = create_conflicted_copy(&target)?;
             let conflicted_rel = relpath_under(Path::new(&folder), &conflicted_path)?;
@@ -1380,13 +1460,92 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 mod tests {
     use super::{
         atomic_replace, choose_upload_strategy, classify_delete_response,
-        conflict_copy_with_content_exists, download_would_conflict, emit_sync_conflict,
-        emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome, UploadStrategy,
-        UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        conflict_copy_with_content_exists, download_would_conflict, download_would_destroy_local,
+        emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome,
+        UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An `AppState` on an isolated temp DB with `sync_folder` set. The NotFound branch
+    /// under test returns before `get_access_token`, so these tests make no network call.
+    fn build_state(root: &std::path::Path) -> crate::state::AppState {
+        let sync_folder = root.join("synced");
+        std::fs::create_dir_all(&sync_folder).expect("create sync folder");
+        let db_path = root.join("db").join("app.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create db dir");
+        let db = crate::storage::db::Db::new_at(&db_path).expect("db init");
+        db.set_sync_folder(&sync_folder.to_string_lossy())
+            .expect("set sync folder");
+        crate::state::AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: std::sync::Arc::new(db),
+            sync_engine: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::sync::engine::SyncEngine::new(),
+            )),
+            token_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            scheduler_started: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            oauth_listener: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sync_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            token_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        }
+    }
+
+    /// DBSYNC-56, the branch itself: a synced file that vanishes mid-upload keeps its row,
+    /// and that row is marked so the next scan cannot walk past it.
+    #[test]
+    fn vanished_file_with_a_remote_copy_keeps_its_row_and_marks_it_for_rescan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // Synced at H1 remotely; the index was already optimistically advanced to H2 when
+        // the edit was detected. The file is NOT on disk — this is the unlink window.
+        state
+            .db
+            .upsert_remote_file("report.docx", "H1", "rev1", 0)
+            .expect("seed remote");
+        state
+            .db
+            .upsert_local_file("report.docx", "H2", 42, 7)
+            .expect("seed local");
+
+        super::upload_local_file_internal(&state, "report.docx", 1).expect("must not error");
+
+        let row = state
+            .db
+            .get_local_file("report.docx")
+            .expect("query")
+            .expect("the row must SURVIVE - deletion detection needs it");
+        assert_eq!(row.hash, crate::storage::db::Db::HASH_NEEDS_RESCAN);
+        // Size and mtime are carried through: only the hash is invalidated.
+        assert_eq!(row.size_bytes, 42);
+        assert_eq!(row.modified_ts, 7);
+    }
+
+    /// Negative control. A vanished path with nothing on Dropbox is forgotten, exactly as
+    /// before — an editor temp file must not linger in the index carrying a marker that
+    /// makes every future scan re-detect a file that does not exist.
+    #[test]
+    fn vanished_file_with_no_remote_copy_is_still_forgotten() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state
+            .db
+            .upsert_local_file("~$draft.docx", "H2", 42, 7)
+            .expect("seed local");
+
+        super::upload_local_file_internal(&state, "~$draft.docx", 1).expect("must not error");
+
+        assert!(
+            state
+                .db
+                .get_local_file("~$draft.docx")
+                .expect("query")
+                .is_none(),
+            "a path with no remote copy has nothing to recover and must be dropped"
+        );
+    }
 
     // `fetch_and_write_file` performs live HTTP calls against the Dropbox API
     // and is intentionally left to manual QA (large-file download against a
@@ -1683,6 +1842,72 @@ mod tests {
     #[test]
     fn download_would_conflict_false_when_baseline_none() {
         assert!(!download_would_conflict(true, "on-disk-hash", None));
+    }
+
+    /// DBSYNC-56, and the assertion is deliberately the opposite of what a first version of
+    /// this change shipped. That version returned `false` here, reasoning that the marker
+    /// is "the same epistemic state as `None`". It is not.
+    ///
+    /// `None` means there is no row at all — nothing was ever recorded, so nothing proves a
+    /// local modification. The marker means a row that WAS advanced for a real local edit
+    /// whose upload was cancelled: these bytes may be content Dropbox has never received.
+    /// Returning `false` let an incoming download overwrite exactly that content, with no
+    /// conflicted copy and nothing logged — the same silent loss this ticket exists to fix,
+    /// re-created by its own fix.
+    #[test]
+    fn download_would_conflict_true_when_baseline_is_the_rescan_marker() {
+        assert!(download_would_conflict(
+            true,
+            "on-disk-hash",
+            Some(crate::storage::db::Db::HASH_NEEDS_RESCAN)
+        ));
+    }
+
+    /// The composed guard, which is what the call site actually asks (DBSYNC-56). Review
+    /// caught that the previous version of this change tested only the helper: two separate
+    /// mutations to the composition — forcing it off, and inverting it — both left the suite
+    /// green. The most safety-critical line in the change had no coverage at all.
+    #[test]
+    fn download_would_destroy_local_protects_a_marked_row_from_different_remote_content() {
+        const MARKER: &str = crate::storage::db::Db::HASH_NEEDS_RESCAN;
+        // The DBSYNC-56 case: unuploaded local bytes, remote holds something else.
+        assert!(download_would_destroy_local(
+            Some("H3"),
+            "on-disk",
+            Some(MARKER)
+        ));
+    }
+
+    #[test]
+    fn download_would_destroy_local_allows_an_overwrite_with_identical_bytes() {
+        const MARKER: &str = crate::storage::db::Db::HASH_NEEDS_RESCAN;
+        // Remote already holds exactly what is on disk: nothing can be destroyed, so this
+        // must NOT take the conflict path even with the marker set. Without it, the marker
+        // would copy content that matches the remote exactly.
+        assert!(!download_would_destroy_local(
+            Some("same"),
+            "same",
+            Some(MARKER)
+        ));
+        // Same reasoning with an ordinary diverged baseline.
+        assert!(!download_would_destroy_local(
+            Some("same"),
+            "same",
+            Some("old-baseline")
+        ));
+    }
+
+    #[test]
+    fn download_would_destroy_local_falls_back_to_the_baseline_when_the_remote_is_unknown() {
+        // No remote row (hydration / manual download call sites): the identical-bytes
+        // shortcut cannot apply, so the baseline decides exactly as before.
+        assert!(download_would_destroy_local(None, "on-disk", Some("old")));
+        assert!(!download_would_destroy_local(
+            None,
+            "on-disk",
+            Some("on-disk")
+        ));
+        assert!(!download_would_destroy_local(None, "on-disk", None));
     }
 
     #[test]
