@@ -1899,16 +1899,42 @@ mod tests {
             .expect("seed remote");
         db.upsert_known_folder("sub").expect("seed folder");
 
-        // Break the fifth deletion. Everything before it will have run.
+        // The lever fires ONLY IF an earlier deletion has already run inside the
+        // transaction, and that is the whole point of using a trigger rather than the
+        // obvious `DROP TABLE known_folders`.
+        //
+        // A dropped table cannot tell "deleted then rolled back" from "never executed".
+        // Reorder the `known_folders` deletion to the front of `reset_sync_state` — a
+        // plausible edit, nothing about the function forbids it — and the surviving-row
+        // assertions below become trivially true, so the test passes with no rollback
+        // exercised at all. Worse, measured: with that reordering the mutation that removes
+        // the transaction ALSO stops reddening. The test the ticket calls its whole
+        // evidence, and the mutation that validates it, are disarmed together by moving one
+        // line inside the function under test.
+        //
+        // This trigger aborts only once `local_file_index` is empty, so the abort IS the
+        // proof that deletion 1 ran. The assertions then prove it was undone.
         {
             let conn = db.write.lock().expect("lock");
-            conn.execute_batch("DROP TABLE known_folders")
-                .expect("drop");
+            conn.execute_batch(
+                "CREATE TRIGGER abort_once_local_is_cleared \
+                 BEFORE DELETE ON known_folders BEGIN \
+                   SELECT RAISE(ABORT, 'local_file_index was already cleared') \
+                   WHERE (SELECT COUNT(*) FROM local_file_index) = 0; \
+                 END",
+            )
+            .expect("install the ordering-sensitive lever");
         }
 
-        let result = db.reset_sync_state();
-
-        assert!(result.is_err(), "the reset must fail, not silently skip");
+        let err = db
+            .reset_sync_state()
+            .expect_err("the reset must fail, not silently skip");
+        assert!(
+            err.to_string()
+                .contains("local_file_index was already cleared"),
+            "the failure must come from the ordering-sensitive lever, which fires only \
+             after an earlier deletion ran: {err}"
+        );
         assert!(
             db.get_local_file("a.txt").expect("query").is_some(),
             "the FIRST deletion must have been rolled back — a half-cleared index is what \
