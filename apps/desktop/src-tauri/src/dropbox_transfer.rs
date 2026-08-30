@@ -1486,11 +1486,14 @@ mod tests {
         super::upload_local_file_internal(&state, "~$draft.docx", 1).expect("must not error");
 
         assert!(
-            state.db.get_local_file("~$draft.docx").expect("query").is_none(),
+            state
+                .db
+                .get_local_file("~$draft.docx")
+                .expect("query")
+                .is_none(),
             "a path with no remote copy has nothing to recover and must be dropped"
         );
     }
-
 
     // `fetch_and_write_file` performs live HTTP calls against the Dropbox API
     // and is intentionally left to manual QA (large-file download against a
