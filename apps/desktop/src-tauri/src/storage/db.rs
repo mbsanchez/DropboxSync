@@ -1553,13 +1553,19 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// The whole schema as comparable rows — every object, its name and its DDL. Used to
-    /// assert that a second `migrate` changes nothing, which is what "idempotent" means and
-    /// what a bare `expect` on the second call does not check.
+    /// The whole schema as comparable rows — every object, its name, its **rootpage** and
+    /// its DDL. Used to assert that a second `migrate` changes nothing, which is what
+    /// "idempotent" means and what a bare `expect` on the second call does not check.
+    ///
+    /// `rootpage` is in there deliberately. Without it, making the `sync_jobs` rebuild
+    /// unconditional — so every startup drops and recreates the table — left both
+    /// idempotency tests green, because the recreated table has identical DDL. A recreated
+    /// table gets a new rootpage, so including it turns "the schema looks the same" into
+    /// "the schema IS the same objects".
     fn schema_rows(c: &Connection) -> Vec<String> {
         let mut stmt = c
             .prepare(
-                "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') \
+                "SELECT type || ' ' || name || ' ' || rootpage || ' ' || COALESCE(sql, '') \
                  FROM sqlite_master ORDER BY type, name",
             )
             .expect("prepare");
@@ -1946,12 +1952,70 @@ mod tests {
         );
     }
 
+    /// DBSYNC-40. `reset_sync_state` must clear **every** table it names, and this test
+    /// exists because a systematic sweep found that three of its six deletions could be
+    /// deleted outright with the whole suite still green — including `remote_file_index`,
+    /// the one this function's own doc comment names as the disaster case:
+    ///
+    /// > *"clear `local_file_index` but not `remote_file_index`, and the next scan walks a
+    /// > folder full of files with no index rows while the remote index still claims to
+    /// > know them"*
+    ///
+    /// The rollback test next door reads like it covers this — it asserts the remote row
+    /// survives a failed reset — but that assertion passes just as happily when the remote
+    /// deletion never runs at all. "Rolled back" and "never executed" look identical from
+    /// the outside, which is the same confusion the trigger lever exists to resolve.
+    #[test]
+    fn reset_sync_state_clears_every_table_it_names() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_local_file("a.txt", "H", 1, 0)
+            .expect("seed local");
+        db.upsert_remote_file("a.txt", "H", "rev", 0)
+            .expect("seed remote");
+        db.enqueue_job("upload", Some("a.txt"), Some("a.txt"))
+            .expect("seed job");
+        db.add_conflict("a.txt", "a.txt", "seeded", None, false)
+            .expect("seed conflict");
+        db.upsert_known_folder("sub").expect("seed folder");
+        db.set_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY, "cursor")
+            .expect("seed cursor");
+
+        db.reset_sync_state().expect("reset");
+
+        assert!(db.get_local_file("a.txt").expect("q").is_none(), "local");
+        assert!(db.get_remote_file("a.txt").expect("q").is_none(), "remote");
+        assert_eq!(db.count_active_jobs().expect("q"), 0, "jobs");
+        assert!(
+            db.list_recent_conflicts(10).expect("q").is_empty(),
+            "conflicts"
+        );
+        assert!(
+            db.list_known_folders().expect("q").is_empty(),
+            "known folders"
+        );
+        assert!(
+            db.get_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY)
+                .expect("q")
+                .is_none(),
+            "delta cursor"
+        );
+    }
+
     /// DBSYNC-40. Same requirement for the schema: a failure partway leaves nothing behind.
     ///
     /// The lever is a **table** named `idx_sync_jobs_status_retry`, colliding with an index
     /// `migrate` creates near the end — SQLite reports "there is already a table named …"
     /// even for `CREATE INDEX IF NOT EXISTS`. `app_config` is created by the very first
     /// statement, so its absence afterwards is what proves the whole batch unwound.
+    ///
+    /// **That last step rests on an ordering this test cannot check**, and saying so is the
+    /// point: it assumes `CREATE TABLE app_config` runs before the failure. Move it after
+    /// the index block and the assertion passes vacuously. The reset test solves the same
+    /// problem with a trigger that fires only after an earlier statement ran, but SQLite has
+    /// no DDL trigger hook, and the failing statement here is a `CREATE INDEX` — so there is
+    /// no way to make this failure conditional on `app_config` already existing. The
+    /// ordering is verified by reading `migrate`, not by this test. Accepted knowingly:
+    /// it would take reordering a `CREATE TABLE` behind an index creation to break it.
     #[test]
     fn migrate_rolls_back_when_a_step_fails_partway() {
         let path = unique_db_path();
