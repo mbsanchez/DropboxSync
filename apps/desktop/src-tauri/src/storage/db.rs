@@ -83,7 +83,7 @@ impl Db {
     /// from the production database (which `db_path()` resolves via OS-specific
     /// app-data dirs), so running `cargo test` never touches a user's real DB.
     pub fn new_at(path: &std::path::Path) -> AppResult<Self> {
-        let write = Connection::open(path)?;
+        let mut write = Connection::open(path)?;
         write.execute_batch(
             "
                 PRAGMA foreign_keys = ON;
@@ -91,7 +91,7 @@ impl Db {
                 PRAGMA synchronous = NORMAL;
                 ",
         )?;
-        migrate(&write)?;
+        migrate(&mut write)?;
 
         let read = Connection::open_with_flags(
             path,
@@ -140,23 +140,46 @@ impl Db {
         Ok(())
     }
 
-    /// Clears local sync state to avoid stale jobs when the sync folder changes.
+    /// Clears every trace of the previous sync folder, **atomically** (DBSYNC-40).
+    ///
+    /// The transaction is the point. These six deletions used to run as six independent
+    /// statements, and a crash, lock error or disk failure between any two left a state
+    /// neither half of the sync engine expects: clear `local_file_index` but not
+    /// `remote_file_index`, and the next scan walks a folder full of files with no index
+    /// rows while the remote index still claims to know them. This is not a hypothetical
+    /// path — it runs whenever the user changes their sync folder — and on a client that
+    /// carries a mass-delete circuit breaker because bulk operations here destroy data, a
+    /// half-cleared index is not a tidiness problem.
+    ///
+    /// `rusqlite::Transaction` rather than literal `BEGIN`/`COMMIT`: it rolls back when
+    /// dropped, so an early `?` return between the statements cannot leave a transaction
+    /// open — which would be this function's own failure mode, one level up.
+    ///
+    /// **The atomic boundary is this function, not the folder switch.** `commands.rs` sets
+    /// the new sync folder in its own transaction and *then* calls this one, so a failure
+    /// here still leaves `app_config` pointing at the new folder while the index describes
+    /// the old one. That is better than the torn index this replaces — coherent-but-stale
+    /// beats half-cleared — but it is not the same as the whole operation being atomic, and
+    /// this comment should not be read as claiming it is. Closing it means one method doing
+    /// the config write and these deletions together: **DBSYNC-94**.
     pub fn reset_sync_state(&self) -> AppResult<()> {
-        let conn = self
+        let mut conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
-        conn.execute("DELETE FROM local_file_index", [])?;
-        conn.execute("DELETE FROM remote_file_index", [])?;
-        conn.execute("DELETE FROM sync_jobs", [])?;
-        conn.execute("DELETE FROM sync_conflicts", [])?;
-        conn.execute("DELETE FROM known_folders", [])?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM local_file_index", [])?;
+        tx.execute("DELETE FROM remote_file_index", [])?;
+        tx.execute("DELETE FROM sync_jobs", [])?;
+        tx.execute("DELETE FROM sync_conflicts", [])?;
+        tx.execute("DELETE FROM known_folders", [])?;
         // Drop the cursor-delta cursor so remote change detection re-seeds
         // against the new folder (DBSYNC-30); other app_config keys are kept.
-        conn.execute(
+        tx.execute(
             "DELETE FROM app_config WHERE key = 'remote_delta_cursor'",
             [],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1080,7 +1103,48 @@ impl Db {
     }
 }
 
-fn migrate(conn: &Connection) -> AppResult<()> {
+/// Brings any database up to the schema this build expects, **atomically** (DBSYNC-40).
+///
+/// ## Why there is no version counter, and what to use if that changes
+///
+/// This is deliberately **declarative and self-converging**: every step states a desired
+/// end state — `CREATE TABLE IF NOT EXISTS`, `add_column_if_missing`, a guarded rebuild —
+/// so a database reaches it from wherever it happens to be. A `schema_version` counter
+/// would describe a *sequence* instead, and a counter that is wrong (a hand-edited file, a
+/// restored backup, a half-applied migration from before this function was transactional)
+/// silently skips the very steps that would have repaired it. Convergence degrades better
+/// than sequencing.
+///
+/// The cost, stated so the trade is visible: startup re-inspects the schema on every run,
+/// and a failure remains a silent retry rather than a detectable stop. Both are small today
+/// and grow slowly. Revisit if this function gets materially longer, or if some migration
+/// ever genuinely cannot be written idempotently.
+///
+/// **If it is revisited, the mechanism is `PRAGMA user_version`, not a row in `app_config`.**
+/// That table is created by this very function, so reading a version out of it before
+/// migrating needs its own bootstrap step on a fresh database — solvable in a line, but one
+/// more thing to get right for no benefit. The real argument is the other one:
+/// `user_version` lives in the file header and participates in the transaction below.
+///
+/// ## The transaction
+///
+/// One transaction for the whole sequence, not one per step: a half-migrated schema is
+/// exactly what must not survive, and committing between steps would preserve it.
+///
+/// `PRAGMA journal_mode` and `foreign_keys` are set by the caller **before** this runs and
+/// must stay there — `journal_mode` cannot be changed inside a transaction, and moving it
+/// in would be a silent regression no test here would catch. The only PRAGMA reached from
+/// inside is `table_info`, a read, which is safe.
+fn migrate(conn: &mut Connection) -> AppResult<()> {
+    let tx = conn.transaction()?;
+    migrate_in_tx(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The migration steps themselves. Split out so [`migrate`] owns the transaction and this
+/// owns the schema — and so a failure anywhere below unwinds through one `?` to a rollback.
+fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS app_config (
@@ -1485,16 +1549,50 @@ fn db_path() -> AppResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::Db;
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// The whole schema as comparable rows — every object, its name, its **rootpage** and
+    /// its DDL. Used to assert that a second `migrate` changes nothing, which is what
+    /// "idempotent" means and what a bare `expect` on the second call does not check.
+    ///
+    /// `rootpage` is in there deliberately. Without it, making the `sync_jobs` rebuild
+    /// unconditional — so every startup drops and recreates the table — left both
+    /// idempotency tests green, because the recreated table has identical DDL. A recreated
+    /// table gets a new rootpage, so including it turns "the schema looks the same" into
+    /// "the schema IS the same objects".
+    fn schema_rows(c: &Connection) -> Vec<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT type || ' ' || name || ' ' || rootpage || ' ' || COALESCE(sql, '') \
+                 FROM sqlite_master ORDER BY type, name",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query");
+        rows.collect::<Result<Vec<_>, _>>().expect("collect")
+    }
+
     /// A unique temp DB file path so tests never touch the production database.
+    ///
+    /// The counter is not decoration. `as_nanos()` has **microsecond** resolution on macOS
+    /// — measured: 192393 of 200000 consecutive readings were duplicates, smallest non-zero
+    /// gap 1000ns — so two tests entering this function in the same microsecond got the
+    /// same directory and shared one database file. Most callers survived that because
+    /// `Db::new_at` is all `CREATE TABLE IF NOT EXISTS`; `migrate_rebuilds_a_legacy_...`
+    /// plants a bare `CREATE TABLE` and dies on the collision. The bug is older than that
+    /// test — the test is just the first caller intolerant enough to expose it, at roughly
+    /// one failed run in ten under the default parallel harness, and none single-threaded.
     fn unique_db_path() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dropbox-sync-test-{ts}"));
+        let dir = std::env::temp_dir().join(format!("dropbox-sync-test-{ts}-{n}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join("app.db")
     }
@@ -1798,6 +1896,329 @@ mod tests {
                 .expect("get prefixes after clear"),
             Some("Fotos,Videos/2024".to_string()),
             "local prefs must survive disconnect"
+        );
+    }
+
+    /// DBSYNC-40, and this is the whole evidence for the ticket: a failure partway through
+    /// `reset_sync_state` must leave the database untouched.
+    ///
+    /// The lever is `DROP TABLE known_folders` — the **fifth** of six deletions, so the
+    /// first four certainly execute before the failure. Without the transaction,
+    /// `local_file_index` is empty when this returns and the assertion below fails. A test
+    /// that only checked the happy path would pass either way, which is the definition of a
+    /// check that cannot fail.
+    #[test]
+    fn reset_sync_state_rolls_back_when_a_deletion_fails_partway() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_local_file("a.txt", "H", 1, 0)
+            .expect("seed local");
+        db.upsert_remote_file("a.txt", "H", "rev", 0)
+            .expect("seed remote");
+        db.upsert_known_folder("sub").expect("seed folder");
+
+        // The lever fires ONLY IF an earlier deletion has already run inside the
+        // transaction, and that is the whole point of using a trigger rather than the
+        // obvious `DROP TABLE known_folders`.
+        //
+        // A dropped table cannot tell "deleted then rolled back" from "never executed".
+        // Reorder the `known_folders` deletion to the front of `reset_sync_state` — a
+        // plausible edit, nothing about the function forbids it — and the surviving-row
+        // assertions below become trivially true, so the test passes with no rollback
+        // exercised at all. Worse, measured: with that reordering the mutation that removes
+        // the transaction ALSO stops reddening. The test the ticket calls its whole
+        // evidence, and the mutation that validates it, are disarmed together by moving one
+        // line inside the function under test.
+        //
+        // This trigger aborts only once `local_file_index` is empty, so the abort IS the
+        // proof that deletion 1 ran. The assertions then prove it was undone.
+        {
+            let conn = db.write.lock().expect("lock");
+            conn.execute_batch(
+                "CREATE TRIGGER abort_once_local_is_cleared \
+                 BEFORE DELETE ON known_folders BEGIN \
+                   SELECT RAISE(ABORT, 'local_file_index was already cleared') \
+                   WHERE (SELECT COUNT(*) FROM local_file_index) = 0; \
+                 END",
+            )
+            .expect("install the ordering-sensitive lever");
+        }
+
+        let err = db
+            .reset_sync_state()
+            .expect_err("the reset must fail, not silently skip");
+        assert!(
+            err.to_string()
+                .contains("local_file_index was already cleared"),
+            "the failure must come from the ordering-sensitive lever, which fires only \
+             after an earlier deletion ran: {err}"
+        );
+        assert!(
+            db.get_local_file("a.txt").expect("query").is_some(),
+            "the FIRST deletion must have been rolled back — a half-cleared index is what \
+             this ticket exists to prevent"
+        );
+        assert!(
+            db.get_remote_file("a.txt").expect("query").is_some(),
+            "and so must the second"
+        );
+    }
+
+    /// DBSYNC-40. `reset_sync_state` must clear **every** table it names, and this test
+    /// exists because a systematic sweep found that three of its six deletions could be
+    /// deleted outright with the whole suite still green — including `remote_file_index`,
+    /// the one this function's own doc comment names as the disaster case:
+    ///
+    /// > *"clear `local_file_index` but not `remote_file_index`, and the next scan walks a
+    /// > folder full of files with no index rows while the remote index still claims to
+    /// > know them"*
+    ///
+    /// The rollback test next door reads like it covers this — it asserts the remote row
+    /// survives a failed reset — but that assertion passes just as happily when the remote
+    /// deletion never runs at all. "Rolled back" and "never executed" look identical from
+    /// the outside, which is the same confusion the trigger lever exists to resolve.
+    #[test]
+    fn reset_sync_state_clears_every_table_it_names() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        // Seeded through raw SQL, and deliberately including rows the application's own
+        // readers cannot see: a `done` and a `failed` job (`count_active_jobs` counts only
+        // queued/retry_wait/running), a resolved conflict (`list_recent_conflicts` filters
+        // `resolved = 0`), and a rescan-marked index row (DBSYNC-56 stores `hash = ''`, and
+        // `get_local_file` is queried here by a different path).
+        //
+        // That is the whole point. A first version of this test asserted through those
+        // readers, and every deletion could then be narrowed to exactly what its reader
+        // shows — `DELETE FROM sync_jobs WHERE status IN ('queued','retry_wait','running')`
+        // left the suite green, and so did the equivalents for conflicts and the index.
+        // Each is a plausible edit someone makes on purpose ("keep the history"), and the
+        // assertion messages would still have read "jobs", "conflicts", "local".
+        {
+            let conn = db.write.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO local_file_index VALUES ('a.txt','H',1,0,'t');
+                 INSERT INTO local_file_index VALUES ('marked.txt','',1,0,'t');
+                 INSERT INTO remote_file_index VALUES ('a.txt','H','rev',0,'t');
+                 INSERT INTO sync_jobs (job_type,status,created_at,updated_at)
+                     VALUES ('upload','queued','t','t'),
+                            ('upload','done','t','t'),
+                            ('upload','failed','t','t');
+                 INSERT INTO sync_conflicts (local_path,remote_path,reason,resolved,created_at)
+                     VALUES ('a.txt','a.txt','unresolved',0,'t'),
+                            ('b.txt','b.txt','resolved',1,'t');
+                 INSERT INTO known_folders VALUES ('sub','t');",
+            )
+            .expect("seed");
+        }
+        db.set_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY, "cursor")
+            .expect("seed cursor");
+
+        db.reset_sync_state().expect("reset");
+
+        // Raw COUNT(*) per table, for the same reason: a filtered reader would let a
+        // narrowed deletion pass.
+        let conn = db.write.lock().expect("lock");
+        for table in [
+            "local_file_index",
+            "remote_file_index",
+            "sync_jobs",
+            "sync_conflicts",
+            "known_folders",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(n, 0, "{table} must be empty after a reset");
+        }
+        // The cursor goes; other app_config keys stay — that distinction is deliberate in
+        // the production code, so assert both halves.
+        let cursor: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_config WHERE key = ?1",
+                [crate::remote_index::REMOTE_DELTA_CURSOR_KEY],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(cursor, 0, "the delta cursor must be dropped");
+    }
+
+    /// DBSYNC-40. Same requirement for the schema: a failure partway leaves nothing behind.
+    ///
+    /// The lever is a **table** named `idx_sync_jobs_status_retry`, colliding with an index
+    /// `migrate` creates near the end — SQLite reports "there is already a table named …"
+    /// even for `CREATE INDEX IF NOT EXISTS`. `app_config` is created by the very first
+    /// statement, so its absence afterwards is what proves the whole batch unwound.
+    ///
+    /// **That last step rests on an ordering this test cannot check**, and saying so is the
+    /// point: it assumes `CREATE TABLE app_config` runs before the failure. Move it after
+    /// the index block and the assertion passes vacuously. The reset test solves the same
+    /// problem with a trigger that fires only after an earlier statement ran, but SQLite has
+    /// no DDL trigger hook, and the failing statement here is a `CREATE INDEX` — so there is
+    /// no way *in SQL* to make this failure conditional on `app_config` already existing —
+    /// a `sqlite3_set_authorizer` hook could, at far more cost than this residual is worth.
+    /// The
+    /// ordering is verified by reading `migrate`, not by this test. Accepted knowingly:
+    /// it would take reordering a `CREATE TABLE` behind an index creation to break it.
+    #[test]
+    fn migrate_rolls_back_when_a_step_fails_partway() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+        conn.execute_batch("CREATE TABLE idx_sync_jobs_status_retry (x)")
+            .expect("plant the collision");
+
+        let err = super::migrate(&mut conn).expect_err("the collision must fail the migration");
+
+        // Pin WHERE it failed. Without this the test passes vacuously: if some future edit
+        // makes an EARLIER step fail — a new first statement, a reordering, a typo in the
+        // opening batch — then `app_config` was never created, its absence is trivially
+        // true, and this becomes a check that cannot fail while looking green. Verified by
+        // forcing exactly that (a stray VIEW named `sync_jobs` breaks the first
+        // `execute_batch`): both assertions below held with no atomicity involved at all.
+        assert!(
+            err.to_string().contains("idx_sync_jobs_status_retry"),
+            "the migration must fail at the planted collision, not earlier: {err}"
+        );
+        let app_config_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_config'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert_eq!(
+            app_config_exists, 0,
+            "app_config is created by the first statement; if it survives a later failure \
+             the migration was not atomic"
+        );
+    }
+
+    /// DBSYNC-40. Running `migrate` twice is the normal case on every restart, so a
+    /// transaction that accidentally broke a step's re-runnability would break every
+    /// existing installation. Compares the WHOLE schema, not one table.
+    #[test]
+    fn migrate_is_idempotent_and_leaves_an_identical_schema() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+
+        super::migrate(&mut conn).expect("first migrate");
+        let after_first = schema_rows(&conn);
+        super::migrate(&mut conn).expect("second migrate must not fail");
+        let after_second = schema_rows(&conn);
+
+        assert_eq!(after_first, after_second);
+        assert!(
+            after_first.iter().any(|s| s.contains("app_config")),
+            "sanity: the schema comparison must be comparing something"
+        );
+    }
+
+    /// DBSYNC-40. The `sync_jobs` rebuild is the one migration step that only ever runs on
+    /// **existing installations** — a fresh database gets the CHECK constraints from the
+    /// `CREATE TABLE`, so `sync_jobs_has_check` is true and the DROP/RENAME never executes.
+    ///
+    /// That means the other migration tests, which all start from an empty file, never
+    /// touch it. The branch most likely to break someone's database was the one with no
+    /// coverage, which is the wrong way round — and it is now the branch running inside a
+    /// transaction for the first time.
+    #[test]
+    fn migrate_rebuilds_a_legacy_sync_jobs_table_inside_the_transaction() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+        // A pre-DBSYNC-31 `sync_jobs`: no CHECK constraints, and carrying rows whose values
+        // are outside the sets the CHECKs will impose.
+        conn.execute_batch(
+            "CREATE TABLE sync_jobs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 job_type TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 source_path TEXT,
+                 target_path TEXT,
+                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                 next_retry_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO sync_jobs (job_type, status, created_at, updated_at)
+                 VALUES ('upload', 'queued', 't', 't'),
+                        ('bogus_type', 'queued', 't', 't');",
+        )
+        .expect("plant a legacy table");
+
+        super::migrate(&mut conn).expect("migrate must rebuild it");
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert!(
+            sql.contains("CHECK"),
+            "the rebuild must add the constraints"
+        );
+
+        // ...and the constraint must actually BITE. The assertion above shares its oracle
+        // with the production code: `sync_jobs_has_check` decides whether to rebuild by
+        // grepping the same stored SQL for the same word, so a test using that heuristic
+        // cannot detect the heuristic being wrong. A legacy table with `-- CHECK` in a
+        // comment satisfies both and skips the rebuild entirely. This asks the database.
+        let violated = conn
+            .execute(
+                "INSERT INTO sync_jobs (job_type, status, created_at, updated_at) \
+                 VALUES ('bogus_type', 'queued', 't', 't')",
+                [],
+            )
+            .expect_err("the rebuilt table must reject an out-of-set job_type");
+        // Pin WHY it failed. A bare `is_err()` was the fourth assertion on this PR to claim
+        // "must" about something it did not constrain: dropping the job_type CHECK from the
+        // rebuild copy AND removing `DEFAULT 0` from attempt_count makes this insert fail on
+        // NOT NULL instead, and the whole suite stayed green with the constraint gone —
+        // measured. That is the realistic shape of the bug this test exists for: a rebuild
+        // that silently produces a WEAKER schema than a fresh install, where every other
+        // test still passes because fresh databases get the CHECK from `CREATE TABLE`.
+        assert!(
+            violated.to_string().contains("job_type"),
+            "the INSERT must fail on the job_type CHECK, not another constraint: {violated}"
+        );
+
+        // The valid row survives; the out-of-set one is dropped rather than aborting the
+        // copy, which is what the migration's own comment promises.
+        let surviving: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_jobs", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(surviving, 1);
+
+        // Indexes must land on the REBUILT table: `DROP TABLE` takes the old ones with it,
+        // so the `CREATE INDEX` block has to run after the rebuild, not before.
+        //
+        // Scoped to `tbl_name` and an exact count, both deliberately. A first version
+        // counted every `idx_%` in the schema with `>= 2`, and that was blind to the exact
+        // bug this comment names: moving the index block before the rebuild destroys
+        // `idx_sync_jobs_status_retry`, but the unscoped count still reached 2 via
+        // `idx_sync_conflicts_resolved` (a different table, untouched) and
+        // `idx_sync_jobs_active_unique` (created later, so it survives the reordering).
+        // The whole suite stayed green with that bug present — measured, not supposed.
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND tbl_name='sync_jobs' AND name LIKE 'idx_%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count indexes");
+        assert_eq!(
+            indexes, 2,
+            "both sync_jobs indexes must land on the REBUILT table"
+        );
+
+        // And it is still idempotent over the rebuilt shape. `expect` alone would prove
+        // only that the second run does not error, which is not what "no-op" means.
+        let before = schema_rows(&conn);
+        super::migrate(&mut conn).expect("second migrate must not fail");
+        assert_eq!(
+            schema_rows(&conn),
+            before,
+            "a second migrate over a rebuilt table must change nothing"
         );
     }
 
