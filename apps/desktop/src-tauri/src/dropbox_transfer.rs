@@ -511,12 +511,20 @@ fn download_would_conflict(
     }
     match baseline_hash {
         None => false, // never indexed locally — nothing to protect against
-        // A row marked for rescan (DBSYNC-56) is the SAME epistemic state as `None`: we do
-        // not know what was last synced, so nothing here proves a local modification.
-        // Falling through to the comparison below would make it differ from every on-disk
-        // hash and manufacture a conflicted copy for a window the user never saw — trading
-        // silent data loss for visible litter.
-        Some(baseline) if baseline == crate::storage::db::Db::HASH_NEEDS_RESCAN => false,
+        // A row marked for rescan (DBSYNC-56) is CONFLICT, and it is worth being exact
+        // about why, because a first version of this got it backwards and would have lost
+        // bytes.
+        //
+        // `None` and the marker look alike — neither gives a usable baseline — but they
+        // carry opposite information. `None` means there is no row at all: nothing was ever
+        // recorded, so nothing proves a local modification. The marker means a row that WAS
+        // advanced for a real local edit whose upload was then cancelled, so these bytes may
+        // be content Dropbox has never received. Overwriting them is precisely the loss this
+        // ticket exists to prevent.
+        //
+        // The cost is bounded: `conflict_copy_with_content_exists` at the call site dedupes
+        // by content, so this is one copy per distinct on-disk content, not one per download.
+        Some(baseline) if baseline == crate::storage::db::Db::HASH_NEEDS_RESCAN => true,
         Some(baseline) => on_disk_hash != baseline,
     }
 }
@@ -887,7 +895,7 @@ pub(crate) fn upload_local_file_internal(
             let had_remote = state.db.get_remote_file(relative)?.is_some();
             if !had_remote || is_ignored_local_path(relative) {
                 state.db.remove_local_file(relative)?;
-            } else if let Some(row) = state.db.get_local_file(relative)? {
+            } else {
                 // DBSYNC-56. The row is kept — deletion detection needs it — but its hash is
                 // marked for rescan, because leaving it intact loses the edit outright.
                 //
@@ -903,12 +911,7 @@ pub(crate) fn upload_local_file_internal(
                 // Bounded retries were considered and rejected: they only cover a time
                 // window, and a file returning after the budget lands in exactly this state.
                 // Marking the row closes it regardless of timing.
-                state.db.upsert_local_file(
-                    relative,
-                    crate::storage::db::Db::HASH_NEEDS_RESCAN,
-                    row.size_bytes,
-                    row.modified_ts,
-                )?;
+                state.db.mark_local_file_for_rescan(relative)?;
             }
             return Ok(());
         }
@@ -1131,7 +1134,18 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         let (on_disk_hash, _size, _mtime) = hash_file(&target)?;
         let baseline_hash = state.db.get_local_file(&relative)?.map(|row| row.hash);
 
-        if download_would_conflict(true, &on_disk_hash, baseline_hash.as_deref())
+        // Nothing can be lost by overwriting bytes with identical bytes, whatever the
+        // baseline says (DBSYNC-56). The remote row was advanced by the sweep that enqueued
+        // this job, so it holds the content about to be fetched. Without this, a row marked
+        // for rescan — which the guard below now correctly treats as a conflict — would
+        // manufacture a conflicted copy of content that already matches the remote exactly.
+        let remote_matches_disk = state
+            .db
+            .get_remote_file(&relative)?
+            .is_some_and(|r| r.content_hash == on_disk_hash);
+
+        if !remote_matches_disk
+            && download_would_conflict(true, &on_disk_hash, baseline_hash.as_deref())
             && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
         {
             let conflicted_path = create_conflicted_copy(&target)?;
@@ -1792,15 +1806,19 @@ mod tests {
         assert!(!download_would_conflict(true, "on-disk-hash", None));
     }
 
-    /// DBSYNC-56. A row marked for rescan means "we do not know what was last synced",
-    /// which is the same answer as `None` — not "the baseline differs".
+    /// DBSYNC-56, and the assertion is deliberately the opposite of what a first version of
+    /// this change shipped. That version returned `false` here, reasoning that the marker
+    /// is "the same epistemic state as `None`". It is not.
     ///
-    /// Without this, every download arriving while the marker is set would manufacture a
-    /// conflicted copy, because the marker differs from every real on-disk hash. That would
-    /// trade silent data loss for visible litter, which is not a trade worth making.
+    /// `None` means there is no row at all — nothing was ever recorded, so nothing proves a
+    /// local modification. The marker means a row that WAS advanced for a real local edit
+    /// whose upload was cancelled: these bytes may be content Dropbox has never received.
+    /// Returning `false` let an incoming download overwrite exactly that content, with no
+    /// conflicted copy and nothing logged — the same silent loss this ticket exists to fix,
+    /// re-created by its own fix.
     #[test]
-    fn download_would_conflict_false_when_baseline_is_the_rescan_marker() {
-        assert!(!download_would_conflict(
+    fn download_would_conflict_true_when_baseline_is_the_rescan_marker() {
+        assert!(download_would_conflict(
             true,
             "on-disk-hash",
             Some(crate::storage::db::Db::HASH_NEEDS_RESCAN)

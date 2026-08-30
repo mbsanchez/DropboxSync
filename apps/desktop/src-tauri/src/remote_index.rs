@@ -422,6 +422,12 @@ pub(crate) fn reconcile_remote_present(
 
     if should_download {
         if let Some(local) = state.db.get_local_file(rel)? {
+            // DBSYNC-56: a marked row makes this comparison trivially true, so a download is
+            // enqueued even when the disk may already hold the new remote content. That is
+            // wasteful but CORRECT, and deferring here would be a bug: `upsert_remote_file`
+            // above has already advanced the row, so `should_download` would be false on
+            // every subsequent sweep and the download would be lost outright. The redundant
+            // case is caught at the download site, where the bytes can actually be compared.
             if local.hash != remote_meta.content_hash {
                 state.db.enqueue_job("download", Some(rel), Some(rel))?;
                 return Ok(1);
@@ -789,10 +795,10 @@ mod tests {
     fn reconcile_remote_absent_does_nothing_while_the_row_is_marked_for_rescan() {
         let state = build_state();
         state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
-        state
-            .db
-            .upsert_local_file("c.txt", crate::storage::db::Db::HASH_NEEDS_RESCAN, 3, 0)
-            .unwrap();
+        // Seeded the way production does it: a real row, then marked. `upsert_local_file`
+        // now refuses an empty hash in debug, so this is the only route.
+        state.db.upsert_local_file("c.txt", "H2", 3, 0).unwrap();
+        state.db.mark_local_file_for_rescan("c.txt").unwrap();
 
         let n = reconcile_remote_absent(&state, "c.txt").unwrap();
 

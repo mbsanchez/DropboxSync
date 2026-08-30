@@ -136,7 +136,14 @@ fn process_local_file_change(
             Ok(1)
         }
         Some(prev) if prev.hash != hash => {
-            if pending_targets.contains(relative) {
+            // DBSYNC-56: a marked row always lands in this arm — that is the design — but it
+            // is a MARKER, not observed content. It is not evidence of a new local edit
+            // racing a pending job, so it must not route to a conflicted copy: doing so
+            // manufactures litter out of a bookkeeping value whenever any job happens to be
+            // active on the path. Take the plain re-upload arm below instead.
+            if pending_targets.contains(relative)
+                && prev.hash != crate::storage::db::Db::HASH_NEEDS_RESCAN
+            {
                 let conflicted_path = create_conflicted_copy(absolute)?;
                 let conflicted_rel = conflicted_path
                     .strip_prefix(tracked_root)
@@ -925,10 +932,6 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     Ok(true)
 }
 
-/// Startup cleanup (DBSYNC-55): forget editor-temp files a previous build tracked,
-/// and resolve failed `upload` jobs whose source is a temp file or no longer
-/// exists, so a phantom "Error" clears without a manual reset. Returns the number
-/// of rows/jobs cleaned.
 /// Whether `p` is **confirmed** absent, as opposed to merely unreadable (DBSYNC-56).
 ///
 /// `Path::exists()` collapses every error into `false`, so a permission denial, a Windows
@@ -946,6 +949,10 @@ fn is_confirmed_absent(p: &Path) -> bool {
     )
 }
 
+/// Startup cleanup (DBSYNC-55): forget editor-temp files a previous build tracked,
+/// and resolve failed `upload` jobs whose source is a temp file or no longer
+/// exists, so a phantom "Error" clears without a manual reset. Returns the number
+/// of rows/jobs cleaned.
 pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
     let mut cleaned = 0usize;
 
@@ -1284,8 +1291,12 @@ mod tests {
         // unusable, and the file on disk is the content nobody has uploaded.
         state
             .db
-            .upsert_local_file("report.docx", Db::HASH_NEEDS_RESCAN, 30, 0)
-            .expect("seed marked row");
+            .upsert_local_file("report.docx", "H2", 30, 0)
+            .expect("seed row");
+        state
+            .db
+            .mark_local_file_for_rescan("report.docx")
+            .expect("mark it");
 
         let enqueued = scan_local_changes_only(&state).expect("scan");
 
@@ -1306,8 +1317,6 @@ mod tests {
         assert_ne!(row.hash, Db::HASH_NEEDS_RESCAN);
     }
 
-    /// Negative control for the NIT. `Path::exists()` reports `false` for an unreadable
-    /// path as readily as for an absent one; only a confirmed `NotFound` means gone.
     #[test]
     fn is_confirmed_absent_distinguishes_missing_from_present() {
         let tmp = tempdir().expect("tempdir");
@@ -1315,6 +1324,80 @@ mod tests {
         std::fs::write(&present, b"x").expect("write");
         assert!(!super::is_confirmed_absent(&present));
         assert!(super::is_confirmed_absent(&tmp.path().join("nope.txt")));
+    }
+
+    /// **This is the test the NIT actually needed**, and the first version of this change
+    /// did not have it. `Path::exists()` already answers present-vs-absent correctly, so a
+    /// test covering only those two cases passes just as happily with `!p.exists()` — it
+    /// certifies nothing. The distinction that matters is **absent vs unreadable**, and it
+    /// takes a path that exists but cannot be stat'd to exercise it.
+    #[cfg(unix)]
+    #[test]
+    fn is_confirmed_absent_is_false_for_a_path_it_cannot_stat() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().expect("tempdir");
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        let hidden = locked.join("file.txt");
+        std::fs::write(&hidden, b"x").expect("write");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        // Root ignores directory permissions, so the premise would not hold there and the
+        // check would pass vacuously. Skip rather than assert something meaningless.
+        let unreadable = std::fs::symlink_metadata(&hidden).is_err();
+        if unreadable {
+            assert!(
+                !super::is_confirmed_absent(&hidden),
+                "a path that cannot be stat'd is NOT confirmed absent"
+            );
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        assert!(
+            unreadable,
+            "premise failed: the path was readable (running as root?)"
+        );
+    }
+
+    /// DBSYNC-56 / review finding C2. A marked row always lands in the changed-arm, so
+    /// without an explicit exclusion any concurrently-active job on the path routes it to
+    /// the conflicted-copy sub-arm — turning a bookkeeping value into filesystem litter.
+    /// Pre-change this could not happen: index and disk agreed, nothing was detected.
+    #[test]
+    fn a_marked_row_does_not_manufacture_a_conflicted_copy_when_a_job_is_pending() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let folder = state.db.get_sync_folder().unwrap().unwrap();
+        let target = std::path::Path::new(&folder).join("report.docx");
+        std::fs::write(&target, b"the edit that must not be lost").expect("write");
+
+        state
+            .db
+            .upsert_local_file("report.docx", "H2", 30, 0)
+            .expect("seed row");
+        state
+            .db
+            .mark_local_file_for_rescan("report.docx")
+            .expect("mark it");
+        // Anything active on the path is enough — a download queued by the remote sweep, or
+        // an upload sitting in retry_wait after a network blip.
+        state
+            .db
+            .enqueue_job("download", Some("report.docx"), Some("report.docx"))
+            .expect("enqueue");
+
+        scan_local_changes_only(&state).expect("scan");
+
+        let copies: Vec<String> = std::fs::read_dir(&folder)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("conflicted copy"))
+            .collect();
+        assert!(
+            copies.is_empty(),
+            "the marker is bookkeeping, not a concurrent edit: {copies:?}"
+        );
     }
 
     #[test]

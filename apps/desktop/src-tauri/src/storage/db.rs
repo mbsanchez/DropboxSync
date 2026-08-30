@@ -351,17 +351,82 @@ impl Db {
     /// disk, and `reconcile_remote_present` only fires when the remote moves.
     ///
     /// The empty string, rather than a new nullable column, because `hash` is `TEXT NOT
-    /// NULL` and this project has no migration system yet (DBSYNC-40). No real hash can
-    /// collide with it: every value written here comes from `hash_file`.
+    /// NULL` and this project has no migration system yet (DBSYNC-40).
+    ///
+    /// **Why nothing collides with it, stated precisely** — a first version of this comment
+    /// claimed "every value written here comes from `hash_file`", which is false:
+    /// `cloudsc_ops::materialize_remote_only_file_if_absent` writes a hash taken from
+    /// Dropbox's `content_hash`. It is safe anyway, but for a reason worth naming rather
+    /// than assuming: `hash_file` returns hex and never `""`, even for a zero-byte file,
+    /// and the remote-sourced path early-returns on an empty `content_hash` before it can
+    /// reach this column. The `debug_assert!` in [`Self::upsert_local_file`] enforces that
+    /// where it is claimed, so a future writer cannot quietly break it.
     ///
     /// **It widens this column's contract** from "a content hash" to "a content hash, or
-    /// this marker", so every reader has to know. Readers that compare it against real
-    /// content must treat it as *unknown*, not as *different* — see
-    /// `download_would_conflict` and `reconcile_remote_absent`. When DBSYNC-40 lands, a
-    /// nullable column expresses this properly and this constant should go.
+    /// this marker", so every reader has to know. The rule, and it must be the same rule
+    /// everywhere — the first version of this change answered it two opposite ways in two
+    /// files and would have lost bytes:
+    ///
+    /// > **The marker means: there is unuploaded local content, and we do not have a
+    /// > trustworthy record of what it is.**
+    ///
+    /// So a reader deciding whether to *destroy* local bytes must treat it as a conflict
+    /// and preserve them ([`download_would_conflict`]). A reader that needs the content to
+    /// decide at all must defer until the next scan supplies a real hash
+    /// (`reconcile_remote_absent`). And a reader asking "was there a NEW edit?" must answer
+    /// no — the marker is bookkeeping, not an observation (`process_local_file_change`'s
+    /// pending-job arm).
+    ///
+    /// When DBSYNC-40 lands, a nullable column expresses this properly and this constant
+    /// should go.
     pub const HASH_NEEDS_RESCAN: &'static str = "";
 
+    /// Marks an existing row for rescan, preserving its size and mtime (DBSYNC-56).
+    ///
+    /// The **only** way [`Self::HASH_NEEDS_RESCAN`] enters the column. That matters more
+    /// than it looks: the marker is the empty string, so a `debug_assert!` inside
+    /// `upsert_local_file` could never tell a deliberate marking from an accidentally-blank
+    /// hash — the two are the same value, and the assert would be incapable of failing.
+    /// Routing intent through a separate method is what makes the assert there meaningful.
+    ///
+    /// No-op when the row is absent: there is nothing to preserve, and creating one here
+    /// would invent a tracked file out of a cancelled upload.
+    pub fn mark_local_file_for_rescan(&self, relative_path: &str) -> AppResult<()> {
+        let Some(row) = self.get_local_file(relative_path)? else {
+            return Ok(());
+        };
+        self.write_local_file_row(
+            relative_path,
+            Self::HASH_NEEDS_RESCAN,
+            row.size_bytes,
+            row.modified_ts,
+        )
+    }
+
     pub fn upsert_local_file(
+        &self,
+        relative_path: &str,
+        hash: &str,
+        size_bytes: i64,
+        modified_ts: i64,
+    ) -> AppResult<()> {
+        // The empty string is reserved for [`Self::HASH_NEEDS_RESCAN`] and every reader of
+        // this column branches on it (DBSYNC-56). A caller writing an accidentally-blank
+        // hash — a remote `content_hash` that came back empty, say — would silently mark the
+        // row for rescan instead of recording a hash. Deliberate marking goes through
+        // [`Self::mark_local_file_for_rescan`], so reaching here with an empty hash is
+        // always a mistake.
+        //
+        // Debug-only: in release the consequence is a redundant re-upload, not data loss,
+        // and panicking inside the sync loop would be the worse failure.
+        debug_assert!(
+            !hash.is_empty(),
+            "empty local hash written for {relative_path}: use mark_local_file_for_rescan"
+        );
+        self.write_local_file_row(relative_path, hash, size_bytes, modified_ts)
+    }
+
+    fn write_local_file_row(
         &self,
         relative_path: &str,
         hash: &str,
@@ -1734,6 +1799,41 @@ mod tests {
             Some("Fotos,Videos/2024".to_string()),
             "local prefs must survive disconnect"
         );
+    }
+
+    /// DBSYNC-56. The marker is the empty string, so an accidentally-blank hash written
+    /// through the ordinary path would silently mark a row for rescan instead of recording
+    /// content. The guard against that is `upsert_local_file`'s `debug_assert!`, and an
+    /// assert nobody exercises is not a guard — this is what makes it one.
+    #[test]
+    #[should_panic(expected = "use mark_local_file_for_rescan")]
+    fn upsert_local_file_rejects_an_empty_hash_in_debug() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_local_file("a.txt", "", 1, 0).expect("upsert");
+    }
+
+    /// The deliberate route in, which must keep working and must preserve size/mtime —
+    /// those are what the row still knows truthfully.
+    #[test]
+    fn mark_local_file_for_rescan_sets_the_marker_and_keeps_size_and_mtime() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_local_file("a.txt", "H2", 42, 7).expect("seed");
+
+        db.mark_local_file_for_rescan("a.txt").expect("mark");
+
+        let row = db.get_local_file("a.txt").expect("get").expect("row");
+        assert_eq!(row.hash, Db::HASH_NEEDS_RESCAN);
+        assert_eq!(row.size_bytes, 42);
+        assert_eq!(row.modified_ts, 7);
+    }
+
+    /// Marking an absent row must not invent one: a cancelled upload for a path we do not
+    /// track is not a reason to start tracking it.
+    #[test]
+    fn mark_local_file_for_rescan_is_a_noop_when_the_row_is_absent() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.mark_local_file_for_rescan("ghost.txt").expect("mark");
+        assert!(db.get_local_file("ghost.txt").expect("get").is_none());
     }
 
     #[test]
