@@ -83,7 +83,7 @@ impl Db {
     /// from the production database (which `db_path()` resolves via OS-specific
     /// app-data dirs), so running `cargo test` never touches a user's real DB.
     pub fn new_at(path: &std::path::Path) -> AppResult<Self> {
-        let write = Connection::open(path)?;
+        let mut write = Connection::open(path)?;
         write.execute_batch(
             "
                 PRAGMA foreign_keys = ON;
@@ -91,7 +91,7 @@ impl Db {
                 PRAGMA synchronous = NORMAL;
                 ",
         )?;
-        migrate(&write)?;
+        migrate(&mut write)?;
 
         let read = Connection::open_with_flags(
             path,
@@ -141,22 +141,38 @@ impl Db {
     }
 
     /// Clears local sync state to avoid stale jobs when the sync folder changes.
+    /// Clears every trace of the previous sync folder, **atomically** (DBSYNC-40).
+    ///
+    /// The transaction is the point. These six deletions used to run as six independent
+    /// statements, and a crash, lock error or disk failure between any two left a state
+    /// neither half of the sync engine expects: clear `local_file_index` but not
+    /// `remote_file_index`, and the next scan walks a folder full of files with no index
+    /// rows while the remote index still claims to know them. This is not a hypothetical
+    /// path — it runs whenever the user changes their sync folder — and on a client that
+    /// carries a mass-delete circuit breaker because bulk operations here destroy data, a
+    /// half-cleared index is not a tidiness problem.
+    ///
+    /// `rusqlite::Transaction` rather than literal `BEGIN`/`COMMIT`: it rolls back when
+    /// dropped, so an early `?` return between the statements cannot leave a transaction
+    /// open — which would be this function's own failure mode, one level up.
     pub fn reset_sync_state(&self) -> AppResult<()> {
-        let conn = self
+        let mut conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
-        conn.execute("DELETE FROM local_file_index", [])?;
-        conn.execute("DELETE FROM remote_file_index", [])?;
-        conn.execute("DELETE FROM sync_jobs", [])?;
-        conn.execute("DELETE FROM sync_conflicts", [])?;
-        conn.execute("DELETE FROM known_folders", [])?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM local_file_index", [])?;
+        tx.execute("DELETE FROM remote_file_index", [])?;
+        tx.execute("DELETE FROM sync_jobs", [])?;
+        tx.execute("DELETE FROM sync_conflicts", [])?;
+        tx.execute("DELETE FROM known_folders", [])?;
         // Drop the cursor-delta cursor so remote change detection re-seeds
         // against the new folder (DBSYNC-30); other app_config keys are kept.
-        conn.execute(
+        tx.execute(
             "DELETE FROM app_config WHERE key = 'remote_delta_cursor'",
             [],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1080,7 +1096,47 @@ impl Db {
     }
 }
 
-fn migrate(conn: &Connection) -> AppResult<()> {
+/// Brings any database up to the schema this build expects, **atomically** (DBSYNC-40).
+///
+/// ## Why there is no version counter, and what to use if that changes
+///
+/// This is deliberately **declarative and self-converging**: every step states a desired
+/// end state — `CREATE TABLE IF NOT EXISTS`, `add_column_if_missing`, a guarded rebuild —
+/// so a database reaches it from wherever it happens to be. A `schema_version` counter
+/// would describe a *sequence* instead, and a counter that is wrong (a hand-edited file, a
+/// restored backup, a half-applied migration from before this function was transactional)
+/// silently skips the very steps that would have repaired it. Convergence degrades better
+/// than sequencing.
+///
+/// The cost, stated so the trade is visible: startup re-inspects the schema on every run,
+/// and a failure remains a silent retry rather than a detectable stop. Both are small today
+/// and grow slowly. Revisit if this function gets materially longer, or if some migration
+/// ever genuinely cannot be written idempotently.
+///
+/// **If it is revisited, the mechanism is `PRAGMA user_version`, not a row in `app_config`.**
+/// That table is created by this very function, so reading a version out of it before
+/// migrating is circular on a fresh database. `user_version` lives in the file header and
+/// participates in the transaction below.
+///
+/// ## The transaction
+///
+/// One transaction for the whole sequence, not one per step: a half-migrated schema is
+/// exactly what must not survive, and committing between steps would preserve it.
+///
+/// `PRAGMA journal_mode` and `foreign_keys` are set by the caller **before** this runs and
+/// must stay there — `journal_mode` cannot be changed inside a transaction, and moving it
+/// in would be a silent regression no test here would catch. The only PRAGMA reached from
+/// inside is `table_info`, a read, which is safe.
+fn migrate(conn: &mut Connection) -> AppResult<()> {
+    let tx = conn.transaction()?;
+    migrate_in_tx(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The migration steps themselves. Split out so [`migrate`] owns the transaction and this
+/// owns the schema — and so a failure anywhere below unwinds through one `?` to a rollback.
+fn migrate_in_tx(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS app_config (
@@ -1395,6 +1451,7 @@ pub fn app_data_dir() -> AppResult<PathBuf> {
 #[cfg(test)]
 mod data_dir_tests {
     use super::Db;
+    use rusqlite::Connection;
 
     /// `data_dir` must never be the empty path (DBSYNC-75). `Path::parent()` returns
     /// `Some("")` for a bare filename rather than `None` — verified, because the first
@@ -1485,6 +1542,7 @@ fn db_path() -> AppResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::Db;
+    use rusqlite::Connection;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1798,6 +1856,110 @@ mod tests {
                 .expect("get prefixes after clear"),
             Some("Fotos,Videos/2024".to_string()),
             "local prefs must survive disconnect"
+        );
+    }
+
+    /// DBSYNC-40, and this is the whole evidence for the ticket: a failure partway through
+    /// `reset_sync_state` must leave the database untouched.
+    ///
+    /// The lever is `DROP TABLE known_folders` — the **fifth** of six deletions, so the
+    /// first four certainly execute before the failure. Without the transaction,
+    /// `local_file_index` is empty when this returns and the assertion below fails. A test
+    /// that only checked the happy path would pass either way, which is the definition of a
+    /// check that cannot fail.
+    #[test]
+    fn reset_sync_state_rolls_back_when_a_deletion_fails_partway() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_local_file("a.txt", "H", 1, 0)
+            .expect("seed local");
+        db.upsert_remote_file("a.txt", "H", "rev", 0)
+            .expect("seed remote");
+        db.upsert_known_folder("sub").expect("seed folder");
+
+        // Break the fifth deletion. Everything before it will have run.
+        {
+            let conn = db.write.lock().expect("lock");
+            conn.execute_batch("DROP TABLE known_folders")
+                .expect("drop");
+        }
+
+        let result = db.reset_sync_state();
+
+        assert!(result.is_err(), "the reset must fail, not silently skip");
+        assert!(
+            db.get_local_file("a.txt").expect("query").is_some(),
+            "the FIRST deletion must have been rolled back — a half-cleared index is what \
+             this ticket exists to prevent"
+        );
+        assert!(
+            db.get_remote_file("a.txt").expect("query").is_some(),
+            "and so must the second"
+        );
+    }
+
+    /// DBSYNC-40. Same requirement for the schema: a failure partway leaves nothing behind.
+    ///
+    /// The lever is a **table** named `idx_sync_jobs_status_retry`, colliding with an index
+    /// `migrate` creates near the end — SQLite reports "there is already a table named …"
+    /// even for `CREATE INDEX IF NOT EXISTS`. `app_config` is created by the very first
+    /// statement, so its absence afterwards is what proves the whole batch unwound.
+    #[test]
+    fn migrate_rolls_back_when_a_step_fails_partway() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+        conn.execute_batch("CREATE TABLE idx_sync_jobs_status_retry (x)")
+            .expect("plant the collision");
+
+        let result = super::migrate(&mut conn);
+
+        assert!(
+            result.is_err(),
+            "the colliding index must fail the migration"
+        );
+        let app_config_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_config'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert_eq!(
+            app_config_exists, 0,
+            "app_config is created by the first statement; if it survives a later failure \
+             the migration was not atomic"
+        );
+    }
+
+    /// DBSYNC-40. Running `migrate` twice is the normal case on every restart, so a
+    /// transaction that accidentally broke a step's re-runnability would break every
+    /// existing installation. Compares the WHOLE schema, not one table.
+    #[test]
+    fn migrate_is_idempotent_and_leaves_an_identical_schema() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+
+        let schema_of = |c: &Connection| -> Vec<String> {
+            let mut stmt = c
+                .prepare(
+                    "SELECT type || ' ' || name || ' ' || COALESCE(sql, '') \
+                     FROM sqlite_master ORDER BY type, name",
+                )
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .expect("query");
+            rows.collect::<Result<Vec<_>, _>>().expect("collect")
+        };
+
+        super::migrate(&mut conn).expect("first migrate");
+        let after_first = schema_of(&conn);
+        super::migrate(&mut conn).expect("second migrate must be a no-op");
+        let after_second = schema_of(&conn);
+
+        assert_eq!(after_first, after_second);
+        assert!(
+            after_first.iter().any(|s| s.contains("app_config")),
+            "sanity: the schema comparison must be comparing something"
         );
     }
 
