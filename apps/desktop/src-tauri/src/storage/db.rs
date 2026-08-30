@@ -1969,7 +1969,7 @@ mod tests {
 
         super::migrate(&mut conn).expect("first migrate");
         let after_first = schema_rows(&conn);
-        super::migrate(&mut conn).expect("second migrate must be a no-op");
+        super::migrate(&mut conn).expect("second migrate must not fail");
         let after_second = schema_rows(&conn);
 
         assert_eq!(after_first, after_second);
@@ -2030,14 +2030,23 @@ mod tests {
         // grepping the same stored SQL for the same word, so a test using that heuristic
         // cannot detect the heuristic being wrong. A legacy table with `-- CHECK` in a
         // comment satisfies both and skips the rebuild entirely. This asks the database.
-        let violated = conn.execute(
-            "INSERT INTO sync_jobs (job_type, status, created_at, updated_at) \
-             VALUES ('bogus_type', 'queued', 't', 't')",
-            [],
-        );
+        let violated = conn
+            .execute(
+                "INSERT INTO sync_jobs (job_type, status, created_at, updated_at) \
+                 VALUES ('bogus_type', 'queued', 't', 't')",
+                [],
+            )
+            .expect_err("the rebuilt table must reject an out-of-set job_type");
+        // Pin WHY it failed. A bare `is_err()` was the fourth assertion on this PR to claim
+        // "must" about something it did not constrain: dropping the job_type CHECK from the
+        // rebuild copy AND removing `DEFAULT 0` from attempt_count makes this insert fail on
+        // NOT NULL instead, and the whole suite stayed green with the constraint gone —
+        // measured. That is the realistic shape of the bug this test exists for: a rebuild
+        // that silently produces a WEAKER schema than a fresh install, where every other
+        // test still passes because fresh databases get the CHECK from `CREATE TABLE`.
         assert!(
-            violated.is_err(),
-            "the rebuilt table must ENFORCE the job_type CHECK, not merely contain the word"
+            violated.to_string().contains("job_type"),
+            "the INSERT must fail on the job_type CHECK, not another constraint: {violated}"
         );
 
         // The valid row survives; the out-of-set one is dropped rather than aborting the
