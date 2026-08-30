@@ -511,6 +511,12 @@ fn download_would_conflict(
     }
     match baseline_hash {
         None => false, // never indexed locally — nothing to protect against
+        // A row marked for rescan (DBSYNC-56) is the SAME epistemic state as `None`: we do
+        // not know what was last synced, so nothing here proves a local modification.
+        // Falling through to the comparison below would make it differ from every on-disk
+        // hash and manufacture a conflicted copy for a window the user never saw — trading
+        // silent data loss for visible litter.
+        Some(baseline) if baseline == crate::storage::db::Db::HASH_NEEDS_RESCAN => false,
         Some(baseline) => on_disk_hash != baseline,
     }
 }
@@ -881,6 +887,28 @@ pub(crate) fn upload_local_file_internal(
             let had_remote = state.db.get_remote_file(relative)?.is_some();
             if !had_remote || is_ignored_local_path(relative) {
                 state.db.remove_local_file(relative)?;
+            } else if let Some(row) = state.db.get_local_file(relative)? {
+                // DBSYNC-56. The row is kept — deletion detection needs it — but its hash is
+                // marked for rescan, because leaving it intact loses the edit outright.
+                //
+                // The index row was already optimistically advanced to the new content when
+                // the change was detected. If the file comes back BYTE-IDENTICAL (a backup
+                // agent or an atomic re-save round-tripping it), index and disk agree on
+                // content the remote has never received, and nothing notices: the local scan
+                // compares index against disk, and `reconcile_remote_present` only fires when
+                // the REMOTE moves. The file stays diverged for as long as nobody touches it
+                // on Dropbox again — while the badge reads `synced`, because it is computed
+                // from this same row.
+                //
+                // Bounded retries were considered and rejected: they only cover a time
+                // window, and a file returning after the budget lands in exactly this state.
+                // Marking the row closes it regardless of timing.
+                state.db.upsert_local_file(
+                    relative,
+                    crate::storage::db::Db::HASH_NEEDS_RESCAN,
+                    row.size_bytes,
+                    row.modified_ts,
+                )?;
             }
             return Ok(());
         }
@@ -1388,6 +1416,82 @@ mod tests {
     use crate::path_util::hash_file;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// An `AppState` on an isolated temp DB with `sync_folder` set. The NotFound branch
+    /// under test returns before `get_access_token`, so these tests make no network call.
+    fn build_state(root: &std::path::Path) -> crate::state::AppState {
+        let sync_folder = root.join("synced");
+        std::fs::create_dir_all(&sync_folder).expect("create sync folder");
+        let db_path = root.join("db").join("app.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create db dir");
+        let db = crate::storage::db::Db::new_at(&db_path).expect("db init");
+        db.set_sync_folder(&sync_folder.to_string_lossy())
+            .expect("set sync folder");
+        crate::state::AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: std::sync::Arc::new(db),
+            sync_engine: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::sync::engine::SyncEngine::new(),
+            )),
+            token_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            scheduler_started: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            oauth_listener: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sync_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            token_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        }
+    }
+
+    /// DBSYNC-56, the branch itself: a synced file that vanishes mid-upload keeps its row,
+    /// and that row is marked so the next scan cannot walk past it.
+    #[test]
+    fn vanished_file_with_a_remote_copy_keeps_its_row_and_marks_it_for_rescan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // Synced at H1 remotely; the index was already optimistically advanced to H2 when
+        // the edit was detected. The file is NOT on disk — this is the unlink window.
+        state
+            .db
+            .upsert_remote_file("report.docx", "H1", "rev1", 0)
+            .expect("seed remote");
+        state
+            .db
+            .upsert_local_file("report.docx", "H2", 42, 7)
+            .expect("seed local");
+
+        super::upload_local_file_internal(&state, "report.docx", 1).expect("must not error");
+
+        let row = state
+            .db
+            .get_local_file("report.docx")
+            .expect("query")
+            .expect("the row must SURVIVE - deletion detection needs it");
+        assert_eq!(row.hash, crate::storage::db::Db::HASH_NEEDS_RESCAN);
+        // Size and mtime are carried through: only the hash is invalidated.
+        assert_eq!(row.size_bytes, 42);
+        assert_eq!(row.modified_ts, 7);
+    }
+
+    /// Negative control. A vanished path with nothing on Dropbox is forgotten, exactly as
+    /// before — an editor temp file must not linger in the index carrying a marker that
+    /// makes every future scan re-detect a file that does not exist.
+    #[test]
+    fn vanished_file_with_no_remote_copy_is_still_forgotten() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state
+            .db
+            .upsert_local_file("~$draft.docx", "H2", 42, 7)
+            .expect("seed local");
+
+        super::upload_local_file_internal(&state, "~$draft.docx", 1).expect("must not error");
+
+        assert!(
+            state.db.get_local_file("~$draft.docx").expect("query").is_none(),
+            "a path with no remote copy has nothing to recover and must be dropped"
+        );
+    }
+
+
     // `fetch_and_write_file` performs live HTTP calls against the Dropbox API
     // and is intentionally left to manual QA (large-file download against a
     // real account, verifying flat memory usage and crash-safety).
@@ -1683,6 +1787,21 @@ mod tests {
     #[test]
     fn download_would_conflict_false_when_baseline_none() {
         assert!(!download_would_conflict(true, "on-disk-hash", None));
+    }
+
+    /// DBSYNC-56. A row marked for rescan means "we do not know what was last synced",
+    /// which is the same answer as `None` — not "the baseline differs".
+    ///
+    /// Without this, every download arriving while the marker is set would manufacture a
+    /// conflicted copy, because the marker differs from every real on-disk hash. That would
+    /// trade silent data loss for visible litter, which is not a trade worth making.
+    #[test]
+    fn download_would_conflict_false_when_baseline_is_the_rescan_marker() {
+        assert!(!download_would_conflict(
+            true,
+            "on-disk-hash",
+            Some(crate::storage::db::Db::HASH_NEEDS_RESCAN)
+        ));
     }
 
     #[test]

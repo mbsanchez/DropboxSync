@@ -929,6 +929,23 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
 /// and resolve failed `upload` jobs whose source is a temp file or no longer
 /// exists, so a phantom "Error" clears without a manual reset. Returns the number
 /// of rows/jobs cleaned.
+/// Whether `p` is **confirmed** absent, as opposed to merely unreadable (DBSYNC-56).
+///
+/// `Path::exists()` collapses every error into `false`, so a permission denial, a Windows
+/// sharing violation, or an editor's atomic save caught mid-rename all read as "gone". This
+/// is the same distinction `classify_path` and the upload path already make for exactly that
+/// reason (DBSYNC-55): only a confirmed `NotFound` means gone.
+///
+/// The consequence here is milder than in the sync paths — the worst case is resolving a
+/// failed job that should have stayed failed, at startup only — but there is no reason for
+/// two answers to the same question to live in one codebase.
+fn is_confirmed_absent(p: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
     let mut cleaned = 0usize;
 
@@ -974,7 +991,7 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
             && folder
                 .as_deref()
                 .and_then(|f| safe_join(Path::new(f), src).ok())
-                .map(|p| !p.exists())
+                .map(|p| is_confirmed_absent(&p))
                 .unwrap_or(false);
         if is_editor_temp_path(src) || missing {
             state.db.mark_job_completed(job.id)?;
@@ -1000,7 +1017,7 @@ pub(crate) fn cleanup_stale_upload_state(state: &AppState) -> AppResult<usize> {
             && folder
                 .as_deref()
                 .and_then(|f| safe_join(Path::new(f), src).ok())
-                .map(|p| !p.exists())
+                .map(|p| is_confirmed_absent(&p))
                 .unwrap_or(false);
         if missing {
             state.db.mark_job_completed(job.id)?;
@@ -1248,6 +1265,56 @@ mod tests {
             token_refresh_lock: Arc::new(Mutex::new(())),
             http_client: crate::state::build_http_client(),
         }
+    }
+
+    /// DBSYNC-56, the half that matters: marking the row must actually cause a re-upload.
+    ///
+    /// This is the recovery, seen from the scan's side. Without the marker the row would
+    /// hold the same hash the file on disk has, `prev.hash != hash` would be false, and the
+    /// scan would walk straight past a file whose content Dropbox has never received.
+    #[test]
+    fn a_row_marked_for_rescan_is_re_detected_and_re_uploaded() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let folder = state.db.get_sync_folder().unwrap().unwrap();
+        let target = std::path::Path::new(&folder).join("report.docx");
+        std::fs::write(&target, b"the edit that must not be lost").expect("write");
+
+        // The state the cancelled upload leaves behind: the row exists, its hash is
+        // unusable, and the file on disk is the content nobody has uploaded.
+        state
+            .db
+            .upsert_local_file("report.docx", Db::HASH_NEEDS_RESCAN, 30, 0)
+            .expect("seed marked row");
+
+        let enqueued = scan_local_changes_only(&state).expect("scan");
+
+        assert_eq!(enqueued, 1, "the marked row must be re-detected");
+        let uploads: Vec<String> = state
+            .db
+            .list_recent_jobs(100)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.job_type == "upload")
+            .filter_map(|j| j.target_path)
+            .collect();
+        assert_eq!(uploads, vec!["report.docx".to_string()]);
+
+        // And the marker is gone afterwards: the scan wrote the real hash back, so the
+        // next tick does not re-upload the same file forever.
+        let row = state.db.get_local_file("report.docx").unwrap().unwrap();
+        assert_ne!(row.hash, Db::HASH_NEEDS_RESCAN);
+    }
+
+    /// Negative control for the NIT. `Path::exists()` reports `false` for an unreadable
+    /// path as readily as for an absent one; only a confirmed `NotFound` means gone.
+    #[test]
+    fn is_confirmed_absent_distinguishes_missing_from_present() {
+        let tmp = tempdir().expect("tempdir");
+        let present = tmp.path().join("here.txt");
+        std::fs::write(&present, b"x").expect("write");
+        assert!(!super::is_confirmed_absent(&present));
+        assert!(super::is_confirmed_absent(&tmp.path().join("nope.txt")));
     }
 
     #[test]

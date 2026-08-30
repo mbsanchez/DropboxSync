@@ -448,6 +448,16 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
         return Ok(0);
     };
 
+    // DBSYNC-56: a row marked for rescan cannot answer the question this function asks.
+    // Both arms below would be a guess — propagating the delete could destroy an edit that
+    // never reached Dropbox, and taking the conflict arm would hand the user a conflict
+    // record for an event they never saw. Do nothing instead: the next scan re-hashes the
+    // file and this resolves with real data one tick later. The remote row is deliberately
+    // left in place, so the next sweep asks again rather than forgetting the path.
+    if local.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
+        return Ok(0);
+    }
+
     if local.hash == prev.content_hash {
         // Local matches the last-synced remote content: safe remote-wins delete.
         // The local_delete job clears both index rows.
@@ -764,6 +774,36 @@ mod tests {
         assert_eq!(
             job_targets(&state, "local_delete"),
             vec!["a.txt".to_string()]
+        );
+    }
+
+    /// DBSYNC-56. With the row marked for rescan, neither arm of this function can answer
+    /// honestly: propagating the delete could destroy an edit that never reached Dropbox,
+    /// and the conflict arm would hand the user a conflict record for an event they never
+    /// saw. So it does nothing and lets the next scan resolve it with real data.
+    ///
+    /// Note what is asserted alongside: the REMOTE row survives. Dropping it would make the
+    /// next sweep forget the path entirely, which is how "do nothing for now" quietly turns
+    /// into "do nothing ever".
+    #[test]
+    fn reconcile_remote_absent_does_nothing_while_the_row_is_marked_for_rescan() {
+        let state = build_state();
+        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_local_file("c.txt", crate::storage::db::Db::HASH_NEEDS_RESCAN, 3, 0)
+            .unwrap();
+
+        let n = reconcile_remote_absent(&state, "c.txt").unwrap();
+
+        assert_eq!(n, 0);
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "must not propagate a delete on a hash it cannot trust"
+        );
+        assert!(
+            state.db.get_remote_file("c.txt").unwrap().is_some(),
+            "the remote row must survive so the next sweep asks again"
         );
     }
 

@@ -339,6 +339,28 @@ impl Db {
         Ok(None)
     }
 
+    /// A `local_file_index.hash` deliberately made unusable, meaning **"re-detect this
+    /// path on the next scan"** (DBSYNC-56).
+    ///
+    /// Change detection asks `prev.hash != hash`, so a row carrying this value always
+    /// compares as changed and the file is re-hashed and re-uploaded. It exists because an
+    /// upload can be cancelled after the index row was already optimistically advanced: the
+    /// file vanishes mid-flight, the job no-ops to avoid the phantom error DBSYNC-55 fixed,
+    /// and the file returns byte-identical. Index and disk then agree on content the remote
+    /// has never seen, and **nothing** re-detects it — the local scan compares index against
+    /// disk, and `reconcile_remote_present` only fires when the remote moves.
+    ///
+    /// The empty string, rather than a new nullable column, because `hash` is `TEXT NOT
+    /// NULL` and this project has no migration system yet (DBSYNC-40). No real hash can
+    /// collide with it: every value written here comes from `hash_file`.
+    ///
+    /// **It widens this column's contract** from "a content hash" to "a content hash, or
+    /// this marker", so every reader has to know. Readers that compare it against real
+    /// content must treat it as *unknown*, not as *different* — see
+    /// `download_would_conflict` and `reconcile_remote_absent`. When DBSYNC-40 lands, a
+    /// nullable column expresses this properly and this constant should go.
+    pub const HASH_NEEDS_RESCAN: &'static str = "";
+
     pub fn upsert_local_file(
         &self,
         relative_path: &str,
