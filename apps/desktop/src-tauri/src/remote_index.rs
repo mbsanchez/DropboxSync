@@ -462,16 +462,21 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
     //
     // **What happens next is a race, and an earlier version of this comment claimed it was
     // a resolution.** It said the next scan "resolves with real data one tick later". It
-    // does not. The scan clears the marker and enqueues an upload; at drain time the remote
-    // row is still present while the file is gone from Dropbox, so the skip-if-identical
-    // check does not fire and the upload can RESURRECT a file the user deleted remotely.
-    // Only if the next remote sweep wins the race does the conflict arm below run instead.
+    // does not. The scan clears the marker and enqueues an upload, and that upload's
+    // skip-if-identical check does a LIVE `fetch_remote_file_metadata` request, which
+    // returns `None` for a deleted file — so the skip does not fire and the upload can
+    // RESURRECT a file the user deleted remotely. Only if the next remote sweep wins the
+    // race does the conflict arm below run instead.
+    //
+    // (The remote row is kept for a different reason than that check: so the next sweep
+    // still asks about the path rather than forgetting it. A second version of this comment
+    // wrongly linked the two.)
     //
     // Deferring is still better than the alternatives — both other arms act on a hash we
     // know is untrustworthy — but it trades a guaranteed wrong answer for a likely one, and
-    // that is worth knowing rather than being told it resolves cleanly. Making the
-    // re-detected upload check remote-absence before running would close it properly; that
-    // is a change to the upload path and belongs in its own ticket, not smuggled in here.
+    // that is worth knowing rather than being told it resolves cleanly. Closing it properly
+    // means teaching the upload path to check remote-absence first, which is a different
+    // module with its own blast radius: **DBSYNC-93**.
     if local.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
         return Ok(0);
     }

@@ -1426,6 +1426,21 @@ mod tests {
             std::fs::read(&copy).expect("read copy"),
             b"the edit that must not be lost"
         );
+
+        // The upload must target the COPY, never the original. An upload on the original
+        // races the download already queued there, and whichever drains first discards the
+        // other side — that was the second half of the loss the previous version of this
+        // test asserted as correct. Without this assertion a one-word edit reintroduces it
+        // with the whole suite green.
+        let upload_targets: Vec<String> = state
+            .db
+            .list_recent_jobs(100)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.job_type == "upload")
+            .filter_map(|j| j.target_path)
+            .collect();
+        assert_eq!(upload_targets, vec![copies[0].clone()]);
     }
 
     #[test]

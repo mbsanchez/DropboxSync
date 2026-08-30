@@ -495,12 +495,24 @@ fn is_final_chunk(offset: u64, bytes_read: usize, total_len: u64) -> bool {
     offset + bytes_read as u64 >= total_len
 }
 
-/// Would writing the freshly-downloaded remote content over `target` destroy
-/// local changes that were never synced? True only when the file exists on
-/// disk, we have a previously-synced baseline hash for it, and the current
-/// on-disk hash differs from that baseline (i.e. the user edited the file
-/// locally since the last sync, and the remote copy is not simply
-/// re-affirming what we already have).
+/// Half of the download-conflict decision: does the **baseline** say these local bytes were
+/// never synced? The call site uses [`download_would_destroy_local`], which also
+/// short-circuits when the remote already holds exactly what is on disk.
+///
+/// True when the file exists on disk **and** either:
+///
+/// - the on-disk hash differs from a real previously-synced baseline — the user edited it
+///   since the last sync; or
+/// - the baseline is [`crate::storage::db::Db::HASH_NEEDS_RESCAN`] (DBSYNC-56) — there are
+///   unuploaded local bytes and no trustworthy record of what they were.
+///
+/// A `None` baseline is **not** a conflict: nothing was ever recorded, so nothing proves a
+/// local modification. That is the opposite of the marker, which is a row that WAS advanced
+/// for a real edit — a distinction an earlier version of this change got backwards.
+///
+/// (This doc block said "true only when we have a previously-synced baseline hash" for three
+/// rounds after the marker arm was added, because every correction edited the comments
+/// *inside* the match and never looked above the signature.)
 fn download_would_conflict(
     target_exists: bool,
     on_disk_hash: &str,
@@ -534,9 +546,17 @@ fn download_would_conflict(
 ///
 /// [`download_would_conflict`] answers only half of it. This composes that with the check
 /// that matters most and is easiest to get wrong: **if the recorded remote hash already
-/// equals the on-disk hash, those exact bytes are on Dropbox**, so overwriting them cannot
+/// equals the on-disk hash, those exact bytes WERE on Dropbox when that row was recorded**
+/// — so overwriting them cannot
 /// destroy anything — whatever the baseline says, and regardless of which call site we came
 /// from or whether the remote row was freshly advanced.
+///
+/// Past tense on purpose: the row can be stale (the remote moved on, and those bytes now
+/// live only in Dropbox's version history) or deliberately retained for a path Dropbox no
+/// longer has at all, which `reconcile_remote_absent` now does on purpose for a marked row.
+/// The guard holds anyway — it is no weaker than the pre-existing baseline arm, which
+/// accepts exactly the same standard — but "are on Dropbox" would be a present-tense
+/// invariant the code elsewhere intentionally violates.
 ///
 /// That last part is why the guard is expressed this way rather than as "the sweep just
 /// updated the row": `download_remote_file_internal` also runs from `.cloudsc` hydration and
