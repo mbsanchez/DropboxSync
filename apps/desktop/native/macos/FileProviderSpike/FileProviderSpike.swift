@@ -165,6 +165,10 @@ final class FileProviderSpike: NSObject, NSFileProviderReplicatedExtension {
         for containerItemIdentifier: NSFileProviderItemIdentifier,
         request _: NSFileProviderRequest
     ) throws -> NSFileProviderEnumerator {
+        // Returns the same enumerator for EVERY container, including .workingSet, whose
+        // items all claim .rootContainer as parent. Harmless in a spike that enumerates four
+        // fixed items; wrong in a real provider, where the working set reports changes across
+        // the whole hierarchy. Do not copy this into production.
         _ = containerItemIdentifier
         return SpikeEnumerator()
     }
