@@ -191,19 +191,31 @@ jobs:
           set -euo pipefail
           BUNDLE=apps/desktop/src-tauri/target/release/bundle
           APP="$BUNDLE/macos/DropboxSyncDesktop.app"
-          APPEX="$APP/Contents/PlugIns/DropboxSyncFinderSync.appex"
-
           echo "--- host"
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Authority=Developer|TeamIdentifier'
-          echo "--- nested appex (F4: this is the one that was unverified before #84)"
-          codesign -dv --verbose=4 "$APPEX" 2>&1 | grep -E 'Authority=Developer|TeamIdentifier'
+          HOST_TEAM=$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')
 
-          HOST_TEAM=$(codesign -dv --verbose=4 "$APP"   2>&1 | sed -n 's/^TeamIdentifier=//p')
-          APPEX_TEAM=$(codesign -dv --verbose=4 "$APPEX" 2>&1 | sed -n 's/^TeamIdentifier=//p')
-          if [ "$HOST_TEAM" != "$APPEX_TEAM" ]; then
-            echo "::error::host team $HOST_TEAM != appex team $APPEX_TEAM"
+          # Iterate over EVERY nested appex rather than one hardcoded path. Before DBSYNC-79 this
+          # named DropboxSyncFinderSync.appex literally, so a second extension would have shipped
+          # unverified — the exact class of gap that left the first appex unchecked until #84.
+          shopt -s nullglob
+          APPEXES=("$APP"/Contents/PlugIns/*.appex)
+          if [ ${#APPEXES[@]} -eq 0 ]; then
+            echo "::error::no appex found under $APP/Contents/PlugIns"
             exit 1
           fi
+          # "${a[@]+"${a[@]}"}" — on the runner's Bash 3.2, iterating a possibly-empty array under
+          # `set -u` is an unbound-variable error. The guard above exits first, so this is belt and
+          # braces; build-appex.sh uses the same idiom for the same reason.
+          for APPEX in "${APPEXES[@]+"${APPEXES[@]}"}"; do
+            echo "--- nested appex: $(basename "$APPEX")"
+            codesign -dv --verbose=4 "$APPEX" 2>&1 | grep -E 'Authority=Developer|TeamIdentifier'
+            APPEX_TEAM=$(codesign -dv --verbose=4 "$APPEX" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+            if [ "$HOST_TEAM" != "$APPEX_TEAM" ]; then
+              echo "::error::host team $HOST_TEAM != $(basename "$APPEX") team $APPEX_TEAM"
+              exit 1
+            fi
+          done
 
           codesign --verify --deep --strict --verbose=2 "$APP"
           xcrun stapler validate "$APP"

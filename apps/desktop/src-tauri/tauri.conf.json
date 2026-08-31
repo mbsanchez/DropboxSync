@@ -63,7 +63,10 @@
       "infoPlist": "Info.plist",
       "signingIdentity": "-",
       "files": {
-        "PlugIns/DropboxSyncFinderSync.appex": "../native/macos/FinderSyncExtension/build/DropboxSyncFinderSync.appex"
+        "PlugIns/DropboxSyncFinderSync.appex": "../native/macos/FinderSyncExtension/build/DropboxSyncFinderSync.appex",
+        // DBSYNC-79 SPIKE — DELETE WITH native/macos/FileProviderSpike/. Present only to prove
+        // the bundler carries a second appex through signing and notarization. Ships nothing.
+        "PlugIns/FileProviderSpike.appex": "../native/macos/FileProviderSpike/build/FileProviderSpike.appex"
       }
     },
     "icon": [

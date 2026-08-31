@@ -25,6 +25,8 @@ dist-ssr
 
 # Finder Sync extension Xcode output (see npm run build:finder-sync)
 native/macos/FinderSyncExtension/build/
+# DBSYNC-79 SPIKE — delete with native/macos/FileProviderSpike/
+native/macos/FileProviderSpike/build/
 
 # Local environment for Dropbox OAuth config
 .env
