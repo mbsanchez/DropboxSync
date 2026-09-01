@@ -21,4 +21,6 @@ function run(cmd, args) {
 run("npm", ["run", "build"]);
 if (process.platform === "darwin") {
   run("npm", ["run", "build:finder-sync"]);
+  // DBSYNC-79 SPIKE — delete with native/macos/FileProviderSpike/.
+  run("npm", ["run", "build:file-provider-spike"]);
 }
