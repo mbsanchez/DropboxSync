@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed. Amends ADR-0002, which chose the `.cloudsc` sidecar model.
+**Accepted** (2026-09-02, by the maintainer). Supersedes ADR-0002 **on the macOS placeholder
+path only**; ADR-0002's Windows CfAPI and hydration-on-demand decisions stand.
 
 Written in English, unlike ADR-0001 and ADR-0002. The repository policy is English for
 commits and code comments; the two earlier ADRs predate that being applied consistently.
@@ -87,25 +88,49 @@ rewritten rather than extended. The App Group migration DBSYNC-72 postponed beco
 
 ## Decision
 
-**To be made by the maintainer.** The evidence above is what DBSYNC-79 was opened to produce; the
-call is a product decision, not a technical one, because it changes where a user's files live.
+**Adopt File Provider as the direction for the macOS placeholder path — but size the identity
+work before writing any of it.**
 
-The recommendation from the evidence is **adopt, but not yet**: the direction is right and the
-window is cheap, while the identity gap is large enough that it should be sized as its own ticket
-before committing. Rejecting is also defensible if the user-chosen folder is non-negotiable — in
-which case that reason belongs here, so the option is not rediscovered a third time.
+Two parts, and the order matters:
+
+1. **The direction is settled.** macOS moves from `.cloudsc` sidecars to
+   `NSFileProviderReplicatedExtension`. The premise that macOS had no CfAPI equivalent is now
+   documented as false, and this file is where that is recorded.
+2. **Nothing is built until stable item identity is sized.** `NSFileProviderItemIdentifier` must
+   survive renames and moves; all three index tables key on `relative_path`; Dropbox's stable
+   `id:` is never captured. That gap reaches the core of the index and is the one thing capable
+   of turning this from a rewrite into a rewrite plus a migration. It gets its own ticket, and
+   its answer can still send this decision back here for amendment.
+
+**The accepted cost:** on macOS the sync root moves to `~/Library/CloudStorage/<Provider>` and
+stops being user-chosen. Windows keeps an arbitrary folder, so the product deliberately diverges
+per platform. This was weighed and accepted rather than discovered later: the window is cheap
+precisely because `v0.1.0-rc1` is an unpublished draft and there are no users to migrate.
+
+**What this decision does not license.** No File Provider extension of ours has ever executed
+(see *Not verified*). The first implementation ticket carries the burden of proving the domain
+mounts and the App Group is authorized at runtime — not this ADR, and not the deleted spike.
 
 ## Consequences
 
-**If adopted:** ADR-0002 becomes superseded on the macOS path only; its Windows and hydration
-decisions stand. Follow-up tickets are needed for stable item identity, the macOS provider arm,
-the App Group migration, and the folder relocation. The interim `.cloudsc` badge work is sunset
-and should attract no further investment.
+**ADR-0002 is superseded on the macOS placeholder path only.** Its Windows CfAPI and
+hydration-on-demand decisions stand untouched.
 
-**If rejected:** ADR-0002 stands, reaffirmed with the reason it lacked. The `.cloudsc` badge
-defects continue to be worth fixing, and this file records why the alternative was declined.
+**The interim `.cloudsc` badge work is sunset.** Defects in the macOS sidecar badge path attract
+no further investment. Of the 23 tickets opened in the 30 days to 2026-08-30, 11 were in that
+subsystem; that spend stops being justified the moment this decision is recorded, which is the
+whole reason DBSYNC-79 was worth doing before the next one.
 
-**Either way:** `.cloudsc` is not deleted, Finder Sync stays, and Windows is unaffected.
+**`.cloudsc` is not deleted, and the code is not retired.** It still serves Windows without
+package identity and Windows where sync-root registration or the hydration connection failed.
+The 121 production references stay; what changes is that macOS stops being one of its consumers.
+
+**Finder Sync stays**, on both platforms, unchanged. So does everything DBSYNC-72 and DBSYNC-76
+built.
+
+**Follow-up work**, in dependency order: stable item identity (blocking, and capable of sending
+this decision back for amendment); then the macOS provider arm, the App Group migration, and the
+folder relocation with its onboarding consequences.
 
 ## Not verified
 

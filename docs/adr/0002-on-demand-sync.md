@@ -1,10 +1,11 @@
 # ADR-0002: On-demand Remote Sync (Week 3)
 
 ## Status
-Accepted — amended by [ADR-0003](0003-macos-file-provider.md), which revisits the
-**macOS** placeholder choice below. The Windows CfAPI path and the hydration-on-demand
-decisions are unaffected. `.cloudsc` is not retired by ADR-0003 in any case: it still serves
-Windows without package identity.
+Accepted, and **superseded on the macOS placeholder path** by
+[ADR-0003](0003-macos-file-provider.md), which replaces `.cloudsc` sidecars with a File Provider
+extension on macOS. The Windows CfAPI path and the hydration-on-demand decisions below stand
+unchanged, and `.cloudsc` itself is not retired: it still serves Windows without package
+identity, and Windows where sync-root registration or the hydration connection failed.
 
 ## Context
 Se busca un UX tipo ODrive/Dropbox Smart Sync: no descargar nada al inicio, pero sí permitir navegación/hidratación bajo demanda.
