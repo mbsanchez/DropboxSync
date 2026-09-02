@@ -128,6 +128,12 @@ The 121 production references stay; what changes is that macOS stops being one o
 **Finder Sync stays**, on both platforms, unchanged. So does everything DBSYNC-72 and DBSYNC-76
 built.
 
+**The folder relocation copies nothing.** The macOS sync root moves to the new domain and the
+content re-downloads from Dropbox; there is no migration code, no copy step and no data to keep
+in two places at once. Decided deliberately rather than by omission — a re-download costs
+bandwidth once, while a copy-and-verify path would be permanent code guarding a one-off event.
+It also exercises the first-run install path for real, which nothing else currently does.
+
 **Follow-up work**, in dependency order: stable item identity (blocking, and capable of sending
 this decision back for amendment); then the macOS provider arm, the App Group migration, and the
 folder relocation with its onboarding consequences.
