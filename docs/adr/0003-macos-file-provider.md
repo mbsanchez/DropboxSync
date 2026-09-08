@@ -46,12 +46,25 @@ are implemented. The system owns the filesystem and pushes local mutations at th
 of the macOS path**, not a backend added beside the existing one.
 
 **Identity is the dominant cost.** `NSFileProviderItemIdentifier` must be stable across renames
-and moves. All three index tables key on `relative_path`, so a rename destroys identity by
-construction. Dropbox supplies a stable `id:` on every entry and **we never capture it** — the
+and moves. Dropbox supplies a stable `id:` on every entry and **we never capture it** — the
 deserialization struct `DropboxEntry` has exactly six fields (`.tag`, `path_display`,
 `content_hash`, `rev`, `server_modified`, `size`) and it is the only parse point for Dropbox
-metadata. *Verified at the struct.* Closing this means a new column, a migration, and revisiting
-every reconciler that joins on path.
+metadata. *Verified at the struct.*
+
+**Five tables carry identity, not three** *(DBSYNC-96, correcting this ADR's original claim of
+"all three index tables")*. `local_file_index`, `remote_file_index` and `known_folders` are the
+obvious ones; `sync_conflicts` stores three paths per row and `sync_jobs` addresses its target by
+path. Rename a file with an open conflict, or with a job queued against it, and the record points
+at nothing.
+
+**A rename already costs a full delete plus a full re-upload — today, on both platforms.**
+*Confirmed by test in DBSYNC-96, with each test proven able to fail under two independent
+mutations.* The watcher keeps only `e.path`, the schema's CHECK constraint admits no `move` or
+`rename` job type, and the index row is dropped rather than moved — so sync state is lost as well
+as bytes re-sent. A directory rename costs one delete per tracked descendant plus the folder row.
+
+That last finding changes what this decision is worth: **stable identity is not only File Provider
+enablement.** See *Sizing and recommendation* below.
 
 **The platform seam already exists.** `cloud_filter.rs` carries `#![cfg(windows)]`, so the module
 compiles to nothing on macOS, and all four call sites of its `placeholders_active` switch are
@@ -62,7 +75,8 @@ false inference from a grep that matched `target_os` but not `cfg(windows)`.*
 **Adoption does not retire `.cloudsc`.** Per `placeholders_active`'s own doc comment the sidecar
 serves three consumers: macOS, Windows without package identity, and Windows where sync-root
 registration or the hydration connection failed. Adoption removes the first. The other two
-remain, so the 121 production references do not go away.
+remain, so the 121 production references do not go away. *(Re-derived by DBSYNC-96: 121 exactly,
+plus 44 in tests, 29 on Windows-specific paths and 89 generic placeholder references.)*
 
 **The App Group is low-risk but unconfirmed.** Dropbox ships a **notarized** Developer ID File
 Provider appex declaring an App Group with **no embedded provisioning profile**, and its group
@@ -97,10 +111,12 @@ Two parts, and the order matters:
    `NSFileProviderReplicatedExtension`. The premise that macOS had no CfAPI equivalent is now
    documented as false, and this file is where that is recorded.
 2. **Nothing is built until stable item identity is sized.** `NSFileProviderItemIdentifier` must
-   survive renames and moves; all three index tables key on `relative_path`; Dropbox's stable
-   `id:` is never captured. That gap reaches the core of the index and is the one thing capable
-   of turning this from a rewrite into a rewrite plus a migration. It gets its own ticket, and
-   its answer can still send this decision back here for amendment.
+   survive renames and moves; **five** tables key on `relative_path`; Dropbox's stable `id:` is
+   never captured. That gap reaches the core of the index and is the one thing capable of turning
+   this from a rewrite into a rewrite plus a migration. It gets its own ticket, and its answer can
+   still send this decision back here for amendment.
+
+   **Done — DBSYNC-96.** The sizing and the recommendation are below; this condition is satisfied.
 
 **The accepted cost:** on macOS the sync root moves to `~/Library/CloudStorage/<Provider>` and
 stops being user-chosen. Windows keeps an arbitrary folder, so the product deliberately diverges
@@ -110,6 +126,68 @@ precisely because `v0.1.0-rc1` is an unpublished draft and there are no users to
 **What this decision does not license.** No File Provider extension of ours has ever executed
 (see *Not verified*). The first implementation ticket carries the burden of proving the domain
 mounts and the App Group is authorized at runtime — not this ADR, and not the deleted spike.
+
+## Sizing and recommendation (DBSYNC-96)
+
+### What the identity change costs
+
+| Work | Size |
+| --- | --- |
+| Capture Dropbox's `id:` — one field on `DropboxEntry` | trivial; the id already arrives and is silently dropped |
+| `dropbox_id` column on five tables + migration | small; the `add_column_if_missing` pattern exists |
+| 9 identifier-addressed storage methods beside the 9 path-addressed ones | small; 9 of `db.rs`'s 47 |
+| 14 single-parameter engine call sites | medium |
+| **6 sites where identity lives in a collection** | **the structural cost** |
+| A local identity space for items Dropbox has never seen | medium, and design-shaped |
+| Back-fill | small; `seed_remote_delta_cursor` already re-snapshots, and there are no users |
+
+**The collections are the real number.** `remote_by_path: &HashMap<String, RemoteFileMeta>` is the
+whole remote index keyed by path; converting it is a key-type change that propagates to every
+consumer and every iteration, and it outweighs the fourteen single-parameter sites combined.
+
+**This is addition, not replacement**, for two independent reasons: `remove_remote_subtree` and
+the `path_util.rs` shape predicates — ignore globs, editor temp files, include/exclude prefixes,
+traversal safety — cannot be expressed by an identifier and stay path-based permanently, on both
+platforms. An identifier cannot answer "does this match `*.tmp`".
+
+**The local identity space was not in the original framing.** `local_file_index` and
+`remote_file_index` are separate tables; a file created locally has no remote row until its upload
+succeeds, and that window is unbounded if uploads keep failing. File Provider will ask about those
+items. So identifiers cannot be a thin mirror of Dropbox's id.
+
+### Recommendation: proceed
+
+Three reasons, in order of weight:
+
+1. **The value case is no longer macOS-only.** The rename defect is live on Windows too, confirmed
+   by test. This work stops being a platform port and becomes a defect fix that File Provider
+   happens to require.
+2. **The storage cost is smaller than this ADR feared** — 9 of 47 methods, and the path-addressed
+   API survives intact beside the new one.
+3. **The window is cheap and closing.** No published release means no back-fill problem; that ends
+   at the first publish.
+
+### The amendment threshold, and an honest note about it
+
+**Amend this ADR if Dropbox's `id:` turns out to be absent or unstable for folders.** `known_folders`
+needs identity as much as files do, and folder metadata is a different response shape. Nothing else
+found so far is capable of flipping the direction: the collection work is heavy but bounded, and the
+local identity space is design work rather than a migration.
+
+**That threshold was written after the numbers were known, not before.** DBSYNC-96's plan required
+the opposite, and the same agent produced both the findings and the threshold, so there was no
+moment at which it could be set blind. Recorded rather than dressed up — a reader should discount
+it accordingly.
+
+### Still unverified
+
+- Whether Dropbox's `id:` exists on folders and survives rename and move. Needs a live API call.
+- Apple's identifier stability requirement across provider restarts. The SDK header states none;
+  its only guidance is that identifiers *"should not contain sensitive information, as it may be
+  recorded in system logs"* — which independently rules out path-derived identifiers, since they
+  would leak user paths into the unified log.
+
+Neither blocks the direction. The first is the one that could amend it.
 
 ## Consequences
 
