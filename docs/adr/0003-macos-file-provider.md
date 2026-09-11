@@ -46,10 +46,18 @@ are implemented. The system owns the filesystem and pushes local mutations at th
 of the macOS path**, not a backend added beside the existing one.
 
 **Identity is the dominant cost.** `NSFileProviderItemIdentifier` must be stable across renames
-and moves. Dropbox supplies a stable `id:` on every entry and **we never capture it** — the
-deserialization struct `DropboxEntry` has exactly six fields (`.tag`, `path_display`,
-`content_hash`, `rev`, `server_modified`, `size`) and it is the only parse point for Dropbox
-metadata. *Verified at the struct.*
+and moves. **We capture no identifier of any kind** — the deserialization struct `DropboxEntry`
+has exactly six fields (`.tag`, `path_display`, `content_hash`, `rev`, `server_modified`, `size`)
+and it is the only parse point for Dropbox metadata. *Verified at the struct.*
+
+> **Unverified premise, flagged.** The plan assumes Dropbox supplies a stable `id:` on every
+> entry. **That has never been observed here.** What was checked is that `DropboxEntry` carries
+> no `deny_unknown_fields`, so serde silently drops fields it does not declare — which establishes
+> only that *if* an id arrives, it is discarded. No recorded response, test fixture or JSON literal
+> anywhere under `src/` contains an `id` field. Dropbox's HTTP documentation could not be cited
+> either: like Apple's, the page is a JavaScript application and renders as navigation and footer
+> only. It is probably true. It is not evidence, and everything below that prices it as cheap
+> depends on it.
 
 **Five tables carry identity, not three** *(DBSYNC-96, correcting this ADR's original claim of
 "all three index tables")*. `local_file_index`, `remote_file_index` and `known_folders` are the
@@ -133,7 +141,7 @@ mounts and the App Group is authorized at runtime — not this ADR, and not the 
 
 | Work | Size |
 | --- | --- |
-| Capture Dropbox's `id:` — one field on `DropboxEntry` | trivial; the id already arrives and is silently dropped |
+| Capture Dropbox's `id:` — one field on `DropboxEntry` | trivial **if** the id is in the response — see the unverified premise above; a different plan if it is not |
 | `dropbox_id` column on five tables + migration | small; the `add_column_if_missing` pattern exists |
 | 9 identifier-addressed storage methods beside the 9 path-addressed ones | small; 9 of `db.rs`'s 47 |
 | 14 single-parameter engine call sites | medium |
@@ -169,25 +177,22 @@ Three reasons, in order of weight:
 
 ### The amendment threshold, and an honest note about it
 
-**Amend this ADR if Dropbox's `id:` turns out to be absent or unstable for folders.** `known_folders`
-needs identity as much as files do, and folder metadata is a different response shape. Nothing else
-found so far is capable of flipping the direction: the collection work is heavy but bounded, and the
-local identity space is design work rather than a migration.
+**Amend this ADR if Dropbox's `id:` turns out to be absent or unstable** — for files or folders.
+`known_folders` needs identity as much as files do, and folder metadata is a different response
+shape. Nothing else found so far is capable of flipping the direction: the collection work is heavy
+but bounded, and the local identity space is design work rather than a migration.
+
+**Note the awkwardness:** this threshold and the unverified premise above are the same fact. The
+decision therefore rests its escape hatch on the one question it did not answer. That is tolerable
+only because answering it is cheap — one API call — and because the first implementation ticket
+cannot get far without doing so.
 
 **That threshold was written after the numbers were known, not before.** DBSYNC-96's plan required
 the opposite, and the same agent produced both the findings and the threshold, so there was no
 moment at which it could be set blind. Recorded rather than dressed up — a reader should discount
 it accordingly.
 
-### Still unverified
-
-- Whether Dropbox's `id:` exists on folders and survives rename and move. Needs a live API call.
-- Apple's identifier stability requirement across provider restarts. The SDK header states none;
-  its only guidance is that identifiers *"should not contain sensitive information, as it may be
-  recorded in system logs"* — which independently rules out path-derived identifiers, since they
-  would leak user paths into the unified log.
-
-Neither blocks the direction. The first is the one that could amend it.
+Everything this ADR does not know is listed in one place: **Not verified**, at the end.
 
 ## Consequences
 
@@ -218,9 +223,35 @@ folder relocation with its onboarding consequences.
 
 ## Not verified
 
-Stated plainly so no reader assumes otherwise. The spike was never registered as a domain and
-never ran: **no File Provider extension of ours has executed.** Specifically untested are the
-domain mounting under `~/Library/CloudStorage/`, notarization of a build carrying the App Group
-entitlement, and the group container at runtime. Registration requires
+**The single place this ADR records what it does not know.** There were briefly two such sections,
+which is how a premise came to be asserted in one part of this document and doubted in another;
+merged deliberately, so that finding one list means finding the whole list.
+
+### The identity premise — the one that could amend this decision
+
+**Whether Dropbox returns an `id:` at all**, for files or folders, and whether it survives rename
+and move. What was checked is only that `DropboxEntry` carries no `deny_unknown_fields`, so serde
+discards fields it does not declare: *if* an id arrives, it is dropped. Nothing under `src/` — no
+recorded response, fixture or JSON literal — contains an `id` field. Neither Dropbox's nor Apple's
+HTTP documentation could be cited: both render as JavaScript applications and yield navigation and
+footer only.
+
+**This is the same fact as the amendment threshold.** The decision rests its escape hatch on its
+one unanswered question. Tolerable only because answering it costs one API call, and because the
+first implementation ticket cannot get far without doing so. **Answer it first in DBSYNC-95.**
+
+### Apple's identifier stability requirement
+
+Whether identifiers must survive provider restarts and domain re-registration. The SDK header
+states no requirement; its only guidance is that identifiers *"should not contain sensitive
+information, as it may be recorded in system logs"* — which independently rules out path-derived
+identifiers, since they would leak user paths into the unified log. Mitigated but unanswered: ids
+must be persisted either way.
+
+### The extension has never run
+
+The spike was never registered as a domain: **no File Provider extension of ours has executed.**
+Untested are the domain mounting under `~/Library/CloudStorage/`, notarization of a build carrying
+the App Group entitlement, and the group container at runtime. Registration requires
 `NSFileProviderManager.add(domain:)` from the host app — feasible, since `objc2` is already a
 dependency and `finder_extension.rs` uses `msg_send!`, but not written.
