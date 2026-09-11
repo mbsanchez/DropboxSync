@@ -365,6 +365,19 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
 
     // Pass two: pair what vanished with what appeared. Everything left unpaired falls
     // through to the behaviour that existed before this ticket.
+    //
+    // Directories are correlated FIRST, and by path arithmetic rather than by content, so a
+    // renamed folder is recognised before any of its contents is hashed. Hashing a thousand
+    // children to discover they moved would cost what the re-upload being avoided costs.
+    let dir_moves = correlate_directory_renames(state, &known, &vanished, &present_dirs)?;
+    let dir_moved_from: Vec<String> = dir_moves.iter().map(|(old, _)| old.clone()).collect();
+    let dir_moved_to: Vec<String> = dir_moves.iter().map(|(_, new)| new.clone()).collect();
+    // A path is spoken for if it IS a moved directory or sits underneath one.
+    let under_moved_dir = |path: &str, dirs: &[String]| -> bool {
+        dirs.iter()
+            .any(|d| path == d || path.starts_with(&format!("{d}/")))
+    };
+
     let moves = correlate_renames(
         state,
         &known_map,
@@ -375,7 +388,18 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     let moved_from: HashSet<&str> = moves.iter().map(|(old, _)| old.as_str()).collect();
     let moved_to: HashSet<&str> = moves.iter().map(|(_, new)| new.as_str()).collect();
 
-    // Pass three: act.
+    // Pass three: act. Directories first, so their contents are already accounted for by
+    // the time the per-file passes run.
+    for (old, new) in &dir_moves {
+        state.db.enqueue_job("move", Some(old), Some(new))?;
+        // ONE job and ONE subtree rewrite, however many children there are. A per-child
+        // loop here would reach the same end state while delivering none of the benefit.
+        state.db.move_index_subtree(old, new)?;
+        pending_targets.insert(new.clone());
+        enqueued += 1;
+        tracing::info!(from = %old, to = %new, "directory rename detected: enqueued one move for the whole subtree");
+    }
+
     for (old, new) in &moves {
         state.db.enqueue_job("move", Some(old), Some(new))?;
         // The row TRAVELS — identity, content hash, rev and Dropbox id all come with it,
@@ -390,6 +414,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         if moved_to.contains(rel.as_str()) {
             continue; // already accounted for as the destination of a move
         }
+        if under_moved_dir(rel, &dir_moved_to) {
+            continue; // it travelled with its directory
+        }
         enqueued += process_local_file_change(
             state,
             &tracked_root,
@@ -401,6 +428,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     }
 
     for (rel, absolute) in &present_dirs {
+        if under_moved_dir(rel, &dir_moved_to) {
+            continue; // the subtree rewrite already put it where it belongs
+        }
         // A moved-in / newly-created directory: record it and enqueue any
         // pre-existing children (a bounded walk of just this subtree, not
         // the whole root). Recursive watching also emits child events.
@@ -416,7 +446,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             if child_rel.ends_with(".cloudsc") || is_ignored_local_path(&child_rel) {
                 continue;
             }
-            if moved_to.contains(child_rel.as_str()) {
+            if moved_to.contains(child_rel.as_str()) || under_moved_dir(&child_rel, &dir_moved_to) {
                 continue;
             }
             enqueued += process_local_file_change(
@@ -434,22 +464,91 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     // removed. `known` was snapshotted before pass three rewrote rows, so a file moved OUT
     // of a directory that vanished in the same batch would otherwise still match that
     // directory's prefix here — and be deleted remotely moments after being moved there.
-    let known_after_moves: Vec<FileIndexRow> = if moved_from.is_empty() {
+    let known_after_moves: Vec<FileIndexRow> = if moved_from.is_empty() && dir_moved_from.is_empty()
+    {
         known
     } else {
         known
             .into_iter()
             .filter(|row| !moved_from.contains(row.relative_path.as_str()))
+            .filter(|row| !under_moved_dir(&row.relative_path, &dir_moved_from))
             .collect()
     };
     for rel in &vanished {
-        if moved_from.contains(rel.as_str()) {
+        if moved_from.contains(rel.as_str()) || under_moved_dir(rel, &dir_moved_from) {
             continue; // it did not vanish, it moved
         }
         enqueued += enqueue_targeted_deletions(state, &tracked_root, rel, &known_after_moves)?;
     }
 
     Ok(enqueued)
+}
+
+/// Pair a vanished directory with an appeared directory when it is the same directory under
+/// a new name (DBSYNC-99 slice 4).
+///
+/// **Detected by path arithmetic, not by hashing.** Every tracked descendant of the old
+/// directory must turn up at the corresponding path under the new one — a `stat` per
+/// descendant. That is what makes renaming a thousand-file folder cheap: hashing the
+/// contents to discover they moved would cost as much as the re-upload being avoided.
+///
+/// The match must be **complete**. A directory whose contents only partly turn up is not a
+/// rename that can be collapsed: falling back to per-file handling costs bandwidth, whereas
+/// guessing costs data. An empty tracked directory is likewise not collapsed — there would
+/// be nothing to distinguish a rename from an unrelated folder appearing in the same batch,
+/// and a move buys nothing when there are no contents to carry.
+fn correlate_directory_renames(
+    state: &AppState,
+    known: &[FileIndexRow],
+    vanished: &[String],
+    present_dirs: &[(String, PathBuf)],
+) -> AppResult<Vec<(String, String)>> {
+    if vanished.is_empty() || present_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known_folders = state.db.list_known_folders()?;
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut claimed_new: HashSet<&str> = HashSet::new();
+
+    for old in vanished {
+        if !known_folders.iter().any(|f| f == old) {
+            continue; // not a directory we were tracking
+        }
+        let prefix = format!("{old}/");
+        let descendants: Vec<&str> = known
+            .iter()
+            .map(|row| row.relative_path.as_str())
+            .filter(|p| p.starts_with(&prefix))
+            .filter(|p| !p.ends_with(".cloudsc") && !is_ignored_local_path(p))
+            .collect();
+        if descendants.is_empty() {
+            continue;
+        }
+
+        for (new, new_absolute) in present_dirs {
+            if claimed_new.contains(new.as_str()) || new == old {
+                continue;
+            }
+            let all_present = descendants.iter().all(|p| {
+                let tail = &p[prefix.len()..];
+                matches!(classify_path(&new_absolute.join(tail)), Ok(PathKind::File))
+            });
+            if !all_present {
+                continue;
+            }
+            // Dropbox must already hold the folder, for the same reason a file move needs a
+            // remote row: there is nothing to move otherwise. A folder it has never seen is
+            // created implicitly by uploading its contents.
+            if state.db.get_remote_file(descendants[0])?.is_none() {
+                continue;
+            }
+            claimed_new.insert(new.as_str());
+            pairs.push((old.clone(), new.clone()));
+            break;
+        }
+    }
+    Ok(pairs)
 }
 
 /// Pair paths that vanished with paths that appeared, when they are the same item under a
@@ -1951,25 +2050,50 @@ mod tests {
         );
     }
 
-    /// The same for a directory, where the cost multiplies by the contents rather than
-    /// being paid once.
+    /// DBSYNC-96 measured a directory rename as one delete per tracked descendant, plus the
+    /// folder row, plus a full upload each — **three** deletes for a two-file folder, not
+    /// two, because the folder row goes as well. **DBSYNC-99 slice 4 inverts it.**
+    ///
+    /// **The assertion that matters is the job count.** A directory move implemented as a
+    /// per-child loop reaches the same end state and would satisfy any test that only
+    /// checked where the files ended up, while delivering none of the benefit — the whole
+    /// point is that renaming a folder costs the same as renaming a file.
     #[test]
-    fn a_directory_rename_re_uploads_every_child() {
+    fn a_directory_rename_is_billed_as_one_move() {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
         let root = sync_root(&state);
 
-        // Old directory: tracked folder + two tracked children, none of them on disk any more.
-        state.db.upsert_known_folder("d").unwrap();
-        state.db.upsert_local_file("d/one.txt", "h1", 3, 0).unwrap();
-        state.db.upsert_local_file("d/two.txt", "h2", 3, 0).unwrap();
-
-        // New directory on disk with the same two files.
+        // New directory on disk with the two files in it.
         std::fs::create_dir_all(root.join("e")).unwrap();
         std::fs::write(root.join("e/one.txt"), b"aaa").unwrap();
         std::fs::write(root.join("e/two.txt"), b"bbb").unwrap();
 
-        process_changed_paths(
+        // The index holds all of it under the old name, and Dropbox has it.
+        state.db.upsert_known_folder("d").unwrap();
+        for (child, bytes) in [("one.txt", "aaa"), ("two.txt", "bbb")] {
+            let (hash, size, mtime) =
+                crate::path_util::hash_file(&root.join(format!("e/{child}"))).unwrap();
+            let _ = bytes;
+            let old_rel = format!("d/{child}");
+            state
+                .db
+                .upsert_local_file(&old_rel, &hash, size, mtime)
+                .unwrap();
+            state
+                .db
+                .upsert_remote_file(&old_rel, &hash, "rev1", mtime, Some("id:CHILD"))
+                .unwrap();
+        }
+        let identity = state
+            .db
+            .get_local_file("d/one.txt")
+            .unwrap()
+            .unwrap()
+            .item_id
+            .expect("identity");
+
+        let n = process_changed_paths(
             &state,
             &[
                 "d".to_string(),
@@ -1980,23 +2104,57 @@ mod tests {
         )
         .expect("process");
 
-        let mut deletes = job_targets(&state, "delete");
-        let mut uploads = job_targets(&state, "upload");
-        deletes.sort();
-        uploads.sort();
-        // Three deletes, not two: the folder row goes as well as both children.
-        assert_eq!(
-            deletes,
-            vec![
-                "d".to_string(),
-                "d/one.txt".to_string(),
-                "d/two.txt".to_string()
-            ]
+        // ONE job. Not one per child, and not one per child plus the folder.
+        assert_eq!(n, 1, "a folder rename must cost what a file rename costs");
+        assert_eq!(job_targets(&state, "move"), vec!["e".to_string()]);
+        assert!(job_targets(&state, "delete").is_empty());
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "not one byte of the contents goes back up"
         );
+
+        // The folder row travels...
         assert_eq!(
-            uploads,
-            vec!["e/one.txt".to_string(), "e/two.txt".to_string()]
+            state.db.list_known_folders().unwrap(),
+            vec!["e".to_string()]
         );
+        // ...and so does every descendant, keeping its identity and its sync state.
+        assert!(state.db.get_local_file("d/one.txt").unwrap().is_none());
+        let moved = state.db.get_local_file("e/one.txt").unwrap().expect("row");
+        assert_eq!(moved.item_id, Some(identity));
+        assert!(
+            state.db.get_remote_file("e/two.txt").unwrap().is_some(),
+            "the remote index must follow too, or the next sweep re-downloads everything"
+        );
+    }
+
+    /// A directory whose tracked contents do NOT all turn up under the new name is not a
+    /// rename that can be collapsed. Falling back costs bandwidth; guessing costs data.
+    #[test]
+    fn a_partial_directory_match_is_not_collapsed_into_a_move() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/one.txt"), b"aaa").unwrap();
+
+        state.db.upsert_known_folder("d").unwrap();
+        state.db.upsert_local_file("d/one.txt", "h1", 3, 0).unwrap();
+        // Tracked under the old name, but absent under the new one.
+        state.db.upsert_local_file("d/two.txt", "h2", 3, 0).unwrap();
+
+        process_changed_paths(
+            &state,
+            &["d".to_string(), "e".to_string(), "e/one.txt".to_string()],
+        )
+        .expect("process");
+
+        assert!(
+            job_targets(&state, "move").is_empty(),
+            "an incomplete match must not be guessed at"
+        );
+        assert!(job_targets(&state, "delete").contains(&"d/two.txt".to_string()));
     }
 
     #[test]

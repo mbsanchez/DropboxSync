@@ -612,6 +612,94 @@ impl Db {
         Ok(())
     }
 
+    /// Move a folder and everything under it from one path to another (DBSYNC-99).
+    ///
+    /// The subtree equivalent of [`Self::move_index_row`]: one prefix rewrite instead of a
+    /// row-by-row loop, so renaming a folder with a thousand files costs one statement per
+    /// table rather than a thousand. Every descendant keeps its identity, its content hash
+    /// and its Dropbox id.
+    ///
+    /// Boundary-safe via `LIKE ... ESCAPE`, the same idiom as
+    /// [`Self::remove_remote_subtree`] and for the same reason: `d` and `d-other` share a
+    /// prefix, so the match is on `d/` plus the exact row, never on `d` alone. `%`, `_` and
+    /// `!` in the path are escaped so they are treated literally.
+    ///
+    /// One transaction. A half-rewritten subtree — some children under the new name, some
+    /// under the old — would be worse than one that never moved.
+    pub fn move_index_subtree(&self, old_prefix: &str, new_prefix: &str) -> AppResult<()> {
+        let old_prefix = old_prefix.replace('\\', "/");
+        let new_prefix = new_prefix.replace('\\', "/");
+        let escaped = old_prefix
+            .replace('!', "!!")
+            .replace('%', "!%")
+            .replace('_', "!_");
+        let child_pattern = format!("{escaped}/%");
+        // SQLite's `substr` is 1-based, so this starts just past the old prefix's trailing
+        // separator and glues the remainder onto the new one.
+        let tail_start = old_prefix.len() as i64 + 1;
+        let now = Utc::now().to_rfc3339();
+
+        let mut conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+
+        for table in ["local_file_index", "remote_file_index", "known_folders"] {
+            // The folder / file at the prefix itself.
+            tx.execute(
+                &format!(
+                    "UPDATE OR IGNORE {table} SET relative_path = ?2, updated_at = ?3 \
+                     WHERE relative_path = ?1"
+                ),
+                params![old_prefix, new_prefix, now],
+            )?;
+            // Everything beneath it.
+            tx.execute(
+                &format!(
+                    "UPDATE OR IGNORE {table} \
+                     SET relative_path = ?2 || substr(relative_path, ?4), updated_at = ?3 \
+                     WHERE relative_path LIKE ?1 ESCAPE '!'"
+                ),
+                params![child_pattern, new_prefix, now, tail_start],
+            )?;
+        }
+
+        for (table, column) in [
+            ("sync_conflicts", "local_path"),
+            ("sync_conflicts", "remote_path"),
+            ("sync_jobs", "source_path"),
+        ] {
+            tx.execute(
+                &format!("UPDATE OR IGNORE {table} SET {column} = ?2 WHERE {column} = ?1"),
+                params![old_prefix, new_prefix],
+            )?;
+            tx.execute(
+                &format!(
+                    "UPDATE OR IGNORE {table} SET {column} = ?2 || substr({column}, ?3) \
+                     WHERE {column} LIKE ?1 ESCAPE '!'"
+                ),
+                params![child_pattern, new_prefix, tail_start],
+            )?;
+        }
+        // `sync_jobs.target_path` carries the partial-unique index on
+        // `(job_type, target_path)`, so a collision with an existing active job is dropped
+        // rather than aborting the rewrite — both rows describe the same work.
+        tx.execute(
+            "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
+             WHERE target_path = ?1 AND status IN ('queued','retry_wait','running')",
+            params![old_prefix, new_prefix, now],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || substr(target_path, ?4), updated_at = ?3 \
+             WHERE target_path LIKE ?1 ESCAPE '!' AND status IN ('queued','retry_wait','running')",
+            params![child_pattern, new_prefix, now, tail_start],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn remove_local_file(&self, relative_path: &str) -> AppResult<()> {
         let relative_path = relative_path.replace('\\', "/");
         let conn = self
@@ -2380,6 +2468,73 @@ mod tests {
                 .item_id,
             row.item_id
         );
+    }
+
+    #[test]
+    /// DBSYNC-99. `d` and `d-other` share a prefix, so a subtree rewrite that matches on the
+    /// bare prefix drags the sibling along with it. `remove_remote_subtree` already carries
+    /// a test for exactly this shape; the rewrite needs its own, because it corrupts paths
+    /// rather than deleting rows, which is quieter and therefore worse.
+    #[test]
+    fn move_index_subtree_rewrites_the_subtree_and_leaves_siblings_alone() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.upsert_known_folder("d").expect("folder");
+        db.upsert_local_file("d", "H", 0, 0).expect("d itself");
+        db.upsert_local_file("d/one.txt", "H1", 1, 0).expect("one");
+        db.upsert_local_file("d/sub/two.txt", "H2", 1, 0)
+            .expect("two");
+        db.upsert_remote_file("d/one.txt", "H1", "rev", 0, Some("id:ONE"))
+            .expect("remote");
+        // Siblings that must not move: a prefix neighbour and an unrelated path.
+        db.upsert_local_file("d-other/keep.txt", "HK", 1, 0)
+            .expect("sibling");
+        db.upsert_local_file("elsewhere.txt", "HE", 1, 0)
+            .expect("other");
+        let identity = db
+            .get_local_file("d/sub/two.txt")
+            .expect("get")
+            .unwrap()
+            .item_id
+            .expect("identity");
+
+        db.move_index_subtree("d", "e").expect("move subtree");
+
+        let paths: Vec<String> = db
+            .list_local_files()
+            .expect("list")
+            .into_iter()
+            .map(|r| r.relative_path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "d-other/keep.txt".to_string(),
+                "e".to_string(),
+                "e/one.txt".to_string(),
+                "e/sub/two.txt".to_string(),
+                "elsewhere.txt".to_string(),
+            ],
+            "the subtree moves whole, and only the subtree"
+        );
+        assert_eq!(
+            db.get_local_file("e/sub/two.txt")
+                .expect("get")
+                .unwrap()
+                .item_id,
+            Some(identity),
+            "identity travels with every descendant, however deep"
+        );
+        assert_eq!(
+            db.get_remote_file("e/one.txt")
+                .expect("get")
+                .unwrap()
+                .dropbox_id
+                .as_deref(),
+            Some("id:ONE"),
+            "and so does the Dropbox identifier"
+        );
+        assert_eq!(db.list_known_folders().expect("folders"), vec!["e"]);
     }
 
     #[test]
