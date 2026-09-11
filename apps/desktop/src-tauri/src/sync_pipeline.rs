@@ -1772,7 +1772,7 @@ mod tests {
         // `process_local_file_deletion` is actually exercised (not short-circuited).
         state
             .db
-            .upsert_remote_file("foo.txt", "hash", "rev123", 0)
+            .upsert_remote_file("foo.txt", "hash", "rev123", 0, None)
             .expect("seed remote row");
 
         let n = super::process_local_file_deletion(&state, &root, "foo.txt").expect("process");
@@ -1814,7 +1814,7 @@ mod tests {
         // must never consult `remote_file_index` (folders aren't keyed there).
         state
             .db
-            .upsert_remote_file("dir", "hash", "rev999", 0)
+            .upsert_remote_file("dir", "hash", "rev999", 0, None)
             .expect("seed remote row");
 
         let n = super::process_known_folder_deletion(&state, &root, "dir").expect("process");
@@ -1906,7 +1906,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .upsert_remote_file("report.docx", "h1", "rev", 0)
+            .upsert_remote_file("report.docx", "h1", "rev", 0, None)
             .unwrap();
 
         crate::dropbox_transfer::upload_local_file_internal(&state, "report.docx", 1)
@@ -2062,7 +2062,7 @@ mod tests {
         write_synced(&state, COPY_REL, "LOCAL_EDIT");
         state
             .db
-            .upsert_remote_file(COPY_REL, "h", "rev1", 1)
+            .upsert_remote_file(COPY_REL, "h", "rev1", 1, None)
             .unwrap();
         state
             .db

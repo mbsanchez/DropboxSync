@@ -14,6 +14,17 @@ pub(crate) struct RemoteFileMeta {
     pub content_hash: String,
     pub rev: String,
     pub modified_ts: i64,
+    /// Dropbox's stable identifier for this item (DBSYNC-99).
+    ///
+    /// It rides in the **value**, deliberately. The obvious move was to rekey
+    /// `remote_by_path` by identifier, which would propagate to every consumer and every
+    /// iteration of the map; comparing ids across two snapshots detects a move just as
+    /// well and costs nothing structural. If File Provider's enumeration turns out to
+    /// need identifier-keyed lookup, that is DBSYNC-95's cost to carry, not this one's.
+    ///
+    /// `Option` is defensive only. A missing id must never disqualify an entry — see
+    /// `remote_meta_from_entry`.
+    pub id: Option<String>,
 }
 
 /// `app_config` key holding the persisted `list_folder` cursor for cursor-delta
@@ -57,6 +68,7 @@ pub(crate) fn delta_action_from_entry(entry: &DropboxEntry) -> DeltaAction {
                     content_hash,
                     rev,
                     modified_ts,
+                    id: entry.id.clone(),
                 },
             )
         }
@@ -119,6 +131,7 @@ pub(crate) fn fetch_remote_file_metadata(
             content_hash,
             rev,
             modified_ts,
+            id: entry.id,
         }));
     }
 
@@ -154,12 +167,17 @@ fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMet
         .as_deref()
         .map(parse_rfc3339_ts_to_unix)
         .unwrap_or(0);
+    // SAFETY (mass-delete): a missing `id` is deliberately NOT a reason to return None,
+    // unlike a missing hash or rev. A path absent from the returned map is read by the
+    // caller as "deleted remotely", so disqualifying entries on a field this function
+    // merely records would enqueue local deletions for files that are still there.
     Some((
         path_display.to_lowercase(),
         RemoteFileMeta {
             content_hash,
             rev,
             modified_ts,
+            id: entry.id.clone(),
         },
     ))
 }
@@ -220,6 +238,26 @@ pub(crate) fn fetch_all_remote_file_metadata(
         for entry in &entries_resp.entries {
             if let Some((path_key, meta)) = remote_meta_from_entry(entry) {
                 remote_by_path.insert(path_key, meta);
+                continue;
+            }
+            // DBSYNC-99: folders never enter the file index — `remote_meta_from_entry`
+            // rejects them, and they must keep being rejected, because a path absent from
+            // this map is read as "deleted remotely". But folders carry identifiers too
+            // (13 of 13 in the captured listing) and `known_folders` is where a folder
+            // rename will have to preserve one. Record it on the row we already have.
+            //
+            // Best-effort and behaviour-neutral by construction: the writer can only fill
+            // a NULL id on an existing row. It cannot insert, delete, or touch any column
+            // the pipeline reads today, so a failure here changes nothing.
+            if entry.tag == "folder" {
+                if let (Some(path_display), Some(id)) =
+                    (entry.path_display.as_deref(), entry.id.as_deref())
+                {
+                    let rel = path_display.trim_start_matches('/');
+                    if let Err(e) = state.db.set_known_folder_dropbox_id(rel, id) {
+                        tracing::warn!(rel, error = %e, "could not record folder identifier");
+                    }
+                }
             }
         }
 
@@ -413,11 +451,15 @@ pub(crate) fn reconcile_remote_present(
         Some(prev) => prev.content_hash != remote_meta.content_hash,
     };
 
+    // DBSYNC-99: this is the path every remote observation flows through — the full
+    // snapshot and the cursor delta both land here — so writing the identifier here is
+    // the whole of the back-fill. No migration is needed: the next sweep fills every row.
     state.db.upsert_remote_file(
         rel,
         &remote_meta.content_hash,
         &remote_meta.rev,
         remote_meta.modified_ts,
+        remote_meta.id.as_deref(),
     )?;
 
     if should_download {
@@ -657,6 +699,7 @@ mod tests {
             rev: rev.map(str::to_string),
             server_modified: server_modified.map(str::to_string),
             size: None,
+            id: None,
         }
     }
 
@@ -701,6 +744,159 @@ mod tests {
         let entry = file_entry(None, Some("hash123"), Some("rev1"), None);
 
         assert!(remote_meta_from_entry(&entry).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Stable identity (DBSYNC-99 slice 2)
+    // ---------------------------------------------------------------------------
+
+    /// A real `files/list_folder` entry, captured against a live account on 2026-09-11
+    /// (DBSYNC-99 slice 1) from a throwaway file since deleted. Kept verbatim, extra
+    /// fields included, because the defect being fixed is precisely that `DropboxEntry`
+    /// declared six fields and carried no `deny_unknown_fields`, so serde dropped the
+    /// identifier without a word. A hand-trimmed literal would not exercise that.
+    const CAPTURED_FILE_ENTRY: &str = r#"{
+        ".tag": "file",
+        "client_modified": "2026-09-11T16:08:30Z",
+        "content_hash": "300e2819c817c3c5b767493bcef06813052d3526c9353756b99b445015ed2e18",
+        "id": "id:eTyPGjL6NDAAAAAAAAABwg",
+        "is_downloadable": true,
+        "name": "a.txt",
+        "path_display": "/dbsync99-probe/a.txt",
+        "path_lower": "/dbsync99-probe/a.txt",
+        "property_groups": [],
+        "rev": "65b374ba88e8456342f44",
+        "server_modified": "2026-09-11T16:08:30Z",
+        "size": 22
+    }"#;
+
+    /// The whole ticket rests on the identifier getting from the wire to the index.
+    /// `models.rs` is the single parse point for Dropbox metadata, so this walks the
+    /// real path: JSON → `DropboxEntry` → `RemoteFileMeta` → the stored row.
+    #[test]
+    fn a_dropbox_id_survives_the_parse_point_into_the_remote_index() {
+        let entry: DropboxEntry = serde_json::from_str(CAPTURED_FILE_ENTRY).expect("parse");
+        let (rel, meta) = remote_meta_from_entry(&entry).expect("indexable file");
+
+        assert_eq!(meta.id.as_deref(), Some("id:eTyPGjL6NDAAAAAAAAABwg"));
+
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file(
+                &rel,
+                &meta.content_hash,
+                &meta.rev,
+                meta.modified_ts,
+                meta.id.as_deref(),
+            )
+            .expect("upsert");
+
+        let row = state.db.get_remote_file(&rel).expect("get").expect("row");
+        assert_eq!(row.dropbox_id.as_deref(), Some("id:eTyPGjL6NDAAAAAAAAABwg"));
+    }
+
+    /// An identifier, once learned, must never be erased by a later write that does not
+    /// carry one. Several paths write the same row — the delta loop, `get_metadata`, the
+    /// placeholder sweep — and they do not all have an id in hand. Losing it silently
+    /// would make an item look brand new, which is the exact defect this ticket exists
+    /// to remove.
+    #[test]
+    fn an_id_less_upsert_never_erases_a_known_dropbox_id() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("a.txt", "H", "rev1", 0, Some("id:ABC"))
+            .expect("seed");
+
+        // The pre-existing four-argument writer: no id to offer.
+        state
+            .db
+            .upsert_remote_file("a.txt", "H2", "rev2", 5, None)
+            .expect("update");
+
+        let row = state
+            .db
+            .get_remote_file("a.txt")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.content_hash, "H2", "the content update must still land");
+        assert_eq!(
+            row.dropbox_id.as_deref(),
+            Some("id:ABC"),
+            "the id must survive"
+        );
+    }
+
+    /// Folders carry identifiers too — 13 of 13 in the captured listing — and a folder
+    /// rename is the expensive case this ticket exists to fix. The writer is an UPDATE
+    /// rather than an upsert on purpose: it must be incapable of creating a
+    /// `known_folders` row, because that table drives local deletion detection.
+    #[test]
+    fn a_folder_identifier_fills_an_existing_row_and_never_creates_one() {
+        let state = build_state();
+        state.db.upsert_known_folder("dir").expect("known");
+
+        assert!(
+            state
+                .db
+                .set_known_folder_dropbox_id("dir", "id:FOLDER")
+                .expect("set"),
+            "a known folder must take the identifier"
+        );
+        assert!(
+            !state
+                .db
+                .set_known_folder_dropbox_id("not-here", "id:GHOST")
+                .expect("set"),
+            "an unknown folder must be left alone, not invented"
+        );
+        assert_eq!(
+            state.db.list_known_folders().expect("list"),
+            vec!["dir".to_string()],
+            "the folder set must be untouched"
+        );
+
+        // Already identified: a second sweep must not overwrite it.
+        assert!(
+            !state
+                .db
+                .set_known_folder_dropbox_id("dir", "id:DIFFERENT")
+                .expect("set"),
+            "a stored identifier stays authoritative"
+        );
+    }
+
+    /// Dropbox cannot name an item it has never seen. A file created locally has no
+    /// remote row until its upload succeeds, and that window is unbounded when uploads
+    /// keep failing — so identity cannot be a thin mirror of Dropbox's id. Every local
+    /// row gets its own identifier at index time, allocated locally and **never derived
+    /// from the path**: Apple's SDK header warns an identifier may be recorded in system
+    /// logs, and a path is user data.
+    #[test]
+    fn every_local_row_gets_an_identity_dropbox_has_never_seen() {
+        let state = build_state();
+        state.db.upsert_local_file("a.txt", "h", 1, 0).expect("a");
+        state.db.upsert_local_file("b.txt", "h", 1, 0).expect("b");
+
+        let a = state.db.get_local_file("a.txt").expect("get").unwrap();
+        let b = state.db.get_local_file("b.txt").expect("get").unwrap();
+
+        let (Some(a_id), Some(b_id)) = (a.item_id, b.item_id) else {
+            panic!("every local row must carry an item_id");
+        };
+        assert_ne!(a_id, b_id, "identifiers must be distinct");
+
+        // Re-indexing the same path must not mint a new identity — that is what makes it
+        // an identity rather than a version.
+        state.db.upsert_local_file("a.txt", "h2", 2, 9).expect("re");
+        let again = state.db.get_local_file("a.txt").expect("get").unwrap();
+        assert_eq!(
+            again.item_id,
+            Some(a_id),
+            "identity must be stable in place"
+        );
+        assert_eq!(again.hash, "h2", "the content update must still land");
     }
 
     // ---------------------------------------------------------------------------
@@ -789,7 +985,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_deletes_when_local_matches_last_synced() {
         let state = build_state();
-        state.db.upsert_remote_file("a.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("a.txt", "H", "rev", 0, None)
+            .unwrap();
         state.db.upsert_local_file("a.txt", "H", 3, 0).unwrap();
 
         let n = reconcile_remote_absent(&state, "a.txt").unwrap();
@@ -811,7 +1010,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_does_nothing_while_the_row_is_marked_for_rescan() {
         let state = build_state();
-        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("c.txt", "H", "rev", 0, None)
+            .unwrap();
         // Seeded the way production does it: a real row, then marked. `upsert_local_file`
         // now refuses an empty hash in debug, so this is the only route.
         state.db.upsert_local_file("c.txt", "H2", 3, 0).unwrap();
@@ -833,7 +1035,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_keeps_diverged_local_as_conflict() {
         let state = build_state();
-        state.db.upsert_remote_file("b.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("b.txt", "H", "rev", 0, None)
+            .unwrap();
         state
             .db
             .upsert_local_file("b.txt", "DIFFERENT", 3, 0)
@@ -848,7 +1053,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_no_local_just_drops_remote_row() {
         let state = build_state();
-        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("c.txt", "H", "rev", 0, None)
+            .unwrap();
 
         let n = reconcile_remote_absent(&state, "c.txt").unwrap();
         assert_eq!(n, 0);
@@ -869,7 +1077,7 @@ mod tests {
         let state = build_state();
         state
             .db
-            .upsert_remote_file("e.txt", "OLD", "rev0", 0)
+            .upsert_remote_file("e.txt", "OLD", "rev0", 0, None)
             .unwrap();
         state.db.upsert_local_file("e.txt", "OLD", 3, 0).unwrap();
 
@@ -877,6 +1085,7 @@ mod tests {
             content_hash: "NEW".to_string(),
             rev: "rev1".to_string(),
             modified_ts: 0,
+            id: None,
         };
         let n = reconcile_remote_present(&state, "e.txt", &meta).unwrap();
         assert_eq!(n, 1);
@@ -897,7 +1106,7 @@ mod tests {
         let state = build_state();
         state
             .db
-            .upsert_remote_file("f.txt", "SAME", "rev0", 0)
+            .upsert_remote_file("f.txt", "SAME", "rev0", 0, None)
             .unwrap();
         state.db.upsert_local_file("f.txt", "SAME", 3, 0).unwrap();
 
@@ -905,6 +1114,7 @@ mod tests {
             content_hash: "SAME".to_string(),
             rev: "rev0".to_string(),
             modified_ts: 0,
+            id: None,
         };
         let n = reconcile_remote_present(&state, "f.txt", &meta).unwrap();
         assert_eq!(n, 0);
@@ -921,7 +1131,10 @@ mod tests {
         // `local_delete` candidates.
         for i in 0..30 {
             let rel = format!("f{i}.txt");
-            state.db.upsert_remote_file(&rel, "H", "rev", 0).unwrap();
+            state
+                .db
+                .upsert_remote_file(&rel, "H", "rev", 0, None)
+                .unwrap();
             state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
         }
         let local_files = state.db.list_local_files().unwrap();
@@ -970,7 +1183,7 @@ mod tests {
         // via reconcile_remote_absent, never counted toward the breaker).
         state
             .db
-            .upsert_remote_file("diverged.txt", "H", "rev", 0)
+            .upsert_remote_file("diverged.txt", "H", "rev", 0, None)
             .unwrap();
         state
             .db
@@ -987,7 +1200,7 @@ mod tests {
         // Present in this sweep's snapshot: excluded from `absent` entirely.
         state
             .db
-            .upsert_remote_file("present.txt", "H", "rev", 0)
+            .upsert_remote_file("present.txt", "H", "rev", 0, None)
             .unwrap();
         state
             .db
@@ -998,7 +1211,7 @@ mod tests {
         // otherwise be a clean delete candidate.
         state
             .db
-            .upsert_remote_file("pending.txt", "H", "rev", 0)
+            .upsert_remote_file("pending.txt", "H", "rev", 0, None)
             .unwrap();
         state
             .db
@@ -1013,6 +1226,7 @@ mod tests {
                 content_hash: "H".to_string(),
                 rev: "rev".to_string(),
                 modified_ts: 0,
+                id: None,
             },
         );
         let mut pending_targets: HashSet<String> = HashSet::new();
@@ -1046,7 +1260,10 @@ mod tests {
         let state = build_state();
         for i in 0..30 {
             let rel = format!("g{i}.txt");
-            state.db.upsert_remote_file(&rel, "H", "rev", 0).unwrap();
+            state
+                .db
+                .upsert_remote_file(&rel, "H", "rev", 0, None)
+                .unwrap();
             state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
         }
         let local_files = state.db.list_local_files().unwrap();

@@ -12,6 +12,17 @@ pub struct FileIndexRow {
     pub hash: String,
     pub size_bytes: i64,
     pub modified_ts: i64,
+    /// Locally allocated, permanent identity for this item (DBSYNC-99).
+    ///
+    /// Dropbox cannot name an item it has never seen, and the gap between a local
+    /// creation and a successful upload is unbounded when uploads keep failing — so this
+    /// is not a mirror of Dropbox's id. It is a monotonic integer minted at first index
+    /// and **never derived from the path**: Apple's SDK header warns an identifier may be
+    /// recorded in system logs, and a path is user data.
+    ///
+    /// `Option` covers rows written before the column existed; they are back-filled the
+    /// next time the path is indexed.
+    pub item_id: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -21,6 +32,10 @@ pub struct RemoteFileIndexRow {
     pub content_hash: String,
     pub rev: String,
     pub modified_ts: i64,
+    /// Dropbox's stable identifier, e.g. `id:eTyPGjL6NDAAAAAAAAABwg` (DBSYNC-99).
+    /// Joined to the local row's `item_id` by `relative_path`; slice 3 rewrites both
+    /// sides together on a move, so the join survives a rename.
+    pub dropbox_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -186,6 +201,10 @@ impl Db {
     /// Records that `relative_path` is a currently-materialized (real, on-disk)
     /// folder under the sync root, so a later scan can detect it being deleted
     /// locally even though folders themselves have no content to diff.
+    ///
+    /// Carries no Dropbox identifier: on the path this is called from the folder exists
+    /// on disk and Dropbox has not named it yet. The identifier is filled in later by
+    /// [`Self::set_known_folder_dropbox_id`].
     pub fn upsert_known_folder(&self, relative_path: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self
@@ -213,6 +232,34 @@ impl Db {
             conn.prepare("SELECT relative_path FROM known_folders ORDER BY relative_path")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fill in a folder's Dropbox identifier without disturbing anything else (DBSYNC-99).
+    ///
+    /// Deliberately an UPDATE and not an upsert. On macOS `known_folders` is populated
+    /// entirely from local discovery, where Dropbox has not named the folder yet, so the
+    /// identifier arrives later from the remote sweep; inserting there instead would
+    /// create rows for remote folders that do not exist locally, and `known_folders`
+    /// drives local deletion detection. The `dropbox_id IS NULL` guard makes it
+    /// idempotent and keeps a stored identifier authoritative.
+    ///
+    /// Returns whether a row was updated, so a caller can tell "filled it in" from
+    /// "no such folder locally" — which is not an error.
+    pub fn set_known_folder_dropbox_id(
+        &self,
+        relative_path: &str,
+        dropbox_id: &str,
+    ) -> AppResult<bool> {
+        let relative_path = relative_path.replace('\\', "/");
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let updated = conn.execute(
+            "UPDATE known_folders SET dropbox_id = ?2 WHERE relative_path = ?1 AND dropbox_id IS NULL",
+            params![relative_path, dropbox_id],
+        )?;
+        Ok(updated > 0)
     }
 
     pub fn remove_known_folder(&self, relative_path: &str) -> AppResult<()> {
@@ -321,7 +368,7 @@ impl Db {
             .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT relative_path, hash, size_bytes, modified_ts FROM local_file_index ORDER BY relative_path",
+                "SELECT relative_path, hash, size_bytes, modified_ts, item_id FROM local_file_index ORDER BY relative_path",
             )
             ?;
 
@@ -331,6 +378,7 @@ impl Db {
                 hash: row.get(1)?,
                 size_bytes: row.get(2)?,
                 modified_ts: row.get(3)?,
+                item_id: row.get(4)?,
             })
         })?;
 
@@ -347,7 +395,7 @@ impl Db {
             .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT relative_path, hash, size_bytes, modified_ts FROM local_file_index WHERE relative_path = ?1 LIMIT 1",
+                "SELECT relative_path, hash, size_bytes, modified_ts, item_id FROM local_file_index WHERE relative_path = ?1 LIMIT 1",
             )
             ?;
         let mut rows = stmt.query(params![relative_path])?;
@@ -357,6 +405,7 @@ impl Db {
                 hash: row.get(1)?,
                 size_bytes: row.get(2)?,
                 modified_ts: row.get(3)?,
+                item_id: row.get(4)?,
             }));
         }
         Ok(None)
@@ -462,18 +511,47 @@ impl Db {
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        // DBSYNC-99: mint an `item_id` on first index, and never mint a second one for a
+        // path that already has one — that is what makes it an identity rather than a
+        // version. Both halves are load-bearing, and so is where the number comes from.
+        //
+        // It is NOT `MAX(item_id) + 1`. Rows are deleted here routinely (every local file
+        // deletion), so the maximum goes back down and the next file would be handed the
+        // identity of a file that no longer exists. Anything still holding the old
+        // identifier — File Provider's enumeration, most of all — would then resolve it to
+        // the wrong item. `item_id_seq` is an AUTOINCREMENT table, which SQLite guarantees
+        // never reuses a rowid even after its rows are gone: the high-water mark lives in
+        // `sqlite_sequence`, so the row is deleted again immediately and the table stays
+        // empty while the counter keeps climbing.
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT item_id FROM local_file_index WHERE relative_path = ?1",
+                params![relative_path],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        let item_id = match existing {
+            Some(id) => id,
+            None => {
+                conn.execute("INSERT INTO item_id_seq DEFAULT VALUES", [])?;
+                let id = conn.last_insert_rowid();
+                conn.execute("DELETE FROM item_id_seq", [])?;
+                id
+            }
+        };
         conn
             .execute(
                 "
-                INSERT INTO local_file_index(relative_path, hash, size_bytes, modified_ts, updated_at)
-                VALUES(?1, ?2, ?3, ?4, ?5)
+                INSERT INTO local_file_index(relative_path, hash, size_bytes, modified_ts, updated_at, item_id)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(relative_path) DO UPDATE SET
                   hash=excluded.hash,
                   size_bytes=excluded.size_bytes,
                   modified_ts=excluded.modified_ts,
-                  updated_at=excluded.updated_at
+                  updated_at=excluded.updated_at,
+                  item_id=COALESCE(local_file_index.item_id, excluded.item_id)
                 ",
-                params![relative_path, hash, size_bytes, modified_ts, now],
+                params![relative_path, hash, size_bytes, modified_ts, now, item_id],
             )
             ?;
         Ok(())
@@ -500,7 +578,7 @@ impl Db {
             .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let mut stmt = conn.prepare(
             "
-                SELECT relative_path, content_hash, rev, modified_ts
+                SELECT relative_path, content_hash, rev, modified_ts, dropbox_id
                 FROM remote_file_index
                 WHERE relative_path = ?1
                 LIMIT 1
@@ -513,17 +591,31 @@ impl Db {
                 content_hash: row.get(1)?,
                 rev: row.get(2)?,
                 modified_ts: row.get(3)?,
+                dropbox_id: row.get(4)?,
             }));
         }
         Ok(None)
     }
 
+    /// Upsert a remote index row, carrying Dropbox's item identifier when the caller
+    /// has one (DBSYNC-99).
+    ///
+    /// `dropbox_id` is a required parameter rather than a second entry point on purpose.
+    /// Several paths write this row — the delta loop, `get_metadata`, the Windows
+    /// placeholder sweep — and a convenience overload that quietly passed `None` would
+    /// let a caller drop an identifier it was holding, without ever saying so.
+    ///
+    /// **A stored `dropbox_id` is never cleared by a write that lacks one.** Not every
+    /// path knows the id, and losing it would make a known item look brand new — the
+    /// exact defect this ticket exists to remove — so the update COALESCEs onto the
+    /// stored value rather than overwriting it.
     pub fn upsert_remote_file(
         &self,
         relative_path: &str,
         content_hash: &str,
         rev: &str,
         modified_ts: i64,
+        dropbox_id: Option<&str>,
     ) -> AppResult<()> {
         let relative_path = relative_path.replace('\\', "/");
         let now = Utc::now().to_rfc3339();
@@ -533,15 +625,23 @@ impl Db {
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn.execute(
             "
-            INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at)
-            VALUES(?1, ?2, ?3, ?4, ?5)
+            INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at, dropbox_id)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(relative_path) DO UPDATE SET
               content_hash=excluded.content_hash,
               rev=excluded.rev,
               modified_ts=excluded.modified_ts,
-              updated_at=excluded.updated_at
+              updated_at=excluded.updated_at,
+              dropbox_id=COALESCE(excluded.dropbox_id, remote_file_index.dropbox_id)
             ",
-            params![relative_path, content_hash, rev, modified_ts, now],
+            params![
+                relative_path,
+                content_hash,
+                rev,
+                modified_ts,
+                now,
+                dropbox_id
+            ],
         )?;
         Ok(())
     }
@@ -1196,6 +1296,15 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
             relative_path TEXT PRIMARY KEY,
             updated_at TEXT NOT NULL
         );
+
+        -- DBSYNC-99: the allocator behind `local_file_index.item_id`. AUTOINCREMENT is
+        -- the point: SQLite keeps the high-water mark in `sqlite_sequence` and never
+        -- reuses a rowid, so an identity belonging to a deleted file is never handed to
+        -- a new one. The table itself stays empty — a row is inserted to claim a number
+        -- and deleted in the same breath.
+        CREATE TABLE IF NOT EXISTS item_id_seq (
+            id INTEGER PRIMARY KEY AUTOINCREMENT
+        );
         ",
     )?;
 
@@ -1206,6 +1315,16 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_len", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_file_mtime", "INTEGER")?;
     add_column_if_missing(conn, "sync_jobs", "delete_parent_rev", "TEXT")?;
+
+    // DBSYNC-99: stable item identity. Three additive, nullable columns — no rebuild, so
+    // nothing here can fail on an existing database. `remote_file_index.dropbox_id` and
+    // `known_folders.dropbox_id` hold what Dropbox calls the item; `local_file_index.item_id`
+    // holds what we call it, which is the only name an item has before its first successful
+    // upload. Back-fill is free: `seed_remote_delta_cursor` already re-snapshots, and legacy
+    // rows pick up an `item_id` the next time their path is indexed.
+    add_column_if_missing(conn, "remote_file_index", "dropbox_id", "TEXT")?;
+    add_column_if_missing(conn, "known_folders", "dropbox_id", "TEXT")?;
+    add_column_if_missing(conn, "local_file_index", "item_id", "INTEGER")?;
 
     // DBSYNC-35: structured fields for conflict resolution — the sibling copy holding
     // the preserved local content, and a flag for the remote-deleted scenario. Both
@@ -1842,12 +1961,13 @@ mod tests {
         // The folder itself, a descendant (with an accent + a space), and two
         // rows that must NOT be touched: a boundary-collision sibling and an
         // unrelated tree.
-        db.upsert_remote_file("UNET", "h", "r", 0).expect("u1");
-        db.upsert_remote_file("UNET/Ascensos/artículos/a b.pdf", "h", "r", 0)
+        db.upsert_remote_file("UNET", "h", "r", 0, None)
+            .expect("u1");
+        db.upsert_remote_file("UNET/Ascensos/artículos/a b.pdf", "h", "r", 0, None)
             .expect("u2");
-        db.upsert_remote_file("UNET-other/keep.txt", "h", "r", 0)
+        db.upsert_remote_file("UNET-other/keep.txt", "h", "r", 0, None)
             .expect("u3");
-        db.upsert_remote_file("Otra/keep.txt", "h", "r", 0)
+        db.upsert_remote_file("Otra/keep.txt", "h", "r", 0, None)
             .expect("u4");
 
         db.remove_remote_subtree("UNET").expect("prune subtree");
@@ -1912,7 +2032,7 @@ mod tests {
         let db = Db::new_at(&unique_db_path()).expect("db init");
         db.upsert_local_file("a.txt", "H", 1, 0)
             .expect("seed local");
-        db.upsert_remote_file("a.txt", "H", "rev", 0)
+        db.upsert_remote_file("a.txt", "H", "rev", 0, None)
             .expect("seed remote");
         db.upsert_known_folder("sub").expect("seed folder");
 
@@ -1995,9 +2115,13 @@ mod tests {
         {
             let conn = db.write.lock().expect("lock");
             conn.execute_batch(
-                "INSERT INTO local_file_index VALUES ('a.txt','H',1,0,'t');
-                 INSERT INTO local_file_index VALUES ('marked.txt','',1,0,'t');
-                 INSERT INTO remote_file_index VALUES ('a.txt','H','rev',0,'t');
+                // Columns are named rather than positional: a bare `VALUES (...)` binds by
+                // ordinal, so adding a column to any of these tables breaks the seed with a
+                // count mismatch that has nothing to do with what the test asserts.
+                "INSERT INTO local_file_index (relative_path,hash,size_bytes,modified_ts,updated_at)
+                     VALUES ('a.txt','H',1,0,'t'), ('marked.txt','',1,0,'t');
+                 INSERT INTO remote_file_index (relative_path,content_hash,rev,modified_ts,updated_at)
+                     VALUES ('a.txt','H','rev',0,'t');
                  INSERT INTO sync_jobs (job_type,status,created_at,updated_at)
                      VALUES ('upload','queued','t','t'),
                             ('upload','done','t','t'),
@@ -2005,7 +2129,7 @@ mod tests {
                  INSERT INTO sync_conflicts (local_path,remote_path,reason,resolved,created_at)
                      VALUES ('a.txt','a.txt','unresolved',0,'t'),
                             ('b.txt','b.txt','resolved',1,'t');
-                 INSERT INTO known_folders VALUES ('sub','t');",
+                 INSERT INTO known_folders (relative_path,updated_at) VALUES ('sub','t');",
             )
             .expect("seed");
         }
@@ -2119,6 +2243,82 @@ mod tests {
     /// touch it. The branch most likely to break someone's database was the one with no
     /// coverage, which is the wrong way round — and it is now the branch running inside a
     /// transaction for the first time.
+    /// DBSYNC-99. The first version of the allocator was `MAX(item_id) + 1`, which is
+    /// wrong in a way the other identity tests cannot see: rows are deleted here on every
+    /// local file deletion, so the maximum falls back and the next file is handed the
+    /// identity of a file that no longer exists. Anything still holding the old
+    /// identifier would resolve it to the wrong item. This is the test that catches it.
+    #[test]
+    fn an_identity_is_never_handed_to_a_second_file() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.upsert_local_file("first.txt", "H", 1, 0).expect("first");
+        let first = db
+            .get_local_file("first.txt")
+            .expect("get")
+            .unwrap()
+            .item_id
+            .expect("identity");
+
+        // The highest identity in the table now belongs to a file that is about to go.
+        db.remove_local_file("first.txt").expect("remove");
+        db.upsert_local_file("second.txt", "H", 1, 0)
+            .expect("second");
+
+        let second = db
+            .get_local_file("second.txt")
+            .expect("get")
+            .unwrap()
+            .item_id
+            .expect("identity");
+        assert_ne!(
+            second, first,
+            "a deleted file's identity must never be reissued"
+        );
+    }
+
+    /// DBSYNC-99. `item_id` is minted by the writer rather than by a back-fill migration,
+    /// so a row that predates the column must pick one up the next time its path is
+    /// indexed. Seeded through raw SQL because no public writer can produce a row without
+    /// an identity — which is the property being relied on.
+    #[test]
+    fn a_row_written_before_item_id_existed_adopts_one_when_reindexed() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        {
+            let conn = db.write.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO local_file_index (relative_path,hash,size_bytes,modified_ts,updated_at)
+                     VALUES ('legacy.txt','H',1,0,'t');",
+            )
+            .expect("seed");
+        }
+        assert_eq!(
+            db.get_local_file("legacy.txt")
+                .expect("get")
+                .unwrap()
+                .item_id,
+            None,
+            "the seeded row must start without an identity, or this proves nothing"
+        );
+
+        db.upsert_local_file("legacy.txt", "H2", 2, 3)
+            .expect("reindex");
+
+        let row = db.get_local_file("legacy.txt").expect("get").unwrap();
+        assert!(row.item_id.is_some(), "reindexing must mint an identity");
+        assert_eq!(row.hash, "H2", "and must still record the content change");
+
+        // A second path must not be handed the same number.
+        db.upsert_local_file("other.txt", "H", 1, 0).expect("other");
+        assert_ne!(
+            db.get_local_file("other.txt")
+                .expect("get")
+                .unwrap()
+                .item_id,
+            row.item_id
+        );
+    }
+
     #[test]
     fn migrate_rebuilds_a_legacy_sync_jobs_table_inside_the_transaction() {
         let path = unique_db_path();

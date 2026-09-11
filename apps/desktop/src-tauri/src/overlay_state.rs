@@ -321,7 +321,7 @@ mod tests {
             .expect("upsert local");
         state
             .db
-            .upsert_remote_file("Planilla.docx.cloudsc", "deadbeef", "rev1", 0)
+            .upsert_remote_file("Planilla.docx.cloudsc", "deadbeef", "rev1", 0, None)
             .expect("upsert remote");
 
         let paths = compute_overlay_paths(&state).expect("compute");
@@ -345,7 +345,7 @@ mod tests {
             .expect("upsert local");
         state
             .db
-            .upsert_remote_file("Anteproyecto.docx", "abc123", "rev1", 0)
+            .upsert_remote_file("Anteproyecto.docx", "abc123", "rev1", 0, None)
             .expect("upsert remote");
 
         let paths = compute_overlay_paths(&state).expect("compute");

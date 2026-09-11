@@ -75,6 +75,12 @@ pub(crate) struct DropboxEntry {
     pub rev: Option<String>,
     pub server_modified: Option<String>,
     pub size: Option<i64>,
+    /// Dropbox's stable item identifier, e.g. `id:eTyPGjL6NDAAAAAAAAABwg` (DBSYNC-99).
+    /// Present on every `file` and `folder` entry and unchanged by a rename or a move —
+    /// verified against a live account on 2026-09-11, which is the observation ADR-0003
+    /// was waiting on. `Option` because `deleted` entries carry no metadata, not because
+    /// a live item might lack one.
+    pub id: Option<String>,
 }
 
 #[derive(Serialize)]

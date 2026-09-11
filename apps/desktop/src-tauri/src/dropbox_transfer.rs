@@ -979,6 +979,7 @@ pub(crate) fn upload_local_file_internal(
                     &remote.content_hash,
                     &remote.rev,
                     remote.modified_ts,
+                    remote.id.as_deref(),
                 )?;
                 return Ok(());
             }
@@ -1221,14 +1222,15 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
     // The downloaded content hash IS the Dropbox content_hash (DBSYNC-9), which
     // is exactly what the deletion / should-download checks compare, so the row
     // is correct even if the best-effort metadata fetch (for rev/mtime) fails.
-    let (rev, remote_mtime) =
+    let (rev, remote_mtime, dropbox_id) =
         match crate::remote_index::fetch_remote_file_metadata(state, &relative) {
-            Ok(Some(meta)) => (meta.rev, meta.modified_ts),
-            _ => (String::new(), modified_ts),
+            Ok(Some(meta)) => (meta.rev, meta.modified_ts, meta.id),
+            _ => (String::new(), modified_ts, None),
         };
-    if let Err(e) = state
-        .db
-        .upsert_remote_file(&relative, &hash, &rev, remote_mtime)
+    if let Err(e) =
+        state
+            .db
+            .upsert_remote_file(&relative, &hash, &rev, remote_mtime, dropbox_id.as_deref())
     {
         tracing::warn!(file_path = %relative, error = %e, "failed recording remote provenance after hydrate");
     }
@@ -1503,7 +1505,7 @@ mod tests {
         // the edit was detected. The file is NOT on disk — this is the unlink window.
         state
             .db
-            .upsert_remote_file("report.docx", "H1", "rev1", 0)
+            .upsert_remote_file("report.docx", "H1", "rev1", 0, None)
             .expect("seed remote");
         state
             .db
