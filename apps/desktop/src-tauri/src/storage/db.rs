@@ -557,6 +557,61 @@ impl Db {
         Ok(())
     }
 
+    /// Move every record of an item from one path to another (DBSYNC-99).
+    ///
+    /// The point of the ticket in one method: the row **travels** instead of being dropped
+    /// and a fresh one created. Identity, content hash, rev and Dropbox id all come along,
+    /// so a renamed item keeps its history rather than looking like a file that appeared
+    /// from nowhere.
+    ///
+    /// Four tables, because four tables address an item by where it is: the local and
+    /// remote indexes, `sync_conflicts` (three paths per row) and any still-active
+    /// `sync_jobs`. One transaction, so a rename is either wholly recorded or not at all —
+    /// a half-moved item would be worse than an unmoved one.
+    ///
+    /// Active jobs are moved with `OR IGNORE`. A partial-unique index allows only one
+    /// active job per `(job_type, target_path)`, and the destination may already have one;
+    /// dropping the redundant duplicate is correct, because both describe the same work on
+    /// the same path.
+    pub fn move_index_row(&self, old_path: &str, new_path: &str) -> AppResult<()> {
+        let old_path = old_path.replace('\\', "/");
+        let new_path = new_path.replace('\\', "/");
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE local_file_index SET relative_path = ?2, updated_at = ?3 WHERE relative_path = ?1",
+            params![old_path, new_path, now],
+        )?;
+        tx.execute(
+            "UPDATE remote_file_index SET relative_path = ?2, updated_at = ?3 WHERE relative_path = ?1",
+            params![old_path, new_path, now],
+        )?;
+        tx.execute(
+            "UPDATE sync_conflicts SET local_path = ?2 WHERE local_path = ?1",
+            params![old_path, new_path],
+        )?;
+        tx.execute(
+            "UPDATE sync_conflicts SET remote_path = ?2 WHERE remote_path = ?1",
+            params![old_path, new_path],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
+             WHERE target_path = ?1 AND status IN ('queued','retry_wait','running')",
+            params![old_path, new_path, now],
+        )?;
+        tx.execute(
+            "UPDATE sync_jobs SET source_path = ?2, updated_at = ?3 \
+             WHERE source_path = ?1 AND status IN ('queued','retry_wait','running')",
+            params![old_path, new_path, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn remove_local_file(&self, relative_path: &str) -> AppResult<()> {
         let relative_path = relative_path.replace('\\', "/");
         let conn = self
@@ -1255,7 +1310,7 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
 
         CREATE TABLE IF NOT EXISTS sync_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
+            job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc','move')),
             source_path TEXT,
             target_path TEXT,
             status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
@@ -1366,25 +1421,33 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
 
     // DBSYNC-31 (AC4): CHECK constraints on sync_jobs(job_type, status). SQLite can't
     // ALTER ... ADD CONSTRAINT, so rebuild the table once. Fresh DBs already get the
-    // CHECKs from the CREATE TABLE above; a pre-existing table (whose stored SQL has no
-    // CHECK) is rebuilt here. Guarded + idempotent. Any row with an out-of-set value
-    // (shouldn't exist — both columns are code-controlled) is dropped rather than
-    // aborting the copy. Runs BEFORE the index creation below so the indexes land on the
-    // rebuilt table. Job rows are transient (re-derived by the scan), so this is safe.
-    let sync_jobs_has_check = conn
+    // CHECKs from the CREATE TABLE above; a pre-existing table is rebuilt here. Guarded +
+    // idempotent. Any row with an out-of-set value (shouldn't exist — both columns are
+    // code-controlled) is dropped rather than aborting the copy. Runs BEFORE the index
+    // creation below so the indexes land on the rebuilt table. Job rows are transient
+    // (re-derived by the scan), so this is safe.
+    //
+    // DBSYNC-99 widened the guard, and the reason is worth keeping. It used to ask "does
+    // the stored schema contain a CHECK at all", which was right exactly once: every
+    // database in existence now has one, so adding `move` to the permitted set would have
+    // been a silent no-op on every upgrade and `enqueue_job("move", ..)` would have failed
+    // a constraint at runtime with the migration reporting success. The guard has to name
+    // the member being added, not the mechanism. The next job type will need the same
+    // treatment — the test is `migrate_widens_a_narrower_job_type_check`.
+    let sync_jobs_check_admits_move = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_jobs'",
             [],
             |r| r.get::<_, String>(0),
         )
-        .map(|sql| sql.contains("CHECK"))
+        .map(|sql| sql.contains("CHECK") && sql.contains("'move'"))
         .unwrap_or(true);
-    if !sync_jobs_has_check {
+    if !sync_jobs_check_admits_move {
         conn.execute_batch(
             "
             CREATE TABLE sync_jobs_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
+                job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc','move')),
                 source_path TEXT,
                 target_path TEXT,
                 status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
@@ -1405,7 +1468,7 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
                        upload_session_file_len, upload_session_file_mtime, delete_parent_rev
                 FROM sync_jobs
                 WHERE status IN ('queued','running','retry_wait','done','failed')
-                  AND job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc');
+                  AND job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc','move');
             DROP TABLE sync_jobs;
             ALTER TABLE sync_jobs_new RENAME TO sync_jobs;
             ",
@@ -2317,6 +2380,63 @@ mod tests {
                 .item_id,
             row.item_id
         );
+    }
+
+    #[test]
+    fn migrate_widens_a_narrower_job_type_check() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+        // A database from before `move` existed: it HAS a CHECK, just not one that admits
+        // the new job type. This is the case the original guard missed — it asked whether
+        // a CHECK was present at all, which every database now satisfies, so the widening
+        // would have been skipped in silence on every real upgrade.
+        conn.execute_batch(
+            "CREATE TABLE sync_jobs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc')),
+                 source_path TEXT,
+                 target_path TEXT,
+                 status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
+                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                 next_retry_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO sync_jobs (job_type, status, target_path, created_at, updated_at)
+                 VALUES ('upload', 'queued', 'keep.txt', 't', 't');",
+        )
+        .expect("plant a narrower table");
+
+        super::migrate(&mut conn).expect("migrate");
+
+        // Ask the database, not the stored SQL. The production guard decides by grepping
+        // that same text for the same word, so an assertion that greps it shares an oracle
+        // with the code under test and cannot catch the guard being wrong.
+        conn.execute(
+            "INSERT INTO sync_jobs (job_type, status, source_path, target_path, created_at, updated_at) \
+             VALUES ('move', 'queued', 'old.txt', 'new.txt', 't', 't')",
+            [],
+        )
+        .expect("the widened table must accept a move job");
+
+        // Widening must not become permissiveness: everything outside the set still fails.
+        conn.execute(
+            "INSERT INTO sync_jobs (job_type, status, created_at, updated_at) \
+             VALUES ('bogus_type', 'queued', 't', 't')",
+            [],
+        )
+        .expect_err("and must still reject a job type that is not in the set");
+
+        // The rebuild copies rows rather than starting fresh — it now runs on databases
+        // that hold real queued work, which it did not before this change.
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_jobs WHERE target_path = 'keep.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(kept, 1, "existing queued work must survive the rebuild");
     }
 
     #[test]

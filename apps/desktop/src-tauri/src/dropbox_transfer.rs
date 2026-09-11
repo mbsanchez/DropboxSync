@@ -1050,6 +1050,101 @@ pub(crate) enum DeleteOutcome {
     Error,
 }
 
+/// What a failed `files/move_v2` response means for the job that issued it (DBSYNC-99).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MoveOutcome {
+    Moved,
+    /// The move cannot succeed and retrying will not change that, but the desired end
+    /// state is reachable another way: drop the move and let the scan re-derive the work
+    /// as an upload plus a delete — the behaviour that existed before this ticket.
+    ///
+    /// Two shapes, both observed live on 2026-09-11 and both HTTP 409, which is why this
+    /// classifier reads the body and not the status code:
+    /// - `from_lookup/not_found` — the source is gone. Someone else moved or deleted it.
+    /// - `to/conflict` — the destination is occupied. `autorename` is off deliberately;
+    ///   letting Dropbox pick a different name would silently desynchronise the two sides.
+    NotApplicable,
+    /// Anything else on a failure status.
+    Error,
+}
+
+/// Classifies a `files/move_v2` response. Pure, so the decision is unit-testable without
+/// a network — the same split as [`classify_delete_response`], for the same reason: the
+/// live call can only be exercised by manual QA.
+///
+/// **Matches on `error_summary`, not on the status code.** Both failure shapes above come
+/// back as 409, so a classifier keyed on status cannot tell "the source vanished" from
+/// "the destination is taken" — nor either from a real error.
+pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOutcome {
+    if status_success {
+        return MoveOutcome::Moved;
+    }
+    if body.contains("from_lookup/not_found") {
+        return MoveOutcome::NotApplicable;
+    }
+    if body.contains("to/conflict") {
+        return MoveOutcome::NotApplicable;
+    }
+    MoveOutcome::Error
+}
+
+/// Performs a live `files/move_v2` call. Manual-QA-only for the network path; the
+/// response classification is covered by the pure `classify_move_response` tests.
+///
+/// One request, one outcome — verified against a live account on 2026-09-11. That is the
+/// whole benefit over the delete-plus-upload it replaces, which left a window in which the
+/// file existed nowhere remotely.
+pub(crate) fn move_remote_file_internal(
+    state: &AppState,
+    from_relative: &str,
+    to_relative: &str,
+) -> AppResult<()> {
+    let token = get_access_token(state)?;
+    let from_path = normalize_dropbox_path(from_relative)?;
+    let to_path = normalize_dropbox_path(to_relative)?;
+    let resp = state
+        .http_client
+        .post("https://api.dropboxapi.com/2/files/move_v2")
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "from_path": from_path,
+            "to_path": to_path,
+            // Never autorename. A server-chosen name would leave Dropbox holding a file
+            // under a name the local index has never heard of.
+            "autorename": false
+        }))
+        .send()
+        .map_err(|e| {
+            AppError::Network(format!(
+                "move request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
+
+    if resp.status().is_success() {
+        return Ok(());
+    }
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    match classify_move_response(false, &body) {
+        MoveOutcome::NotApplicable => {
+            tracing::info!(
+                from = %from_relative,
+                to = %to_relative,
+                "remote move not applicable (source gone or destination taken) — dropping job; the next scan re-derives the work"
+            );
+            Ok(())
+        }
+        _ => Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("move {from_path} -> {to_path}: {body}"),
+        }),
+    }
+}
+
 /// Classifies a `files/delete_v2` response. `AlreadyGoneOrConflict` means
 /// treat as a no-op and drop the job: the target is already gone
 /// (`not_found`) OR a `parent_rev` precondition failed because the file was
@@ -1461,10 +1556,10 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_replace, choose_upload_strategy, classify_delete_response,
+        atomic_replace, choose_upload_strategy, classify_delete_response, classify_move_response,
         conflict_copy_with_content_exists, download_would_conflict, download_would_destroy_local,
         emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome,
-        UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        MoveOutcome, UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
@@ -1700,6 +1795,39 @@ mod tests {
     #[test]
     fn classify_delete_response_malformed_or_empty_body_is_error() {
         assert_eq!(classify_delete_response(false, ""), DeleteOutcome::Error);
+    }
+
+    /// DBSYNC-99. The two failure bodies are verbatim from a live `files/move_v2` probe on
+    /// 2026-09-11 — the endpoint is called nowhere else in this codebase, so a classifier
+    /// written against invented bodies would have been a guess dressed as a decision.
+    #[test]
+    fn classify_move_reads_the_body_because_both_failures_are_409() {
+        assert_eq!(classify_move_response(true, ""), MoveOutcome::Moved);
+
+        // HTTP 409 — the source is gone.
+        let source_gone = r#"{"error":{".tag":"from_lookup","from_lookup":{".tag":"not_found"}},"error_summary":"from_lookup/not_found/"}"#;
+        assert_eq!(
+            classify_move_response(false, source_gone),
+            MoveOutcome::NotApplicable
+        );
+
+        // HTTP 409 — the destination is occupied. Same status, different meaning; a
+        // classifier keyed on the status code could not tell these apart, which is the
+        // lesson `classify_delete_response` already learned for `delete_v2`.
+        let destination_taken = r#"{"error":{".tag":"to","to":{".tag":"conflict","conflict":{".tag":"file"}}},"error_summary":"to/conflict/file/"}"#;
+        assert_eq!(
+            classify_move_response(false, destination_taken),
+            MoveOutcome::NotApplicable
+        );
+
+        // A real failure must stay a real failure, or a move job would be dropped for a
+        // reason that retrying would have fixed.
+        let rate_limited = r#"{"error_summary":"too_many_write_operations/"}"#;
+        assert_eq!(
+            classify_move_response(false, rate_limited),
+            MoveOutcome::Error
+        );
+        assert_eq!(classify_move_response(false, ""), MoveOutcome::Error);
     }
 
     #[test]
