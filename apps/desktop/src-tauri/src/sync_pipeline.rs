@@ -1582,6 +1582,88 @@ mod tests {
         assert_eq!(job_targets(&state, "upload"), vec!["m.txt".to_string()]);
     }
 
+    /// DBSYNC-96: what does a rename actually cost today?
+    ///
+    /// The claim under test is that the pipeline cannot see a rename at all — it sees a path
+    /// that vanished and a path that appeared, and bills them as a delete plus a full upload.
+    /// That claim came from reading three things (`fs_watcher` keeps only `e.path`, there is no
+    /// `move` job type, a vanished path reaches `enqueue_targeted_deletions`), and reading is
+    /// not evidence of behaviour.
+    ///
+    /// **Both paths go into ONE call on purpose.** The watcher hands over a single debounced
+    /// batch, so the old and new names arrive together. Splitting them across two calls would
+    /// be a weaker test: it could not detect a correlation even if the pipeline had one, and
+    /// would "confirm" the claim for the wrong reason.
+    #[test]
+    fn a_rename_is_billed_as_a_delete_plus_a_full_upload() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // Indexed and in sync under its old name...
+        state.db.upsert_local_file("old.txt", "h", 5, 0).unwrap();
+        // ...and on disk it now exists only under the new one. Same bytes, same inode in a
+        // real rename; the pipeline sees neither.
+        std::fs::write(sync_root(&state).join("new.txt"), b"hello").unwrap();
+
+        let n = process_changed_paths(&state, &["old.txt".to_string(), "new.txt".to_string()])
+            .expect("process");
+
+        // Two jobs, not one move.
+        assert_eq!(n, 2);
+        assert_eq!(job_targets(&state, "delete"), vec!["old.txt".to_string()]);
+        assert_eq!(job_targets(&state, "upload"), vec!["new.txt".to_string()]);
+        // And the index row does not travel: it is dropped and a fresh one is created.
+        assert!(state.db.get_local_file("old.txt").unwrap().is_none());
+        assert!(state.db.get_local_file("new.txt").unwrap().is_some());
+    }
+
+    /// The same for a directory, where the cost multiplies by the contents rather than
+    /// being paid once.
+    #[test]
+    fn a_directory_rename_re_uploads_every_child() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        // Old directory: tracked folder + two tracked children, none of them on disk any more.
+        state.db.upsert_known_folder("d").unwrap();
+        state.db.upsert_local_file("d/one.txt", "h1", 3, 0).unwrap();
+        state.db.upsert_local_file("d/two.txt", "h2", 3, 0).unwrap();
+
+        // New directory on disk with the same two files.
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/one.txt"), b"aaa").unwrap();
+        std::fs::write(root.join("e/two.txt"), b"bbb").unwrap();
+
+        process_changed_paths(
+            &state,
+            &[
+                "d".to_string(),
+                "e".to_string(),
+                "e/one.txt".to_string(),
+                "e/two.txt".to_string(),
+            ],
+        )
+        .expect("process");
+
+        let mut deletes = job_targets(&state, "delete");
+        let mut uploads = job_targets(&state, "upload");
+        deletes.sort();
+        uploads.sort();
+        // Three deletes, not two: the folder row goes as well as both children.
+        assert_eq!(
+            deletes,
+            vec![
+                "d".to_string(),
+                "d/one.txt".to_string(),
+                "d/two.txt".to_string()
+            ]
+        );
+        assert_eq!(
+            uploads,
+            vec!["e/one.txt".to_string(), "e/two.txt".to_string()]
+        );
+    }
+
     #[test]
     fn targeted_removed_file_enqueues_delete() {
         let tmp = tempdir().expect("tempdir");
