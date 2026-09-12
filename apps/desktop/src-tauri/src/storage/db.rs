@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -958,16 +959,24 @@ impl Db {
     /// carries `delete_parent_rev`: if an upload for this destination is already active, the
     /// plain `enqueue_job` collapse would silently discard the owed deletion.
     ///
+    /// But it must NOT overwrite a **different** owed deletion. Two refused moves onto the
+    /// same destination (A→X refused, later B→X refused) would leave the upload owing only B,
+    /// while A's index rows are already gone — an orphan on Dropbox that nothing will ever
+    /// delete or index. `COALESCE` keeps the first debt and the caller is told the second was
+    /// not taken, because one upload can only settle one source.
+    ///
     /// **If the upload never succeeds** — five attempts exhausted, or the app stops first —
     /// the deletion simply never happens and Dropbox keeps the source as a duplicate. That is
-    /// the failure this shape is chosen for: a duplicate the next scan can reconcile, never a
-    /// window with no copy at all.
+    /// the failure this shape is chosen for: never a window with no copy at all. The duplicate
+    /// is not self-healing; see the caller for what is logged.
+    ///
+    /// Returns whether this call's deletion is the one now owed.
     pub fn enqueue_upload_then_delete(
         &self,
         upload_path: &str,
         delete_path: &str,
         delete_parent_rev: Option<&str>,
-    ) -> AppResult<()> {
+    ) -> AppResult<bool> {
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -978,27 +987,48 @@ impl Db {
             INSERT INTO sync_jobs(job_type, source_path, target_path, on_success_delete_path, on_success_delete_rev, status, attempt_count, next_retry_at, created_at, updated_at)
             VALUES('upload', ?1, ?1, ?2, ?3, 'queued', 0, NULL, ?4, ?4)
             ON CONFLICT(job_type, target_path) WHERE status IN ('queued','retry_wait','running')
-            DO UPDATE SET source_path=excluded.source_path, on_success_delete_path=excluded.on_success_delete_path, on_success_delete_rev=excluded.on_success_delete_rev, updated_at=excluded.updated_at
+            DO UPDATE SET
+                source_path=excluded.source_path,
+                on_success_delete_path=COALESCE(sync_jobs.on_success_delete_path, excluded.on_success_delete_path),
+                on_success_delete_rev=CASE
+                    WHEN sync_jobs.on_success_delete_path IS NULL THEN excluded.on_success_delete_rev
+                    ELSE sync_jobs.on_success_delete_rev END,
+                updated_at=excluded.updated_at
             ",
             params![upload_path, delete_path, delete_parent_rev, now],
         )?;
-        Ok(())
+        let owed: Option<String> = conn
+            .query_row(
+                "SELECT on_success_delete_path FROM sync_jobs WHERE job_type='upload' AND target_path=?1 AND status IN ('queued','retry_wait','running')",
+                params![upload_path],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(owed.as_deref() == Some(delete_path))
     }
 
-    /// Read and clear the deletion an upload job owes its source, in one step so it can be
-    /// acted on at most once.
+    /// Read the deletion an upload job owes its source, **without** clearing it.
+    ///
+    /// Read and clear used to be one step, which looked like "act on it at most once" and was
+    /// really "destroy it on the first look". The caller checks a condition after reading, and
+    /// every way that check can decline — the destination does not hold the bytes, a storage
+    /// error, the enqueue itself failing — returned with the record already gone and the job
+    /// marked `done` immediately after. A single transient error permanently discarded a
+    /// deletion for an upload that had succeeded. Clearing is now
+    /// [`Self::clear_deferred_source_delete`], called only once the delete job exists.
     ///
     /// Restricted to `upload` rows: the column has no meaning on any other job type, and a
     /// query that would honour it there is a query that could be made to delete a path by
     /// setting a field on the wrong row.
-    pub fn take_deferred_source_delete(
+    pub fn peek_deferred_source_delete(
         &self,
         job_id: i64,
     ) -> AppResult<Option<(String, Option<String>)>> {
         let conn = self
-            .write
+            .read
             .lock()
-            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let owed: Option<(Option<String>, Option<String>)> = conn
             .query_row(
                 "SELECT on_success_delete_path, on_success_delete_rev FROM sync_jobs WHERE id = ?1 AND job_type = 'upload'",
@@ -1009,11 +1039,65 @@ impl Db {
         let Some((Some(path), rev)) = owed else {
             return Ok(None);
         };
+        Ok(Some((path, rev)))
+    }
+
+    /// Clear a settled debt, so the same deletion cannot be enqueued twice. Call only after
+    /// the delete job exists — see [`Self::peek_deferred_source_delete`].
+    pub fn clear_deferred_source_delete(&self, job_id: i64) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         conn.execute(
-            "UPDATE sync_jobs SET on_success_delete_path=NULL, on_success_delete_rev=NULL WHERE id = ?1",
+            "UPDATE sync_jobs SET on_success_delete_path=NULL, on_success_delete_rev=NULL WHERE id = ?1 AND job_type = 'upload'",
             params![job_id],
         )?;
-        Ok(Some((path, rev)))
+        Ok(())
+    }
+
+    /// DBSYNC-99: remember a folder move Dropbox permanently refused, so the correlator stops
+    /// proposing it. See the `refused_moves` table comment for why not remembering it means
+    /// the rename never reaches Dropbox at all.
+    pub fn record_refused_move(&self, from_path: &str, to_path: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO refused_moves(from_path, to_path, refused_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(from_path, to_path) DO UPDATE SET refused_at=excluded.refused_at",
+            params![from_path, to_path, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_refused_moves(&self) -> AppResult<HashSet<(String, String)>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare("SELECT from_path, to_path FROM refused_moves")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+    }
+
+    /// Drop refusals whose source folder the index no longer tracks.
+    ///
+    /// The entry exists to stop a pair being re-proposed, and a pair can only be proposed
+    /// while `from_path` is still a known folder. Once the delete-plus-upload fallback has
+    /// converged it is not, and keeping the entry would make a genuine future rename of that
+    /// same pair fall back needlessly.
+    pub fn prune_stale_refused_moves(&self) -> AppResult<usize> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let removed = conn.execute(
+            "DELETE FROM refused_moves WHERE from_path NOT IN (SELECT relative_path FROM known_folders)",
+            [],
+        )?;
+        Ok(removed)
     }
 
     pub fn count_active_jobs(&self) -> AppResult<usize> {
@@ -1619,6 +1703,23 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
             updated_at TEXT NOT NULL
         );
 
+        -- DBSYNC-99: folder renames Dropbox has permanently refused.
+        --
+        -- Without this the refusal does not converge. `rederive_refused_move` declines to
+        -- recover a folder (see DBSYNC-100), but declining writes nothing, so the correlator
+        -- sees byte-for-byte identical inputs on the next scan and makes the same pair again
+        -- — one live `files/move_v2` per tick, forever. Worse, the pair itself suppresses the
+        -- ordinary delete-plus-upload fallback via `under_moved_dir`, so the rename never
+        -- reaches Dropbox and edits under the renamed folder stop being uploaded entirely.
+        --
+        -- Remembering the refusal lets the correlator step aside so that fallback can run.
+        CREATE TABLE IF NOT EXISTS refused_moves (
+            from_path TEXT NOT NULL,
+            to_path TEXT NOT NULL,
+            refused_at TEXT NOT NULL,
+            PRIMARY KEY (from_path, to_path)
+        );
+
         -- DBSYNC-99: the allocator behind `local_file_index.item_id`. AUTOINCREMENT is
         -- the point: SQLite keeps the high-water mark in `sqlite_sequence` and never
         -- reuses a rowid, so an identity belonging to a deleted file is never handed to
@@ -2189,6 +2290,41 @@ mod tests {
         assert_eq!(
             uploads, 2,
             "a new active upload coexists with the completed one"
+        );
+    }
+
+    /// DBSYNC-99. `peek_deferred_source_delete` restricts itself to `upload` rows, and that
+    /// restriction has to be a guard rather than a comment.
+    ///
+    /// Nothing writes the column onto another job type today — `enqueue_upload_then_delete`
+    /// is the only writer and its `ON CONFLICT` target is the partial-unique index on
+    /// `(job_type, target_path)`, so a collapse is necessarily with another `upload`. That is
+    /// exactly why this needs a test: the guard is unreachable through the public API, so
+    /// removing it broke nothing and survived a full mutation run. What it defends against is
+    /// a future writer, a migration, or a bug putting a path there — and then a `delete` job
+    /// completing would enqueue a deletion of whatever that field named.
+    #[test]
+    fn a_deferred_deletion_on_a_non_upload_row_is_not_honoured() {
+        let path = unique_db_path();
+        let db = Db::new_at(&path).expect("db init");
+        db.enqueue_delete_job("victim-carrier.txt", None)
+            .expect("enqueue");
+        let job_id = db.list_recent_jobs(10).expect("jobs")[0].id;
+
+        // Plant the column on a `delete` row, which no code path does — that is the point.
+        Connection::open(&path)
+            .expect("raw open")
+            .execute(
+                "UPDATE sync_jobs SET on_success_delete_path = ?2 WHERE id = ?1",
+                rusqlite::params![job_id, "innocent.txt"],
+            )
+            .expect("plant");
+
+        assert_eq!(
+            db.peek_deferred_source_delete(job_id).expect("peek"),
+            None,
+            "only an upload can owe a deletion; honouring this row would delete a path \
+             because a field was set on the wrong job"
         );
     }
 

@@ -1223,18 +1223,41 @@ pub(crate) fn rederive_refused_move(
         .iter()
         .any(|folder| folder == from_relative);
     if moving_a_directory {
+        // Record the refusal, and that is not bookkeeping — it is the whole fix.
+        //
+        // Declining to recover writes nothing, so the correlator's inputs are byte-for-byte
+        // identical next scan and it proposes the same pair again: one live `move_v2` per
+        // tick, forever. And the pair is what SUPPRESSES the ordinary delete-plus-upload —
+        // `under_moved_dir` skips every path beneath the destination — so the rename never
+        // reaches Dropbox and edits under the renamed folder stop being uploaded at all,
+        // while the UI reads `synced`. An earlier version of this comment claimed doing
+        // nothing was "exactly what `main` does, and `main` loses nothing". It is not:
+        // `main` has no directory correlation, so the fallback runs there and converges.
+        state.db.record_refused_move(from_relative, to_relative)?;
         tracing::warn!(
             from = %from_relative,
             to = %to_relative,
-            "remote folder move refused — left for the ordinary scan; no folder recovery is attempted (DBSYNC-100)"
+            "remote folder move refused — recorded so the correlator steps aside and the ordinary delete-plus-upload runs; no folder recovery is attempted (DBSYNC-100)"
         );
         return Ok(());
     }
 
     let parent_rev = state.db.get_remote_file(from_relative)?.map(|r| r.rev);
-    state
-        .db
-        .enqueue_upload_then_delete(to_relative, from_relative, parent_rev.as_deref())?;
+    let took_the_debt =
+        state
+            .db
+            .enqueue_upload_then_delete(to_relative, from_relative, parent_rev.as_deref())?;
+    if !took_the_debt {
+        // An upload for this destination already owes a different source. One upload can
+        // settle one source, so this one is not deferred — and its index rows must stay, or
+        // it becomes an orphan on Dropbox that nothing deletes and nothing indexes.
+        tracing::error!(
+            from = %from_relative,
+            to = %to_relative,
+            "a second refused move onto the same destination: this source is left indexed and on Dropbox rather than silently orphaned"
+        );
+        return Ok(());
+    }
     // The source's rows go now: it is no longer anywhere the app should look. Leaving them
     // would let the next scan derive its own delete of the source — unordered with respect to
     // the upload, which is the race this whole shape exists to remove.
@@ -1266,7 +1289,7 @@ pub(crate) fn rederive_refused_move(
 /// Dropbox; a `?` here would leave the job `running`, which `pick_next_due_job` never picks
 /// again, and wedge the queue instead.
 pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destination: &str) {
-    let owed = match state.db.take_deferred_source_delete(job_id) {
+    let owed = match state.db.peek_deferred_source_delete(job_id) {
         Ok(Some(owed)) => owed,
         Ok(None) => return,
         Err(e) => {
@@ -1278,12 +1301,19 @@ pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destina
 
     match destination_holds_the_bytes(state, destination) {
         Ok(true) => match state.db.enqueue_delete_job(&source, parent_rev.as_deref()) {
-            Ok(()) => tracing::info!(
-                job_id,
-                source = %source,
-                destination = %destination,
-                "upload landed — enqueued the deletion of the move source it replaced"
-            ),
+            // Clear only now, with the delete job in existence. Reading and clearing in one
+            // step meant every decline below destroyed the debt on first sight.
+            Ok(()) => {
+                if let Err(e) = state.db.clear_deferred_source_delete(job_id) {
+                    tracing::warn!(job_id, error = %e, "the source deletion was enqueued but its debt could not be cleared");
+                }
+                tracing::info!(
+                    job_id,
+                    source = %source,
+                    destination = %destination,
+                    "upload landed — enqueued the deletion of the move source it replaced"
+                );
+            }
             Err(e) => tracing::error!(
                 job_id,
                 source = %source,
@@ -1291,33 +1321,85 @@ pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destina
                 "upload landed but the move source could not be enqueued for deletion; it stays on Dropbox as a duplicate"
             ),
         },
-        Ok(false) => tracing::warn!(
-            job_id,
-            source = %source,
-            destination = %destination,
-            "upload job finished without putting the destination's bytes on Dropbox — the move source is NOT deleted; it stays as a duplicate rather than the only copy disappearing"
-        ),
-        Err(e) => tracing::error!(
-            job_id,
-            source = %source,
-            error = %e,
-            "could not confirm the destination's bytes are on Dropbox; the move source is left in place"
-        ),
+        Ok(false) => {
+            tracing::error!(
+                job_id,
+                source = %source,
+                destination = %destination,
+                "upload job finished without putting the destination's bytes on Dropbox — the move source is NOT deleted. Dropbox keeps it as a duplicate of the renamed file"
+            );
+            surface_withheld_deletion(state, &source, destination);
+        }
+        Err(e) => {
+            tracing::error!(
+                job_id,
+                source = %source,
+                error = %e,
+                "could not confirm the destination's bytes are on Dropbox; the move source is left in place"
+            );
+            surface_withheld_deletion(state, &source, destination);
+        }
     }
 }
 
-/// Does Dropbox hold, at `relative`, the content the local index says is there?
+/// Make a withheld deletion something the user can find.
 ///
-/// Both rows are required. A missing remote row means nothing was uploaded; a missing local
-/// row means there is nothing to compare against and no basis for claiming a match.
+/// Withholding is the right call — the source may be the only copy — but it does not heal
+/// itself, and a `warn!` in a log file is not a user-visible outcome. Dropbox is left holding
+/// the old name alongside the new one, and until this is surfaced nothing tells anybody.
+/// `reconcile_remote_absent` already does exactly this for its analogous case.
+///
+/// Best-effort: the deletion was already withheld, and failing here would add nothing.
+fn surface_withheld_deletion(state: &AppState, source: &str, destination: &str) {
+    if let Err(e) = state.db.add_conflict(
+        destination,
+        source,
+        "renamed on Dropbox as a copy: the old name could not be removed, so both exist",
+        None,
+        false,
+    ) {
+        tracing::warn!(source = %source, error = %e, "could not record the withheld deletion as a conflict");
+    }
+}
+
+/// Does Dropbox hold, at `relative`, the bytes the user has there?
+///
+/// **The local index row is not required, and requiring it made this unsatisfiable.** The
+/// destination of a refused move has no `local_file_index` row and never gets one before the
+/// upload completes: `correlate_renames` pairs only a destination the local index does NOT
+/// contain, the scan's third pass skips `moved_to` paths so `process_local_file_change` never
+/// runs for it, `rederive_refused_move` removes the *source's* rows rather than creating the
+/// destination's, and `record_upload_result` writes `remote_file_index` only. An earlier
+/// version demanded that row, so this returned `false` for every refused move ever made and
+/// the whole deferred-deletion mechanism was inert in production. Three unit tests passed
+/// because each manufactured the row by hand — a state the pipeline does not produce.
+///
+/// So the authority is the file on disk, which is what the upload just read. The index row is
+/// used when it happens to exist because hashing is not free, but its absence is not evidence.
+///
+/// A hash mismatch still withholds, which is what keeps the `to/conflict` case safe: a
+/// destination Dropbox already holds under somebody else's content fails the comparison
+/// rather than licensing the source's deletion.
 pub(crate) fn destination_holds_the_bytes(state: &AppState, relative: &str) -> AppResult<bool> {
-    let (Some(remote), Some(local)) = (
-        state.db.get_remote_file(relative)?,
-        state.db.get_local_file(relative)?,
-    ) else {
+    let Some(remote) = state.db.get_remote_file(relative)? else {
         return Ok(false);
     };
-    Ok(remote.content_hash == local.hash)
+    if let Some(local) = state.db.get_local_file(relative)? {
+        return Ok(remote.content_hash == local.hash);
+    }
+    let Some(folder) = state.db.get_sync_folder()? else {
+        return Ok(false);
+    };
+    let absolute = safe_join(Path::new(&folder), relative)?;
+    // Unreadable now — vanished, locked, permissions — is not proof of a match. Withhold: a
+    // duplicate on Dropbox is recoverable and a wrong deletion is not.
+    match crate::path_util::hash_file(&absolute) {
+        Ok((hash, _, _)) => Ok(remote.content_hash == hash),
+        Err(e) => {
+            tracing::warn!(rel = %relative, error = %e, "could not hash the move destination to confirm the upload landed");
+            Ok(false)
+        }
+    }
 }
 
 /// Make the index match a move Dropbox has already performed.

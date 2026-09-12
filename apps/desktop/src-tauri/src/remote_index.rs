@@ -1136,7 +1136,65 @@ mod tests {
         assert!(state.db.get_local_file("old.txt").unwrap().is_none());
         assert!(state.db.get_remote_file("old.txt").unwrap().is_none());
 
-        // The upload owes it, carrying the rev captured before the row was dropped.
+        let upload = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload")
+            .unwrap();
+
+        // `source_path` is what actually gets uploaded (`process_sync_queue_internal`'s upload
+        // arm dispatches on it) AND what the landing gate is evaluated against. Nothing
+        // asserted it before, so binding it to the delete path instead — which uploads the old
+        // name and gates the wrong destination, a total inversion of the feature — survived
+        // the whole suite.
+        assert_eq!(
+            upload.source_path.as_deref(),
+            Some("new.txt"),
+            "the upload's source_path is the DESTINATION: it is the path uploaded and the path \
+             the landing gate checks"
+        );
+
+        // The upload owes the deletion, carrying the rev captured before the row was dropped.
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload.id).unwrap(),
+            Some(("old.txt".to_string(), Some("rev1".to_string())))
+        );
+        // Peeking does NOT consume it. Read-and-clear in one step meant every way the caller
+        // can decline destroyed the debt on first sight.
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload.id).unwrap(),
+            Some(("old.txt".to_string(), Some("rev1".to_string()))),
+            "a peek must leave the debt intact — only a settled deletion clears it"
+        );
+        state.db.clear_deferred_source_delete(upload.id).unwrap();
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload.id).unwrap(),
+            None
+        );
+    }
+
+    /// One upload can settle one source. A second refused move onto the same destination must
+    /// not silently replace the first debt.
+    ///
+    /// The `DO UPDATE` used to overwrite it. A→X refused, then B→X refused, left the upload
+    /// owing only B while A's index rows were already gone — an orphan on Dropbox that nothing
+    /// would ever delete or index. A's rows must therefore survive the refusal.
+    #[test]
+    fn a_second_refused_move_onto_one_destination_does_not_replace_the_first_debt() {
+        let state = build_state();
+        for (path, id) in [("a.txt", "id:A"), ("b.txt", "id:B")] {
+            state.db.upsert_local_file(path, "H", 5, 0).unwrap();
+            state
+                .db
+                .upsert_remote_file(path, "H", "rev1", 0, Some(id))
+                .unwrap();
+        }
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt").unwrap();
+
         let upload_id = state
             .db
             .list_recent_jobs(50)
@@ -1146,14 +1204,20 @@ mod tests {
             .unwrap()
             .id;
         assert_eq!(
-            state.db.take_deferred_source_delete(upload_id).unwrap(),
-            Some(("old.txt".to_string(), Some("rev1".to_string())))
+            state
+                .db
+                .peek_deferred_source_delete(upload_id)
+                .unwrap()
+                .map(|(p, _)| p),
+            Some("a.txt".to_string()),
+            "the first debt stands"
         );
-        assert_eq!(
-            state.db.take_deferred_source_delete(upload_id).unwrap(),
-            None,
-            "read-and-clear: an upload cannot owe the same deletion twice"
+        assert!(
+            state.db.get_remote_file("b.txt").unwrap().is_some(),
+            "and the source whose deletion was NOT taken stays indexed, or it becomes an \
+             orphan on Dropbox that nothing deletes and nothing knows about"
         );
+        assert!(state.db.get_local_file("b.txt").unwrap().is_some());
     }
 
     /// The failure that broke the id-order design, reproduced.
@@ -1190,173 +1254,6 @@ mod tests {
              here removes the one copy Dropbox still has. Got: {:?}",
             due.map(|j| (j.job_type, j.target_path))
         );
-    }
-
-    /// An upload that returned `Ok(())` without putting anything on Dropbox must not cost
-    /// the user the only copy.
-    ///
-    /// `upload_local_file_internal` returns `Ok(())` from three places where nothing was
-    /// uploaded: a `.cloudsc` path, a source that vanished before the upload (an atomic save,
-    /// or the file deleted right after being renamed), and content Dropbox already held.
-    /// Reading `Ok(())` as "the bytes landed" would enqueue the source deletion after the
-    /// second of those — Dropbox holds the source, holds nothing at the destination, the
-    /// destination is gone from disk, and the delete removes the last copy. That is the
-    /// ordering defect this whole mechanism replaced, reintroduced one layer in.
-    #[test]
-    fn an_upload_that_did_not_land_does_not_delete_the_move_source() {
-        let state = build_state();
-        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
-        state
-            .db
-            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
-            .unwrap();
-        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt").unwrap();
-        let upload_id = state
-            .db
-            .list_recent_jobs(50)
-            .unwrap()
-            .into_iter()
-            .find(|j| j.job_type == "upload")
-            .unwrap()
-            .id;
-
-        // The upload "completed" — with nothing on Dropbox at the destination.
-        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
-
-        assert!(
-            job_targets(&state, "delete").is_empty(),
-            "no delete may be enqueued while Dropbox holds nothing at the destination — the \
-             source is the only copy left"
-        );
-    }
-
-    /// The same gate, against the shape the classifier sends here most often.
-    ///
-    /// `to/conflict` means the destination is already TAKEN on Dropbox, so a remote row for it
-    /// can exist without this upload having done anything. A presence check would pass and
-    /// delete the source; the content is what has to match.
-    #[test]
-    fn a_destination_holding_different_content_does_not_license_the_deletion() {
-        let state = build_state();
-        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
-        state
-            .db
-            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
-            .unwrap();
-        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt").unwrap();
-        let upload_id = state
-            .db
-            .list_recent_jobs(50)
-            .unwrap()
-            .into_iter()
-            .find(|j| j.job_type == "upload")
-            .unwrap()
-            .id;
-
-        // Someone else's file already sits at the destination on Dropbox, and the user's
-        // renamed file sits at the destination on disk. They are not the same bytes.
-        state.db.upsert_local_file("new.txt", "H", 5, 0).unwrap();
-        state
-            .db
-            .upsert_remote_file("new.txt", "OTHER", "revX", 0, Some("id:OTHER"))
-            .unwrap();
-
-        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
-
-        assert!(
-            job_targets(&state, "delete").is_empty(),
-            "a destination that merely EXISTS on Dropbox is not the destination holding the \
-             user's bytes; deleting the source here loses them"
-        );
-    }
-
-    /// And when the bytes really are there, the source goes — carrying the rev captured
-    /// before its row was dropped, so `delete_v2` can still detect a server-side change.
-    #[test]
-    fn an_upload_that_landed_deletes_the_move_source() {
-        let state = build_state();
-        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
-        state
-            .db
-            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
-            .unwrap();
-        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt").unwrap();
-        let upload_id = state
-            .db
-            .list_recent_jobs(50)
-            .unwrap()
-            .into_iter()
-            .find(|j| j.job_type == "upload")
-            .unwrap()
-            .id;
-
-        // The upload landed: Dropbox holds, at the new name, the bytes the user has there.
-        state.db.upsert_local_file("new.txt", "H", 5, 0).unwrap();
-        state
-            .db
-            .upsert_remote_file("new.txt", "H", "rev2", 0, Some("id:OLD"))
-            .unwrap();
-
-        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
-
-        assert_eq!(job_targets(&state, "delete"), vec!["old.txt".to_string()]);
-        let delete = state
-            .db
-            .list_recent_jobs(50)
-            .unwrap()
-            .into_iter()
-            .find(|j| j.job_type == "delete")
-            .unwrap();
-        assert_eq!(
-            delete.delete_parent_rev.as_deref(),
-            Some("rev1"),
-            "the source's pre-move rev must survive the deferral — `delete_v2` needs it to \
-             notice the server copy changed in the meantime"
-        );
-
-        // And it is settled: a second pass cannot enqueue it again.
-        state.db.mark_job_completed(delete.id).unwrap();
-        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
-        assert_eq!(
-            job_targets(&state, "delete").len(),
-            1,
-            "read-and-clear: an upload cannot owe the same deletion twice"
-        );
-    }
-
-    /// A refused **folder** move recovers nothing, on purpose.
-    ///
-    /// Three of the six permanent `RelocationError` markers are folder-only, and
-    /// `cant_move_shared_folder` is reached by renaming a shared folder — ordinary, not a
-    /// corner. Neither half of the file recovery transfers: `upload_local_file_internal`
-    /// opens its path as a file, and the delete is recursive on a folder, so it would take
-    /// the destination's children down with the source. A dehydrated child has no bytes on
-    /// disk, so that is permanent loss.
-    ///
-    /// Doing nothing is `main`'s behaviour and `main` loses nothing. Folder recovery is
-    /// DBSYNC-100.
-    #[test]
-    fn a_refused_folder_move_recovers_nothing() {
-        let state = build_state();
-        state.db.upsert_known_folder("Docs").unwrap();
-        state.db.upsert_local_file("Docs/a.txt", "H", 5, 0).unwrap();
-        state
-            .db
-            .upsert_remote_file("Docs/a.txt", "H", "rev1", 0, Some("id:A"))
-            .unwrap();
-
-        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
-
-        assert!(
-            state.db.list_recent_jobs(50).unwrap().is_empty(),
-            "no job may be enqueued for a refused folder move: the upload cannot open a \
-             directory, and the delete is recursive"
-        );
-        assert!(
-            state.db.get_remote_file("Docs/a.txt").unwrap().is_some(),
-            "and the children stay indexed where Dropbox still holds them"
-        );
-        assert!(state.db.get_local_file("Docs/a.txt").unwrap().is_some());
     }
 
     #[test]
