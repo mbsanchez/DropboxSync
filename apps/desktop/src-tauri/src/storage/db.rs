@@ -605,6 +605,13 @@ impl Db {
         // undoing the rename on the server. The partial-unique index only covers active
         // statuses, so widening the set here cannot collide with it.
         //
+        // `local_delete` is excluded alongside `move`, and for a sharper reason than tidiness.
+        // `delete_local_file_internal` removes the file unconditionally. A failed
+        // `local_delete` naming the OLD path is harmless — the path no longer exists, so the
+        // retry is a no-op — but retargeted to the new one it deletes the file the user just
+        // renamed, the moment they press Retry. The argument for widening the set was about
+        // `download`; it does not extend to a job whose whole purpose is destruction.
+        //
         // `job_type <> 'move'` is not an optimisation. A move job's two paths describe an
         // OPERATION — move this from here to there — not where an item currently lives, so
         // rewriting them corrupts the instruction. Rewriting the `source_path` of the very
@@ -613,12 +620,12 @@ impl Db {
         // server does not have. Measured on a real install, not imagined.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
+             WHERE target_path = ?1 AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
             params![old_path, new_path, now],
         )?;
         tx.execute(
             "UPDATE sync_jobs SET source_path = ?2, updated_at = ?3 \
-             WHERE source_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
+             WHERE source_path = ?1 AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
             params![old_path, new_path, now],
         )?;
         tx.commit()?;
@@ -708,23 +715,31 @@ impl Db {
         // rather than aborting the rewrite — both rows describe the same work.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
+             WHERE target_path = ?1 AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
             params![old_prefix, new_prefix, now],
         )?;
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || substr(target_path, ?4), updated_at = ?3 \
-             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
+             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
             params![child_pattern, new_prefix, now, tail_start],
         )?;
 
-        // Anything still under the old prefix could not be moved, because the destination
-        // was occupied. Count it before the transaction closes.
-        let stranded: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM local_file_index \
-             WHERE relative_path = ?1 OR relative_path LIKE ?2 ESCAPE '!'",
-            params![old_prefix, child_pattern],
-            |row| row.get(0),
-        )?;
+        // Anything still under the old prefix could not be moved, because the destination was
+        // occupied. Count it across ALL THREE tables the rewrite touches: counting only
+        // `local_file_index` was blind to the collision most likely to happen — a destination
+        // Dropbox holds that was never downloaded has remote rows and no local ones, so it
+        // would strand `remote_file_index` rows and report zero.
+        let mut stranded: i64 = 0;
+        for table in ["local_file_index", "remote_file_index", "known_folders"] {
+            stranded += tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} \
+                     WHERE relative_path = ?1 OR relative_path LIKE ?2 ESCAPE '!'"
+                ),
+                params![old_prefix, child_pattern],
+                |row| row.get::<_, i64>(0),
+            )?;
+        }
 
         tx.commit()?;
         Ok(stranded.max(0) as usize)
@@ -2658,6 +2673,48 @@ mod tests {
             db.get_local_file("a.txt").expect("get").unwrap().item_id,
             a,
             "an identity, once given, is not reissued on the next startup"
+        );
+    }
+
+    /// W4-bis. Widening the path rewrite to `failed` rows was justified by `download`, but
+    /// the clause caught every job type. `delete_local_file_internal` removes the file
+    /// unconditionally, so a failed `local_delete` retargeted to the new name deletes the
+    /// file the user just renamed the moment they press Retry. Naming the OLD path, it was a
+    /// harmless no-op — the path no longer exists.
+    #[test]
+    fn a_failed_local_delete_does_not_follow_a_rename() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_local_file("old.txt", "H", 1, 0).expect("seed");
+        {
+            let conn = db.write.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_jobs (job_type,status,source_path,target_path,created_at,updated_at) \
+                 VALUES ('local_delete','failed','old.txt','old.txt','t','t'), \
+                        ('download','failed','old.txt','old.txt','t','t')",
+                [],
+            )
+            .expect("seed jobs");
+        }
+
+        db.move_index_row("old.txt", "new.txt").expect("move");
+
+        let rows: Vec<(String, Option<String>)> = {
+            let conn = db.read.lock().expect("lock");
+            let mut stmt = conn
+                .prepare("SELECT job_type, target_path FROM sync_jobs ORDER BY job_type")
+                .expect("prepare");
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .expect("query");
+            mapped.collect::<Result<Vec<_>, _>>().expect("rows")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("download".to_string(), Some("new.txt".to_string())),
+                ("local_delete".to_string(), Some("old.txt".to_string())),
+            ],
+            "the download follows the rename; the local_delete must be left behind"
         );
     }
 

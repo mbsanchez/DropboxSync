@@ -1065,10 +1065,13 @@ pub(crate) enum MoveOutcome {
     /// - `to/conflict` — the destination is occupied. `autorename` is off deliberately;
     ///   letting Dropbox pick a different name would silently desynchronise the two sides.
     ///
-    /// The rest are from `RelocationError` and are permanent for the same reason, so they
-    /// take the same fallback rather than retrying to exhaustion and ending `failed` with
-    /// the index already rewritten. `too_many_files` is the one a user will actually hit:
-    /// `move_v2` is capped at 10,000 files, so a large folder rename lands here.
+    /// The rest are from `RelocationError` and cannot be retried into success either, so
+    /// they take the same fallback rather than retrying to exhaustion and ending `failed`
+    /// with the index already rewritten. `too_many_files` is the one a user will actually
+    /// hit: `move_v2` is capped at 10,000 files, so a large folder rename lands here.
+    ///
+    /// Transient conditions stay out of this arm even when they look terminal — see the
+    /// list in `classify_move_response`.
     NotApplicable,
     /// Anything else on a failure status.
     Error,
@@ -1085,15 +1088,20 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
     if status_success {
         return MoveOutcome::Moved;
     }
-    const PERMANENT: [&str; 8] = [
+    // Permanent means "retrying cannot help", not merely "this attempt failed".
+    //
+    // `insufficient_quota` and `from_write/conflict` were briefly in this list and are not:
+    // quota clears when the user frees space, and a write conflict is a lock or an operation
+    // in flight. Routing them here would have undone the index rewrite and left the item to
+    // be re-uploaded — an upload that also needs the quota that was missing — while a plain
+    // retry would have cost nothing.
+    const PERMANENT: [&str; 6] = [
         "from_lookup/not_found",
         "to/conflict",
-        "from_write/conflict",
         "too_many_files",
         "cant_move_shared_folder",
         "cant_nest_shared_folder",
         "duplicated_or_nested_paths",
-        "insufficient_quota",
     ];
     if PERMANENT.iter().any(|marker| body.contains(marker)) {
         return MoveOutcome::NotApplicable;
@@ -1101,28 +1109,70 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
     MoveOutcome::Error
 }
 
-/// Put the index back the way it was before a move that turned out to be impossible, and
-/// fall back to the upload-plus-delete a rename cost before DBSYNC-99.
+/// Put the index back after a move that turned out to be impossible, so the next scan
+/// re-uploads at the new path instead of the index quietly claiming work that never happened.
 ///
-/// Separated from the network call so the recovery is unit-testable — the failure it
-/// repairs was data loss, and the network path around it can only be exercised by hand.
+/// Separated from the network call so the recovery is unit-testable — the failure it repairs
+/// was data loss, and the network path around it can only be exercised by hand.
 ///
-/// Three steps, none of them optional:
-/// - **Drop the remote row.** With it present, `reconcile_remote_absent` matches
-///   `local.hash == prev.content_hash` and enqueues a `local_delete` of the user's file.
-///   Without it, that function takes its "never indexed remotely" early return.
-/// - **Mark the local row for rescan.** The row currently holds the hash of the bytes on
-///   disk, so the scan would see nothing to do. The DBSYNC-56 marker makes it upload.
-/// - **Delete the source.** Its content now lives at the destination, and the row that
-///   pointed at it was rewritten away, so nothing else will ever reclaim it.
+/// **Two shapes, and conflating them destroyed data.** The first version of this function was
+/// written for a file and run for both: against a folder, `remove_remote_file` and
+/// `mark_local_file_for_rescan` were no-ops (folders are not keyed in `remote_file_index`,
+/// and there is no local row at a folder path) while `enqueue_delete_job` fired — a recursive
+/// `delete_v2` of the source. The descendants stayed rewritten to the new prefix, so the
+/// sweep then deleted every one of them locally. It destroyed both copies, and the case it
+/// destroyed them in is the one a user actually reaches: `too_many_files`, above the 10,000
+/// cap on `move_v2`.
+///
+/// **Nothing is deleted here.** The earlier version enqueued a delete of the source to
+/// complete an "upload plus delete" fallback, but jobs drain in id order and the upload is
+/// only enqueued later, by the scan — so the delete could run first and remove the one copy
+/// Dropbox still had. A leftover folder or file at the old remote path is visible and
+/// harmless; losing the bytes is neither. The orphan is logged so it is discoverable.
 pub(crate) fn undo_move_index_rewrite(
     state: &AppState,
     from_relative: &str,
     to_relative: &str,
 ) -> AppResult<()> {
+    let is_directory = state
+        .db
+        .list_known_folders()?
+        .iter()
+        .any(|folder| folder == to_relative);
+
+    if is_directory {
+        // Undo the subtree row by row rather than reversing the prefix rewrite. Reversing it
+        // would put the index back at the old paths while the disk holds the new ones, and
+        // the very next scan would correlate the same rename again — a loop of moves that
+        // fail the same way, forever, whenever the failure is permanent.
+        let prefix = format!("{to_relative}/");
+        let descendants: Vec<String> = state
+            .db
+            .list_local_files()?
+            .into_iter()
+            .map(|row| row.relative_path)
+            .filter(|path| path.starts_with(&prefix))
+            .collect();
+        for child in &descendants {
+            state.db.remove_remote_file(child)?;
+            state.db.mark_local_file_for_rescan(child)?;
+        }
+        tracing::warn!(
+            from = %from_relative,
+            to = %to_relative,
+            children = descendants.len(),
+            "directory move refused — marked the subtree for re-upload; the source folder is left on Dropbox and may now be an orphan"
+        );
+        return Ok(());
+    }
+
     state.db.remove_remote_file(to_relative)?;
     state.db.mark_local_file_for_rescan(to_relative)?;
-    state.db.enqueue_delete_job(from_relative, None)?;
+    tracing::warn!(
+        from = %from_relative,
+        to = %to_relative,
+        "move refused — marked for re-upload; the source is left on Dropbox and may now be an orphan"
+    );
     Ok(())
 }
 
