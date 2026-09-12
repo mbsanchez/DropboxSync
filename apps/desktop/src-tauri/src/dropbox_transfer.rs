@@ -1166,6 +1166,42 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
     MoveOutcome::Error
 }
 
+/// Re-derive a refused move as the upload-plus-delete it replaces.
+///
+/// Extracted so the recovery — and above all its ORDER — can be tested: the network call
+/// around it is manual-QA-only, and the ordering is the part three review rounds got wrong.
+///
+/// The upload is enqueued first and therefore carries the lower id, and `pick_next_due_job`
+/// drains by id, so the bytes land at the destination before the delete removes the source.
+/// There is no moment in which the content exists at neither path.
+///
+/// **Known residual, deliberately accepted.** If the materialization sweep plants a
+/// `.cloudsc` sidecar over the source before the delete drains, `delete_suppressed_by_
+/// dehydration` reads it as a dehydration and drops the delete — leaving the source on
+/// Dropbox as a duplicate. The content is safe at the destination, so this is a duplicate
+/// rather than a loss. Closing it means teaching the sweep about in-flight paths, which is
+/// a `.cloudsc` change: round 7 showed that doing it from here re-arms DBSYNC-62's evicted-
+/// placeholder recovery on Windows, because every CfAPI placeholder carries a local index
+/// row. It needs its own ticket.
+pub(crate) fn rederive_refused_move(
+    state: &AppState,
+    from_relative: &str,
+    to_relative: &str,
+) -> AppResult<()> {
+    let parent_rev = state.db.get_remote_file(from_relative)?.map(|r| r.rev);
+    state
+        .db
+        .enqueue_job("upload", Some(to_relative), Some(to_relative))?;
+    state
+        .db
+        .enqueue_delete_job(from_relative, parent_rev.as_deref())?;
+    // The source's rows go now: it is no longer anywhere the app should look. Leaving them
+    // would make the next scan enqueue a second, redundant delete.
+    state.db.remove_local_file(from_relative)?;
+    state.db.remove_remote_file(from_relative)?;
+    Ok(())
+}
+
 /// Make the index match a move Dropbox has already performed.
 ///
 /// Separated from the network call so the rewrite is unit-testable — it is the one step that
@@ -1301,19 +1337,29 @@ pub(crate) fn move_remote_file_internal(
         .unwrap_or_else(|_| "<unreadable body>".to_string());
     match classify_move_response(false, &body) {
         MoveOutcome::NotApplicable => {
-            // Nothing to undo: the index was never touched. Dropping the job leaves it
-            // describing the pre-rename world, which is still what the server holds, and once
-            // this job leaves the active set the ordinary scan re-derives a delete plus an
-            // upload — what a rename cost before this ticket.
+            // Nothing to UNDO — the index was never touched, which is what makes a failed
+            // move incapable of losing data. But the work still has to be re-derived, and
+            // leaving that to the next scan is what three review rounds kept failing on:
+            // between this moment and that scan, the materialization sweep sees the source
+            // as a remote child with no local counterpart and plants a `.cloudsc` sidecar
+            // over it. `process_local_file_deletion` then reads that placeholder as a
+            // dehydration and drops the delete along with the index row that remembers the
+            // path, so the source stays on Dropbox forever and the user gets a duplicate.
             //
-            // Three rounds of review were spent on the version of this arm that had to repair
-            // a rewrite made too early. Each repair was worse than the defect it fixed. There
-            // is nothing here now because there is nothing to repair.
+            // So re-derive it here, explicitly, instead of hoping a later scan wins the race.
+            //
+            // **The order is the point.** The upload is enqueued first and therefore carries
+            // the lower id, and `pick_next_due_job` drains by id — so the bytes land at the
+            // destination before the delete removes the source. There is no moment in which
+            // the content exists at neither path. An earlier version of this recovery
+            // enqueued only the delete and relied on the scan for the upload; the delete won
+            // the race and removed the one copy Dropbox still had.
+            rederive_refused_move(state, from_relative, to_relative)?;
             tracing::warn!(
                 from = %from_relative,
                 to = %to_relative,
                 body = %body,
-                "remote move not applicable — dropping the job; the index was never changed"
+                "remote move not applicable — re-derived as an upload of the destination then a delete of the source"
             );
             Ok(())
         }

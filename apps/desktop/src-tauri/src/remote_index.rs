@@ -1094,39 +1094,57 @@ mod tests {
         );
     }
 
-    /// Round 6's critical, and the end of a chain six rounds long.
+    /// A refused move is re-derived here and now, in an order that matters.
     ///
-    /// When a move comes back not-applicable the job completes, nothing is rewritten, and
-    /// Dropbox still holds the source. The materialization sweep then saw a remote child with
-    /// no local counterpart and planted a `.cloudsc` sidecar — consulting **no index at all**.
-    /// The next scan found a placeholder at that path, and `process_local_file_deletion`
-    /// treats a placeholder as a dehydration: it dropped the delete *and* the index row that
-    /// remembered it. The source stayed on Dropbox forever and the user got a duplicate.
+    /// Three review rounds were spent leaving this to the next scan. Between the refusal and
+    /// that scan the materialization sweep plants a `.cloudsc` sidecar over the source, and
+    /// `process_local_file_deletion` reads a placeholder as a dehydration — dropping the
+    /// delete along with the index row that remembers the path. The source stayed on Dropbox
+    /// forever and the user got a duplicate instead of a rename.
     ///
-    /// Rounds 5 and 6 both tried to fix this by choosing which deletions to defer. That moved
-    /// the window without closing it. The root is the sweep's blindness, and this is the
-    /// condition that ends it: **a path the local index still tracks is not a cloud-only
-    /// file**, however absent it looks on disk.
+    /// **The assertion that matters is the order.** Jobs drain by id, so the upload must
+    /// carry the lower one: the bytes land at the destination before the delete removes the
+    /// source, and there is no moment in which the content exists at neither path. An earlier
+    /// recovery enqueued only the delete and left the upload to the scan; the delete won and
+    /// removed the one copy Dropbox still had.
     #[test]
-    fn a_path_the_index_still_tracks_is_never_a_cloud_only_file() {
+    fn a_refused_move_is_rederived_upload_before_delete() {
         let state = build_state();
-
-        // Mid-move: the index still names the source, the disk does not.
         state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt").unwrap();
+
+        let jobs: Vec<(i64, String, Option<String>)> = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .map(|j| (j.id, j.job_type, j.target_path))
+            .collect();
+        let upload = jobs
+            .iter()
+            .find(|(_, t, _)| t == "upload")
+            .expect("the destination must be uploaded");
+        let delete = jobs
+            .iter()
+            .find(|(_, t, _)| t == "delete")
+            .expect("and the source deleted");
+        assert_eq!(upload.2.as_deref(), Some("new.txt"));
+        assert_eq!(delete.2.as_deref(), Some("old.txt"));
         assert!(
-            crate::cloudsc_ops::is_tracked_locally(&state, "old.txt"),
-            "the sweep must not plant a sidecar over a path the app is still working on"
+            upload.0 < delete.0,
+            "the upload must carry the lower id — jobs drain in id order, and a delete that \
+             runs first removes the one copy Dropbox still has"
         );
 
-        // A path the app has genuinely never heard of is what the sweep is for.
-        assert!(
-            !crate::cloudsc_ops::is_tracked_locally(&state, "never-seen.txt"),
-            "and it must still materialize files the index does not know"
-        );
-
-        // Once the deletion has drained and the row is gone, the path becomes eligible again.
-        state.db.remove_local_file("old.txt").unwrap();
-        assert!(!crate::cloudsc_ops::is_tracked_locally(&state, "old.txt"));
+        // The source is no longer anywhere the app should look, so a later scan does not
+        // enqueue a second, redundant delete for it.
+        assert!(state.db.get_local_file("old.txt").unwrap().is_none());
+        assert!(state.db.get_remote_file("old.txt").unwrap().is_none());
     }
 
     #[test]

@@ -2863,6 +2863,10 @@ mod tests {
             crate::path_util::hash_file(&root.join("parent/moved/one.txt")).unwrap();
         state.db.upsert_known_folder("parent").unwrap();
         state.db.upsert_known_folder("parent/inner").unwrap();
+        // A sub-folder UNDER the move's destination. It is not a member of the move set by
+        // name, so only the prefix predicate protects it — an exact match lets it through to
+        // a recursive remote delete.
+        state.db.upsert_known_folder("parent/moved/deep").unwrap();
         state
             .db
             .upsert_local_file("parent/inner/one.txt", &hash, size, mtime)
@@ -2897,6 +2901,88 @@ mod tests {
         assert!(
             !job_targets(&state, "delete").contains(&"parent/inner/one.txt".to_string()),
             "nor may its contents be deleted individually"
+        );
+        assert!(
+            !job_targets(&state, "delete").contains(&"parent/moved/deep".to_string()),
+            "nor a sub-folder under the destination, which delete_v2 would remove recursively"
+        );
+    }
+
+    /// The prefix behaviour of the deletion guards, pinned.
+    ///
+    /// Every deletion test so far reported the **folder** absent, and a folder is an exact
+    /// member of `active_move_paths` — so reverting those guards to `.contains()` left the
+    /// suite green. The hazard they exist for is the other shape: a queued `move d → e` names
+    /// only `d` and `e`, while every descendant is equally mid-relocation, and the watcher
+    /// routinely reports descendants on their own.
+    ///
+    /// This is the test that distinguishes the prefix predicate from the exact match. Without
+    /// it, reverting any of those guards — which this ticket has done by accident five times —
+    /// says nothing.
+    #[test]
+    fn a_descendant_reported_absent_during_a_folder_move_is_not_deleted() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/one.txt"), b"aaa").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("e/one.txt")).unwrap();
+        state.db.upsert_known_folder("d").unwrap();
+        state
+            .db
+            .upsert_local_file("d/one.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", &hash, "rev1", mtime, Some("id:ONE"))
+            .unwrap();
+
+        process_changed_paths(&state, &["d".to_string(), "e".to_string()]).expect("batch 1");
+        assert_eq!(move_jobs(&state), vec![("d".to_string(), "e".to_string())]);
+
+        // A later batch reports only the DESCENDANT absent. It is not in the move set by
+        // name — only its folder is — so an exact-match guard lets it through.
+        process_changed_paths(&state, &["d/one.txt".to_string()]).expect("batch 2");
+
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "a descendant of a folder being moved is not a deletion"
+        );
+        assert!(
+            state.db.get_local_file("d/one.txt").unwrap().is_some(),
+            "and it keeps its row, and therefore its identity"
+        );
+    }
+
+    /// The same shape for the full scan's deletion filters, which walk the whole tree rather
+    /// than a reported batch. `:1170` was pinned; `:1180`, the folder half, was not.
+    #[test]
+    fn a_full_scan_during_a_folder_move_deletes_nothing_under_it() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/one.txt"), b"aaa").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("e/one.txt")).unwrap();
+        state.db.upsert_known_folder("d").unwrap();
+        state.db.upsert_known_folder("d/inner").unwrap();
+        state
+            .db
+            .upsert_local_file("d/one.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", &hash, "rev1", mtime, Some("id:ONE"))
+            .unwrap();
+
+        process_changed_paths(&state, &["d".to_string(), "e".to_string()]).expect("correlate");
+        scan_local_changes_only(&state).expect("scan");
+
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "neither the descendant file nor the sub-folder may be deleted mid-move"
         );
     }
 
