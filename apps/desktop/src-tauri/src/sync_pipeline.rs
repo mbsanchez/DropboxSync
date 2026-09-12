@@ -188,7 +188,7 @@ fn process_local_file_change(
             // equal to the on-disk hash, returns false, and the download overwrites the
             // unuploaded edit with nothing logged. The C1 guard is disarmed by the very act
             // of skipping this branch.
-            if pending_targets.contains(relative) {
+            if covered_by_active_job(relative, pending_targets) {
                 let conflicted_path = create_conflicted_copy(absolute)?;
                 let conflicted_rel = conflicted_path
                     .strip_prefix(tracked_root)
@@ -1160,9 +1160,6 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
         // landing in that window would propagate a remote delete of the very file the move is
         // about to relocate — and `delete_v2` on a folder is recursive.
         let pending = state.db.active_move_paths()?;
-        let move_protected = |rel: &String| -> bool {
-            pending.contains(rel) || pending.iter().any(|p| rel.starts_with(&format!("{p}/")))
-        };
         let file_deletions: Vec<String> = known
             .iter()
             .map(|f| f.relative_path.clone())
@@ -2892,6 +2889,14 @@ mod tests {
         assert!(
             !job_targets(&state, "delete").contains(&"parent/inner".to_string()),
             "a folder with a queued move must not be recursively deleted on Dropbox"
+        );
+        // And its FILES are guarded separately, by the descendant filter rather than the
+        // folder one. The test stopped one assertion short of that branch, which is why
+        // mutating it left the suite green: every other test short-circuits before reaching
+        // it, because the early return fires whenever the reported path is itself covered.
+        assert!(
+            !job_targets(&state, "delete").contains(&"parent/inner/one.txt".to_string()),
+            "nor may its contents be deleted individually"
         );
     }
 

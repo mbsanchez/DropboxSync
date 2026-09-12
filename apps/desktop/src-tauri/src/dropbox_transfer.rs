@@ -752,7 +752,7 @@ fn upload_via_session(
     job_id: i64,
 ) -> AppResult<Option<UploadCommitResponse>> {
     let client = &state.http_client;
-    let mut committed: Option<UploadCommitResponse> = None;
+    let committed: Option<UploadCommitResponse>;
 
     let file_mtime = file
         .metadata()

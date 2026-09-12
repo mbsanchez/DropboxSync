@@ -26,6 +26,15 @@ use crate::state::AppState;
 /// ignores `*.tmp`, so a concurrent scan won't try to upload the aside copy.
 const DEHYDRATE_ASIDE_SUFFIX: &str = ".dbsync-dehydrate.tmp";
 
+/// Does the local index still know this path?
+///
+/// A remote child the app tracks locally is **not** a cloud-only file, however absent it
+/// looks on disk right now. Extracted so the decision can be tested: the sweep around it
+/// begins with a network call, and this is the condition six review rounds converged on.
+pub(crate) fn is_tracked_locally(state: &AppState, relative: &str) -> bool {
+    matches!(state.db.get_local_file(relative), Ok(Some(_)))
+}
+
 pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     state: &AppState,
     remote_folder_path_display: &str,
@@ -135,6 +144,24 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
             let relative = path_display.trim_start_matches('/').to_string();
             if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
+                continue;
+            }
+
+            // DBSYNC-99: a path the local index still tracks is NOT a cloud-only file.
+            //
+            // This sweep decided entirely from the disk — placeholder present, target
+            // present — and consulted no index at all. That is right for a file the app has
+            // never heard of, and wrong for one it is in the middle of moving or deleting:
+            // between a rename and the delete of the vacated source, the source is a remote
+            // child with no local counterpart, so a sidecar was planted for it. The next
+            // scan then found a placeholder at that path, and `process_local_file_deletion`
+            // treats a placeholder as a dehydration — dropping the delete AND the index row
+            // that remembers it. The source stayed on Dropbox forever, the sidecar was
+            // refreshed every cycle, and the user got a duplicate instead of a rename.
+            //
+            // Six review rounds arrived here. Narrowing which deletions were deferred moved
+            // the window without closing it; the sweep's blindness to the index is the root.
+            if is_tracked_locally(state, &relative) {
                 continue;
             }
 

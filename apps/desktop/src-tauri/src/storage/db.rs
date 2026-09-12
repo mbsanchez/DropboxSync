@@ -952,20 +952,6 @@ impl Db {
         Ok(count as usize)
     }
 
-    /// Distinct `target_path` + `source_path` of every ACTIVE job (`queued`,
-    /// `retry_wait`, `running`). DBSYNC-31: replaces the `list_recent_jobs(N)`-based
-    /// dedup, which silently missed jobs once the table exceeded N rows. Backed by the
-    /// `idx_sync_jobs_status_retry` index. Used to avoid enqueuing duplicate work and to
-    /// route a change that races a still-pending job to a conflicted copy.
-
-    /// Every path an active job names, as source or as target.
-    ///
-    /// The UNION of both columns is load-bearing for DBSYNC-99 and not merely thorough: a
-    /// queued `move` names the pre-rename path as its source and the post-rename path as its
-    /// target, and the index is not rewritten until Dropbox confirms the move. So between
-    /// enqueue and drain the index still describes the old world while the disk describes the
-    /// new one, and BOTH paths have to be protected from the scan — the old one from being
-    /// propagated as a deletion, the new one from being uploaded as a stranger.
     /// The paths an active **move** job names, as source or as target.
     ///
     /// Narrower than [`Self::active_job_paths`] and deliberately so. A deletion must be held
@@ -1003,6 +989,21 @@ impl Db {
         Ok(out)
     }
 
+    /// Distinct `target_path` + `source_path` of every ACTIVE job (`queued`,
+    /// `retry_wait`, `running`). DBSYNC-31: replaces the `list_recent_jobs(N)`-based
+    /// dedup, which silently missed jobs once the table exceeded N rows. Backed by the
+    /// `idx_sync_jobs_status_retry` index. Used to avoid enqueuing duplicate work and to
+    /// route a change that races a still-pending job to a conflicted copy.
+    ///
+    /// The UNION of both columns is load-bearing for DBSYNC-99 and not merely thorough: a
+    /// queued `move` names the pre-rename path as its source and the post-rename path as its
+    /// target, and the index is not rewritten until Dropbox confirms the move. So between
+    /// enqueue and drain the index still describes the old world while the disk describes the
+    /// new one, and BOTH paths have to be protected — the old one from being propagated as a
+    /// deletion, the new one from being uploaded as a stranger.
+    ///
+    /// Consumers must ask with `covered_by_active_job`, never `.contains()`: the hazard is
+    /// prefix-shaped and this set holds only the two folder paths.
     pub fn active_job_paths(&self) -> AppResult<std::collections::HashSet<String>> {
         let conn = self
             .read

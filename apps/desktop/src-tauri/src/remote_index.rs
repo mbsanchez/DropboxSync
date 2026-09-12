@@ -350,7 +350,7 @@ fn reconcile_remote_snapshot_with_breaker(
     for local in local_files {
         let rel = &local.relative_path;
         if rel.ends_with(".cloudsc")
-            || crate::sync_pipeline::covered_by_active_job(rel, &pending_targets)
+            || crate::sync_pipeline::covered_by_active_job(rel, pending_targets)
         {
             continue;
         }
@@ -411,7 +411,7 @@ fn remote_sweep_delete_candidates(
     for local in local_files {
         let rel = &local.relative_path;
         if rel.ends_with(".cloudsc")
-            || crate::sync_pipeline::covered_by_active_job(rel, &pending_targets)
+            || crate::sync_pipeline::covered_by_active_job(rel, pending_targets)
         {
             continue;
         }
@@ -1092,6 +1092,41 @@ mod tests {
             job_targets(&state, "local_delete").is_empty(),
             "and least of all a local delete, which costs the descendant its identity"
         );
+    }
+
+    /// Round 6's critical, and the end of a chain six rounds long.
+    ///
+    /// When a move comes back not-applicable the job completes, nothing is rewritten, and
+    /// Dropbox still holds the source. The materialization sweep then saw a remote child with
+    /// no local counterpart and planted a `.cloudsc` sidecar — consulting **no index at all**.
+    /// The next scan found a placeholder at that path, and `process_local_file_deletion`
+    /// treats a placeholder as a dehydration: it dropped the delete *and* the index row that
+    /// remembered it. The source stayed on Dropbox forever and the user got a duplicate.
+    ///
+    /// Rounds 5 and 6 both tried to fix this by choosing which deletions to defer. That moved
+    /// the window without closing it. The root is the sweep's blindness, and this is the
+    /// condition that ends it: **a path the local index still tracks is not a cloud-only
+    /// file**, however absent it looks on disk.
+    #[test]
+    fn a_path_the_index_still_tracks_is_never_a_cloud_only_file() {
+        let state = build_state();
+
+        // Mid-move: the index still names the source, the disk does not.
+        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
+        assert!(
+            crate::cloudsc_ops::is_tracked_locally(&state, "old.txt"),
+            "the sweep must not plant a sidecar over a path the app is still working on"
+        );
+
+        // A path the app has genuinely never heard of is what the sweep is for.
+        assert!(
+            !crate::cloudsc_ops::is_tracked_locally(&state, "never-seen.txt"),
+            "and it must still materialize files the index does not know"
+        );
+
+        // Once the deletion has drained and the row is gone, the path becomes eligible again.
+        state.db.remove_local_file("old.txt").unwrap();
+        assert!(!crate::cloudsc_ops::is_tracked_locally(&state, "old.txt"));
     }
 
     #[test]
