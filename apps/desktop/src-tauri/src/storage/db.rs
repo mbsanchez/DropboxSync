@@ -598,14 +598,20 @@ impl Db {
             "UPDATE sync_conflicts SET remote_path = ?2 WHERE remote_path = ?1",
             params![old_path, new_path],
         )?;
+        // `job_type <> 'move'` is not an optimisation. A move job's two paths describe an
+        // OPERATION — move this from here to there — not where an item currently lives, so
+        // rewriting them corrupts the instruction. Rewriting the `source_path` of the very
+        // move being enqueued collapses it to "move X to X", which Dropbox rejects as not
+        // applicable and the job is dropped, leaving the local index pointing at a path the
+        // server does not have. Measured on a real install, not imagined.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND status IN ('queued','retry_wait','running')",
+             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
             params![old_path, new_path, now],
         )?;
         tx.execute(
             "UPDATE sync_jobs SET source_path = ?2, updated_at = ?3 \
-             WHERE source_path = ?1 AND status IN ('queued','retry_wait','running')",
+             WHERE source_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
             params![old_path, new_path, now],
         )?;
         tx.commit()?;
@@ -665,19 +671,21 @@ impl Db {
             )?;
         }
 
-        for (table, column) in [
-            ("sync_conflicts", "local_path"),
-            ("sync_conflicts", "remote_path"),
-            ("sync_jobs", "source_path"),
+        // See `move_index_row`: a move job's paths are an instruction, not a location, so
+        // they are excluded from every rewrite below.
+        for (table, column, guard) in [
+            ("sync_conflicts", "local_path", ""),
+            ("sync_conflicts", "remote_path", ""),
+            ("sync_jobs", "source_path", " AND job_type <> 'move'"),
         ] {
             tx.execute(
-                &format!("UPDATE OR IGNORE {table} SET {column} = ?2 WHERE {column} = ?1"),
+                &format!("UPDATE OR IGNORE {table} SET {column} = ?2 WHERE {column} = ?1{guard}"),
                 params![old_prefix, new_prefix],
             )?;
             tx.execute(
                 &format!(
                     "UPDATE OR IGNORE {table} SET {column} = ?2 || substr({column}, ?3) \
-                     WHERE {column} LIKE ?1 ESCAPE '!'"
+                     WHERE {column} LIKE ?1 ESCAPE '!'{guard}"
                 ),
                 params![child_pattern, new_prefix, tail_start],
             )?;
@@ -687,12 +695,12 @@ impl Db {
         // rather than aborting the rewrite — both rows describe the same work.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND status IN ('queued','retry_wait','running')",
+             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
             params![old_prefix, new_prefix, now],
         )?;
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || substr(target_path, ?4), updated_at = ?3 \
-             WHERE target_path LIKE ?1 ESCAPE '!' AND status IN ('queued','retry_wait','running')",
+             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
             params![child_pattern, new_prefix, now, tail_start],
         )?;
 

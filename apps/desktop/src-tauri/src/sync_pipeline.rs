@@ -391,20 +391,30 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     // Pass three: act. Directories first, so their contents are already accounted for by
     // the time the per-file passes run.
     for (old, new) in &dir_moves {
-        state.db.enqueue_job("move", Some(old), Some(new))?;
-        // ONE job and ONE subtree rewrite, however many children there are. A per-child
-        // loop here would reach the same end state while delivering none of the benefit.
+        // ONE subtree rewrite, however many children there are. A per-child loop here
+        // would reach the same end state while delivering none of the benefit.
+        //
+        // The rewrite happens BEFORE the job is enqueued, and the order is load-bearing:
+        // `move_index_subtree` retargets active jobs that name the old path, so a move job
+        // enqueued first would have had its own `source_path` rewritten to the destination
+        // and would ask Dropbox to move the folder to where it already is.
         state.db.move_index_subtree(old, new)?;
+        state.db.enqueue_job("move", Some(old), Some(new))?;
         pending_targets.insert(new.clone());
         enqueued += 1;
         tracing::info!(from = %old, to = %new, "directory rename detected: enqueued one move for the whole subtree");
     }
 
     for (old, new) in &moves {
-        state.db.enqueue_job("move", Some(old), Some(new))?;
         // The row TRAVELS — identity, content hash, rev and Dropbox id all come with it,
         // instead of the old row being dropped and a fresh one created under the new name.
+        //
+        // The rewrite happens BEFORE the job is enqueued, and the order is load-bearing:
+        // `move_index_row` retargets active jobs that name the old path, so a move job
+        // enqueued first would have had its own `source_path` rewritten to the destination
+        // and would ask Dropbox to move the file to where it already is.
         state.db.move_index_row(old, new)?;
+        state.db.enqueue_job("move", Some(old), Some(new))?;
         pending_targets.insert(new.clone());
         enqueued += 1;
         tracing::info!(from = %old, to = %new, "rename detected: enqueued a move instead of a delete plus a full upload");
@@ -1811,6 +1821,29 @@ mod tests {
         std::path::PathBuf::from(state.db.get_sync_folder().unwrap().unwrap())
     }
 
+    /// Both paths of every move job, as `(source, target)`.
+    ///
+    /// `job_targets` reads only `target_path`, and that blind spot let a real defect
+    /// through: a move was enqueued with the right target and a `source_path` that had been
+    /// rewritten to the same value, asking Dropbox to move a file to where it already was.
+    /// Every assertion about a move must therefore look at both halves — a job that exists
+    /// and points at the right destination is not the same as a job that is well formed.
+    fn move_jobs(state: &AppState) -> Vec<(String, String)> {
+        state
+            .db
+            .list_recent_jobs(500)
+            .expect("jobs")
+            .into_iter()
+            .filter(|j| j.job_type == "move")
+            .map(|j| {
+                (
+                    j.source_path.unwrap_or_default(),
+                    j.target_path.unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
     fn job_targets(state: &AppState, job_type: &str) -> Vec<String> {
         state
             .db
@@ -1895,7 +1928,11 @@ mod tests {
 
         // One move, not two jobs.
         assert_eq!(n, 1);
-        assert_eq!(job_targets(&state, "move"), vec!["new.txt".to_string()]);
+        // Both halves. A move whose source equals its target is a no-op Dropbox rejects.
+        assert_eq!(
+            move_jobs(&state),
+            vec![("old.txt".to_string(), "new.txt".to_string())]
+        );
         assert!(
             job_targets(&state, "delete").is_empty(),
             "nothing is deleted"
@@ -2106,7 +2143,11 @@ mod tests {
 
         // ONE job. Not one per child, and not one per child plus the folder.
         assert_eq!(n, 1, "a folder rename must cost what a file rename costs");
-        assert_eq!(job_targets(&state, "move"), vec!["e".to_string()]);
+        assert_eq!(
+            move_jobs(&state),
+            vec![("d".to_string(), "e".to_string())],
+            "one move, and it must name where the folder came FROM as well as where it went"
+        );
         assert!(job_targets(&state, "delete").is_empty());
         assert!(
             job_targets(&state, "upload").is_empty(),
