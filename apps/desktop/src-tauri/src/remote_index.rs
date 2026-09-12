@@ -984,6 +984,49 @@ mod tests {
         assert_eq!(state.db.list_known_folders().unwrap(), vec!["e"]);
     }
 
+    /// DBSYNC-99, found by manual QA against a live account rather than by any test here.
+    ///
+    /// Nothing wrote a `remote_file_index` row on the upload success path, so after a real
+    /// upload there was no remote row until the next full sweep — and the content-agreement
+    /// guard needs one, so a rename inside that window fell back to a delete plus a full
+    /// re-upload and minted a fresh identity. The window is exactly when a user renames
+    /// something: just after creating it.
+    #[test]
+    fn an_upload_records_what_dropbox_says_it_now_holds() {
+        let state = build_state();
+        // The real shape of a `files/upload` 200, captured on 2026-09-11.
+        let raw = r#"{
+            "client_modified": "2026-09-11T16:08:30Z",
+            "content_hash": "300e2819c817c3c5b767493bcef06813052d3526c9353756b99b445015ed2e18",
+            "id": "id:eTyPGjL6NDAAAAAAAAABwg",
+            "name": "a.txt",
+            "path_display": "/qa/a.txt",
+            "rev": "65b374ba88e8456342f44",
+            "server_modified": "2026-09-11T16:08:30Z",
+            "size": 22
+        }"#;
+        // No `.tag` — this is the real shape, and parsing it as a `DropboxEntry` fails.
+        let entry: crate::models::UploadCommitResponse = serde_json::from_str(raw).expect("parse");
+        crate::dropbox_transfer::record_upload_result(&state, "qa/a.txt", Some(entry));
+
+        let row = state
+            .db
+            .get_remote_file("qa/a.txt")
+            .expect("get")
+            .expect("the row must exist the moment the upload commits");
+        assert_eq!(
+            row.content_hash,
+            "300e2819c817c3c5b767493bcef06813052d3526c9353756b99b445015ed2e18"
+        );
+        assert_eq!(row.rev, "65b374ba88e8456342f44");
+        assert_eq!(row.dropbox_id.as_deref(), Some("id:eTyPGjL6NDAAAAAAAAABwg"));
+
+        // An unparseable response must not write a row and must not panic — the bytes are
+        // already on Dropbox, so failing here would re-upload a file that is already there.
+        crate::dropbox_transfer::record_upload_result(&state, "qa/b.txt", None);
+        assert!(state.db.get_remote_file("qa/b.txt").expect("get").is_none());
+    }
+
     #[test]
     fn delta_action_classifies_file_deleted_folder_and_invalid() {
         match delta_action_from_entry(&file_entry(Some("/A/b.txt"), Some("h"), Some("r"), None)) {

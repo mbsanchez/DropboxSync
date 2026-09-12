@@ -12,7 +12,7 @@ use crate::auth_session::get_access_token;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     DropboxListFolderResponse, ListRemoteFolderResponse, MoveV2Response, RemoteEntry,
-    SyncConflictEvent, UploadProgressEvent, UploadSessionStartResponse,
+    SyncConflictEvent, UploadCommitResponse, UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
     create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed,
@@ -448,7 +448,7 @@ fn finish_upload_session(
     offset: u64,
     dropbox_path: &str,
     last_chunk: &[u8],
-) -> AppResult<()> {
+) -> AppResult<Option<UploadCommitResponse>> {
     let resp = client
         .post("https://content.dropboxapi.com/2/files/upload_session/finish")
         .bearer_auth(token)
@@ -485,7 +485,11 @@ fn finish_upload_session(
         });
     }
 
-    Ok(())
+    // The commit response is the file's metadata, carrying the `id`, `rev` and
+    // `content_hash` Dropbox just assigned. Returned rather than discarded so the caller can
+    // record the remote row — see `upload_local_file_internal`. Best-effort: a parse failure
+    // must never fail an upload that has already committed.
+    Ok(resp.json::<UploadCommitResponse>().ok())
 }
 
 /// Pure boundary check: is the chunk just read (`bytes_read` bytes, starting
@@ -746,8 +750,9 @@ fn upload_via_session(
     len: u64,
     dropbox_path: &str,
     job_id: i64,
-) -> AppResult<()> {
+) -> AppResult<Option<UploadCommitResponse>> {
     let client = &state.http_client;
+    let mut committed: Option<UploadCommitResponse> = None;
 
     let file_mtime = file
         .metadata()
@@ -800,9 +805,10 @@ fn upload_via_session(
                 finish_upload_session(client, token, &session_id, chunk_offset, dropbox_path, &[])
             });
             match result {
-                Ok(()) => {
+                Ok(meta) => {
                     state.db.clear_upload_checkpoint(job_id)?;
                     emit_upload_progress(dropbox_path, offset, len);
+                    committed = meta;
                     break;
                 }
                 Err(e) if !restarted && e.is_session_invalid() => {
@@ -838,10 +844,11 @@ fn upload_via_session(
                 )
             });
             match result {
-                Ok(()) => {
+                Ok(meta) => {
                     offset += n as u64;
                     state.db.clear_upload_checkpoint(job_id)?;
                     emit_upload_progress(dropbox_path, offset, len);
+                    committed = meta;
                     break;
                 }
                 Err(e) if !restarted && e.is_session_invalid() => {
@@ -899,7 +906,7 @@ fn upload_via_session(
         }
     }
 
-    Ok(())
+    Ok(committed)
 }
 
 pub(crate) fn upload_local_file_internal(
@@ -1034,13 +1041,58 @@ pub(crate) fn upload_local_file_internal(
                     message: format!("upload for {dropbox_path}: {body}"),
                 });
             }
+            record_upload_result(state, relative, resp.json::<UploadCommitResponse>().ok());
         }
         UploadStrategy::Session => {
-            upload_via_session(state, &token, file, len, &dropbox_path, job_id)?;
+            let committed = upload_via_session(state, &token, file, len, &dropbox_path, job_id)?;
+            record_upload_result(state, relative, committed);
         }
     }
 
     Ok(())
+}
+
+/// Record what Dropbox says it now holds, immediately after an upload commits.
+///
+/// **Found by manual QA, not by a test.** Nothing used to write a `remote_file_index` row on
+/// the success path — only the skip-if-identical early return did — so after a real upload
+/// there was no remote row until the next full sweep. DBSYNC-99's content-agreement guard
+/// requires one, so it correctly refused to correlate, and a rename inside that window fell
+/// back to a delete plus a full re-upload and minted a fresh identity. Measured on a live
+/// account: the same file renamed twice, delete-plus-upload before a sweep and a clean move
+/// after, identity 10 → 11 in the first case and preserved in the second.
+///
+/// The window is exactly when a user is most likely to rename something — just after creating
+/// it. Slice 1 recorded that `files/upload` returns the full metadata including the `id`, and
+/// slice 2 deferred using it on the grounds that the sweep fills the row eventually. It does;
+/// arriving late is the defect.
+///
+/// Best-effort throughout: the bytes are already on Dropbox, and failing the job here would
+/// re-upload a file that is already there.
+pub(crate) fn record_upload_result(
+    state: &AppState,
+    relative: &str,
+    committed: Option<UploadCommitResponse>,
+) {
+    let Some(entry) = committed else {
+        tracing::warn!(rel = %relative, "upload committed but its metadata could not be parsed; the remote row waits for the next sweep");
+        return;
+    };
+    let (Some(hash), Some(rev)) = (entry.content_hash.as_deref(), entry.rev.as_deref()) else {
+        return;
+    };
+    let modified_ts = entry
+        .server_modified
+        .as_deref()
+        .map(crate::remote_index::parse_rfc3339_ts_to_unix)
+        .unwrap_or(0);
+    if let Err(e) =
+        state
+            .db
+            .upsert_remote_file(relative, hash, rev, modified_ts, entry.id.as_deref())
+    {
+        tracing::warn!(rel = %relative, error = %e, "upload committed but the remote row could not be recorded");
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
