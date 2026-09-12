@@ -936,6 +936,71 @@ mod tests {
             .collect()
     }
 
+    /// C1, the worst defect this ticket produced: **a move that Dropbox refused deleted the
+    /// user's file.**
+    ///
+    /// The index is rewritten when the move is enqueued, so by the time the job runs and is
+    /// told "not applicable" the local row at the destination already holds the hash of the
+    /// bytes on disk and the remote row already claims Dropbox holds them. The local scan
+    /// then sees nothing to upload, and this function matches `local.hash ==
+    /// prev.content_hash` and enqueues a `local_delete` of the file the user just renamed.
+    /// The comment at the drop site said the next scan would re-derive the work; there was
+    /// nothing left to re-derive.
+    ///
+    /// The first half of this test is the defect, reproduced. The second is the repair.
+    #[test]
+    fn a_refused_move_must_not_cost_the_user_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("synced");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let seed = |state: &AppState| {
+            std::fs::write(root.join("new.txt"), b"hello").unwrap();
+            let (hash, size, mtime) = crate::path_util::hash_file(&root.join("new.txt")).unwrap();
+            state.db.set_sync_folder(&root.to_string_lossy()).unwrap();
+            state
+                .db
+                .upsert_local_file("new.txt", &hash, size, mtime)
+                .unwrap();
+            state
+                .db
+                .upsert_remote_file("new.txt", &hash, "rev1", mtime, Some("id:OLD"))
+                .unwrap();
+        };
+
+        // Without the undo: Dropbox does not have `new.txt`, and the sweep deletes it locally.
+        let unrepaired = build_state();
+        seed(&unrepaired);
+        reconcile_remote_absent(&unrepaired, "new.txt").unwrap();
+        assert_eq!(
+            job_targets(&unrepaired, "local_delete"),
+            vec!["new.txt".to_string()],
+            "this is the defect: without the undo the renamed file is deleted"
+        );
+
+        // With it: no deletion, and the bytes are queued to go up instead.
+        let repaired = build_state();
+        seed(&repaired);
+        crate::dropbox_transfer::undo_move_index_rewrite(&repaired, "old.txt", "new.txt").unwrap();
+        reconcile_remote_absent(&repaired, "new.txt").unwrap();
+        assert!(
+            job_targets(&repaired, "local_delete").is_empty(),
+            "the user's file must not be deleted"
+        );
+        assert_eq!(
+            job_targets(&repaired, "delete"),
+            vec!["old.txt".to_string()],
+            "and the source, whose index row was rewritten away, must still be reclaimed"
+        );
+        let row = repaired.db.get_local_file("new.txt").unwrap().unwrap();
+        assert_eq!(
+            row.hash,
+            crate::storage::db::Db::HASH_NEEDS_RESCAN,
+            "the row must be marked so the next scan uploads it"
+        );
+        std::mem::forget(dir);
+    }
+
     #[test]
     fn delta_action_classifies_file_deleted_folder_and_invalid() {
         match delta_action_from_entry(&file_entry(Some("/A/b.txt"), Some("h"), Some("r"), None)) {

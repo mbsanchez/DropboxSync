@@ -598,6 +598,13 @@ impl Db {
             "UPDATE sync_conflicts SET remote_path = ?2 WHERE remote_path = ?1",
             params![old_path, new_path],
         )?;
+        // `failed` is in the status set deliberately. It looks transient, but
+        // `requeue_failed_jobs` resets every failed row back to `queued`, so a download that
+        // failed before a rename would be resurrected pointing at the pre-rename path — it
+        // writes the file back under its old name and the next scan uploads it as untracked,
+        // undoing the rename on the server. The partial-unique index only covers active
+        // statuses, so widening the set here cannot collide with it.
+        //
         // `job_type <> 'move'` is not an optimisation. A move job's two paths describe an
         // OPERATION — move this from here to there — not where an item currently lives, so
         // rewriting them corrupts the instruction. Rewriting the `source_path` of the very
@@ -606,12 +613,12 @@ impl Db {
         // server does not have. Measured on a real install, not imagined.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
+             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
             params![old_path, new_path, now],
         )?;
         tx.execute(
             "UPDATE sync_jobs SET source_path = ?2, updated_at = ?3 \
-             WHERE source_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
+             WHERE source_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
             params![old_path, new_path, now],
         )?;
         tx.commit()?;
@@ -632,7 +639,13 @@ impl Db {
     ///
     /// One transaction. A half-rewritten subtree — some children under the new name, some
     /// under the old — would be worse than one that never moved.
-    pub fn move_index_subtree(&self, old_prefix: &str, new_prefix: &str) -> AppResult<()> {
+    ///
+    /// **Returns the number of rows left behind.** `UPDATE OR IGNORE` cannot fail on a
+    /// destination collision, which is what keeps one surprising row from discarding the
+    /// whole watcher batch — but it also means the method used to report `Ok(())` while
+    /// silently orphaning rows that kept their identity at a path no longer on disk. The
+    /// caller decides what a non-zero count means; it is not this method's to swallow.
+    pub fn move_index_subtree(&self, old_prefix: &str, new_prefix: &str) -> AppResult<usize> {
         let old_prefix = old_prefix.replace('\\', "/");
         let new_prefix = new_prefix.replace('\\', "/");
         let escaped = old_prefix
@@ -695,17 +708,26 @@ impl Db {
         // rather than aborting the rewrite — both rows describe the same work.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
+             WHERE target_path = ?1 AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
             params![old_prefix, new_prefix, now],
         )?;
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || substr(target_path, ?4), updated_at = ?3 \
-             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type <> 'move' AND status IN ('queued','retry_wait','running')",
+             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type <> 'move' AND status IN ('queued','retry_wait','running','failed')",
             params![child_pattern, new_prefix, now, tail_start],
         )?;
 
+        // Anything still under the old prefix could not be moved, because the destination
+        // was occupied. Count it before the transaction closes.
+        let stranded: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM local_file_index \
+             WHERE relative_path = ?1 OR relative_path LIKE ?2 ESCAPE '!'",
+            params![old_prefix, child_pattern],
+            |row| row.get(0),
+        )?;
+
         tx.commit()?;
-        Ok(())
+        Ok(stranded.max(0) as usize)
     }
 
     pub fn remove_local_file(&self, relative_path: &str) -> AppResult<()> {
@@ -1640,6 +1662,19 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
         [],
     )?;
 
+    // DBSYNC-99: let the database enforce what the allocator is careful about. Two rows
+    // sharing an `item_id` would make an identifier ambiguous, and DBSYNC-95 will resolve
+    // identifiers to items. Partial, so the rows that predate the column and have not been
+    // back-filled yet do not all collide on NULL.
+    conn.execute(
+        "
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_local_item_id
+          ON local_file_index(item_id)
+          WHERE item_id IS NOT NULL
+        ",
+        [],
+    )?;
+
     // Only ONE active job per (job_type, target_path); DONE/failed history is exempt
     // (partial index), so `enqueue_job`'s ON CONFLICT collapses re-enqueues of the same
     // pending work instead of piling up duplicates.
@@ -2432,14 +2467,6 @@ mod tests {
         );
     }
 
-    /// DBSYNC-40. The `sync_jobs` rebuild is the one migration step that only ever runs on
-    /// **existing installations** — a fresh database gets the CHECK constraints from the
-    /// `CREATE TABLE`, so `sync_jobs_has_check` is true and the DROP/RENAME never executes.
-    ///
-    /// That means the other migration tests, which all start from an empty file, never
-    /// touch it. The branch most likely to break someone's database was the one with no
-    /// coverage, which is the wrong way round — and it is now the branch running inside a
-    /// transaction for the first time.
     /// DBSYNC-99. The first version of the allocator was `MAX(item_id) + 1`, which is
     /// wrong in a way the other identity tests cannot see: rows are deleted here on every
     /// local file deletion, so the maximum falls back and the next file is handed the
@@ -2516,7 +2543,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// DBSYNC-99. `d` and `d-other` share a prefix, so a subtree rewrite that matches on the
     /// bare prefix drags the sibling along with it. `remove_remote_subtree` already carries
     /// a test for exactly this shape; the rewrite needs its own, because it corrupts paths
@@ -2583,7 +2609,6 @@ mod tests {
         assert_eq!(db.list_known_folders().expect("folders"), vec!["e"]);
     }
 
-    #[test]
     /// DBSYNC-99. The writer mints an identity when it touches a path, which covers every
     /// new or changed file and nothing else — a file that simply sits there unchanged is
     /// never written. On a real install that left **every** pre-existing row without one,
@@ -2693,6 +2718,17 @@ mod tests {
         assert_eq!(kept, 1, "existing queued work must survive the rebuild");
     }
 
+    /// DBSYNC-40. The `sync_jobs` rebuild is the one migration step that only ever runs on
+    /// **existing installations** — a fresh database gets the CHECK constraints from the
+    /// `CREATE TABLE`, so the guard is satisfied and the DROP/RENAME never executes.
+    ///
+    /// That means the other migration tests, which all start from an empty file, never
+    /// touch it. The branch most likely to break someone's database was the one with no
+    /// coverage, which is the wrong way round — and it is now the branch running inside a
+    /// transaction for the first time.
+    ///
+    /// (Restored: inserting a DBSYNC-99 test above this one detached this comment from the
+    /// test it describes, leaving it documenting an unrelated one. Caught in review.)
     #[test]
     fn migrate_rebuilds_a_legacy_sync_jobs_table_inside_the_transaction() {
         let path = unique_db_path();

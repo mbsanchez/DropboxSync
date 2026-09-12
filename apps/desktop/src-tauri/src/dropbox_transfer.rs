@@ -11,8 +11,8 @@ use tauri::{Emitter, EventTarget};
 use crate::auth_session::get_access_token;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DropboxListFolderResponse, ListRemoteFolderResponse, RemoteEntry, SyncConflictEvent,
-    UploadProgressEvent, UploadSessionStartResponse,
+    DropboxListFolderResponse, ListRemoteFolderResponse, MoveV2Response, RemoteEntry,
+    SyncConflictEvent, UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
     create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed,
@@ -1054,15 +1054,21 @@ pub(crate) enum DeleteOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MoveOutcome {
     Moved,
-    /// The move cannot succeed and retrying will not change that, but the desired end
-    /// state is reachable another way: drop the move and let the scan re-derive the work
-    /// as an upload plus a delete — the behaviour that existed before this ticket.
+    /// The move cannot succeed and retrying will not change that. The desired end state is
+    /// still reachable, but **only because the caller undoes the index rewrite** — see
+    /// [`move_remote_file_internal`]. An earlier version of this doc said the next scan
+    /// re-derives the work; it does not, and believing it cost a data-loss defect.
     ///
-    /// Two shapes, both observed live on 2026-09-11 and both HTTP 409, which is why this
+    /// Two shapes were observed live on 2026-09-11, both HTTP 409, which is why this
     /// classifier reads the body and not the status code:
     /// - `from_lookup/not_found` — the source is gone. Someone else moved or deleted it.
     /// - `to/conflict` — the destination is occupied. `autorename` is off deliberately;
     ///   letting Dropbox pick a different name would silently desynchronise the two sides.
+    ///
+    /// The rest are from `RelocationError` and are permanent for the same reason, so they
+    /// take the same fallback rather than retrying to exhaustion and ending `failed` with
+    /// the index already rewritten. `too_many_files` is the one a user will actually hit:
+    /// `move_v2` is capped at 10,000 files, so a large folder rename lands here.
     NotApplicable,
     /// Anything else on a failure status.
     Error,
@@ -1079,13 +1085,45 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
     if status_success {
         return MoveOutcome::Moved;
     }
-    if body.contains("from_lookup/not_found") {
-        return MoveOutcome::NotApplicable;
-    }
-    if body.contains("to/conflict") {
+    const PERMANENT: [&str; 8] = [
+        "from_lookup/not_found",
+        "to/conflict",
+        "from_write/conflict",
+        "too_many_files",
+        "cant_move_shared_folder",
+        "cant_nest_shared_folder",
+        "duplicated_or_nested_paths",
+        "insufficient_quota",
+    ];
+    if PERMANENT.iter().any(|marker| body.contains(marker)) {
         return MoveOutcome::NotApplicable;
     }
     MoveOutcome::Error
+}
+
+/// Put the index back the way it was before a move that turned out to be impossible, and
+/// fall back to the upload-plus-delete a rename cost before DBSYNC-99.
+///
+/// Separated from the network call so the recovery is unit-testable — the failure it
+/// repairs was data loss, and the network path around it can only be exercised by hand.
+///
+/// Three steps, none of them optional:
+/// - **Drop the remote row.** With it present, `reconcile_remote_absent` matches
+///   `local.hash == prev.content_hash` and enqueues a `local_delete` of the user's file.
+///   Without it, that function takes its "never indexed remotely" early return.
+/// - **Mark the local row for rescan.** The row currently holds the hash of the bytes on
+///   disk, so the scan would see nothing to do. The DBSYNC-56 marker makes it upload.
+/// - **Delete the source.** Its content now lives at the destination, and the row that
+///   pointed at it was rewritten away, so nothing else will ever reclaim it.
+pub(crate) fn undo_move_index_rewrite(
+    state: &AppState,
+    from_relative: &str,
+    to_relative: &str,
+) -> AppResult<()> {
+    state.db.remove_remote_file(to_relative)?;
+    state.db.mark_local_file_for_rescan(to_relative)?;
+    state.db.enqueue_delete_job(from_relative, None)?;
+    Ok(())
 }
 
 /// Performs a live `files/move_v2` call. Manual-QA-only for the network path; the
@@ -1122,6 +1160,40 @@ pub(crate) fn move_remote_file_internal(
         })?;
 
     if resp.status().is_success() {
+        // Refresh the row from the response rather than letting it carry the pre-move
+        // `rev`. Dropbox changes `rev` on a move while `content_hash` and `id` stay put —
+        // this ticket measured that and then discarded the body that says so, and a stale
+        // `rev` is not inert: `process_local_file_deletion` passes it as `delete_parent_rev`,
+        // a mismatched parent_rev makes `delete_v2` answer `path_write/conflict`, and
+        // `classify_delete_response` maps that to AlreadyGoneOrConflict — so the job is
+        // dropped as a no-op, the local row goes, Dropbox keeps the file, and the next sweep
+        // downloads it back. The user's deletion undoes itself. "Rename a file, then think
+        // better of it and delete it" is ordinary behaviour, not a corner.
+        //
+        // Best-effort: the move itself succeeded, and failing the job here would retry a
+        // move that is already done.
+        match resp.json::<MoveV2Response>() {
+            Ok(parsed) => {
+                let m = parsed.metadata;
+                if let (Some(hash), Some(rev)) = (m.content_hash.as_deref(), m.rev.as_deref()) {
+                    let ts = m
+                        .server_modified
+                        .as_deref()
+                        .map(crate::remote_index::parse_rfc3339_ts_to_unix)
+                        .unwrap_or(0);
+                    if let Err(e) =
+                        state
+                            .db
+                            .upsert_remote_file(to_relative, hash, rev, ts, m.id.as_deref())
+                    {
+                        tracing::warn!(rel = %to_relative, error = %e, "move succeeded but the remote row could not be refreshed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(rel = %to_relative, error = %e, "move succeeded but its metadata could not be parsed; the recorded rev is now stale")
+            }
+        }
         return Ok(());
     }
 
@@ -1131,10 +1203,28 @@ pub(crate) fn move_remote_file_internal(
         .unwrap_or_else(|_| "<unreadable body>".to_string());
     match classify_move_response(false, &body) {
         MoveOutcome::NotApplicable => {
-            tracing::info!(
+            // UNDO the index rewrite, which happened back when the move was enqueued.
+            //
+            // Simply dropping the job here used to DELETE THE USER'S FILE. The index had
+            // already been moved, so the local row at the destination held the hash of the
+            // bytes on disk and the remote row claimed Dropbox held them too. The local
+            // scan therefore saw nothing to upload, and the remote sweep saw the
+            // destination absent on Dropbox, matched `local.hash == prev.content_hash` in
+            // `reconcile_remote_absent`, and enqueued a `local_delete` of the file the user
+            // had just renamed. Reproduced; the comment that used to sit here claimed the
+            // next scan would re-derive the work, and there was nothing left to re-derive.
+            //
+            // Dropping the remote row makes `reconcile_remote_absent` take its "never
+            // indexed remotely" early return instead of the delete arm, and the rescan
+            // marker (DBSYNC-56) makes the next local scan enqueue the upload. Deleting the
+            // source completes the fallback this outcome is named for: an upload plus a
+            // delete, which is exactly what a rename cost before this ticket.
+            undo_move_index_rewrite(state, from_relative, to_relative)?;
+            tracing::warn!(
                 from = %from_relative,
                 to = %to_relative,
-                "remote move not applicable (source gone or destination taken) — dropping job; the next scan re-derives the work"
+                body = %body,
+                "remote move not applicable — undid the index rewrite and fell back to upload plus delete"
             );
             Ok(())
         }

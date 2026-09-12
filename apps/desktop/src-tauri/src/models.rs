@@ -66,6 +66,14 @@ pub(crate) struct DropboxLongpollResponse {
     pub backoff: Option<u64>,
 }
 
+/// The 200 body of `files/move_v2` and `files/create_folder_v2`: the moved item's
+/// metadata under a `metadata` key (DBSYNC-99). Reusing `DropboxEntry` for the inner
+/// value means a `rev` change on a move is recorded rather than discarded.
+#[derive(Deserialize)]
+pub(crate) struct MoveV2Response {
+    pub metadata: DropboxEntry,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct DropboxEntry {
     #[serde(rename = ".tag")]

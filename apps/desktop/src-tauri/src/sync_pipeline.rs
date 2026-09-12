@@ -378,13 +378,22 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             .any(|d| path == d || path.starts_with(&format!("{d}/")))
     };
 
-    let moves = correlate_renames(
+    let mut moves = correlate_renames(
         state,
         &known_map,
         &vanished,
         &present_files,
         &pending_targets,
     )?;
+    // A child of a folder that is itself moving travels with it. Enqueueing both is not
+    // merely redundant: job order is `ORDER BY id ASC`, so if the folder move takes one
+    // transient failure and backs off into `retry_wait`, the child move becomes due first
+    // and creates the destination — after which the folder move retries into `to/conflict`
+    // and is dropped, leaving the old folder on Dropbox with no index row pointing at it.
+    // The upload and delete passes were already filtered this way; the move pass was not.
+    moves.retain(|(old, new)| {
+        !under_moved_dir(old, &dir_moved_from) && !under_moved_dir(new, &dir_moved_to)
+    });
     let moved_from: HashSet<&str> = moves.iter().map(|(old, _)| old.as_str()).collect();
     let moved_to: HashSet<&str> = moves.iter().map(|(_, new)| new.as_str()).collect();
 
@@ -398,7 +407,18 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         // `move_index_subtree` retargets active jobs that name the old path, so a move job
         // enqueued first would have had its own `source_path` rewritten to the destination
         // and would ask Dropbox to move the folder to where it already is.
-        state.db.move_index_subtree(old, new)?;
+        let stranded = state.db.move_index_subtree(old, new)?;
+        if stranded > 0 {
+            // The destination was occupied for some descendants, so the subtree did not
+            // travel whole. Say so: those rows keep their identity at a path that is no
+            // longer on disk, and nothing else will notice.
+            tracing::warn!(
+                from = %old,
+                to = %new,
+                stranded,
+                "directory move left index rows behind — the destination was already occupied"
+            );
+        }
         state.db.enqueue_job("move", Some(old), Some(new))?;
         pending_targets.insert(new.clone());
         enqueued += 1;
@@ -526,11 +546,14 @@ fn correlate_directory_renames(
             continue; // not a directory we were tracking
         }
         let prefix = format!("{old}/");
-        let descendants: Vec<&str> = known
+        let descendants: Vec<(&str, i64)> = known
             .iter()
-            .map(|row| row.relative_path.as_str())
-            .filter(|p| p.starts_with(&prefix))
-            .filter(|p| !p.ends_with(".cloudsc") && !is_ignored_local_path(p))
+            .filter(|row| row.relative_path.starts_with(&prefix))
+            .filter(|row| {
+                !row.relative_path.ends_with(".cloudsc")
+                    && !is_ignored_local_path(&row.relative_path)
+            })
+            .map(|row| (row.relative_path.as_str(), row.size_bytes))
             .collect();
         if descendants.is_empty() {
             continue;
@@ -540,17 +563,44 @@ fn correlate_directory_renames(
             if claimed_new.contains(new.as_str()) || new == old {
                 continue;
             }
-            let all_present = descendants.iter().all(|p| {
-                let tail = &p[prefix.len()..];
-                matches!(classify_path(&new_absolute.join(tail)), Ok(PathKind::File))
+            // A rename destination cannot be a folder we were ALREADY tracking — that is a
+            // different folder that happens to contain files with matching names. This is
+            // the direct analogue of the `known_map.contains_key(rel)` check the file
+            // correlator has, and its absence let `d` and `e` — two real folders, each with
+            // its own `README.md` — be paired as a rename: `d`'s deletion was suppressed so
+            // it was never deleted on Dropbox, a bogus move was enqueued, and `d`'s rows
+            // were orphaned in the index. Single-child folders are the common case.
+            if known_folders.iter().any(|f| f == new) {
+                continue;
+            }
+            // Every tracked descendant must turn up under the new name AND be the same
+            // size. Matching on names alone paired unrelated folders. Size is already in
+            // `FileIndexRow` and each child is being stat-ed here anyway, so this is the
+            // same I/O — it just stops throwing away half of what the stat returned.
+            // Hashing would be stronger and is still deliberately avoided: it would cost
+            // what the re-upload being avoided costs.
+            let all_present = descendants.iter().all(|(child, size_bytes)| {
+                let tail = &child[prefix.len()..];
+                match std::fs::symlink_metadata(new_absolute.join(tail)) {
+                    Ok(m) => m.is_file() && m.len() == *size_bytes as u64,
+                    Err(_) => false,
+                }
             });
             if !all_present {
                 continue;
             }
-            // Dropbox must already hold the folder, for the same reason a file move needs a
-            // remote row: there is nothing to move otherwise. A folder it has never seen is
-            // created implicitly by uploading its contents.
-            if state.db.get_remote_file(descendants[0])?.is_none() {
+            // Dropbox must already hold EVERY descendant, for the same reason a file move
+            // needs one: there is nothing to move otherwise. Checking only the first let a
+            // folder through whose fifth child had never been uploaded — its local row would
+            // be rewritten to the new path while its failed upload job still named the old.
+            let mut all_remote = true;
+            for (child, _) in &descendants {
+                if state.db.get_remote_file(child)?.is_none() {
+                    all_remote = false;
+                    break;
+                }
+            }
+            if !all_remote {
                 continue;
             }
             claimed_new.insert(new.as_str());
@@ -602,13 +652,20 @@ fn correlate_renames(
         if row.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
             continue;
         }
-        // Dropbox cannot move what it has never received. Without a `remote_file_index`
-        // row the item exists only locally — a file created and renamed before its first
-        // upload drained — and asking for a move would fail `from_lookup/not_found` while
-        // the upload it actually needs was never enqueued. Let it fall through to the
-        // upload-plus-no-op-delete path, which reaches the right end state.
-        if state.db.get_remote_file(rel)?.is_none() {
-            continue;
+        // Dropbox must hold THESE BYTES, not merely a file at this path.
+        //
+        // Asking only whether a `remote_file_index` row exists was a data-loss defect, and
+        // a regression against the behaviour this ticket replaced. `process_local_file_change`
+        // writes the local row at enqueue time, so between an edit and a successful upload
+        // the local hash runs ahead of the remote one; if that upload reaches `failed` it
+        // leaves `active_job_paths` and the `pending_targets` guard below stops firing.
+        // Dropbox would then move the OLD content to the new path, after which the local
+        // scan sees disk == index and the remote sweep sees server == remote-index, so
+        // nothing ever notices the edit was lost. The delete-plus-upload this replaced was
+        // wasteful, but it preserved those bytes.
+        match state.db.get_remote_file(rel)? {
+            Some(remote) if remote.content_hash == row.hash => {}
+            _ => continue,
         }
         // Queued work already names this path, and a move reorders the world underneath
         // it: `move_index_row` retargets that job to the new name, and if it drains before
@@ -632,6 +689,16 @@ fn correlate_renames(
     for (rel, absolute) in present_files {
         if known_map.contains_key(rel) {
             continue; // already tracked under this very name, so it did not move here
+        }
+        // The destination must be free in BOTH indexes. Checking only the local one let a
+        // path that Dropbox holds but which has not been downloaded yet — a remote row with
+        // no local row — through to `move_index_row`, whose bare UPDATE then hit a UNIQUE
+        // violation on `remote_file_index`. The transaction rolled back correctly, but the
+        // error propagated out of `process_changed_paths` and discarded EVERY other path in
+        // the batch: deletes, uploads, folder discovery. Refusing the pair here keeps the
+        // bare UPDATE free to fail loudly on a genuine surprise.
+        if state.db.get_remote_file(rel)?.is_some() {
+            continue;
         }
         // Never hash a Windows dehydrated placeholder — opening it triggers a download
         // (DBSYNC-59). It is cloud-only content, not a rename destination.
@@ -2016,6 +2083,230 @@ mod tests {
         assert!(job_targets(&state, "upload").contains(&"new.txt".to_string()));
     }
 
+    // -----------------------------------------------------------------------------------
+    // Regressions from the DBSYNC-99 code review. Every one of these reproduced a defect
+    // that green CI and a passing manual QA were both blind to.
+    // -----------------------------------------------------------------------------------
+
+    /// C3. The correlator used to ask only whether a remote row EXISTED. Between an edit
+    /// and a successful upload the local hash runs ahead of the remote one, and once that
+    /// upload reaches `failed` it leaves `active_job_paths` so the pending-work guard stops
+    /// firing. Moving then tells Dropbox to relocate content it holds — the OLD content —
+    /// and the edit is stranded with nothing left to notice it. The delete-plus-upload this
+    /// replaced was wasteful, but it preserved those bytes.
+    #[test]
+    fn a_rename_is_not_a_move_when_dropbox_holds_different_content() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("new.txt"), b"edited content").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("new.txt")).unwrap();
+        state
+            .db
+            .upsert_local_file("old.txt", &hash, size, mtime)
+            .unwrap();
+        // Dropbox still holds the PRE-EDIT bytes: the upload never landed.
+        state
+            .db
+            .upsert_remote_file(
+                "old.txt",
+                "STALE_REMOTE_HASH",
+                "rev1",
+                mtime,
+                Some("id:OLD"),
+            )
+            .unwrap();
+
+        process_changed_paths(&state, &["old.txt".to_string(), "new.txt".to_string()])
+            .expect("process");
+
+        assert!(
+            job_targets(&state, "move").is_empty(),
+            "Dropbox does not hold these bytes, so there is nothing to move"
+        );
+        assert_eq!(
+            job_targets(&state, "upload"),
+            vec!["new.txt".to_string()],
+            "the edited bytes must go up"
+        );
+    }
+
+    /// C4. The destination was only checked against the LOCAL index. A path Dropbox holds
+    /// but which has not been downloaded has a remote row and no local row; the bare UPDATE
+    /// in `move_index_row` then hit a UNIQUE violation whose error propagated out of
+    /// `process_changed_paths` and discarded every other path in the batch.
+    #[test]
+    fn a_destination_already_known_remotely_does_not_abort_the_batch() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("new.txt"), b"hello").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("new.txt")).unwrap();
+        state
+            .db
+            .upsert_local_file("old.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", &hash, "rev1", mtime, Some("id:OLD"))
+            .unwrap();
+        // Dropbox already has something at the destination; we have never downloaded it.
+        state
+            .db
+            .upsert_remote_file("new.txt", "OTHER", "rev9", 0, Some("id:OTHER"))
+            .unwrap();
+        // An unrelated file in the same batch, whose fate proves the batch survived.
+        std::fs::write(root.join("unrelated.txt"), b"xyz").unwrap();
+
+        let result = process_changed_paths(
+            &state,
+            &[
+                "old.txt".to_string(),
+                "new.txt".to_string(),
+                "unrelated.txt".to_string(),
+            ],
+        );
+
+        assert!(result.is_ok(), "the batch must not abort: {result:?}");
+        assert!(
+            job_targets(&state, "upload").contains(&"unrelated.txt".to_string()),
+            "the rest of the batch must still be processed"
+        );
+    }
+
+    /// C2, first guard. The directory correlator compared nothing — not content, not size,
+    /// not whether the candidate was already a tracked folder. Two real folders each holding
+    /// a `README.md` were paired as a rename, which suppressed the genuine deletion of one,
+    /// enqueued a bogus move, and orphaned index rows.
+    ///
+    /// **The two READMEs are deliberately the same size**, so the size guard cannot fire and
+    /// only the already-tracked check can save this. A first version of this test gave them
+    /// different sizes and passed with the guard it is named after removed — green for a
+    /// reason unrelated to its own name, which is the exact defect class this review found.
+    #[test]
+    fn a_folder_we_already_track_is_never_a_rename_destination() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/README.md"), b"aaaaa").unwrap();
+        state.db.upsert_known_folder("e").unwrap();
+        state
+            .db
+            .upsert_local_file("e/README.md", "hE", 5, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("e/README.md", "hE", "rev", 0, Some("id:E"))
+            .unwrap();
+
+        // `d` is tracked, gone from disk, and its README is the SAME five bytes.
+        state.db.upsert_known_folder("d").unwrap();
+        state
+            .db
+            .upsert_local_file("d/README.md", "hD", 5, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/README.md", "hD", "rev", 0, Some("id:D"))
+            .unwrap();
+
+        process_changed_paths(&state, &["d".to_string(), "e".to_string()]).expect("process");
+
+        assert!(
+            job_targets(&state, "move").is_empty(),
+            "a folder we are already tracking is a different folder, not a destination"
+        );
+        assert!(
+            job_targets(&state, "delete").contains(&"d/README.md".to_string()),
+            "and the real deletion must still propagate"
+        );
+    }
+
+    /// C2, second guard. Matching descendant NAMES is not enough — an untracked folder that
+    /// happens to contain the same filenames is not the same folder. Size is already in
+    /// `FileIndexRow` and each child is stat-ed anyway, so this costs no extra I/O.
+    ///
+    /// Here `e` is **not** tracked, so the first guard cannot fire and only the size
+    /// comparison can block the pairing.
+    #[test]
+    fn a_folder_whose_children_differ_in_size_is_not_a_rename_destination() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        // Untracked on disk, same child name, different bytes.
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/README.md"), b"a much longer readme").unwrap();
+
+        state.db.upsert_known_folder("d").unwrap();
+        state
+            .db
+            .upsert_local_file("d/README.md", "hD", 5, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/README.md", "hD", "rev", 0, Some("id:D"))
+            .unwrap();
+
+        process_changed_paths(&state, &["d".to_string(), "e".to_string()]).expect("process");
+
+        assert!(
+            job_targets(&state, "move").is_empty(),
+            "same filename, different contents — not a rename"
+        );
+        assert!(
+            job_targets(&state, "delete").contains(&"d/README.md".to_string()),
+            "and the real deletion must still propagate"
+        );
+    }
+
+    /// W1. A child of a folder that is itself moving travels with it. Enqueueing both is
+    /// not merely redundant: jobs drain by id, so one transient failure on the folder move
+    /// lets the child move run first and create the destination, after which the folder
+    /// move hits `to/conflict` and is dropped — stranding the old folder on Dropbox with no
+    /// index row pointing at it.
+    #[test]
+    fn a_child_of_a_moving_directory_is_not_moved_separately() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/one.txt"), b"aaa").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("e/one.txt")).unwrap();
+        state.db.upsert_known_folder("d").unwrap();
+        state
+            .db
+            .upsert_local_file("d/one.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", &hash, "rev", mtime, Some("id:ONE"))
+            .unwrap();
+
+        let n = process_changed_paths(
+            &state,
+            &[
+                "d".to_string(),
+                "e".to_string(),
+                "e/one.txt".to_string(),
+                "d/one.txt".to_string(),
+            ],
+        )
+        .expect("process");
+
+        assert_eq!(
+            move_jobs(&state),
+            vec![("d".to_string(), "e".to_string())],
+            "the folder move carries its children; a second move for a child is a trap"
+        );
+        assert_eq!(n, 1);
+    }
+
     /// A vanished path with no counterpart is still a delete. The correlation must not be so
     /// eager that deleting a file looks like moving it somewhere unobserved.
     #[test]
@@ -2171,6 +2462,13 @@ mod tests {
 
     /// A directory whose tracked contents do NOT all turn up under the new name is not a
     /// rename that can be collapsed. Falling back costs bandwidth; guessing costs data.
+    ///
+    /// **Every other guard is deliberately satisfied here** so that only the completeness
+    /// check can block the pairing: `e` is untracked, `one.txt` is byte-for-byte the size
+    /// the index records, and both descendants have remote rows. An earlier version of this
+    /// test seeded no remote rows at all, so `get_remote_file` blocked the correlation and
+    /// the test passed with the guard it is named after removed — green for the wrong
+    /// reason, caught by the DBSYNC-99 review.
     #[test]
     fn a_partial_directory_match_is_not_collapsed_into_a_move() {
         let tmp = tempdir().expect("tempdir");
@@ -2182,8 +2480,16 @@ mod tests {
 
         state.db.upsert_known_folder("d").unwrap();
         state.db.upsert_local_file("d/one.txt", "h1", 3, 0).unwrap();
-        // Tracked under the old name, but absent under the new one.
+        // Tracked under the old name, but absent under the new one. This alone must stop it.
         state.db.upsert_local_file("d/two.txt", "h2", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", "h1", "rev", 0, Some("id:ONE"))
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/two.txt", "h2", "rev", 0, Some("id:TWO"))
+            .unwrap();
 
         process_changed_paths(
             &state,
