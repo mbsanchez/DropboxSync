@@ -1469,6 +1469,44 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     add_column_if_missing(conn, "known_folders", "dropbox_id", "TEXT")?;
     add_column_if_missing(conn, "local_file_index", "item_id", "INTEGER")?;
 
+    // ...and rows that predate the column get their identity here, rather than waiting to
+    // be re-indexed.
+    //
+    // The writer mints an `item_id` when it touches a path, which covers every new or
+    // changed file and nothing else. A file that simply sits there unchanged is never
+    // written, so on a real database every pre-existing row stayed NULL — measured, not
+    // supposed: seven of seven on the maintainer's own install after the first launch
+    // carrying this schema. `dropbox_id` has the remote sweep as its trigger and this had
+    // no equivalent, which would have left DBSYNC-95 an empty substrate to enumerate.
+    //
+    // Inside the migration transaction, so it is atomic with the column that makes it
+    // possible, and idempotent: once every row has an identity the SELECT returns nothing
+    // and this costs one scan of a small table per startup.
+    let unidentified: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT relative_path FROM local_file_index WHERE item_id IS NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if !unidentified.is_empty() {
+        for relative_path in &unidentified {
+            // Same allocator as the writer, for the same reason: an identity belonging to a
+            // deleted file must never be reissued, so it comes from the AUTOINCREMENT
+            // sequence and never from `MAX + 1`.
+            conn.execute("INSERT INTO item_id_seq DEFAULT VALUES", [])?;
+            let item_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE local_file_index SET item_id = ?2 WHERE relative_path = ?1",
+                params![relative_path, item_id],
+            )?;
+        }
+        conn.execute("DELETE FROM item_id_seq", [])?;
+        tracing::info!(
+            count = unidentified.len(),
+            "back-filled local item identities for rows that predate the column"
+        );
+    }
+
     // DBSYNC-35: structured fields for conflict resolution — the sibling copy holding
     // the preserved local content, and a flag for the remote-deleted scenario. Both
     // have constant defaults, so ADD COLUMN is safe on existing rows.
@@ -2535,6 +2573,59 @@ mod tests {
             "and so does the Dropbox identifier"
         );
         assert_eq!(db.list_known_folders().expect("folders"), vec!["e"]);
+    }
+
+    #[test]
+    /// DBSYNC-99. The writer mints an identity when it touches a path, which covers every
+    /// new or changed file and nothing else — a file that simply sits there unchanged is
+    /// never written. On a real install that left **every** pre-existing row without one,
+    /// so `dropbox_id` (which has the remote sweep as its trigger) filled in while
+    /// `item_id` did not. Migration is the trigger it was missing.
+    #[test]
+    fn migrate_gives_an_identity_to_rows_that_predate_the_column() {
+        let path = unique_db_path();
+        let db = Db::new_at(&path).expect("db init");
+        {
+            // Raw SQL because no public writer can produce a row without an identity —
+            // which is the property this back-fill exists to repair.
+            let conn = db.write.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO local_file_index (relative_path,hash,size_bytes,modified_ts,updated_at)
+                     VALUES ('a.txt','H',1,0,'t'), ('b.txt','H',1,0,'t');",
+            )
+            .expect("seed");
+        }
+        for rel in ["a.txt", "b.txt"] {
+            assert!(
+                db.get_local_file(rel)
+                    .expect("get")
+                    .unwrap()
+                    .item_id
+                    .is_none(),
+                "the seeded rows must start without one, or this proves nothing"
+            );
+        }
+        drop(db);
+
+        // Re-open: `Db::new_at` runs the migration, which is where the repair happens.
+        let db = Db::new_at(&path).expect("reopen");
+
+        let a = db.get_local_file("a.txt").expect("get").unwrap().item_id;
+        let b = db.get_local_file("b.txt").expect("get").unwrap().item_id;
+        assert!(
+            a.is_some() && b.is_some(),
+            "every row must end up identified"
+        );
+        assert_ne!(a, b, "and no two rows may share an identity");
+
+        // Idempotent: a third open must not re-mint what is already there.
+        drop(db);
+        let db = Db::new_at(&path).expect("reopen again");
+        assert_eq!(
+            db.get_local_file("a.txt").expect("get").unwrap().item_id,
+            a,
+            "an identity, once given, is not reissued on the next startup"
+        );
     }
 
     #[test]
