@@ -1166,40 +1166,158 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
     MoveOutcome::Error
 }
 
-/// Re-derive a refused move as the upload-plus-delete it replaces.
+/// Re-derive a refused move as the upload-plus-delete it replaces. **Files only.**
 ///
-/// Extracted so the recovery — and above all its ORDER — can be tested: the network call
-/// around it is manual-QA-only, and the ordering is the part three review rounds got wrong.
+/// Extracted so the recovery can be tested: the network call around it is manual-QA-only.
 ///
-/// The upload is enqueued first and therefore carries the lower id, and `pick_next_due_job`
-/// drains by id, so the bytes land at the destination before the delete removes the source.
-/// There is no moment in which the content exists at neither path.
+/// # The delete is caused by the upload, not merely ordered after it
 ///
-/// **Known residual, deliberately accepted.** If the materialization sweep plants a
-/// `.cloudsc` sidecar over the source before the delete drains, `delete_suppressed_by_
-/// dehydration` reads it as a dehydration and drops the delete — leaving the source on
-/// Dropbox as a duplicate. The content is safe at the destination, so this is a duplicate
-/// rather than a loss. Closing it means teaching the sweep about in-flight paths, which is
-/// a `.cloudsc` change: round 7 showed that doing it from here re-arms DBSYNC-62's evicted-
-/// placeholder recovery on Windows, because every CfAPI placeholder carries a local index
-/// row. It needs its own ticket.
+/// An earlier version of this enqueued both jobs and relied on the upload carrying the lower
+/// id. That was wrong, and the test written to defend it asserted the enqueue order rather
+/// than the property the order was standing in for. `pick_next_due_job` orders by id **among
+/// due jobs**; one transient upload failure parks the upload in `retry_wait` with a future
+/// `next_retry_at`, removing it from the candidate set entirely, and the delete drains first.
+/// The content then exists at neither path for as long as the backoff lasts.
+///
+/// So the deletion is not enqueued here at all. It rides on the upload row and is enqueued by
+/// the upload's success arm — see [`Db::enqueue_upload_then_delete`]. If the upload never
+/// succeeds, the source is never deleted: a duplicate on Dropbox, which the next scan can
+/// reconcile, instead of a window with no copy anywhere.
+///
+/// # Directories are refused, not recovered
+///
+/// A directory returns early with a log and nothing else — which is exactly what `main` does
+/// today, and `main` loses nothing. Three of the six permanent `RelocationError` markers are
+/// folder-only, `cant_move_shared_folder` among them, so a refused **folder** move is ordinary
+/// rather than a corner: renaming a shared folder hits it every time.
+///
+/// Neither half of the file recovery transfers. `upload_local_file_internal` opens its path as
+/// a file, so the upload cannot work; and the delete is recursive on a folder, so it would take
+/// the destination's children down with the source. Children that are dehydrated placeholders
+/// have no bytes on disk, so that is permanent loss — over the very population of placeholders
+/// this ticket's round-7 revert exists to protect.
+///
+/// The recovery a refused folder move deserves is a per-child re-derivation, which is a
+/// different piece of work with its own failure modes. It is tracked in DBSYNC-100.
+///
+/// # Known residual, deliberately accepted
+///
+/// If the materialization sweep plants a `.cloudsc` sidecar over the source before the delete
+/// drains, `delete_suppressed_by_dehydration` reads it as a dehydration and drops the delete —
+/// leaving the source on Dropbox as a duplicate. The content is safe at the destination, so
+/// this is a duplicate rather than a loss. Closing it means teaching the sweep about in-flight
+/// paths, which is a `.cloudsc` change: round 7 showed that doing it from here re-arms
+/// DBSYNC-62's evicted-placeholder recovery on Windows, because every CfAPI placeholder carries
+/// a local index row. Tracked in DBSYNC-101.
 pub(crate) fn rederive_refused_move(
     state: &AppState,
     from_relative: &str,
     to_relative: &str,
 ) -> AppResult<()> {
+    // Read the shape from `known_folders`, the same source `apply_confirmed_move` reads, and
+    // read it against the SOURCE: nothing has been written, so the index still describes the
+    // pre-rename world and `from_relative` is the path that answers reliably.
+    let moving_a_directory = state
+        .db
+        .list_known_folders()?
+        .iter()
+        .any(|folder| folder == from_relative);
+    if moving_a_directory {
+        tracing::warn!(
+            from = %from_relative,
+            to = %to_relative,
+            "remote folder move refused — left for the ordinary scan; no folder recovery is attempted (DBSYNC-100)"
+        );
+        return Ok(());
+    }
+
     let parent_rev = state.db.get_remote_file(from_relative)?.map(|r| r.rev);
     state
         .db
-        .enqueue_job("upload", Some(to_relative), Some(to_relative))?;
-    state
-        .db
-        .enqueue_delete_job(from_relative, parent_rev.as_deref())?;
+        .enqueue_upload_then_delete(to_relative, from_relative, parent_rev.as_deref())?;
     // The source's rows go now: it is no longer anywhere the app should look. Leaving them
-    // would make the next scan enqueue a second, redundant delete.
+    // would let the next scan derive its own delete of the source — unordered with respect to
+    // the upload, which is the race this whole shape exists to remove.
     state.db.remove_local_file(from_relative)?;
     state.db.remove_remote_file(from_relative)?;
     Ok(())
+}
+
+/// Settle the deletion an upload job owes the source of a move Dropbox refused — enqueuing it
+/// only once Dropbox is **actually holding the destination's bytes**.
+///
+/// `Ok(())` from [`upload_local_file_internal`] does not mean the bytes landed. Three of its
+/// returns are no-ops that leave nothing new on Dropbox: a `.cloudsc` path, a source that
+/// vanished before the upload (an atomic save, a file deleted right after being renamed), and
+/// a destination Dropbox already held identical content for. Treating all three as success
+/// would delete the source out from under the second one and leave the content nowhere — the
+/// same shape as the ordering defect this whole mechanism replaced, reintroduced one layer in.
+///
+/// So this asks the question directly instead of inferring it: the remote row and the local
+/// row for the destination must agree on `content_hash`. Dropbox holds, at the new name, the
+/// bytes the user has there. Nothing weaker licenses removing the old name.
+///
+/// That also covers the case the classifier sends here most often. `to/conflict` means the
+/// destination is already taken on Dropbox — so a remote row for it can exist without this
+/// upload having done anything. If its content differs, the hashes disagree and the source
+/// stays: a duplicate the user can see and resolve, never a silent loss.
+///
+/// **Never fails the job.** An owed deletion that cannot be enqueued leaves a duplicate on
+/// Dropbox; a `?` here would leave the job `running`, which `pick_next_due_job` never picks
+/// again, and wedge the queue instead.
+pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destination: &str) {
+    let owed = match state.db.take_deferred_source_delete(job_id) {
+        Ok(Some(owed)) => owed,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(job_id, error = %e, "could not read the deferred source deletion for a completed upload");
+            return;
+        }
+    };
+    let (source, parent_rev) = owed;
+
+    match destination_holds_the_bytes(state, destination) {
+        Ok(true) => match state.db.enqueue_delete_job(&source, parent_rev.as_deref()) {
+            Ok(()) => tracing::info!(
+                job_id,
+                source = %source,
+                destination = %destination,
+                "upload landed — enqueued the deletion of the move source it replaced"
+            ),
+            Err(e) => tracing::error!(
+                job_id,
+                source = %source,
+                error = %e,
+                "upload landed but the move source could not be enqueued for deletion; it stays on Dropbox as a duplicate"
+            ),
+        },
+        Ok(false) => tracing::warn!(
+            job_id,
+            source = %source,
+            destination = %destination,
+            "upload job finished without putting the destination's bytes on Dropbox — the move source is NOT deleted; it stays as a duplicate rather than the only copy disappearing"
+        ),
+        Err(e) => tracing::error!(
+            job_id,
+            source = %source,
+            error = %e,
+            "could not confirm the destination's bytes are on Dropbox; the move source is left in place"
+        ),
+    }
+}
+
+/// Does Dropbox hold, at `relative`, the content the local index says is there?
+///
+/// Both rows are required. A missing remote row means nothing was uploaded; a missing local
+/// row means there is nothing to compare against and no basis for claiming a match.
+pub(crate) fn destination_holds_the_bytes(state: &AppState, relative: &str) -> AppResult<bool> {
+    let (Some(remote), Some(local)) = (
+        state.db.get_remote_file(relative)?,
+        state.db.get_local_file(relative)?,
+    ) else {
+        return Ok(false);
+    };
+    Ok(remote.content_hash == local.hash)
 }
 
 /// Make the index match a move Dropbox has already performed.
@@ -1348,18 +1466,15 @@ pub(crate) fn move_remote_file_internal(
             //
             // So re-derive it here, explicitly, instead of hoping a later scan wins the race.
             //
-            // **The order is the point.** The upload is enqueued first and therefore carries
-            // the lower id, and `pick_next_due_job` drains by id — so the bytes land at the
-            // destination before the delete removes the source. There is no moment in which
-            // the content exists at neither path. An earlier version of this recovery
-            // enqueued only the delete and relied on the scan for the upload; the delete won
-            // the race and removed the one copy Dropbox still had.
+            // **Files only, and the delete is caused by the upload rather than ordered after
+            // it** — both of those are load-bearing, and both cost a review round to learn.
+            // See `rederive_refused_move`.
             rederive_refused_move(state, from_relative, to_relative)?;
             tracing::warn!(
                 from = %from_relative,
                 to = %to_relative,
                 body = %body,
-                "remote move not applicable — re-derived as an upload of the destination then a delete of the source"
+                "remote move not applicable — see the preceding line for what was re-derived"
             );
             Ok(())
         }

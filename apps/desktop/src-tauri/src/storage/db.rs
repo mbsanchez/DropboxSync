@@ -1,6 +1,6 @@
 use crate::error::{AppError, AppResult};
 use chrono::Utc;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -939,6 +939,83 @@ impl Db {
         Ok(())
     }
 
+    /// DBSYNC-99: enqueue an upload that **owes a deletion** — the source of a move Dropbox
+    /// refused. The deletion is carried on the upload row instead of being enqueued next to
+    /// it, and that is the whole point.
+    ///
+    /// Two jobs ordered by id only look safe. `pick_next_due_job` orders by id **among the
+    /// jobs that are due**, and a job in `retry_wait` with a future `next_retry_at` is not
+    /// due at all — so one transient upload failure (a 429, a 5xx, a file locked by another
+    /// process) drops the upload out of the candidate set and the delete, still `queued`,
+    /// drains first. The content would then exist at neither path until the upload came back,
+    /// which for a five-attempt backoff is minutes.
+    ///
+    /// Carried here, the delete row does not exist until the upload has actually succeeded —
+    /// see the `upload` success arm in `process_sync_queue_internal`, which is the only place
+    /// that reads this column. Causation, not ordering.
+    ///
+    /// The `DO UPDATE` must carry the columns for the same reason `enqueue_delete_job`'s
+    /// carries `delete_parent_rev`: if an upload for this destination is already active, the
+    /// plain `enqueue_job` collapse would silently discard the owed deletion.
+    ///
+    /// **If the upload never succeeds** — five attempts exhausted, or the app stops first —
+    /// the deletion simply never happens and Dropbox keeps the source as a duplicate. That is
+    /// the failure this shape is chosen for: a duplicate the next scan can reconcile, never a
+    /// window with no copy at all.
+    pub fn enqueue_upload_then_delete(
+        &self,
+        upload_path: &str,
+        delete_path: &str,
+        delete_parent_rev: Option<&str>,
+    ) -> AppResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
+            INSERT INTO sync_jobs(job_type, source_path, target_path, on_success_delete_path, on_success_delete_rev, status, attempt_count, next_retry_at, created_at, updated_at)
+            VALUES('upload', ?1, ?1, ?2, ?3, 'queued', 0, NULL, ?4, ?4)
+            ON CONFLICT(job_type, target_path) WHERE status IN ('queued','retry_wait','running')
+            DO UPDATE SET source_path=excluded.source_path, on_success_delete_path=excluded.on_success_delete_path, on_success_delete_rev=excluded.on_success_delete_rev, updated_at=excluded.updated_at
+            ",
+            params![upload_path, delete_path, delete_parent_rev, now],
+        )?;
+        Ok(())
+    }
+
+    /// Read and clear the deletion an upload job owes its source, in one step so it can be
+    /// acted on at most once.
+    ///
+    /// Restricted to `upload` rows: the column has no meaning on any other job type, and a
+    /// query that would honour it there is a query that could be made to delete a path by
+    /// setting a field on the wrong row.
+    pub fn take_deferred_source_delete(
+        &self,
+        job_id: i64,
+    ) -> AppResult<Option<(String, Option<String>)>> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let owed: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT on_success_delete_path, on_success_delete_rev FROM sync_jobs WHERE id = ?1 AND job_type = 'upload'",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((Some(path), rev)) = owed else {
+            return Ok(None);
+        };
+        conn.execute(
+            "UPDATE sync_jobs SET on_success_delete_path=NULL, on_success_delete_rev=NULL WHERE id = ?1",
+            params![job_id],
+        )?;
+        Ok(Some((path, rev)))
+    }
+
     pub fn count_active_jobs(&self) -> AppResult<usize> {
         let conn = self
             .read
@@ -1554,6 +1631,12 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     )?;
 
     // Additive migrations for databases created before a column existed.
+    //
+    // **These six run BEFORE the `sync_jobs` rebuild below, and that placement is a
+    // precondition, not a preference.** The rebuild's `INSERT ... SELECT` names each of them
+    // by hand, so they have to exist on the old table before it runs. Anything added to
+    // `sync_jobs` AFTER the rebuild was written belongs in the second block, further down —
+    // see the comment there for what happens when it lands here instead.
     add_column_if_missing(conn, "sync_jobs", "last_error", "TEXT")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_id", "TEXT")?;
     add_column_if_missing(conn, "sync_jobs", "upload_session_offset", "INTEGER")?;
@@ -1702,6 +1785,27 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
             ",
         )?;
     }
+
+    // `sync_jobs` columns added AFTER the rebuild above was written, and therefore added
+    // AFTER it runs.
+    //
+    // The rebuild's column list is frozen at DBSYNC-31. A column declared in the first
+    // additive block is created, then dropped again by `DROP TABLE sync_jobs` on any legacy
+    // database that still needs rebuilding — and the code that uses it fails at runtime with
+    // `no such column` while the migration reports success. DBSYNC-99 put
+    // `on_success_delete_path` there and this is where it came back from; the catch was
+    // `migrate_rebuilds_a_legacy_sync_jobs_table_inside_the_transaction`, whose second-migrate
+    // idempotence check saw the two runs disagree.
+    //
+    // Declaring them here instead of widening the rebuild removes the class rather than this
+    // instance: the rebuild copies what it was written to copy, and everything since is
+    // re-applied on top of whatever table survives. The next `sync_jobs` column goes here.
+    //
+    // DBSYNC-99: the source deletion an upload owes once its bytes have landed. Set only on
+    // `upload` rows, and only by `enqueue_upload_then_delete`. See that function for why the
+    // deletion is carried on the upload row rather than enqueued alongside it.
+    add_column_if_missing(conn, "sync_jobs", "on_success_delete_path", "TEXT")?;
+    add_column_if_missing(conn, "sync_jobs", "on_success_delete_rev", "TEXT")?;
 
     // DBSYNC-31: indexes for the hot job/conflict queries (previously full scans) and a
     // partial-unique guard so a path can never have two ACTIVE jobs of the same type.
@@ -2934,6 +3038,29 @@ mod tests {
             indexes, 2,
             "both sync_jobs indexes must land on the REBUILT table"
         );
+
+        // Columns added after the rebuild's frozen column list must survive the rebuild.
+        //
+        // The idempotence check below already catches this — it is how the defect was found
+        // — but it catches it as "the two runs disagree", which names the symptom. This names
+        // the property: a legacy database that gets rebuilt must come out of ONE migrate with
+        // every column the code expects, because the app starts using them immediately and
+        // does not get a second migrate first.
+        let rebuilt_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        for column in ["on_success_delete_path", "on_success_delete_rev"] {
+            assert!(
+                rebuilt_sql.contains(column),
+                "`{column}` must survive the rebuild — declare it in the additive block AFTER \
+                 the rebuild, not before, or `DROP TABLE sync_jobs` takes it with the old \
+                 table: {rebuilt_sql}"
+            );
+        }
 
         // And it is still idempotent over the rebuilt shape. `expect` alone would prove
         // only that the second run does not error, which is not what "no-op" means.

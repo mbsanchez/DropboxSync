@@ -1349,6 +1349,23 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
 
     match op_result {
         Ok(()) => {
+            // DBSYNC-99: the source deletion a refused move owes is enqueued HERE and nowhere
+            // else. It exists because this upload put the bytes at the destination — not
+            // because it was given a higher id at enqueue time, which `pick_next_due_job`
+            // honours only among DUE jobs and therefore does not guarantee at all.
+            //
+            // `Ok(())` from an upload is NOT proof the bytes landed — see
+            // `settle_owed_source_deletion`, which checks rather than assumes, and which
+            // never fails the job.
+            if job.job_type == "upload" {
+                if let Some(destination) = job.source_path.as_deref() {
+                    crate::dropbox_transfer::settle_owed_source_deletion(
+                        state,
+                        job.id,
+                        destination,
+                    );
+                }
+            }
             state.db.mark_job_completed(job.id)?;
             if let Ok(mut engine) = state.sync_engine.lock() {
                 engine.record_job_processed();
