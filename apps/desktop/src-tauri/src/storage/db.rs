@@ -966,6 +966,43 @@ impl Db {
     /// enqueue and drain the index still describes the old world while the disk describes the
     /// new one, and BOTH paths have to be protected from the scan — the old one from being
     /// propagated as a deletion, the new one from being uploaded as a stranger.
+    /// The paths an active **move** job names, as source or as target.
+    ///
+    /// Narrower than [`Self::active_job_paths`] and deliberately so. A deletion must be held
+    /// back only when something is about to **relocate** that path — which is what a move
+    /// does and what nothing else does. Holding one back for any job in flight was too broad,
+    /// and the excess lost deletions outright: the materialization sweep plants a `.cloudsc`
+    /// sidecar for any remote child whose local counterpart is absent, consulting no index,
+    /// and `process_local_file_deletion` then drops a delete whose path has a placeholder —
+    /// removing the index row that remembers it. The file stayed on Dropbox forever.
+    ///
+    /// Before that over-broad deferral the delete was emitted in the same watcher batch and
+    /// drained before any sweep could run, so the window was ~0. This restores that for every
+    /// job type except the one with a real claim on the path.
+    pub fn active_move_paths(&self) -> AppResult<std::collections::HashSet<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT target_path FROM sync_jobs
+              WHERE job_type = 'move' AND status IN ('queued','retry_wait','running')
+                AND target_path IS NOT NULL AND target_path <> ''
+            UNION
+            SELECT source_path FROM sync_jobs
+              WHERE job_type = 'move' AND status IN ('queued','retry_wait','running')
+                AND source_path IS NOT NULL AND source_path <> ''
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(r?);
+        }
+        Ok(out)
+    }
+
     pub fn active_job_paths(&self) -> AppResult<std::collections::HashSet<String>> {
         let conn = self
             .read

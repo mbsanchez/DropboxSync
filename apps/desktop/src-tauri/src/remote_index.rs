@@ -349,7 +349,9 @@ fn reconcile_remote_snapshot_with_breaker(
     // PRESENT files: reconcile immediately, never gated by the breaker.
     for local in local_files {
         let rel = &local.relative_path;
-        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
+        if rel.ends_with(".cloudsc")
+            || crate::sync_pipeline::covered_by_active_job(rel, &pending_targets)
+        {
             continue;
         }
         if let Some(remote_meta) = remote_by_path.get(&normalize_dropbox_path(rel)?.to_lowercase())
@@ -408,7 +410,9 @@ fn remote_sweep_delete_candidates(
 
     for local in local_files {
         let rel = &local.relative_path;
-        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
+        if rel.ends_with(".cloudsc")
+            || crate::sync_pipeline::covered_by_active_job(rel, &pending_targets)
+        {
             continue;
         }
         if remote_by_path.contains_key(&normalize_dropbox_path(rel)?.to_lowercase()) {
@@ -431,6 +435,14 @@ fn remote_sweep_delete_candidates(
 
 /// The set of relative paths with an in-flight job, so we don't enqueue a
 /// duplicate download/delete for a file already being processed.
+/// The paths every active job names.
+///
+/// Consumers must ask about them with `covered_by_active_job`, never `.contains()`: a queued
+/// folder move names only the two folder paths while everything underneath is equally in
+/// flight, and four checks in this module asked the exact question until round 5 of the
+/// DBSYNC-99 review. The sharpest was the delta's removal arm — a `Remove` for a descendant of
+/// a pending move went unfiltered and enqueued a `local_delete`, costing that descendant the
+/// identity this ticket exists to preserve.
 fn pending_job_targets(state: &AppState) -> AppResult<HashSet<String>> {
     // DBSYNC-31: single indexed SQL query instead of scanning list_recent_jobs(400).
     state.db.active_job_paths()
@@ -632,7 +644,9 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
         for entry in &resp.entries {
             match delta_action_from_entry(entry) {
                 DeltaAction::Upsert(rel, meta) => {
-                    if !rel.ends_with(".cloudsc") && !pending_targets.contains(&rel) {
+                    if !rel.ends_with(".cloudsc")
+                        && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
+                    {
                         enqueued += reconcile_remote_present(state, &rel, &meta)?;
                         // DBSYNC-59: surface a newly-appeared remote file as a native
                         // placeholder within seconds (targeted — just this file) instead
@@ -653,7 +667,9 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
                     }
                 }
                 DeltaAction::Remove(rel) => {
-                    if !rel.ends_with(".cloudsc") && !pending_targets.contains(&rel) {
+                    if !rel.ends_with(".cloudsc")
+                        && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
+                    {
                         enqueued += reconcile_remote_absent(state, &rel)?;
                         // DBSYNC-59: purge a legacy `.cloudsc` sidecar for the removed
                         // file now (CfAPI placeholders are removed by the local_delete
@@ -1025,6 +1041,57 @@ mod tests {
         // already on Dropbox, so failing here would re-upload a file that is already there.
         crate::dropbox_transfer::record_upload_result(&state, "qa/b.txt", None);
         assert!(state.db.get_remote_file("qa/b.txt").expect("get").is_none());
+    }
+
+    /// DBSYNC-99 round 5. The sweep's skip test asked `.contains()` where the hazard is
+    /// prefix-shaped: a queued `move d → e` names only `d` and `e`, while every descendant is
+    /// equally mid-relocation. Reconciling one of them against a snapshot that does not list
+    /// it enqueues work against a path the move is about to vacate.
+    ///
+    /// Mutating this guard left the suite green until this test existed.
+    #[test]
+    fn the_sweep_skips_descendants_of_a_pending_move() {
+        let state = build_state();
+        state.db.upsert_local_file("d/one.txt", "H", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", "H", "rev", 0, Some("id:ONE"))
+            .unwrap();
+
+        // The snapshot DOES list it, with different content — so without the guard the
+        // present-branch would reconcile and enqueue a download against a path the move is
+        // about to vacate. A first version of this test left the snapshot empty, which never
+        // reaches the present branch at all: it asserted nothing about the guard it names,
+        // and said so only under mutation.
+        let mut remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        remote_by_path.insert(
+            "/d/one.txt".to_string(),
+            RemoteFileMeta {
+                content_hash: "DIFFERENT".to_string(),
+                rev: "rev2".to_string(),
+                modified_ts: 9,
+                id: Some("id:ONE".to_string()),
+            },
+        );
+        // A queued folder move names the two folder paths, never the descendants.
+        let pending: HashSet<String> = ["d".to_string(), "e".to_string()].into_iter().collect();
+
+        let enqueued = reconcile_remote_snapshot_with_breaker(
+            &state,
+            &state.db.list_local_files().unwrap(),
+            &remote_by_path,
+            &pending,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enqueued, 0,
+            "nothing may be enqueued for a path mid-relocation"
+        );
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "and least of all a local delete, which costs the descendant its identity"
+        );
     }
 
     #[test]
