@@ -605,12 +605,17 @@ impl Db {
         // undoing the rename on the server. The partial-unique index only covers active
         // statuses, so widening the set here cannot collide with it.
         //
-        // `local_delete` is excluded alongside `move`, and for a sharper reason than tidiness.
-        // `delete_local_file_internal` removes the file unconditionally. A failed
-        // `local_delete` naming the OLD path is harmless — the path no longer exists, so the
-        // retry is a no-op — but retargeted to the new one it deletes the file the user just
-        // renamed, the moment they press Retry. The argument for widening the set was about
-        // `download`; it does not extend to a job whose whole purpose is destruction.
+        // `local_delete` AND `delete` are excluded alongside `move`, for a sharper reason than
+        // tidiness: a job whose whole purpose is destruction must never be re-aimed.
+        //
+        // `delete_local_file_internal` removes the file unconditionally, so a failed
+        // `local_delete` naming the OLD path is harmless — that path no longer exists — but
+        // retargeted to the new one it deletes the file the user just renamed, the moment they
+        // press Retry. `delete` is the same argument one level out: it destroys the REMOTE
+        // copy, the one every other device syncs from, and recursively when the target is a
+        // folder. An earlier version of this reasoning was applied to `local_delete` only, and
+        // that omission is what turned a stale delete of a path Dropbox no longer has — a
+        // benign 409 — into a recursive delete of the folder the user had just renamed.
         //
         // `job_type <> 'move'` is not an optimisation. A move job's two paths describe an
         // OPERATION — move this from here to there — not where an item currently lives, so
@@ -620,12 +625,12 @@ impl Db {
         // server does not have. Measured on a real install, not imagined.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
+             WHERE target_path = ?1 AND job_type NOT IN ('move','local_delete','delete') AND status IN ('queued','retry_wait','running','failed')",
             params![old_path, new_path, now],
         )?;
         tx.execute(
             "UPDATE sync_jobs SET source_path = ?2, updated_at = ?3 \
-             WHERE source_path = ?1 AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
+             WHERE source_path = ?1 AND job_type NOT IN ('move','local_delete','delete') AND status IN ('queued','retry_wait','running','failed')",
             params![old_path, new_path, now],
         )?;
         tx.commit()?;
@@ -696,7 +701,12 @@ impl Db {
         for (table, column, guard) in [
             ("sync_conflicts", "local_path", ""),
             ("sync_conflicts", "remote_path", ""),
-            ("sync_jobs", "source_path", " AND job_type <> 'move'"),
+            (
+                "sync_jobs",
+                "source_path",
+                " AND job_type NOT IN ('move','local_delete','delete') \
+                  AND status IN ('queued','retry_wait','running','failed')",
+            ),
         ] {
             tx.execute(
                 &format!("UPDATE OR IGNORE {table} SET {column} = ?2 WHERE {column} = ?1{guard}"),
@@ -715,12 +725,12 @@ impl Db {
         // rather than aborting the rewrite — both rows describe the same work.
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2, updated_at = ?3 \
-             WHERE target_path = ?1 AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
+             WHERE target_path = ?1 AND job_type NOT IN ('move','local_delete','delete') AND status IN ('queued','retry_wait','running','failed')",
             params![old_prefix, new_prefix, now],
         )?;
         tx.execute(
             "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || substr(target_path, ?4), updated_at = ?3 \
-             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type NOT IN ('move','local_delete') AND status IN ('queued','retry_wait','running','failed')",
+             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type NOT IN ('move','local_delete','delete') AND status IN ('queued','retry_wait','running','failed')",
             params![child_pattern, new_prefix, now, tail_start],
         )?;
 
@@ -947,6 +957,7 @@ impl Db {
     /// dedup, which silently missed jobs once the table exceeded N rows. Backed by the
     /// `idx_sync_jobs_status_retry` index. Used to avoid enqueuing duplicate work and to
     /// route a change that races a still-pending job to a conflicted copy.
+
     /// Every path an active job names, as source or as target.
     ///
     /// The UNION of both columns is load-bearing for DBSYNC-99 and not merely thorough: a

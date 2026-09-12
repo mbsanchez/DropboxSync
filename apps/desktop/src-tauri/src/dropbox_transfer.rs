@@ -1066,9 +1066,14 @@ pub(crate) enum MoveOutcome {
     ///   letting Dropbox pick a different name would silently desynchronise the two sides.
     ///
     /// The rest are from `RelocationError` and cannot be retried into success either, so
-    /// they take the same fallback rather than retrying to exhaustion and ending `failed`
-    /// with the index already rewritten. `too_many_files` is the one a user will actually
-    /// hit: `move_v2` is capped at 10,000 files, so a large folder rename lands here.
+    /// they take the fallback immediately rather than burning five attempts first.
+    /// `too_many_files` is the one a user will actually hit: `move_v2` is capped at 10,000
+    /// files, so a large folder rename lands here.
+    ///
+    /// Misclassifying costs attempts, not data. Since the index is not written until Dropbox
+    /// confirms, a permanent failure that lands in `Error` simply exhausts its retries and
+    /// leaves the index describing the pre-rename world — which is still what the server
+    /// holds. This list was briefly a data-safety boundary and is now an optimisation.
     ///
     /// Transient conditions stay out of this arm even when they look terminal — see the
     /// list in `classify_move_response`.
