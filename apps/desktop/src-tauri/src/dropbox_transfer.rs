@@ -1109,79 +1109,68 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
     MoveOutcome::Error
 }
 
-/// Put the index back after a move that turned out to be impossible, so the next scan
-/// re-uploads at the new path instead of the index quietly claiming work that never happened.
+/// Make the index match a move Dropbox has already performed.
 ///
-/// Separated from the network call so the recovery is unit-testable — the failure it repairs
-/// was data loss, and the network path around it can only be exercised by hand.
+/// Separated from the network call so the rewrite is unit-testable — it is the one step that
+/// changes durable state, and the network path around it can only be exercised by hand.
 ///
-/// **Two shapes, and conflating them destroyed data.** The first version of this function was
-/// written for a file and run for both: against a folder, `remove_remote_file` and
-/// `mark_local_file_for_rescan` were no-ops (folders are not keyed in `remote_file_index`,
-/// and there is no local row at a folder path) while `enqueue_delete_job` fired — a recursive
-/// `delete_v2` of the source. The descendants stayed rewritten to the new prefix, so the
-/// sweep then deleted every one of them locally. It destroyed both copies, and the case it
-/// destroyed them in is the one a user actually reaches: `too_many_files`, above the 10,000
-/// cap on `move_v2`.
-///
-/// **Nothing is deleted here.** The earlier version enqueued a delete of the source to
-/// complete an "upload plus delete" fallback, but jobs drain in id order and the upload is
-/// only enqueued later, by the scan — so the delete could run first and remove the one copy
-/// Dropbox still had. A leftover folder or file at the old remote path is visible and
-/// harmless; losing the bytes is neither. The orphan is logged so it is discoverable.
-pub(crate) fn undo_move_index_rewrite(
+/// **The shape is read before anything is written.** `known_folders` still describes the
+/// pre-rename world at this point, so `from_relative` answers reliably; an earlier design
+/// asked about the *destination* after rewriting, and was silently wrong whenever the folder
+/// row had moved since. Choosing the wrong branch here is not cosmetic: `move_index_row` on a
+/// folder touches nothing, leaving the whole subtree stranded at paths that no longer exist.
+pub(crate) fn apply_confirmed_move(
     state: &AppState,
     from_relative: &str,
     to_relative: &str,
 ) -> AppResult<()> {
-    let is_directory = state
+    let moving_a_directory = state
         .db
         .list_known_folders()?
         .iter()
-        .any(|folder| folder == to_relative);
+        .any(|folder| folder == from_relative);
 
-    if is_directory {
-        // Undo the subtree row by row rather than reversing the prefix rewrite. Reversing it
-        // would put the index back at the old paths while the disk holds the new ones, and
-        // the very next scan would correlate the same rename again — a loop of moves that
-        // fail the same way, forever, whenever the failure is permanent.
-        let prefix = format!("{to_relative}/");
-        let descendants: Vec<String> = state
-            .db
-            .list_local_files()?
-            .into_iter()
-            .map(|row| row.relative_path)
-            .filter(|path| path.starts_with(&prefix))
-            .collect();
-        for child in &descendants {
-            state.db.remove_remote_file(child)?;
-            state.db.mark_local_file_for_rescan(child)?;
+    if moving_a_directory {
+        let stranded = state.db.move_index_subtree(from_relative, to_relative)?;
+        if stranded > 0 {
+            // The remote move already happened, so the index must be made to match. This is
+            // now a loud surprise rather than a data-safety decision — nothing is lost by it,
+            // because the bytes are already where the index is being pointed.
+            tracing::error!(
+                from = %from_relative,
+                to = %to_relative,
+                stranded,
+                "moved on Dropbox but the index subtree did not travel whole"
+            );
         }
-        tracing::warn!(
-            from = %from_relative,
-            to = %to_relative,
-            children = descendants.len(),
-            "directory move refused — marked the subtree for re-upload; the source folder is left on Dropbox and may now be an orphan"
-        );
-        return Ok(());
+    } else {
+        state.db.move_index_row(from_relative, to_relative)?;
     }
-
-    state.db.remove_remote_file(to_relative)?;
-    state.db.mark_local_file_for_rescan(to_relative)?;
-    tracing::warn!(
-        from = %from_relative,
-        to = %to_relative,
-        "move refused — marked for re-upload; the source is left on Dropbox and may now be an orphan"
-    );
     Ok(())
 }
 
-/// Performs a live `files/move_v2` call. Manual-QA-only for the network path; the
-/// response classification is covered by the pure `classify_move_response` tests.
+/// Performs a live `files/move_v2` call and, **only if Dropbox accepted it**, rewrites the
+/// index to match. Manual-QA-only for the network path; the response classification is
+/// covered by the pure `classify_move_response` tests.
 ///
 /// One request, one outcome — verified against a live account on 2026-09-11. That is the
 /// whole benefit over the delete-plus-upload it replaces, which left a window in which the
 /// file existed nowhere remotely.
+///
+/// **The order here is the whole design, and it took three rounds of review to get right.**
+/// The index used to be rewritten when the move was *enqueued*, which meant every failure
+/// path had to undo it — and each repair for that undo introduced a worse defect than the
+/// one it fixed: a refused move deleting the user's file, then a refused folder move deleting
+/// the folder from Dropbox and every file locally, then an "abandon" that suppressed the very
+/// fallback it deferred to. Six data-loss defects, all downstream of writing down an outcome
+/// before it happened.
+///
+/// Now nothing is written until Dropbox confirms. A failure needs no repair because nothing
+/// was changed: the index still describes the pre-rename world, which is still what the
+/// server holds, and once the job leaves the active set the ordinary scan re-derives a delete
+/// plus an upload — the behaviour a rename had before this ticket. That also demotes
+/// `classify_move_response` from a data-safety boundary to an optimisation: misclassifying a
+/// permanent failure as retryable now costs five attempts, not a file.
 pub(crate) fn move_remote_file_internal(
     state: &AppState,
     from_relative: &str,
@@ -1210,6 +1199,8 @@ pub(crate) fn move_remote_file_internal(
         })?;
 
     if resp.status().is_success() {
+        apply_confirmed_move(state, from_relative, to_relative)?;
+
         // Refresh the row from the response rather than letting it carry the pre-move
         // `rev`. Dropbox changes `rev` on a move while `content_hash` and `id` stay put —
         // this ticket measured that and then discarded the body that says so, and a stale
@@ -1253,28 +1244,19 @@ pub(crate) fn move_remote_file_internal(
         .unwrap_or_else(|_| "<unreadable body>".to_string());
     match classify_move_response(false, &body) {
         MoveOutcome::NotApplicable => {
-            // UNDO the index rewrite, which happened back when the move was enqueued.
+            // Nothing to undo: the index was never touched. Dropping the job leaves it
+            // describing the pre-rename world, which is still what the server holds, and once
+            // this job leaves the active set the ordinary scan re-derives a delete plus an
+            // upload — what a rename cost before this ticket.
             //
-            // Simply dropping the job here used to DELETE THE USER'S FILE. The index had
-            // already been moved, so the local row at the destination held the hash of the
-            // bytes on disk and the remote row claimed Dropbox held them too. The local
-            // scan therefore saw nothing to upload, and the remote sweep saw the
-            // destination absent on Dropbox, matched `local.hash == prev.content_hash` in
-            // `reconcile_remote_absent`, and enqueued a `local_delete` of the file the user
-            // had just renamed. Reproduced; the comment that used to sit here claimed the
-            // next scan would re-derive the work, and there was nothing left to re-derive.
-            //
-            // Dropping the remote row makes `reconcile_remote_absent` take its "never
-            // indexed remotely" early return instead of the delete arm, and the rescan
-            // marker (DBSYNC-56) makes the next local scan enqueue the upload. Deleting the
-            // source completes the fallback this outcome is named for: an upload plus a
-            // delete, which is exactly what a rename cost before this ticket.
-            undo_move_index_rewrite(state, from_relative, to_relative)?;
+            // Three rounds of review were spent on the version of this arm that had to repair
+            // a rewrite made too early. Each repair was worse than the defect it fixed. There
+            // is nothing here now because there is nothing to repair.
             tracing::warn!(
                 from = %from_relative,
                 to = %to_relative,
                 body = %body,
-                "remote move not applicable — undid the index rewrite and fell back to upload plus delete"
+                "remote move not applicable — dropping the job; the index was never changed"
             );
             Ok(())
         }

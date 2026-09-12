@@ -126,6 +126,14 @@ fn process_local_file_change(
 
     match known {
         None => {
+            // DBSYNC-99: the destination of a queued move looks exactly like a stranger — on
+            // disk, absent from the index — because the index is not rewritten until Dropbox
+            // confirms the move. Uploading it here would put the bytes at the destination
+            // before the move ran, so the move would then fail `to/conflict` and be dropped,
+            // leaving the source behind on the server under its old name.
+            if pending_targets.contains(relative) {
+                return Ok(0);
+            }
             state
                 .db
                 .enqueue_job("upload", Some(relative), Some(relative))?;
@@ -398,47 +406,19 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     let moved_from: HashSet<&str> = moves.iter().map(|(old, _)| old.as_str()).collect();
     let moved_to: HashSet<&str> = moves.iter().map(|(_, new)| new.as_str()).collect();
 
-    // Pass three: act. Directories first, so their contents are already accounted for by
-    // the time the per-file passes run.
-    for (old, new) in &dir_moves {
-        // ONE subtree rewrite, however many children there are. A per-child loop here
-        // would reach the same end state while delivering none of the benefit.
-        //
-        // The rewrite happens BEFORE the job is enqueued, and the order is load-bearing:
-        // `move_index_subtree` retargets active jobs that name the old path, so a move job
-        // enqueued first would have had its own `source_path` rewritten to the destination
-        // and would ask Dropbox to move the folder to where it already is.
-        let stranded = state.db.move_index_subtree(old, new)?;
-        if stranded > 0 {
-            // The subtree did not travel whole, so the move would relocate a folder whose
-            // index no longer describes it. The correlator's destination checks should make
-            // this unreachable; if it happens anyway, the safe response is to enqueue
-            // nothing and let the scan re-derive from what is actually on disk. Warning and
-            // proceeding — which an earlier version did — acts on a world it knows is wrong.
-            tracing::error!(
-                from = %old,
-                to = %new,
-                stranded,
-                "directory move abandoned: the index subtree did not travel whole"
-            );
-            continue;
-        }
+    // Pass three: act.
+    //
+    // **Nothing but the job is written here.** The index is rewritten by the move job itself,
+    // and only after Dropbox confirms — see `move_remote_file_internal`. Writing it down at
+    // enqueue time meant every failure path had to undo it, and three rounds of review were
+    // spent on repairs that each turned out worse than the defect they fixed.
+    //
+    // Both paths of a correlated pair are already in `pending_targets` by virtue of the job
+    // naming them as source and target, which is what keeps the next scan from undoing the
+    // intent while the job waits.
+    for (old, new) in dir_moves.iter().chain(moves.iter()) {
         state.db.enqueue_job("move", Some(old), Some(new))?;
-        pending_targets.insert(new.clone());
-        enqueued += 1;
-        tracing::info!(from = %old, to = %new, "directory rename detected: enqueued one move for the whole subtree");
-    }
-
-    for (old, new) in &moves {
-        // The row TRAVELS — identity, content hash, rev and Dropbox id all come with it,
-        // instead of the old row being dropped and a fresh one created under the new name.
-        //
-        // The rewrite happens BEFORE the job is enqueued, and the order is load-bearing:
-        // `move_index_row` retargets active jobs that name the old path, so a move job
-        // enqueued first would have had its own `source_path` rewritten to the destination
-        // and would ask Dropbox to move the file to where it already is.
-        state.db.move_index_row(old, new)?;
-        state.db.enqueue_job("move", Some(old), Some(new))?;
+        pending_targets.insert(old.clone());
         pending_targets.insert(new.clone());
         enqueued += 1;
         tracing::info!(from = %old, to = %new, "rename detected: enqueued a move instead of a delete plus a full upload");
@@ -1103,6 +1083,16 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     // `seen_dirs`), and a stale row from an older build would otherwise trigger a
     // RECURSIVE remote delete of a folder that still exists (DBSYNC-55).
     if !walk_had_error {
+        // DBSYNC-99: a path a queued move names is NOT a deletion, however absent it looks.
+        //
+        // The index is not rewritten until Dropbox confirms the move, so between enqueue and
+        // drain the old path is legitimately missing from disk. Without this filter a scan
+        // landing in that window would propagate a remote delete of the very file the move is
+        // about to relocate — and `delete_v2` on a folder is recursive.
+        let pending = state.db.active_job_paths()?;
+        let move_protected = |rel: &String| -> bool {
+            pending.contains(rel) || pending.iter().any(|p| rel.starts_with(&format!("{p}/")))
+        };
         let file_deletions: Vec<String> = known
             .iter()
             .map(|f| f.relative_path.clone())
@@ -1110,13 +1100,16 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
                 !rel.ends_with(".cloudsc")
                     && !is_ignored_local_path(rel)
                     && !seen_paths.contains(rel)
+                    && !move_protected(rel)
             })
             .collect();
         let folder_deletions: Vec<String> = state
             .db
             .list_known_folders()?
             .into_iter()
-            .filter(|rel| !is_ignored_local_path(rel) && !seen_dirs.contains(rel))
+            .filter(|rel| {
+                !is_ignored_local_path(rel) && !seen_dirs.contains(rel) && !move_protected(rel)
+            })
             .collect();
 
         let candidate_count = file_deletions.len() + folder_deletions.len();
@@ -2059,12 +2052,27 @@ mod tests {
             "and not one byte goes back up"
         );
 
-        // The index row travels rather than being dropped and recreated, so the item keeps
-        // its identity and its sync state instead of looking brand new.
-        assert!(state.db.get_local_file("old.txt").unwrap().is_none());
-        let moved = state.db.get_local_file("new.txt").unwrap().expect("row");
-        assert_eq!(moved.item_id, Some(identity), "identity survives the move");
-        assert_eq!(moved.hash, hash, "and so does the recorded content");
+        // And the index has NOT moved yet. That is the property that makes a failed move
+        // incapable of losing data: there is nothing to undo, because nothing was written.
+        // The rewrite happens in `move_remote_file_internal`, after Dropbox confirms.
+        let still_there = state.db.get_local_file("old.txt").unwrap().expect("row");
+        assert_eq!(still_there.item_id, Some(identity));
+        assert_eq!(still_there.hash, hash);
+        assert!(
+            state.db.get_local_file("new.txt").unwrap().is_none(),
+            "the destination row appears only once the server has confirmed the move"
+        );
+
+        // Both paths are protected from the scan while the job waits.
+        let pending = state.db.active_job_paths().unwrap();
+        assert!(
+            pending.contains("old.txt"),
+            "the source must not look deleted"
+        );
+        assert!(
+            pending.contains("new.txt"),
+            "the destination must not look new"
+        );
     }
 
     /// A file Dropbox has never received cannot be moved on Dropbox. Renaming it before its
@@ -2450,6 +2458,89 @@ mod tests {
         );
     }
 
+    /// **The invariant the whole redesign exists for.**
+    ///
+    /// The index used to be rewritten when a move was enqueued, so every failure path had to
+    /// undo it — and three rounds of review were spent on repairs that each turned out worse
+    /// than the defect they fixed: a refused move deleting the user's file, then a refused
+    /// folder move deleting the folder from Dropbox and every file locally, then an "abandon"
+    /// that suppressed the fallback it deferred to. Six data-loss defects, all downstream of
+    /// writing an outcome down before it happened.
+    ///
+    /// Nothing is written until Dropbox confirms. So this test does not check a repair — it
+    /// checks that there is nothing to repair.
+    #[test]
+    fn a_move_that_never_runs_leaves_the_index_exactly_as_it_was() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("new.txt"), b"hello").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("new.txt")).unwrap();
+        state
+            .db
+            .upsert_local_file("old.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", &hash, "rev1", mtime, Some("id:OLD"))
+            .unwrap();
+        let before_local = state.db.get_local_file("old.txt").unwrap().unwrap();
+        let before_remote = state.db.get_remote_file("old.txt").unwrap().unwrap();
+
+        process_changed_paths(&state, &["old.txt".to_string(), "new.txt".to_string()])
+            .expect("process");
+
+        // The move is queued and has not run. Every index row is byte-for-byte what it was.
+        let after_local = state.db.get_local_file("old.txt").unwrap().expect("row");
+        let after_remote = state.db.get_remote_file("old.txt").unwrap().expect("row");
+        assert_eq!(after_local.hash, before_local.hash);
+        assert_eq!(after_local.item_id, before_local.item_id);
+        assert_eq!(after_remote.content_hash, before_remote.content_hash);
+        assert_eq!(after_remote.dropbox_id, before_remote.dropbox_id);
+        assert!(state.db.get_local_file("new.txt").unwrap().is_none());
+        assert!(state.db.get_remote_file("new.txt").unwrap().is_none());
+    }
+
+    /// A full scan landing between the enqueue and the drain must not undo the intent.
+    ///
+    /// This is the hazard the redesign trades for: while the move waits, the index describes
+    /// the old world and the disk describes the new one, so the source looks deleted and the
+    /// destination looks like a stranger. Propagating either would be destructive — the
+    /// deletion recursively so, for a folder.
+    #[test]
+    fn a_scan_while_a_move_is_queued_neither_deletes_the_source_nor_uploads_the_destination() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("new.txt"), b"hello").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("new.txt")).unwrap();
+        state
+            .db
+            .upsert_local_file("old.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", &hash, "rev1", mtime, Some("id:OLD"))
+            .unwrap();
+        process_changed_paths(&state, &["old.txt".to_string(), "new.txt".to_string()])
+            .expect("process");
+
+        // The full scan runs before the move job drains.
+        scan_local_changes_only(&state).expect("scan");
+
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "the source is not gone, it is waiting to be moved"
+        );
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "and the destination must not be uploaded out from under the move"
+        );
+        assert_eq!(move_jobs(&state).len(), 1, "still exactly one move");
+    }
+
     /// A vanished path with no counterpart is still a delete. The correlation must not be so
     /// eager that deleting a file looks like moving it somewhere unobserved.
     #[test]
@@ -2512,6 +2603,12 @@ mod tests {
 
         process_changed_paths(&state, &["old.txt".to_string(), "new.txt".to_string()])
             .expect("process");
+        // The rewrite now happens when the server confirms the move, so drive it directly —
+        // the network call around it is manual-QA-only.
+        state
+            .db
+            .move_index_row("old.txt", "new.txt")
+            .expect("confirm");
 
         let conflicts = state.db.list_recent_conflicts(10).expect("conflicts");
         assert_eq!(conflicts.len(), 1, "the record must not be dropped");
@@ -2588,19 +2685,25 @@ mod tests {
             "not one byte of the contents goes back up"
         );
 
-        // The folder row travels...
+        // The index has NOT moved yet, and that is the point: a move that Dropbox refuses
+        // has nothing to undo, because nothing was written. The subtree rewrite happens in
+        // `move_remote_file_internal` once the server confirms, and
+        // `move_index_subtree_rewrites_the_subtree_and_leaves_siblings_alone` covers that it
+        // travels whole when it does.
         assert_eq!(
             state.db.list_known_folders().unwrap(),
-            vec!["e".to_string()]
+            vec!["d".to_string()]
         );
-        // ...and so does every descendant, keeping its identity and its sync state.
-        assert!(state.db.get_local_file("d/one.txt").unwrap().is_none());
-        let moved = state.db.get_local_file("e/one.txt").unwrap().expect("row");
-        assert_eq!(moved.item_id, Some(identity));
-        assert!(
-            state.db.get_remote_file("e/two.txt").unwrap().is_some(),
-            "the remote index must follow too, or the next sweep re-downloads everything"
+        assert_eq!(
+            state
+                .db
+                .get_local_file("d/one.txt")
+                .unwrap()
+                .unwrap()
+                .item_id,
+            Some(identity)
         );
+        assert!(state.db.get_local_file("e/one.txt").unwrap().is_none());
     }
 
     /// A directory whose tracked contents do NOT all turn up under the new name is not a

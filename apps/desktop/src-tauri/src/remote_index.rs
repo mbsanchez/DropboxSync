@@ -936,124 +936,52 @@ mod tests {
             .collect()
     }
 
-    /// C1, the worst defect this ticket produced: **a move that Dropbox refused deleted the
-    /// user's file.**
-    ///
-    /// The index is rewritten when the move is enqueued, so by the time the job runs and is
-    /// told "not applicable" the local row at the destination already holds the hash of the
-    /// bytes on disk and the remote row already claims Dropbox holds them. The local scan
-    /// then sees nothing to upload, and this function matches `local.hash ==
-    /// prev.content_hash` and enqueues a `local_delete` of the file the user just renamed.
-    /// The comment at the drop site said the next scan would re-derive the work; there was
-    /// nothing left to re-derive.
-    ///
-    /// The first half of this test is the defect, reproduced. The second is the repair.
+    /// DBSYNC-99. Confirming a move has two shapes, and using the file one on a folder is not
+    /// cosmetic: `move_index_row` matches an exact path, so on a folder it touches nothing and
+    /// the whole subtree is left stranded at paths that no longer exist on disk. That mistake
+    /// was made once in this ticket and cost a data-loss defect, so the branch gets a test.
     #[test]
-    fn a_refused_move_must_not_cost_the_user_the_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("synced");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let seed = |state: &AppState| {
-            std::fs::write(root.join("new.txt"), b"hello").unwrap();
-            let (hash, size, mtime) = crate::path_util::hash_file(&root.join("new.txt")).unwrap();
-            state.db.set_sync_folder(&root.to_string_lossy()).unwrap();
-            state
-                .db
-                .upsert_local_file("new.txt", &hash, size, mtime)
-                .unwrap();
-            state
-                .db
-                .upsert_remote_file("new.txt", &hash, "rev1", mtime, Some("id:OLD"))
-                .unwrap();
-        };
-
-        // Without the undo: Dropbox does not have `new.txt`, and the sweep deletes it locally.
-        let unrepaired = build_state();
-        seed(&unrepaired);
-        reconcile_remote_absent(&unrepaired, "new.txt").unwrap();
-        assert_eq!(
-            job_targets(&unrepaired, "local_delete"),
-            vec!["new.txt".to_string()],
-            "this is the defect: without the undo the renamed file is deleted"
-        );
-
-        // With it: no deletion, and the bytes are queued to go up instead.
-        let repaired = build_state();
-        seed(&repaired);
-        crate::dropbox_transfer::undo_move_index_rewrite(&repaired, "old.txt", "new.txt").unwrap();
-        reconcile_remote_absent(&repaired, "new.txt").unwrap();
-        assert!(
-            job_targets(&repaired, "local_delete").is_empty(),
-            "the user's file must not be deleted"
-        );
-        assert!(
-            job_targets(&repaired, "delete").is_empty(),
-            "and nothing is deleted: jobs drain by id and the re-upload is only enqueued by \
-             the next scan, so a delete queued here could remove the one copy Dropbox still \
-             has. The source is left as a visible orphan instead — recoverable, unlike bytes."
-        );
-        let row = repaired.db.get_local_file("new.txt").unwrap().unwrap();
-        assert_eq!(
-            row.hash,
-            crate::storage::db::Db::HASH_NEEDS_RESCAN,
-            "the row must be marked so the next scan uploads it"
-        );
-        std::mem::forget(dir);
-    }
-
-    /// C1-bis. The first repair for C1 was written for a file and run for both shapes, and
-    /// against a folder it was catastrophic: `remove_remote_file` and
-    /// `mark_local_file_for_rescan` are no-ops at a folder path, while the delete of the
-    /// source fired — and `delete_v2` on a folder is recursive. The descendants stayed
-    /// rewritten to the new prefix, so the sweep then deleted each of them locally. Both
-    /// copies gone, in the case a user actually reaches: a folder above `move_v2`'s
-    /// 10,000-file cap.
-    #[test]
-    fn a_refused_directory_move_must_not_cost_the_user_the_folder() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("synced");
-        std::fs::create_dir_all(root.join("e")).unwrap();
-        std::fs::write(root.join("e/one.txt"), b"hello").unwrap();
+    fn confirming_a_move_picks_the_shape_from_the_source() {
         let state = build_state();
-        state.db.set_sync_folder(&root.to_string_lossy()).unwrap();
-        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("e/one.txt")).unwrap();
 
-        // The state a correlated directory rename leaves: subtree rewritten, move enqueued.
+        // A folder: the subtree must travel.
         state.db.upsert_known_folder("d").unwrap();
+        state.db.upsert_local_file("d/one.txt", "H", 1, 0).unwrap();
         state
             .db
-            .upsert_local_file("d/one.txt", &hash, size, mtime)
+            .upsert_remote_file("d/one.txt", "H", "rev", 0, Some("id:ONE"))
             .unwrap();
-        state
+        let identity = state
             .db
-            .upsert_remote_file("d/one.txt", &hash, "rev1", mtime, Some("id:ONE"))
-            .unwrap();
-        state.db.move_index_subtree("d", "e").unwrap();
+            .get_local_file("d/one.txt")
+            .unwrap()
+            .unwrap()
+            .item_id;
 
-        crate::dropbox_transfer::undo_move_index_rewrite(&state, "d", "e").unwrap();
+        crate::dropbox_transfer::apply_confirmed_move(&state, "d", "e").unwrap();
 
+        assert_eq!(state.db.list_known_folders().unwrap(), vec!["e"]);
         assert!(
-            job_targets(&state, "delete").is_empty(),
-            "the source folder must NOT be recursively deleted on Dropbox"
+            state.db.get_local_file("d/one.txt").unwrap().is_none(),
+            "the descendant must not be stranded at the old path"
         );
         assert_eq!(
-            state.db.get_local_file("e/one.txt").unwrap().unwrap().hash,
-            crate::storage::db::Db::HASH_NEEDS_RESCAN,
-            "every descendant must be marked for re-upload, not just the folder path"
-        );
-        assert!(
-            state.db.get_remote_file("e/one.txt").unwrap().is_none(),
-            "and its remote row must go, or the sweep deletes it locally"
+            state
+                .db
+                .get_local_file("e/one.txt")
+                .unwrap()
+                .unwrap()
+                .item_id,
+            identity,
+            "and it keeps its identity"
         );
 
-        // The sweep must now leave the child alone.
-        reconcile_remote_absent(&state, "e/one.txt").unwrap();
-        assert!(
-            job_targets(&state, "local_delete").is_empty(),
-            "no descendant may be deleted from disk"
-        );
-        std::mem::forget(dir);
+        // A file: the single row travels and no folder is invented.
+        state.db.upsert_local_file("solo.txt", "H", 1, 0).unwrap();
+        crate::dropbox_transfer::apply_confirmed_move(&state, "solo.txt", "renamed.txt").unwrap();
+        assert!(state.db.get_local_file("solo.txt").unwrap().is_none());
+        assert!(state.db.get_local_file("renamed.txt").unwrap().is_some());
+        assert_eq!(state.db.list_known_folders().unwrap(), vec!["e"]);
     }
 
     #[test]
