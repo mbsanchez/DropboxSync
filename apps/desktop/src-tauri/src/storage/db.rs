@@ -1056,6 +1056,37 @@ impl Db {
         Ok(())
     }
 
+    /// DBSYNC-99: a source deletion still owed by an upload that will never run again.
+    ///
+    /// The debt is cleared only when the delete job exists, so a debt still sitting on a
+    /// **terminal** upload row means the deletion never happened and never will: either the
+    /// upload died after five attempts, or it landed and the destination could not be
+    /// confirmed to hold the bytes. Either way Dropbox keeps the old name beside the new one
+    /// and nothing heals it.
+    ///
+    /// Returning it from the jobs table rather than a flag is deliberate. `refresh_queue_
+    /// depth_internal` recomputes `last_error` from durable sources on every tick and clears
+    /// anything else, so a bare `set_last_error` would vanish a second later — its own comment
+    /// says so. This is durable for exactly as long as the condition holds, and self-clearing:
+    /// settling the debt or clearing the job row removes it, with no new user action to build.
+    pub fn unsettled_source_deletion(&self) -> AppResult<Option<(String, String)>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let row = conn
+            .query_row(
+                "SELECT on_success_delete_path, source_path FROM sync_jobs
+                 WHERE job_type = 'upload' AND status IN ('done','failed')
+                   AND on_success_delete_path IS NOT NULL
+                 ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(source, destination)| (source, destination.unwrap_or_default())))
+    }
+
     /// DBSYNC-99: remember a folder move Dropbox permanently refused, so the correlator stops
     /// proposing it. See the `refused_moves` table comment for why not remembering it means
     /// the rename never reaches Dropbox at all.
@@ -1082,19 +1113,37 @@ impl Db {
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
 
-    /// Drop refusals whose source folder the index no longer tracks.
+    /// Drop refusals whose source the index no longer tracks **and** which no job still names.
     ///
-    /// The entry exists to stop a pair being re-proposed, and a pair can only be proposed
-    /// while `from_path` is still a known folder. Once the delete-plus-upload fallback has
-    /// converged it is not, and keeping the entry would make a genuine future rename of that
-    /// same pair fall back needlessly.
+    /// An entry exists to stop a pair being re-proposed, and a pair can only be proposed while
+    /// `from_path` is still tracked — as a folder for the directory correlator, as a local file
+    /// row for the file one. Both are checked: an earlier version tested `known_folders` alone
+    /// and so forgot a file refusal on the next tick, which is one of the two halves that let
+    /// a refused file move loop.
+    ///
+    /// The active-job clause is the other half, and it is about timing. Being untracked means
+    /// the fallback has **started**, not that it has finished: at that moment its deletes and
+    /// its upload are still queued and can still fail, be dropped by
+    /// `delete_suppressed_by_dehydration`, or exhaust their attempts. If anything then puts
+    /// the source back — the remote sweep re-seeding a folder Dropbox still holds because the
+    /// delete failed — the whole cycle re-arms: correlate, live `move_v2`, refusal, record.
+    /// So the refusal outlives the work it caused.
     pub fn prune_stale_refused_moves(&self) -> AppResult<usize> {
         let conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         let removed = conn.execute(
-            "DELETE FROM refused_moves WHERE from_path NOT IN (SELECT relative_path FROM known_folders)",
+            "DELETE FROM refused_moves
+             WHERE from_path NOT IN (SELECT relative_path FROM known_folders)
+               AND from_path NOT IN (SELECT relative_path FROM local_file_index)
+               AND from_path NOT IN (
+                     SELECT source_path FROM sync_jobs
+                       WHERE status IN ('queued','retry_wait','running') AND source_path IS NOT NULL
+                     UNION
+                     SELECT target_path FROM sync_jobs
+                       WHERE status IN ('queued','retry_wait','running') AND target_path IS NOT NULL
+                   )",
             [],
         )?;
         Ok(removed)

@@ -1175,6 +1175,43 @@ mod tests {
         );
     }
 
+    /// A directory that has lost its `known_folders` row is still a directory.
+    ///
+    /// The shape used to be decided by that single lookup, and the wrong answer is expensive:
+    /// the file branch would create an upload whose `source_path` is a directory — `File::open`
+    /// on a directory fails, so five attempts burn and the job sticks — while the two
+    /// `remove_*_file` calls are no-ops that strand every child row at the old prefix, and a
+    /// RECURSIVE deletion of the source is owed to an upload that can never succeed.
+    ///
+    /// Index rows under the prefix answer the question on their own.
+    #[test]
+    fn a_directory_without_a_folder_row_does_not_take_the_file_branch() {
+        let state = build_state();
+        // Deliberately NO `upsert_known_folder("Docs")` — a partial prune, a half-applied
+        // subtree move, any path that leaves the rows behind but not the folder.
+        state.db.upsert_local_file("Docs/a.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("Docs/a.txt", "H", "rev1", 0, Some("id:A"))
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "an upload of a directory path cannot work and owes a recursive delete"
+        );
+        assert!(
+            state
+                .db
+                .list_refused_moves()
+                .unwrap()
+                .contains(&("Docs".to_string(), "Papers".to_string())),
+            "it must take the directory branch, refusal recorded and all"
+        );
+        assert!(state.db.get_remote_file("Docs/a.txt").unwrap().is_some());
+    }
+
     /// One upload can settle one source. A second refused move onto the same destination must
     /// not silently replace the first debt.
     ///

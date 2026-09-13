@@ -49,12 +49,29 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
         .filter(|s| !s.is_empty());
     let paused = scan_paused.or(remote_paused);
 
+    // DBSYNC-99: a source deletion owed by an upload that will never run again. Ranked above
+    // a transient job error because it describes a state of the user's Dropbox — two copies
+    // of one file — that no retry will fix, and below the mass-deletion pause because that
+    // one has sync stopped entirely.
+    //
+    // Deliberately NOT a conflict row. `resolve_conflict_internal` has no arm that removes a
+    // stray remote path: a row with no conflicted copy and `remote_deleted = false` lands in
+    // `(UseRemote, None, false)` / `(KeepBoth, None, false)`, both literal empty arms that
+    // then mark it resolved. The user would click a button, watch the row vanish, and still
+    // have two copies. Telling someone they have fixed something they have not is worse than
+    // saying plainly what happened.
+    let stranded = state.db.unsettled_source_deletion()?.map(|(source, dest)| {
+        format!(
+            "'{source}' was renamed to '{dest}', but the old copy could not be removed from Dropbox. Both names exist there; delete '{source}' by hand if the rename is what you wanted."
+        )
+    });
+
     let mut engine = state
         .sync_engine
         .lock()
         .map_err(|_| AppError::Sync("sync engine lock poisoned".to_string()))?;
     engine.set_queue_depth(queue_depth);
-    match paused.or(failed_error) {
+    match paused.or(stranded).or(failed_error) {
         Some(msg) => engine.set_last_error(msg),
         None => engine.clear_last_error(),
     }
@@ -732,6 +749,10 @@ fn correlate_renames(
     if vanished.is_empty() || present_files.is_empty() {
         return Ok(Vec::new());
     }
+    // Pairs Dropbox has already permanently refused — read here for the same reason
+    // `correlate_directory_renames` reads it: a re-proposed pair suppresses the fallback that
+    // would actually carry the rename across.
+    let refused = state.db.list_refused_moves()?;
 
     let mut by_hash: HashMap<&str, Vec<&str>> = HashMap::new();
     for rel in vanished {
@@ -802,9 +823,25 @@ fn correlate_renames(
         let Some(candidates) = by_hash.get_mut(hash.as_str()) else {
             continue;
         };
-        let Some(old) = candidates.pop() else {
+        // Peeked, not popped. Dropbox has already refused exactly this pair, permanently —
+        // but the same source may still legitimately pair with a DIFFERENT destination, so
+        // consuming the candidate before the check would lose that.
+        //
+        // Re-proposing a refused pair costs a live `move_v2` per scan tick and — worse — the
+        // pair suppresses the ordinary delete-plus-upload that would carry the rename across,
+        // because `moved_from` and `moved_to` skip both halves in the passes below.
+        //
+        // The directory correlator has had this check since the folder loop was found; not
+        // having it here is what let the same loop happen to files. The two correlators are
+        // deliberately symmetrical and anything added to one belongs in the other.
+        let Some(old) = candidates.last().copied() else {
             continue;
         };
+        if refused.contains(&(old.to_string(), rel.clone())) {
+            tracing::debug!(from = %old, to = %rel, "not correlating a rename: Dropbox already refused this move");
+            continue;
+        }
+        candidates.pop();
         pairs.push((old.to_string(), rel.clone()));
     }
     Ok(pairs)
@@ -3432,6 +3469,15 @@ mod tests {
 
     // ---- DBSYNC-55: editor-temp / vanished-source handling ----
 
+    fn last_error(state: &AppState) -> Option<String> {
+        state
+            .sync_engine
+            .lock()
+            .unwrap()
+            .current_status(false)
+            .last_error
+    }
+
     fn delete_jobs(state: &AppState) -> Vec<String> {
         state
             .db
@@ -3445,10 +3491,10 @@ mod tests {
 
     /// DBSYNC-99. Build a refused file move exactly as production does, then settle it.
     ///
-    /// Returns `(state, upload_job_id, content_hash)`. Nothing here writes a
+    /// Returns `(upload_job_id, content_hash)`. Nothing here writes a
     /// `local_file_index` row for the destination, **because the pipeline does not**: the
     /// correlator pairs only a destination the local index lacks, and pass three skips
-    /// `moved_to` paths. Three earlier tests manufactured that row by hand and so asserted a
+    /// `moved_to` paths. Two earlier tests manufactured that row by hand and so asserted a
     /// world that never occurs — the gate they were defending could not pass in production
     /// and the whole mechanism was inert. Setup goes through `process_changed_paths`.
     fn refused_file_move(root: &std::path::Path, state: &AppState) -> (i64, String) {
@@ -3528,6 +3574,22 @@ mod tests {
             "carrying the source's pre-move rev, so `delete_v2` still notices a server-side \
              change in the meantime"
         );
+
+        // Settled means the debt is DISCHARGED, not merely that a job appeared once. Without
+        // this, removing the `clear` call entirely left the suite green — coverage of `clear`
+        // had migrated to the db method while the mechanism went unpinned.
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload_id).unwrap(),
+            None,
+            "the debt must be cleared once the delete job exists"
+        );
+        state.db.mark_job_completed(delete.id).unwrap();
+        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
+        assert_eq!(
+            delete_jobs(&state).len(),
+            1,
+            "and a second settle cannot enqueue the same deletion again"
+        );
     }
 
     /// And with nothing at the destination, the source is the only copy and must survive.
@@ -3555,12 +3617,170 @@ mod tests {
             Some("old.txt".to_string()),
             "and the debt survives the decline: reading it used to destroy it on first sight"
         );
+        // The queue marks the job done right after settling, exactly as production does.
+        state.db.mark_job_completed(upload_id).unwrap();
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+
         // Withholding is correct and it does not heal itself, so it cannot be a log line only.
+        // It is deliberately NOT a conflict row: `resolve_conflict_internal` has no arm that
+        // removes a stray remote path, so the buttons would be no-ops that mark it resolved.
+        assert!(
+            state
+                .db
+                .list_unresolved_conflict_local_paths()
+                .unwrap()
+                .is_empty(),
+            "no conflict row: a conflict promises a resolution this shape does not have, and \
+             telling the user they fixed it is worse than the log line"
+        );
+        let err = last_error(&state).expect("the user must be told both names now exist");
+        assert!(
+            err.contains("old.txt") && err.contains("new.txt"),
+            "and told WHICH ones, or they cannot act on it: {err}"
+        );
+
+        // And it is durable: the next tick recomputes `last_error` from scratch and clears
+        // anything transient. A bare `set_last_error` — the first thing I reached for — would
+        // be gone here.
+        super::refresh_queue_depth_internal(&state).expect("second refresh");
+        assert!(
+            last_error(&state).is_some_and(|e| e.contains("old.txt")),
+            "the notice must survive a recompute, or the user sees it for one tick"
+        );
+    }
+
+    /// The index fast path must compare hashes, not merely find rows.
+    ///
+    /// This site had a test and this commit's predecessor deleted it: the replacement
+    /// deliberately has no local row and so exercises the **disk** branch instead. Two
+    /// near-identical names, two different sites — "the `to/conflict` case is covered" was
+    /// true of the group and false of this one, and substituting `local.hash == local.hash`
+    /// left the whole suite green.
+    ///
+    /// The local row is production-built: once the move job is gone, an ordinary scan indexes
+    /// the destination like any other new file.
+    #[test]
+    fn an_indexed_destination_with_a_different_remote_hash_withholds() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (upload_id, _) = refused_file_move(&root, &state);
+
+        let move_id = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "move")
+            .unwrap()
+            .id;
+        state.db.mark_job_completed(move_id).unwrap();
+        process_changed_paths(&state, &["new.txt".to_string()]).expect("scan indexes it");
+        assert!(
+            state.db.get_local_file("new.txt").unwrap().is_some(),
+            "precondition: the scan gave the destination a local row"
+        );
+
+        // Dropbox holds something else entirely at that name — the `to/conflict` shape.
+        state
+            .db
+            .upsert_remote_file("new.txt", "SOMEONE-ELSES-BYTES", "revX", 0, None)
+            .unwrap();
+
+        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
+
+        assert!(
+            delete_jobs(&state).is_empty(),
+            "rows on both sides is not agreement; deleting the source here loses the user's bytes"
+        );
+    }
+
+    /// A destination that cannot be read is not a destination that matches.
+    ///
+    /// The disk fallback's `Err` arm was unpinned: making it return `Ok(true)` left 265 tests
+    /// green while an unreadable destination — vanished, locked, permission denied — licensed
+    /// deleting the source. That is the data-loss shape the comment above it forbids.
+    #[test]
+    fn an_unreadable_destination_withholds_the_deletion() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (upload_id, hash) = refused_file_move(&root, &state);
+
+        // Dropbox reports the bytes are there...
+        state
+            .db
+            .upsert_remote_file("new.txt", &hash, "rev2", 0, None)
+            .unwrap();
+        // ...but the destination is gone from disk, so nothing can confirm it.
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(
+            state.db.get_local_file("new.txt").unwrap().is_none(),
+            "precondition: no local row, so the check must reach the disk"
+        );
+
+        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
+
+        assert!(
+            delete_jobs(&state).is_empty(),
+            "unreadable is not proof of a match — withhold, because a duplicate is recoverable \
+             and a wrong deletion is not"
+        );
+    }
+
+    /// The common residual, and it used to be entirely silent.
+    ///
+    /// `settle_owed_source_deletion` runs only from the upload's SUCCESS arm. An upload that
+    /// exhausts its five attempts goes to `mark_job_failed`, and nothing ever reads the debt
+    /// on a `failed` row — while the source's index rows are already gone, so the app no
+    /// longer knows Dropbox holds that path at all. `enqueue_upload_then_delete`'s doc claimed
+    /// the caller logged something for this case. It did not.
+    #[test]
+    fn an_upload_that_dies_owing_a_deletion_tells_the_user() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        // An upload whose path escapes the sync root fails in `safe_join`, which
+        // `upload_local_file_internal` reaches BEFORE `get_access_token` — so this drains to
+        // permanent failure deterministically, with no network and no keychain.
+        assert!(state
+            .db
+            .enqueue_upload_then_delete("../escaped.txt", "old.txt", Some("rev1"))
+            .unwrap());
+        let upload_id = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload")
+            .unwrap()
+            .id;
+        // Last attempt, so the next drain takes the max-attempts branch.
+        state
+            .db
+            .mark_job_retry_wait(upload_id, 4, &Utc::now().to_rfc3339(), Some("previous"))
+            .unwrap();
+
+        assert!(super::process_sync_queue_internal(&state).expect("drain"));
+
         assert_eq!(
-            state.db.list_unresolved_conflict_local_paths().unwrap(),
-            vec!["new.txt".to_string()],
-            "the user is left with the old name still on Dropbox beside the new one; that has \
-             to be visible somewhere they look"
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.id == upload_id)
+                .unwrap()
+                .status,
+            "failed",
+            "precondition: the upload really died rather than backing off again"
+        );
+
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+        let err = last_error(&state).expect("a stranded deletion must reach the user");
+        assert!(
+            err.contains("old.txt"),
+            "naming the path Dropbox still holds, not just 'job 1 failed': {err}"
         );
     }
 
@@ -3606,27 +3826,43 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
 
+        let root = sync_root(&state);
         assert!(state
             .db
             .enqueue_upload_then_delete("new.txt.cloudsc", "old.txt", Some("rev1"))
             .unwrap());
-        // The destination holds the bytes: index rows agree, so no disk hash is needed.
+        // The destination genuinely holds the bytes, established the way production does it:
+        // a real file on disk plus the remote row `record_upload_result` would write. An
+        // earlier version wrote a `local_file_index` row for this path instead — which the
+        // scan never creates for a move destination, and doubly never for a `.cloudsc` path,
+        // since `process_changed_paths` skips those outright. That is the same hand-built
+        // state this module's own helper exists to stop using.
+        std::fs::write(root.join("new.txt.cloudsc"), b"hello").unwrap();
+        let (hash, _, _) = crate::path_util::hash_file(&root.join("new.txt.cloudsc")).unwrap();
         state
             .db
-            .upsert_local_file("new.txt.cloudsc", "H", 5, 0)
+            .upsert_remote_file("new.txt.cloudsc", &hash, "rev2", 0, None)
             .unwrap();
-        state
-            .db
-            .upsert_remote_file("new.txt.cloudsc", "H", "rev2", 0, None)
-            .unwrap();
+        assert!(
+            state
+                .db
+                .get_local_file("new.txt.cloudsc")
+                .unwrap()
+                .is_none(),
+            "precondition: no manufactured local row — the gate must reach the disk"
+        );
 
         assert!(super::process_sync_queue_internal(&state).expect("drain"));
 
+        // What this pins is that the success arm calls settle at all. It does NOT pin which
+        // field the destination is read from: `enqueue_upload_then_delete` inserts
+        // `VALUES('upload', ?1, ?1, …)`, so `source_path` and `target_path` are equal by
+        // construction for every row this mechanism creates, and an assertion here cannot
+        // tell them apart. The earlier version of this test claimed it could.
         assert_eq!(
             delete_jobs(&state),
             vec!["old.txt".to_string()],
-            "the success arm must settle the debt — and must read the destination from the \
-             job's own source_path, not from anywhere else"
+            "the upload's success arm must settle the debt it owes"
         );
     }
 
@@ -3705,6 +3941,49 @@ mod tests {
         );
     }
 
+    /// A second refused move onto one destination must not loop either.
+    ///
+    /// The early return that keeps the declined source's index rows — correct, or it becomes
+    /// an orphan on Dropbox — reproduced the folder loop at file granularity: the correlator's
+    /// inputs stay identical, so it re-proposed the same pair on every scan, one live
+    /// `move_v2` per tick, and the pair suppressed the fallback through `moved_from`.
+    /// `refused_moves` covered only directories, and `correlate_renames` did not read it.
+    #[test]
+    fn a_declined_second_refusal_is_not_re_proposed() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("x.txt"), b"hello").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("x.txt")).unwrap();
+        for src in ["a.txt", "b.txt"] {
+            state.db.upsert_local_file(src, &hash, size, mtime).unwrap();
+            state
+                .db
+                .upsert_remote_file(src, &hash, "rev1", mtime, Some("id:X"))
+                .unwrap();
+        }
+
+        // Both refused onto the same destination. The second is declined, keeping its rows.
+        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt").unwrap();
+        assert!(
+            state.db.get_local_file("b.txt").unwrap().is_some(),
+            "precondition: the declined source keeps its rows"
+        );
+
+        let before = move_jobs(&state).len();
+        process_changed_paths(&state, &["a.txt".into(), "b.txt".into(), "x.txt".into()])
+            .expect("scan");
+
+        assert_eq!(
+            move_jobs(&state).len(),
+            before,
+            "the refused pair must not be proposed again: {:?}",
+            move_jobs(&state)
+        );
+    }
+
     /// A refusal is only worth remembering while its source folder is still tracked — that is
     /// the only state in which the correlator could propose the pair again. Kept forever, it
     /// would make a genuine later rename of that same pair fall back to delete-plus-upload
@@ -3723,6 +4002,56 @@ mod tests {
         assert!(
             state.db.list_refused_moves().unwrap().is_empty(),
             "the refusal outlived the folder it was about"
+        );
+    }
+
+    /// ...but not while the work it caused is still in flight.
+    ///
+    /// Being untracked means the fallback has **started**, not finished: at that moment its
+    /// deletes and its upload are still queued and can still fail, be dropped by
+    /// `delete_suppressed_by_dehydration`, or exhaust their attempts. If anything then puts
+    /// the source back — the remote sweep re-seeding a folder Dropbox still holds because the
+    /// delete failed — forgetting the refusal re-arms the entire cycle.
+    #[test]
+    fn a_refusal_outlives_the_fallback_it_caused() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.record_refused_move("Docs", "Papers").unwrap();
+        // Untracked in both indexes — the old predicate would prune here...
+        state.db.enqueue_delete_job("Docs", None).unwrap();
+
+        state.db.prune_stale_refused_moves().unwrap();
+
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "...but a queued job still names it, so the fallback has not converged yet"
+        );
+    }
+
+    /// A file refusal is forgotten on the same terms as a folder one.
+    ///
+    /// The first version of the prune tested `known_folders` alone, so a file entry was swept
+    /// on the very next tick — one of the two halves that let a refused file move loop.
+    #[test]
+    fn a_file_refusal_survives_while_its_source_is_still_indexed() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.upsert_local_file("b.txt", "H", 5, 0).unwrap();
+        state.db.record_refused_move("b.txt", "x.txt").unwrap();
+
+        state.db.prune_stale_refused_moves().unwrap();
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "the source is still indexed, so the correlator can still propose the pair"
+        );
+
+        state.db.remove_local_file("b.txt").unwrap();
+        state.db.prune_stale_refused_moves().unwrap();
+        assert!(
+            state.db.list_refused_moves().unwrap().is_empty(),
+            "and once it is not, the entry would only punish a genuine future rename"
         );
     }
 
