@@ -49,29 +49,52 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
         .filter(|s| !s.is_empty());
     let paused = scan_paused.or(remote_paused);
 
-    // DBSYNC-99: a source deletion owed by an upload that will never run again. Ranked above
-    // a transient job error because it describes a state of the user's Dropbox — two copies
-    // of one file — that no retry will fix, and below the mass-deletion pause because that
-    // one has sync stopped entirely.
+    // DBSYNC-99: a source deletion owed by an upload that will never run again.
     //
-    // Deliberately NOT a conflict row. `resolve_conflict_internal` has no arm that removes a
-    // stray remote path: a row with no conflicted copy and `remote_deleted = false` lands in
-    // `(UseRemote, None, false)` / `(KeepBoth, None, false)`, both literal empty arms that
-    // then mark it resolved. The user would click a button, watch the row vanish, and still
-    // have two copies. Telling someone they have fixed something they have not is worse than
-    // saying plainly what happened.
-    let stranded = state.db.unsettled_source_deletion()?.map(|(source, dest)| {
-        format!(
-            "'{source}' was renamed to '{dest}', but the old copy could not be removed from Dropbox. Both names exist there; delete '{source}' by hand if the rename is what you wanted."
-        )
-    });
+    // **It never recommends deleting anything, and that is the whole point of this shape.**
+    // The first version said "Both names exist there; delete '{source}' by hand". Of the
+    // states that reach here, most have nothing at the destination at all — an upload that
+    // exhausted its attempts, one that no-oped because the source vanished, a gate that
+    // returned false for want of a remote row — so the sentence was false and the source was
+    // the user's ONLY copy. `destination_holds_the_bytes` withholds that same deletion saying
+    // "a duplicate is recoverable and a wrong deletion is not", and this handed it to the user
+    // without the gate. A message that prescribes a destructive action has to rest on the same
+    // evidence the automatic path required; this one states facts and stops.
+    //
+    // Ranked BELOW `failed_error`. A job failure is actionable and clears itself; this is an
+    // advisory that can persist, so it must never be the thing hiding an actionable error.
+    //
+    // Deliberately not a conflict row either. `resolve_conflict_internal` has no arm that
+    // removes a stray remote path: a row with no conflicted copy and `remote_deleted = false`
+    // lands in `(UseRemote, None, false)` / `(KeepBoth, None, false)`, both literal empty arms
+    // that then mark it resolved. Telling someone they have fixed something they have not is
+    // worse than saying plainly what happened.
+    let stranded = state
+        .db
+        .unsettled_source_deletion()?
+        .map(|(source, dest, status)| {
+            // Only "both names exist" if the destination is actually observed on Dropbox. A
+            // remote row can hold different content (the `to/conflict` case), and that is
+            // still two names on Dropbox — but it is emphatically not a spare copy, so the
+            // wording claims presence and never equivalence.
+            let destination_on_dropbox = matches!(state.db.get_remote_file(&dest), Ok(Some(_)));
+            if status == "failed" || !destination_on_dropbox {
+                format!(
+                    "'{source}' was renamed to '{dest}', but the new name could not be put on Dropbox. Dropbox still holds it under the old name '{source}'."
+                )
+            } else {
+                format!(
+                    "'{source}' was renamed to '{dest}'. Dropbox holds both names; the old one could not be removed automatically."
+                )
+            }
+        });
 
     let mut engine = state
         .sync_engine
         .lock()
         .map_err(|_| AppError::Sync("sync engine lock poisoned".to_string()))?;
     engine.set_queue_depth(queue_depth);
-    match paused.or(stranded).or(failed_error) {
+    match paused.or(failed_error).or(stranded) {
         Some(msg) => engine.set_last_error(msg),
         None => engine.clear_last_error(),
     }
@@ -83,7 +106,7 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
 /// True when a `<rel>.cloudsc` placeholder exists on disk for `rel`, i.e. the
 /// path was DEHYDRATED (real file/folder replaced by its cloud placeholder)
 /// rather than deleted by the user. Used to suppress spurious remote deletions.
-fn placeholder_exists(tracked_root: &std::path::Path, rel: &str) -> bool {
+pub(crate) fn placeholder_exists(tracked_root: &std::path::Path, rel: &str) -> bool {
     tracked_root.join(format!("{rel}.cloudsc")).exists()
 }
 
@@ -823,25 +846,29 @@ fn correlate_renames(
         let Some(candidates) = by_hash.get_mut(hash.as_str()) else {
             continue;
         };
-        // Peeked, not popped. Dropbox has already refused exactly this pair, permanently —
-        // but the same source may still legitimately pair with a DIFFERENT destination, so
-        // consuming the candidate before the check would lose that.
+        // Pick the last candidate Dropbox has NOT already refused for this destination.
         //
         // Re-proposing a refused pair costs a live `move_v2` per scan tick and — worse — the
         // pair suppresses the ordinary delete-plus-upload that would carry the rename across,
         // because `moved_from` and `moved_to` skip both halves in the passes below.
         //
-        // The directory correlator has had this check since the folder loop was found; not
-        // having it here is what let the same loop happen to files. The two correlators are
-        // deliberately symmetrical and anything added to one belongs in the other.
-        let Some(old) = candidates.last().copied() else {
+        // Searching rather than inspecting only the last one. An earlier version peeked at
+        // `candidates.last()` and gave up on the whole destination if that one was refused,
+        // so with two sources sharing a content hash and only one pair ever refused, the
+        // OTHER — a perfectly good pair nobody has refused — was abandoned and both sources
+        // were deleted and the destination re-uploaded in full. `correlate_directory_renames`
+        // keeps looking, and the two correlators are deliberately symmetrical.
+        //
+        // `remove(idx)` rather than `pop`: the candidate is consumed only when it pairs, so a
+        // source refused for THIS destination stays available for a different one.
+        let Some(idx) = candidates
+            .iter()
+            .rposition(|old| !refused.contains(&((*old).to_string(), rel.clone())))
+        else {
+            tracing::debug!(to = %rel, "not correlating a rename: every candidate source has been refused for this destination");
             continue;
         };
-        if refused.contains(&(old.to_string(), rel.clone())) {
-            tracing::debug!(from = %old, to = %rel, "not correlating a rename: Dropbox already refused this move");
-            continue;
-        }
-        candidates.pop();
+        let old = candidates.remove(idx);
         pairs.push((old.to_string(), rel.clone()));
     }
     Ok(pairs)
@@ -3619,6 +3646,21 @@ mod tests {
         );
         // The queue marks the job done right after settling, exactly as production does.
         state.db.mark_job_completed(upload_id).unwrap();
+
+        // Nothing is said yet: the source's remote row was dropped at re-derivation, so the
+        // app has not OBSERVED that Dropbox still holds it. Claiming otherwise would be the
+        // guess that made the first version of this notice dangerous.
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+        assert!(
+            last_error(&state).is_none(),
+            "no claim may be made before Dropbox has been seen to still hold the old name"
+        );
+
+        // The remote sweep re-indexes `old.txt`, because Dropbox does still hold it.
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
         super::refresh_queue_depth_internal(&state).expect("refresh");
 
         // Withholding is correct and it does not heal itself, so it cannot be a log line only.
@@ -3633,10 +3675,21 @@ mod tests {
             "no conflict row: a conflict promises a resolution this shape does not have, and \
              telling the user they fixed it is worse than the log line"
         );
-        let err = last_error(&state).expect("the user must be told both names now exist");
+        let err = last_error(&state).expect("the user must be told the rename did not complete");
         assert!(
             err.contains("old.txt") && err.contains("new.txt"),
-            "and told WHICH ones, or they cannot act on it: {err}"
+            "and told WHICH paths, or they cannot act on it: {err}"
+        );
+        // **The message must never recommend a deletion.** Here the destination was never put
+        // on Dropbox, so `old.txt` is the user's only copy; the first version of this notice
+        // said "delete 'old.txt' by hand".
+        assert!(
+            !err.to_lowercase().contains("delete"),
+            "this must not instruct a deletion — the app itself refused to perform it: {err}"
+        );
+        assert!(
+            err.contains("still holds it under the old name"),
+            "it must say what is actually true of Dropbox right now: {err}"
         );
 
         // And it is durable: the next tick recomputes `last_error` from scratch and clears
@@ -3728,15 +3781,16 @@ mod tests {
         );
     }
 
-    /// The common residual, and it used to be entirely silent.
+    /// A dead upload surfaces its OWN error, not the advisory — and that ordering is the fix.
     ///
-    /// `settle_owed_source_deletion` runs only from the upload's SUCCESS arm. An upload that
-    /// exhausts its five attempts goes to `mark_job_failed`, and nothing ever reads the debt
-    /// on a `failed` row — while the source's index rows are already gone, so the app no
-    /// longer knows Dropbox holds that path at all. `enqueue_upload_then_delete`'s doc claimed
-    /// the caller logged something for this case. It did not.
+    /// The stranded notice used to outrank `latest_failed_error`, and since nothing ever
+    /// clears the debt on a terminal row (no caller outside settle's success arm, `sync_jobs`
+    /// never pruned of `done`/`failed`, `requeue_failed_jobs` touching only `failed`), it
+    /// masked every real failure after it — an expired token, a full disk — for the life of
+    /// the database. A job failure is actionable and clears itself when acted on; an advisory
+    /// is not, so it must never be the thing hiding one.
     #[test]
-    fn an_upload_that_dies_owing_a_deletion_tells_the_user() {
+    fn a_dead_upload_surfaces_its_own_error_not_the_advisory() {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
 
@@ -3776,11 +3830,29 @@ mod tests {
             "precondition: the upload really died rather than backing off again"
         );
 
-        super::refresh_queue_depth_internal(&state).expect("refresh");
-        let err = last_error(&state).expect("a stranded deletion must reach the user");
+        // Dropbox is observed to still hold the source, so the advisory is available...
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
         assert!(
-            err.contains("old.txt"),
-            "naming the path Dropbox still holds, not just 'job 1 failed': {err}"
+            state.db.unsettled_source_deletion().unwrap().is_some(),
+            "precondition: the debt is stranded on a terminal row and would be reportable"
+        );
+
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+        let err = last_error(&state).expect("something must reach the user");
+        // Discriminating, not co-varying: the destination in this test is `../escaped.txt`,
+        // so BOTH messages contain "escaped.txt" and asserting that proves nothing. The
+        // advisory's distinctive phrase is "was renamed to"; the job error's is the failure
+        // reason itself.
+        assert!(
+            err.contains("rejected unsafe relative path"),
+            "...but the actionable job error is what surfaces: {err}"
+        );
+        assert!(
+            !err.contains("was renamed to"),
+            "the advisory must NOT be what the user sees while a real failure stands: {err}"
         );
     }
 
@@ -3984,6 +4056,131 @@ mod tests {
         );
     }
 
+    /// A source refused for ONE destination must still pair with another.
+    ///
+    /// The check used to inspect only `candidates.last()` and give up on the whole destination
+    /// if that one was refused. With two sources sharing a content hash and only one pair ever
+    /// refused, the other — a pair nobody has refused — was abandoned, and both sources were
+    /// deleted remotely while the destination went back up in full: the exact re-upload this
+    /// ticket exists to prevent, caused by the fix for a different defect.
+    #[test]
+    fn a_refusal_for_one_destination_does_not_block_another_candidate() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        // Two tracked sources with identical content, one present destination.
+        std::fs::write(root.join("x.txt"), b"hello").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("x.txt")).unwrap();
+        for src in ["a.txt", "b.txt"] {
+            state.db.upsert_local_file(src, &hash, size, mtime).unwrap();
+            state
+                .db
+                .upsert_remote_file(src, &hash, "rev1", mtime, Some("id:X"))
+                .unwrap();
+        }
+        // Dropbox has refused exactly one of the two possible pairs.
+        state.db.record_refused_move("b.txt", "x.txt").unwrap();
+
+        process_changed_paths(&state, &["a.txt".into(), "b.txt".into(), "x.txt".into()])
+            .expect("scan");
+
+        assert_eq!(
+            move_jobs(&state),
+            vec![("a.txt".to_string(), "x.txt".to_string())],
+            "the unrefused pair must still form — abandoning it costs the full re-upload"
+        );
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "and nothing goes back up"
+        );
+    }
+
+    /// The advisory must not fire while the upload is still alive and healthy.
+    ///
+    /// The terminal-status clause is the whole meaning of "an upload that will never run
+    /// again". Without it the notice appears the instant a move is refused — while the upload
+    /// is `queued` and about to succeed — telling the user their Dropbox holds two copies
+    /// when it holds one.
+    #[test]
+    fn no_advisory_while_the_upload_is_still_queued() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        refused_file_move(&root, &state);
+        // Dropbox is observed to still hold the source.
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+
+        assert!(
+            state.db.unsettled_source_deletion().unwrap().is_none(),
+            "the upload is queued and owes a deletion it is perfectly likely to settle"
+        );
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+        assert!(last_error(&state).is_none());
+    }
+
+    /// A halted sync outranks the advisory: nothing is moving at all, which is the more
+    /// urgent thing to say.
+    #[test]
+    fn the_mass_deletion_pause_outranks_the_advisory() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (upload_id, _) = refused_file_move(&root, &state);
+        state.db.mark_job_completed(upload_id).unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+        state
+            .db
+            .set_app_config(
+                super::MASS_DELETE_BLOCKED_SCAN_KEY,
+                "sync paused: mass deletion blocked",
+            )
+            .unwrap();
+
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+
+        assert!(
+            last_error(&state).is_some_and(|e| e.contains("mass deletion")),
+            "the pause must win: sync is stopped entirely"
+        );
+    }
+
+    /// A cloud-only destination is not hashed, and therefore licenses nothing.
+    ///
+    /// I claimed this could not be pinned on macOS because `is_dehydrated_placeholder` is
+    /// `#[cfg(windows)]`. That was wrong twice over: the guard should check the legacy
+    /// `.cloudsc` sidecar too — `delete_suppressed_by_dehydration` does, and the guard's own
+    /// comment cited it as precedent while being weaker than it — and the sidecar half is
+    /// platform-independent, so adding it makes the guard both correct and testable here.
+    ///
+    /// The remote hash deliberately MATCHES, so only the guard can withhold the deletion.
+    #[test]
+    fn a_cloud_only_destination_withholds_the_deletion() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (upload_id, hash) = refused_file_move(&root, &state);
+        state
+            .db
+            .upsert_remote_file("new.txt", &hash, "rev2", 0, None)
+            .unwrap();
+        std::fs::write(root.join("new.txt.cloudsc"), b"").unwrap();
+
+        crate::dropbox_transfer::settle_owed_source_deletion(&state, upload_id, "new.txt");
+
+        assert!(
+            delete_jobs(&state).is_empty(),
+            "the destination is cloud-only; hashing it would trigger a download and its bytes \
+             are not local evidence of anything"
+        );
+    }
+
     /// A refusal is only worth remembering while its source folder is still tracked — that is
     /// the only state in which the correlator could propose the pair again. Kept forever, it
     /// would make a genuine later rename of that same pair fall back to delete-plus-upload
@@ -4002,6 +4199,41 @@ mod tests {
         assert!(
             state.db.list_refused_moves().unwrap().is_empty(),
             "the refusal outlived the folder it was about"
+        );
+    }
+
+    /// A refusal recorded for a directory found STRUCTURALLY must survive the prune.
+    ///
+    /// The detector identifies a directory by rows under `from_path + "/"`; the prune used to
+    /// identify "still tracked" by exact membership. For a folder with no `known_folders` row
+    /// — the case the structural detector exists for — every clause was satisfied and the
+    /// entry was deleted on the very next tick. The refusal that `rederive_refused_move` calls
+    /// "not bookkeeping, the whole fix" lived for one scan.
+    #[test]
+    fn a_structurally_detected_directorys_refusal_survives_the_prune() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        // No `known_folders` row — only children.
+        state.db.upsert_local_file("Docs/a.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("Docs/a.txt", "H", "rev1", 0, Some("id:A"))
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "precondition: the structural detector took the directory branch and recorded it"
+        );
+
+        state.db.prune_stale_refused_moves().unwrap();
+
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "the prune must use the same notion of 'tracked' the detector does, or the record \
+             is gone before the next scan can read it"
         );
     }
 
@@ -4026,6 +4258,30 @@ mod tests {
             state.db.list_refused_moves().unwrap().len(),
             1,
             "...but a queued job still names it, so the fallback has not converged yet"
+        );
+    }
+
+    /// ...including when the in-flight work names only the folder's CHILDREN.
+    ///
+    /// A folder's fallback enqueues a delete per tracked descendant and an upload per child;
+    /// a delete of the folder path itself is enqueued by `process_known_folder_deletion`,
+    /// which is skipped outright when a `.cloudsc` placeholder exists. So an exact match on
+    /// the folder path covers only part of the window, and the rest of it the refusal would
+    /// be forgotten while its own fallback was still running.
+    #[test]
+    fn a_refusal_outlives_a_fallback_that_names_only_children() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.record_refused_move("Docs", "Papers").unwrap();
+        // Nothing names `Docs` itself — only what is under it.
+        state.db.enqueue_delete_job("Docs/one.txt", None).unwrap();
+
+        state.db.prune_stale_refused_moves().unwrap();
+
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "the fallback for this very refusal is still draining"
         );
     }
 

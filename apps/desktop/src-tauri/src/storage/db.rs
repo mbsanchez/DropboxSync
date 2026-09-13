@@ -1069,22 +1069,47 @@ impl Db {
     /// anything else, so a bare `set_last_error` would vanish a second later — its own comment
     /// says so. This is durable for exactly as long as the condition holds, and self-clearing:
     /// settling the debt or clearing the job row removes it, with no new user action to build.
-    pub fn unsettled_source_deletion(&self) -> AppResult<Option<(String, String)>> {
+    /// Returns `(source, destination, status)` — the status because the message that gets
+    /// built from this **must not claim more than was checked**.
+    ///
+    /// The source must still be in `remote_file_index`, and that clause is the exit. The
+    /// notice used to have none: nothing clears the column on a terminal row, `sync_jobs` is
+    /// never pruned of `done`/`failed` rows, and `requeue_failed_jobs` touches only `failed`.
+    /// So it returned `Some` forever, and — ranked above `latest_failed_error` — it masked
+    /// every real failure after it: an expired token, a full disk, a rejected upload. Tying it
+    /// to the remote row makes it self-falsifying: when the user (or the sweep) removes the
+    /// old name from Dropbox, the condition stops holding and the notice goes.
+    ///
+    /// `rederive_refused_move` drops the source's remote row, so this fires only once the
+    /// sweep has re-indexed the path — i.e. only once Dropbox has actually been observed to
+    /// still hold it. Saying nothing until then is correct: before that we do not know.
+    pub fn unsettled_source_deletion(&self) -> AppResult<Option<(String, String, String)>> {
         let conn = self
             .read
             .lock()
             .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let row = conn
             .query_row(
-                "SELECT on_success_delete_path, source_path FROM sync_jobs
+                "SELECT on_success_delete_path, source_path, status FROM sync_jobs
                  WHERE job_type = 'upload' AND status IN ('done','failed')
                    AND on_success_delete_path IS NOT NULL
+                   AND on_success_delete_path IN (SELECT relative_path FROM remote_file_index)
                  ORDER BY updated_at DESC LIMIT 1",
                 [],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        Ok(row.map(|(source, destination)| (source, destination.unwrap_or_default())))
+        // A NULL `source_path` cannot happen — `enqueue_upload_then_delete` always writes it —
+        // but rendering "renamed to ''" would be worse than saying nothing, so decline.
+        Ok(row.and_then(|(source, destination, status)| {
+            destination.map(|destination| (source, destination, status))
+        }))
     }
 
     /// DBSYNC-99: remember a folder move Dropbox permanently refused, so the correlator stops
@@ -1133,19 +1158,41 @@ impl Db {
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
-        let removed = conn.execute(
+        // Prefix-aware, because `rederive_refused_move` decides "this is a directory" by
+        // finding index rows UNDER the path. Matching only exact rows meant a directory found
+        // that way — one with no `known_folders` row, the case the structural test was added
+        // for — satisfied every clause and had its refusal deleted on the very next tick. The
+        // entry the code calls "not bookkeeping, the whole fix" lived for one scan.
+        //
+        // The same applies to the in-flight clause: a folder's fallback enqueues jobs for its
+        // CHILDREN, so an exact match only covered the window in which a delete for the folder
+        // path itself happened to be queued — and `process_known_folder_deletion` is skipped
+        // outright when a `.cloudsc` placeholder exists.
+        //
+        // `NOT EXISTS` rather than `NOT IN`: `relative_path` is a TEXT PRIMARY KEY, which
+        // SQLite does not imply NOT NULL, and one NULL row would make `NOT IN` evaluate to
+        // NULL for every candidate and silently prune nothing for ever.
+        //
+        // `LIKE … ESCAPE '!'` with the prefix escaped, matching `move_index_subtree`'s
+        // convention — a path containing `%` or `_` must not widen the match.
+        const ESCAPED_PREFIX: &str =
+            "replace(replace(replace(refused_moves.from_path, '!', '!!'), '%', '!%'), '_', '!_') || '/%'";
+        let sql = format!(
             "DELETE FROM refused_moves
-             WHERE from_path NOT IN (SELECT relative_path FROM known_folders)
-               AND from_path NOT IN (SELECT relative_path FROM local_file_index)
-               AND from_path NOT IN (
-                     SELECT source_path FROM sync_jobs
-                       WHERE status IN ('queued','retry_wait','running') AND source_path IS NOT NULL
-                     UNION
-                     SELECT target_path FROM sync_jobs
-                       WHERE status IN ('queued','retry_wait','running') AND target_path IS NOT NULL
-                   )",
-            [],
-        )?;
+             WHERE NOT EXISTS (SELECT 1 FROM known_folders
+                                WHERE relative_path = refused_moves.from_path
+                                   OR relative_path LIKE {ESCAPED_PREFIX} ESCAPE '!')
+               AND NOT EXISTS (SELECT 1 FROM local_file_index
+                                WHERE relative_path = refused_moves.from_path
+                                   OR relative_path LIKE {ESCAPED_PREFIX} ESCAPE '!')
+               AND NOT EXISTS (SELECT 1 FROM sync_jobs
+                                WHERE status IN ('queued','retry_wait','running')
+                                  AND (source_path = refused_moves.from_path
+                                    OR target_path = refused_moves.from_path
+                                    OR source_path LIKE {ESCAPED_PREFIX} ESCAPE '!'
+                                    OR target_path LIKE {ESCAPED_PREFIX} ESCAPE '!'))"
+        );
+        let removed = conn.execute(&sql, [])?;
         Ok(removed)
     }
 

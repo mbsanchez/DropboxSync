@@ -1227,28 +1227,34 @@ pub(crate) fn rederive_refused_move(
     // `remove_*_file` calls are no-ops that strand every child row at the old prefix, and a
     // RECURSIVE deletion of the source is owed to an upload that can never succeed. Index
     // rows under the prefix, or a directory on disk, each answer the question on their own.
-    let moving_a_directory = state
-        .db
-        .list_known_folders()?
-        .iter()
-        .any(|folder| folder == from_relative)
-        || {
-            let prefix = format!("{from_relative}/");
-            state
-                .db
-                .list_local_files()?
-                .iter()
-                .any(|row| row.relative_path.starts_with(&prefix))
-        }
-        || state
+    // Decisive question first: a directory never has an EXACT `local_file_index` row, so one
+    // settles it. Without this, a tracked file at `Notes` with leftover rows under `Notes/` —
+    // a directory that used to live at that name, a partial prune — answered "directory" to
+    // the prefix clause and the rename silently degraded to delete-plus-upload, which is the
+    // whole regression this ticket removes, under a `warn!` claiming a folder move.
+    let moving_a_directory = state.db.get_local_file(from_relative)?.is_none()
+        && (state
             .db
-            .get_sync_folder()?
-            .map(|folder| {
-                safe_join(Path::new(&folder), from_relative)
-                    .map(|abs| abs.is_dir())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+            .list_known_folders()?
+            .iter()
+            .any(|folder| folder == from_relative)
+            || {
+                let prefix = format!("{from_relative}/");
+                state
+                    .db
+                    .list_local_files()?
+                    .iter()
+                    .any(|row| row.relative_path.starts_with(&prefix))
+            }
+            || state
+                .db
+                .get_sync_folder()?
+                .map(|folder| {
+                    safe_join(Path::new(&folder), from_relative)
+                        .map(|abs| abs.is_dir())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false));
     if moving_a_directory {
         // Record the refusal, and that is not bookkeeping — it is the whole fix.
         //
@@ -1409,11 +1415,18 @@ pub(crate) fn destination_holds_the_bytes(state: &AppState, relative: &str) -> A
         return Ok(false);
     };
     let absolute = safe_join(Path::new(&folder), relative)?;
-    // Never hash a dehydrated placeholder: opening it triggers a download (DBSYNC-59). The
-    // correlator refuses a dehydrated destination so this should be unreachable, but this is
-    // a user-renamed path being opened with no guard, and every other site that hashes one
-    // checks first — `correlate_renames` and `process_local_file_change` both do.
-    if crate::path_util::is_dehydrated_placeholder(&absolute) {
+    // Never hash cloud-only content: opening a Windows placeholder triggers a download
+    // (DBSYNC-59), and a legacy `.cloudsc` sidecar means the bytes are not here either.
+    //
+    // BOTH halves, matching `delete_suppressed_by_dehydration`, which is the nearest analogue.
+    // An earlier version checked only the CfAPI attribute and its comment cited the
+    // neighbouring sites as precedent — while being weaker than them. It was also the reason
+    // I claimed this could not be tested on macOS, where `is_dehydrated_placeholder` is
+    // `#[cfg(windows)]` and constant `false`: the sidecar half is platform-independent, so
+    // adding it is what makes the guard both correct and pinnable here.
+    if crate::path_util::is_dehydrated_placeholder(&absolute)
+        || crate::sync_pipeline::placeholder_exists(Path::new(&folder), relative)
+    {
         return Ok(false);
     }
     // Unreadable now — vanished, locked, permissions — is not proof of a match. Withhold: a

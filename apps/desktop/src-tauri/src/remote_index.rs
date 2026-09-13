@@ -1212,6 +1212,62 @@ mod tests {
         assert!(state.db.get_remote_file("Docs/a.txt").unwrap().is_some());
     }
 
+    /// An EMPTY tracked folder is still a directory.
+    ///
+    /// The `known_folders` clause is the original mechanism and the one that fires for every
+    /// real folder refusal — and it was entirely unpinned, because every other directory test
+    /// also seeds child index rows, so the prefix clause shadowed it. Both could be dead at
+    /// once with the suite green. This case has nothing under it and nothing on disk, so only
+    /// the folder row can answer.
+    #[test]
+    fn an_empty_tracked_folder_is_still_a_directory() {
+        let state = build_state();
+        state.db.upsert_known_folder("Empty").unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Empty", "Renamed").unwrap();
+
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "no upload: the path is a directory and `File::open` on one cannot work"
+        );
+        assert!(state
+            .db
+            .list_refused_moves()
+            .unwrap()
+            .contains(&("Empty".to_string(), "Renamed".to_string())));
+    }
+
+    /// ...and a tracked FILE is not a directory, whatever is left under its name.
+    ///
+    /// Leftover rows under `Notes/` — a directory that used to live at that name, a partial
+    /// prune — made the prefix clause answer "directory" for a tracked file at `Notes`. The
+    /// rename then silently degraded to delete-plus-upload, which is the whole regression this
+    /// ticket removes, under a `warn!` claiming a folder move was refused. An exact
+    /// `local_file_index` row settles it: a directory never has one.
+    #[test]
+    fn a_tracked_file_is_not_a_directory_however_stale_the_rows_beneath_it() {
+        let state = build_state();
+        state.db.upsert_local_file("Notes", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("Notes", "H", "rev1", 0, Some("id:N"))
+            .unwrap();
+        // Stale descendants of a directory that once lived at this name.
+        state
+            .db
+            .upsert_local_file("Notes/old.txt", "H2", 5, 0)
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Notes", "Notes2").unwrap();
+
+        assert_eq!(
+            job_targets(&state, "upload"),
+            vec!["Notes2".to_string()],
+            "the file must be re-derived as a move source, not abandoned to delete-plus-upload"
+        );
+        assert!(state.db.get_local_file("Notes").unwrap().is_none());
+    }
+
     /// One upload can settle one source. A second refused move onto the same destination must
     /// not silently replace the first debt.
     ///
