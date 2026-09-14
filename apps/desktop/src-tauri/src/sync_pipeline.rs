@@ -72,19 +72,37 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
     let stranded = state
         .db
         .unsettled_source_deletion()?
-        .map(|(source, dest, status)| {
+        .map(|(source, dest)| {
             // Only "both names exist" if the destination is actually observed on Dropbox. A
             // remote row can hold different content (the `to/conflict` case), and that is
             // still two names on Dropbox — but it is emphatically not a spare copy, so the
             // wording claims presence and never equivalence.
-            let destination_on_dropbox = matches!(state.db.get_remote_file(&dest), Ok(Some(_)));
-            if status == "failed" || !destination_on_dropbox {
-                format!(
-                    "'{source}' was renamed to '{dest}', but the new name could not be put on Dropbox. Dropbox still holds it under the old name '{source}'."
-                )
-            } else {
+            //
+            // An earlier version also branched on the job's `status`, and that disjunct was
+            // dead: `latest_failed_error` returns `Some` whenever ANY job row is `failed`, and
+            // it now outranks this, so a `failed` row's advisory is discarded before it is
+            // read. Worse, it only changed the outcome when the destination WAS on Dropbox,
+            // where it produced a false sentence. Inert where right, wrong where decisive.
+            let destination_on_dropbox = match state.db.get_remote_file(&dest) {
+                Ok(row) => row.is_some(),
+                Err(e) => {
+                    // Not knowing is not absence. Take the branch that asserts least about the
+                    // user's Dropbox, and say why it was taken.
+                    tracing::warn!(rel = %dest, error = %e, "could not read the destination's remote row while describing a stranded rename");
+                    false
+                }
+            };
+            if destination_on_dropbox {
                 format!(
                     "'{source}' was renamed to '{dest}'. Dropbox holds both names; the old one could not be removed automatically."
+                )
+            } else {
+                // No remote row is absence of KNOWLEDGE, not absence of the file: the bytes
+                // can be on Dropbox with the row still missing — `record_upload_result` says
+                // so itself when it fails to parse a commit response. So this claims only what
+                // is certain, that Dropbox still holds the old name.
+                format!(
+                    "'{source}' was renamed to '{dest}', and the old name '{source}' could not be removed from Dropbox. Dropbox still holds it under the old name."
                 )
             }
         });
@@ -525,6 +543,12 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         // A moved-in / newly-created directory: record it and enqueue any
         // pre-existing children (a bounded walk of just this subtree, not
         // the whole root). Recursive watching also emits child events.
+        // A path that is now a directory cannot also be a tracked file. Without this, a file
+        // replaced on disk by a directory of the same name kept its `local_file_index` row
+        // until the next full scan — up to five minutes, and suppressible by the mass-deletion
+        // breaker — and anything asking "is this a file?" got the stale answer yes. That is
+        // what let a real folder move take the file branch in `rederive_refused_move`.
+        state.db.remove_local_file(rel)?;
         state.db.upsert_known_folder(rel)?;
         for entry in WalkDir::new(absolute).into_iter().flatten() {
             if !entry.file_type().is_file() {
@@ -3647,20 +3671,14 @@ mod tests {
         // The queue marks the job done right after settling, exactly as production does.
         state.db.mark_job_completed(upload_id).unwrap();
 
-        // Nothing is said yet: the source's remote row was dropped at re-derivation, so the
-        // app has not OBSERVED that Dropbox still holds it. Claiming otherwise would be the
-        // guess that made the first version of this notice dangerous.
-        super::refresh_queue_depth_internal(&state).expect("refresh");
-        assert!(
-            last_error(&state).is_none(),
-            "no claim may be made before Dropbox has been seen to still hold the old name"
-        );
-
-        // The remote sweep re-indexes `old.txt`, because Dropbox does still hold it.
-        state
-            .db
-            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
-            .unwrap();
+        // The notice is available immediately, with no hand-written row: `rederive_refused_
+        // move` keeps the source's REMOTE row precisely so this precondition is real.
+        //
+        // The previous version of this test wrote that row itself, under a comment claiming
+        // "the remote sweep re-indexes it". The sweep cannot: it is driven from the local
+        // index, which no longer holds the path. So the notice could never fire in production
+        // and this test passed only because it manufactured the state — the exact failure this
+        // module's own helper exists to stop.
         super::refresh_queue_depth_internal(&state).expect("refresh");
 
         // Withholding is correct and it does not heal itself, so it cannot be a log line only.
@@ -3778,6 +3796,44 @@ mod tests {
             delete_jobs(&state).is_empty(),
             "unreadable is not proof of a match — withhold, because a duplicate is recoverable \
              and a wrong deletion is not"
+        );
+    }
+
+    /// The other message branch: Dropbox is observed to hold BOTH names.
+    ///
+    /// Only the "could not be removed" wording was pinned; forcing `destination_on_dropbox`
+    /// false left the whole suite green, so this branch — the `to/conflict` case, which is the
+    /// marker that sends most moves down this path — was never exercised.
+    ///
+    /// The wording claims presence and never equivalence: a remote row at the destination can
+    /// hold somebody else's content, so "both names" is true while "a spare copy" is not.
+    #[test]
+    fn a_destination_present_on_dropbox_says_both_names_exist() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (upload_id, _) = refused_file_move(&root, &state);
+        state.db.mark_job_completed(upload_id).unwrap();
+        // Dropbox holds the destination too, under different content — the `to/conflict` shape.
+        state
+            .db
+            .upsert_remote_file("new.txt", "OTHER-BYTES", "revX", 0, None)
+            .unwrap();
+
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+
+        let err = last_error(&state).expect("the user must be told");
+        assert!(
+            err.contains("Dropbox holds both names"),
+            "the destination IS on Dropbox, so the wording must say so: {err}"
+        );
+        assert!(
+            !err.contains("could not be removed from Dropbox. Dropbox still holds it under"),
+            "and must not use the no-knowledge wording: {err}"
+        );
+        assert!(
+            !err.to_lowercase().contains("delete"),
+            "and still recommends nothing: {err}"
         );
     }
 
@@ -4258,6 +4314,112 @@ mod tests {
             state.db.list_refused_moves().unwrap().len(),
             1,
             "...but a queued job still names it, so the fallback has not converged yet"
+        );
+    }
+
+    /// A path that becomes a directory loses its tracked-file row immediately.
+    ///
+    /// `upsert_known_folder` did not clear it, so a file replaced on disk by a directory of
+    /// the same name kept its `local_file_index` row until the next full scan — up to five
+    /// minutes, and suppressible by the mass-deletion breaker. Anything asking "is this a
+    /// file?" got the stale answer yes, which is what let a real folder move take the file
+    /// branch in `rederive_refused_move` and owe a recursive delete.
+    #[test]
+    fn a_path_that_became_a_directory_loses_its_file_row() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        // Tracked as a file...
+        state.db.upsert_local_file("Notes", "H", 5, 0).unwrap();
+        // ...and now a directory on disk under the same name.
+        std::fs::create_dir_all(root.join("Notes")).unwrap();
+        std::fs::write(root.join("Notes/inner.txt"), b"hi").unwrap();
+
+        process_changed_paths(&state, &["Notes".to_string()]).expect("scan");
+
+        assert!(
+            state.db.get_local_file("Notes").unwrap().is_none(),
+            "the stale file row must go the moment the path is known to be a directory"
+        );
+        assert!(state
+            .db
+            .list_known_folders()
+            .unwrap()
+            .contains(&"Notes".to_string()));
+    }
+
+    /// The `known_folders` clause must be prefix-aware too, not only `local_file_index`'s.
+    ///
+    /// Both halves exist and only one was pinned: narrowing the `local_file_index` clause was
+    /// killed, narrowing this one left the whole suite green. A refused parent folder whose
+    /// only surviving trace is a tracked SUBfolder would have its refusal pruned, and the
+    /// correlator would re-propose the pair it had just been refused.
+    #[test]
+    fn a_refusal_survives_on_a_tracked_subfolder_alone() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.record_refused_move("Docs", "Papers").unwrap();
+        // Nothing at `Docs` itself in either index — only a folder row beneath it.
+        state.db.upsert_known_folder("Docs/Sub").unwrap();
+
+        state.db.prune_stale_refused_moves().unwrap();
+
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "a tracked subfolder is still a trace of the refused parent"
+        );
+    }
+
+    /// Prefix matching is BINARY and needs no escaping — two properties in one test, because
+    /// the same choice of operator broke both.
+    ///
+    /// `LIKE` is ASCII case-insensitive in SQLite while `=` is BINARY, so the exact and prefix
+    /// halves disagreed on case and an unrelated `docs/...` retained a refusal for `Docs`.
+    /// `COLLATE BINARY` does not fix that — collations are ignored by `LIKE`, measured. And
+    /// `LIKE` needed `%`/`_`/`!` escaping that nothing tested. `substr` answers both.
+    #[test]
+    fn prefix_matching_is_case_sensitive_and_needs_no_escaping() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.record_refused_move("Docs", "Papers").unwrap();
+        state.db.record_refused_move("a%b", "c").unwrap();
+        state.db.record_refused_move("My_Files", "Other").unwrap();
+
+        // Traces that must NOT retain anything: differing only in case, and paths a wildcard
+        // would have matched but a literal prefix does not.
+        state
+            .db
+            .upsert_local_file("docs/unrelated.txt", "H", 1, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("aXb/child.txt", "H", 1, 0)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("MyXFiles/child.txt", "H", 1, 0)
+            .unwrap();
+
+        state.db.prune_stale_refused_moves().unwrap();
+
+        assert!(
+            state.db.list_refused_moves().unwrap().is_empty(),
+            "none of those traces belongs to the refused paths: {:?}",
+            state.db.list_refused_moves().unwrap()
+        );
+
+        // And a literal prefix still matches when it genuinely should.
+        state.db.record_refused_move("a%b", "c").unwrap();
+        state
+            .db
+            .upsert_local_file("a%b/child.txt", "H", 1, 0)
+            .unwrap();
+        state.db.prune_stale_refused_moves().unwrap();
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "a real child under a path containing '%' must still retain it"
         );
     }
 

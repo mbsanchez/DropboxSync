@@ -1227,34 +1227,44 @@ pub(crate) fn rederive_refused_move(
     // `remove_*_file` calls are no-ops that strand every child row at the old prefix, and a
     // RECURSIVE deletion of the source is owed to an upload that can never succeed. Index
     // rows under the prefix, or a directory on disk, each answer the question on their own.
-    // Decisive question first: a directory never has an EXACT `local_file_index` row, so one
-    // settles it. Without this, a tracked file at `Notes` with leftover rows under `Notes/` —
-    // a directory that used to live at that name, a partial prune — answered "directory" to
-    // the prefix clause and the rename silently degraded to delete-plus-upload, which is the
-    // whole regression this ticket removes, under a `warn!` claiming a folder move.
-    let moving_a_directory = state.db.get_local_file(from_relative)?.is_none()
-        && (state
+    // Ask the filesystem about the path that still EXISTS.
+    //
+    // `from_relative` is gone from disk by definition — that is why it vanished — so it cannot
+    // answer. `to_relative` is on disk right now, and a directory rename produces a directory
+    // at the new name. That is the one decisive, non-stale signal available here.
+    //
+    // An earlier version instead vetoed on "the source has an exact `local_file_index` row,
+    // therefore it is a file". The premise is false and the pipeline produces the
+    // counterexample: `process_changed_paths` called `upsert_known_folder` for a path that had
+    // become a directory **without clearing a pre-existing file row at that path**, so a real
+    // folder kept a stale file row until the next full scan and took the file branch — an
+    // upload whose `source_path` is a directory, child rows stranded at the old prefix, and a
+    // recursive `delete_v2` owed to an upload that can never succeed. That veto also traded
+    // the safe default for the unsafe one: in the ambiguous state the directory branch does
+    // nothing destructive, and the file branch writes jobs and deletes rows.
+    let sync_folder = state.db.get_sync_folder()?;
+    let is_dir_on_disk = |rel: &str| -> bool {
+        sync_folder
+            .as_deref()
+            .and_then(|folder| safe_join(Path::new(folder), rel).ok())
+            .map(|abs| abs.is_dir())
+            .unwrap_or(false)
+    };
+    let moving_a_directory = is_dir_on_disk(to_relative)
+        || is_dir_on_disk(from_relative)
+        || state
             .db
             .list_known_folders()?
             .iter()
             .any(|folder| folder == from_relative)
-            || {
-                let prefix = format!("{from_relative}/");
-                state
-                    .db
-                    .list_local_files()?
-                    .iter()
-                    .any(|row| row.relative_path.starts_with(&prefix))
-            }
-            || state
+        || {
+            let prefix = format!("{from_relative}/");
+            state
                 .db
-                .get_sync_folder()?
-                .map(|folder| {
-                    safe_join(Path::new(&folder), from_relative)
-                        .map(|abs| abs.is_dir())
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false));
+                .list_local_files()?
+                .iter()
+                .any(|row| row.relative_path.starts_with(&prefix))
+        };
     if moving_a_directory {
         // Record the refusal, and that is not bookkeeping — it is the whole fix.
         //
@@ -1300,11 +1310,23 @@ pub(crate) fn rederive_refused_move(
         );
         return Ok(());
     }
-    // The source's rows go now: it is no longer anywhere the app should look. Leaving them
-    // would let the next scan derive its own delete of the source — unordered with respect to
-    // the upload, which is the race this whole shape exists to remove.
+    // The LOCAL row goes: it is what the next scan would derive its own delete of the source
+    // from, unordered with respect to the upload, which is the race this shape exists to
+    // remove. It is also what `correlate_renames` needs at the source to re-propose the pair.
+    //
+    // **The REMOTE row stays, and removing it made the stranded notice unreachable.** It is
+    // the app's only record that Dropbox still holds the old name, and
+    // `unsettled_source_deletion` requires it — so dropping it here meant the notice could
+    // never fire for any refused move ever made. The doc claimed the sweep would re-index the
+    // path; it cannot. `reconcile_remote_snapshot_with_breaker`'s present loop, the delete
+    // sweep and `reconcile_remote_absent` are all driven by `for local in local_files`, so
+    // with no local row nothing ever asks about that path again.
+    //
+    // Keeping it is safe for the same reason: no deletion is derived from a remote row alone.
+    // `reconcile_remote_absent` with a remote row and no local row just drops the remote row
+    // and returns 0 — verified, not assumed. And settling the debt clears the notice by
+    // itself, because `delete_remote_file_internal` calls `remove_remote_subtree` on success.
     state.db.remove_local_file(from_relative)?;
-    state.db.remove_remote_file(from_relative)?;
     Ok(())
 }
 

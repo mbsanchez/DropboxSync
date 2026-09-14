@@ -1131,10 +1131,18 @@ mod tests {
              not scheduled beside it"
         );
 
-        // The source is no longer anywhere the app should look, so a later scan does not
-        // derive its own delete of it — which would be unordered against the upload.
+        // The LOCAL row goes, so a later scan does not derive its own delete of the source —
+        // which would be unordered against the upload.
         assert!(state.db.get_local_file("old.txt").unwrap().is_none());
-        assert!(state.db.get_remote_file("old.txt").unwrap().is_none());
+        // The REMOTE row stays, and that is load-bearing: it is the app's only record that
+        // Dropbox still holds the old name, and `unsettled_source_deletion` requires it.
+        // Dropping it made the stranded notice unreachable for every refused move ever made,
+        // because nothing can restore it — every sweep that could is driven from the local
+        // index, which no longer has the path either.
+        assert!(
+            state.db.get_remote_file("old.txt").unwrap().is_some(),
+            "the record that Dropbox still holds the old name must survive"
+        );
 
         let upload = state
             .db
@@ -1212,6 +1220,39 @@ mod tests {
         assert!(state.db.get_remote_file("Docs/a.txt").unwrap().is_some());
     }
 
+    /// The DESTINATION on disk decides the shape, even with no index evidence at all.
+    ///
+    /// It is the only path that still exists — the source vanished, that is why we are here —
+    /// so it is the only non-stale signal available. With every index clause silent, removing
+    /// this one sent a real folder into the file branch: an upload whose `source_path` is a
+    /// directory, and a recursive delete owed to it.
+    #[test]
+    fn the_destination_being_a_directory_on_disk_decides_the_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state();
+        state
+            .db
+            .set_sync_folder(dir.path().to_string_lossy().as_ref())
+            .unwrap();
+        // The destination exists on disk as a directory. Nothing else says so: no
+        // `known_folders` row, no rows under the prefix, source gone from disk.
+        std::fs::create_dir_all(dir.path().join("Papers")).unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "no upload: `File::open` on a directory cannot work and the delete owed would be \
+             recursive"
+        );
+        assert!(state
+            .db
+            .list_refused_moves()
+            .unwrap()
+            .contains(&("Docs".to_string(), "Papers".to_string())));
+        std::mem::drop(dir);
+    }
+
     /// An EMPTY tracked folder is still a directory.
     ///
     /// The `known_folders` clause is the original mechanism and the one that fires for every
@@ -1260,12 +1301,29 @@ mod tests {
 
         crate::dropbox_transfer::rederive_refused_move(&state, "Notes", "Notes2").unwrap();
 
-        assert_eq!(
-            job_targets(&state, "upload"),
-            vec!["Notes2".to_string()],
-            "the file must be re-derived as a move source, not abandoned to delete-plus-upload"
+        // The ambiguous state resolves to DIRECTORY, on purpose, and this test was inverted to
+        // say so. It previously asserted the file answer, on the premise that a directory
+        // never has an exact `local_file_index` row — which is false, and the pipeline
+        // produces the counterexample, so a real folder took the file branch.
+        //
+        // The two mistakes are not symmetrical. Answering "file" for a directory enqueues an
+        // upload of a directory path that burns five attempts and sticks, strands every child
+        // row, and owes a RECURSIVE delete. Answering "directory" for a file costs one
+        // wasteful delete-plus-upload. When the evidence is genuinely ambiguous, take the
+        // answer whose failure is cheap.
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "ambiguous evidence must not reach the file branch, which is the destructive one"
         );
-        assert!(state.db.get_local_file("Notes").unwrap().is_none());
+        assert!(state
+            .db
+            .list_refused_moves()
+            .unwrap()
+            .contains(&("Notes".to_string(), "Notes2".to_string())));
+        assert!(
+            state.db.get_local_file("Notes").unwrap().is_some(),
+            "and nothing is dropped: the directory branch writes no index changes"
+        );
     }
 
     /// One upload can settle one source. A second refused move onto the same destination must

@@ -1069,8 +1069,12 @@ impl Db {
     /// anything else, so a bare `set_last_error` would vanish a second later — its own comment
     /// says so. This is durable for exactly as long as the condition holds, and self-clearing:
     /// settling the debt or clearing the job row removes it, with no new user action to build.
-    /// Returns `(source, destination, status)` — the status because the message that gets
-    /// built from this **must not claim more than was checked**.
+    /// Returns `(source, destination)`. The message built from this **must not claim more than
+    /// was checked** — see the caller, which asks about the destination rather than guessing.
+    ///
+    /// A third element carrying the job's `status` was carried through this whole call chain
+    /// to decide nothing: `latest_failed_error` fires whenever any job row is `failed` and now
+    /// outranks this advisory, so a `failed` row never reaches the message at all.
     ///
     /// The source must still be in `remote_file_index`, and that clause is the exit. The
     /// notice used to have none: nothing clears the column on a terminal row, `sync_jobs` is
@@ -1083,33 +1087,25 @@ impl Db {
     /// `rederive_refused_move` drops the source's remote row, so this fires only once the
     /// sweep has re-indexed the path — i.e. only once Dropbox has actually been observed to
     /// still hold it. Saying nothing until then is correct: before that we do not know.
-    pub fn unsettled_source_deletion(&self) -> AppResult<Option<(String, String, String)>> {
+    pub fn unsettled_source_deletion(&self) -> AppResult<Option<(String, String)>> {
         let conn = self
             .read
             .lock()
             .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
         let row = conn
             .query_row(
-                "SELECT on_success_delete_path, source_path, status FROM sync_jobs
+                "SELECT on_success_delete_path, source_path FROM sync_jobs
                  WHERE job_type = 'upload' AND status IN ('done','failed')
                    AND on_success_delete_path IS NOT NULL
                    AND on_success_delete_path IN (SELECT relative_path FROM remote_file_index)
                  ORDER BY updated_at DESC LIMIT 1",
                 [],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                },
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
         // A NULL `source_path` cannot happen — `enqueue_upload_then_delete` always writes it —
         // but rendering "renamed to ''" would be worse than saying nothing, so decline.
-        Ok(row.and_then(|(source, destination, status)| {
-            destination.map(|destination| (source, destination, status))
-        }))
+        Ok(row.and_then(|(source, destination)| destination.map(|d| (source, d))))
     }
 
     /// DBSYNC-99: remember a folder move Dropbox permanently refused, so the correlator stops
@@ -1173,24 +1169,39 @@ impl Db {
         // SQLite does not imply NOT NULL, and one NULL row would make `NOT IN` evaluate to
         // NULL for every candidate and silently prune nothing for ever.
         //
-        // `LIKE … ESCAPE '!'` with the prefix escaped, matching `move_index_subtree`'s
-        // convention — a path containing `%` or `_` must not widen the match.
-        const ESCAPED_PREFIX: &str =
-            "replace(replace(replace(refused_moves.from_path, '!', '!!'), '%', '!%'), '_', '!_') || '/%'";
+        // Prefix matching by `substr`, not `LIKE`.
+        //
+        // `LIKE` is ASCII case-insensitive in SQLite unless `case_sensitive_like` is set, while
+        // `=` is BINARY — so the exact half and the prefix half of each clause disagreed on
+        // case, and an unrelated `docs/other.txt` retained a refusal recorded for `Docs`. That
+        // direction is safe (over-retention), but a retained refusal pushes a genuine later
+        // rename back onto delete-plus-full-upload, which is the regression this ticket exists
+        // to remove. `COLLATE BINARY` does NOT fix it: collations are ignored by `LIKE` —
+        // measured, after reaching for it first.
+        //
+        // `substr(path, 1, length(prefix) + 1) = prefix || '/'` compares binary, says exactly
+        // what is meant, and needs **no escaping at all**: `%`, `_` and `!` are ordinary
+        // characters here. That removes the triple-`replace` and the bug class it guarded.
+        let under = |col: &str| {
+            format!("substr({col}, 1, length(refused_moves.from_path) + 1) = refused_moves.from_path || '/'")
+        };
+        let (kf, lfi, sp, tp) = (
+            under("relative_path"),
+            under("relative_path"),
+            under("source_path"),
+            under("target_path"),
+        );
         let sql = format!(
             "DELETE FROM refused_moves
              WHERE NOT EXISTS (SELECT 1 FROM known_folders
-                                WHERE relative_path = refused_moves.from_path
-                                   OR relative_path LIKE {ESCAPED_PREFIX} ESCAPE '!')
+                                WHERE relative_path = refused_moves.from_path OR {kf})
                AND NOT EXISTS (SELECT 1 FROM local_file_index
-                                WHERE relative_path = refused_moves.from_path
-                                   OR relative_path LIKE {ESCAPED_PREFIX} ESCAPE '!')
+                                WHERE relative_path = refused_moves.from_path OR {lfi})
                AND NOT EXISTS (SELECT 1 FROM sync_jobs
                                 WHERE status IN ('queued','retry_wait','running')
                                   AND (source_path = refused_moves.from_path
                                     OR target_path = refused_moves.from_path
-                                    OR source_path LIKE {ESCAPED_PREFIX} ESCAPE '!'
-                                    OR target_path LIKE {ESCAPED_PREFIX} ESCAPE '!'))"
+                                    OR {sp} OR {tp}))"
         );
         let removed = conn.execute(&sql, [])?;
         Ok(removed)
