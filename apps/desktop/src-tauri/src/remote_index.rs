@@ -1118,7 +1118,7 @@ mod tests {
             .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
             .unwrap();
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt", true).unwrap();
 
         assert_eq!(
             job_targets(&state, "upload"),
@@ -1203,7 +1203,7 @@ mod tests {
             .upsert_remote_file("Docs/a.txt", "H", "rev1", 0, Some("id:A"))
             .unwrap();
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
 
         assert!(
             job_targets(&state, "upload").is_empty(),
@@ -1238,7 +1238,7 @@ mod tests {
         // `known_folders` row, no rows under the prefix, source gone from disk.
         std::fs::create_dir_all(dir.path().join("Papers")).unwrap();
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
 
         assert!(
             job_targets(&state, "upload").is_empty(),
@@ -1253,6 +1253,79 @@ mod tests {
         std::mem::drop(dir);
     }
 
+    /// `AlreadyGone` clears the remote row; `RevConflict` keeps it. Same job outcome, opposite
+    /// statements about Dropbox — and conflating them is what created the phantom.
+    #[test]
+    fn only_a_genuine_not_found_clears_the_remote_row() {
+        use crate::dropbox_transfer::{apply_delete_outcome, DeleteOutcome};
+
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("gone.txt", "H", "rev", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("gone.txt/child.txt", "H", "rev", 0, None)
+            .unwrap();
+        assert!(apply_delete_outcome(&state, "gone.txt", DeleteOutcome::AlreadyGone).unwrap());
+        assert!(
+            state.db.get_remote_file("gone.txt").unwrap().is_none(),
+            "Dropbox does not have it, so the row is a phantom and must go"
+        );
+        assert!(
+            state
+                .db
+                .get_remote_file("gone.txt/child.txt")
+                .unwrap()
+                .is_none(),
+            "and so must the subtree, since delete_v2 on a folder is recursive"
+        );
+
+        state
+            .db
+            .upsert_remote_file("back.txt", "H", "rev", 0, None)
+            .unwrap();
+        assert!(apply_delete_outcome(&state, "back.txt", DeleteOutcome::RevConflict).unwrap());
+        assert!(
+            state.db.get_remote_file("back.txt").unwrap().is_some(),
+            "the file is back on the server under a new rev, so the row is TRUE and stays"
+        );
+
+        assert!(
+            !apply_delete_outcome(&state, "back.txt", DeleteOutcome::Error).unwrap(),
+            "a real error does not settle the job"
+        );
+    }
+
+    /// When the refusal says the SOURCE is not on Dropbox, its remote row must go.
+    ///
+    /// `from_lookup/not_found` is the first permanent marker and means exactly that: a stale
+    /// index made the correlator propose a move of a path Dropbox no longer holds. Keeping the
+    /// remote row then left a phantom nothing could clear — every deletion path is driven from
+    /// the local index, which no longer has it either — and a phantom permanently refuses any
+    /// future rename INTO that path, because both correlators guard on
+    /// `get_remote_file(destination).is_some()`.
+    #[test]
+    fn a_source_dropbox_does_not_have_leaves_no_phantom_row() {
+        let state = build_state();
+        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+
+        // `source_may_still_exist = false` — the refusal was `from_lookup/not_found`.
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt", false)
+            .unwrap();
+
+        assert!(
+            state.db.get_remote_file("old.txt").unwrap().is_none(),
+            "a row for a path Dropbox does not have is a phantom that blocks every future \
+             rename into it"
+        );
+    }
+
     /// An EMPTY tracked folder is still a directory.
     ///
     /// The `known_folders` clause is the original mechanism and the one that fires for every
@@ -1265,7 +1338,7 @@ mod tests {
         let state = build_state();
         state.db.upsert_known_folder("Empty").unwrap();
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "Empty", "Renamed").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "Empty", "Renamed", true).unwrap();
 
         assert!(
             job_targets(&state, "upload").is_empty(),
@@ -1299,7 +1372,7 @@ mod tests {
             .upsert_local_file("Notes/old.txt", "H2", 5, 0)
             .unwrap();
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "Notes", "Notes2").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "Notes", "Notes2", true).unwrap();
 
         // The ambiguous state resolves to DIRECTORY, on purpose, and this test was inverted to
         // say so. It previously asserted the file answer, on the premise that a directory
@@ -1343,8 +1416,8 @@ mod tests {
                 .unwrap();
         }
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt").unwrap();
-        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt", true).unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt", true).unwrap();
 
         let upload_id = state
             .db
@@ -1388,7 +1461,7 @@ mod tests {
             .db
             .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
             .unwrap();
-        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt", true).unwrap();
 
         let upload = state.db.pick_next_due_job().unwrap().unwrap();
         assert_eq!(upload.job_type, "upload");

@@ -661,15 +661,30 @@ impl Db {
     pub fn move_index_subtree(&self, old_prefix: &str, new_prefix: &str) -> AppResult<usize> {
         let old_prefix = old_prefix.replace('\\', "/");
         let new_prefix = new_prefix.replace('\\', "/");
-        let escaped = old_prefix
-            .replace('!', "!!")
-            .replace('%', "!%")
-            .replace('_', "!_");
-        let child_pattern = format!("{escaped}/%");
-        // SQLite's `substr` is 1-based, so this starts just past the old prefix's trailing
-        // separator and glues the remainder onto the new one.
-        let tail_start = old_prefix.len() as i64 + 1;
         let now = Utc::now().to_rfc3339();
+
+        // **The offset is computed in SQL, in characters, and it must stay that way.**
+        //
+        // This used to pass `old_prefix.len() as i64 + 1` — Rust's BYTE length — as the
+        // `substr` start, and SQLite's `substr` counts CHARACTERS. For any non-ASCII prefix
+        // the overshoot is `bytes - chars`, which eats the `/` separator and, when it exceeds
+        // the tail, the whole tail: measured, `artículos/a.txt` became `Papersa.txt` and
+        // `我的文档/a.txt` became exactly `Docs` — the child row collapsing onto the prefix.
+        //
+        // It was silent. `stranded` counts rows LEFT under the old prefix, and a mangled row
+        // is not under it, so the count stayed 0 and `apply_confirmed_move`'s `tracing::error!`
+        // never fired. The consequences ran from a lost identity and a full re-upload, through
+        // the mass-deletion breaker pausing sync, to a collapsed row naming a real directory
+        // and being taken for a deleted file — which enqueues a RECURSIVE `delete_v2` of the
+        // folder the user just renamed.
+        //
+        // `LIKE` is gone for the same reason `prune_stale_refused_moves` dropped it: it is
+        // ASCII case-insensitive while `=` is BINARY, so the two halves of every statement
+        // here disagreed on case. `substr` compares binary and needs no `%`/`_`/`!` escaping.
+        const MATCH: &str = "substr({c}, 1, length(?1) + 1) = ?1 || '/'";
+        const TAIL: &str = "substr({c}, length(?1) + 1)";
+        let m = |c: &str| MATCH.replace("{c}", c);
+        let tail = |c: &str| TAIL.replace("{c}", c);
 
         let mut conn = self
             .write
@@ -689,11 +704,12 @@ impl Db {
             // Everything beneath it.
             tx.execute(
                 &format!(
-                    "UPDATE OR IGNORE {table} \
-                     SET relative_path = ?2 || substr(relative_path, ?4), updated_at = ?3 \
-                     WHERE relative_path LIKE ?1 ESCAPE '!'"
+                    "UPDATE OR IGNORE {table} SET relative_path = ?2 || {t}, updated_at = ?3 \
+                     WHERE {w}",
+                    t = tail("relative_path"),
+                    w = m("relative_path")
                 ),
-                params![child_pattern, new_prefix, now, tail_start],
+                params![old_prefix, new_prefix, now],
             )?;
         }
 
@@ -715,10 +731,11 @@ impl Db {
             )?;
             tx.execute(
                 &format!(
-                    "UPDATE OR IGNORE {table} SET {column} = ?2 || substr({column}, ?3) \
-                     WHERE {column} LIKE ?1 ESCAPE '!'{guard}"
+                    "UPDATE OR IGNORE {table} SET {column} = ?2 || {t} WHERE {w}{guard}",
+                    t = tail(column),
+                    w = m(column)
                 ),
-                params![child_pattern, new_prefix, tail_start],
+                params![old_prefix, new_prefix],
             )?;
         }
         // `sync_jobs.target_path` carries the partial-unique index on
@@ -730,9 +747,14 @@ impl Db {
             params![old_prefix, new_prefix, now],
         )?;
         tx.execute(
-            "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || substr(target_path, ?4), updated_at = ?3 \
-             WHERE target_path LIKE ?1 ESCAPE '!' AND job_type NOT IN ('move','local_delete','delete') AND status IN ('queued','retry_wait','running','failed')",
-            params![child_pattern, new_prefix, now, tail_start],
+            &format!(
+                "UPDATE OR IGNORE sync_jobs SET target_path = ?2 || {t}, updated_at = ?3 \
+                 WHERE {w} AND job_type NOT IN ('move','local_delete','delete') \
+                   AND status IN ('queued','retry_wait','running','failed')",
+                t = tail("target_path"),
+                w = m("target_path")
+            ),
+            params![old_prefix, new_prefix, now],
         )?;
 
         // Anything still under the old prefix could not be moved, because the destination was
@@ -744,10 +766,10 @@ impl Db {
         for table in ["local_file_index", "remote_file_index", "known_folders"] {
             stranded += tx.query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM {table} \
-                     WHERE relative_path = ?1 OR relative_path LIKE ?2 ESCAPE '!'"
+                    "SELECT COUNT(*) FROM {table} WHERE relative_path = ?1 OR {w}",
+                    w = m("relative_path")
                 ),
-                params![old_prefix, child_pattern],
+                params![old_prefix],
                 |row| row.get::<_, i64>(0),
             )?;
         }
@@ -868,18 +890,19 @@ impl Db {
     /// equivalent to `remove_remote_file` (no `prefix/...` descendants exist).
     pub fn remove_remote_subtree(&self, prefix: &str) -> AppResult<()> {
         let prefix = prefix.replace('\\', "/");
-        let escaped = prefix
-            .replace('!', "!!")
-            .replace('%', "!%")
-            .replace('_', "!_");
-        let child_pattern = format!("{escaped}/%");
         let conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        // `substr`, not `LIKE`, for the reason `move_index_subtree` and
+        // `prune_stale_refused_moves` both carry: `LIKE` is ASCII case-insensitive in SQLite
+        // while `=` is BINARY, so the two halves of this statement disagreed on case — this
+        // one DELETES, so `remove_remote_subtree("Docs")` also took `docs/...` and `DOCS/...`.
+        // `substr` compares binary and needs no `%`/`_`/`!` escaping.
         conn.execute(
-            "DELETE FROM remote_file_index WHERE relative_path = ?1 OR relative_path LIKE ?2 ESCAPE '!'",
-            params![prefix, child_pattern],
+            "DELETE FROM remote_file_index \
+             WHERE relative_path = ?1 OR substr(relative_path, 1, length(?1) + 1) = ?1 || '/'",
+            params![prefix],
         )?;
         Ok(())
     }
@@ -1084,9 +1107,12 @@ impl Db {
     /// to the remote row makes it self-falsifying: when the user (or the sweep) removes the
     /// old name from Dropbox, the condition stops holding and the notice goes.
     ///
-    /// `rederive_refused_move` drops the source's remote row, so this fires only once the
-    /// sweep has re-indexed the path — i.e. only once Dropbox has actually been observed to
-    /// still hold it. Saying nothing until then is correct: before that we do not know.
+    /// **The clause is a filter, not evidence, and an earlier version of this doc claimed
+    /// otherwise.** It said the row appears only once the sweep has re-indexed the path, so
+    /// its presence meant Dropbox had been *observed* to still hold it. That was false twice
+    /// over: the sweep cannot re-index a path with no local row, and `rederive_refused_move`
+    /// now writes the row itself. What the clause does is exclude paths already known to be
+    /// gone, and give the notice an exit — when the row goes, so does the notice.
     pub fn unsettled_source_deletion(&self) -> AppResult<Option<(String, String)>> {
         let conn = self
             .read
@@ -2432,6 +2458,72 @@ mod tests {
             None,
             "only an upload can owe a deletion; honouring this row would delete a path \
              because a field was set on the wrong job"
+        );
+    }
+
+    /// A non-ASCII folder rename must not mangle its subtree.
+    ///
+    /// The offset used to be `old_prefix.len()` — Rust BYTES — fed to SQLite's `substr`, which
+    /// counts CHARACTERS. Two shapes, both silent, because `stranded` counts rows left UNDER
+    /// the old prefix and a mangled row is not under it:
+    ///
+    /// - overshoot smaller than the tail: the `/` is eaten (`artículos/a.txt` → `Papersa.txt`)
+    /// - overshoot larger than the tail: `substr` returns `''` and the child row COLLAPSES onto
+    ///   the prefix (`我的文档/a.txt` → `Docs`), which then names a real directory and is taken
+    ///   for a deleted file by the next full scan — a RECURSIVE `delete_v2` of the folder just
+    ///   renamed.
+    ///
+    /// Both cases are here on purpose: the accented one alone cannot see the collapse.
+    #[test]
+    fn move_index_subtree_is_character_safe_for_multibyte_prefixes() {
+        for (old, new, child) in [
+            ("artículos", "Papers", "artículos/a.txt"),
+            ("我的文档", "Docs", "我的文档/a.txt"),
+            ("Ñoño", "Plain", "Ñoño/deep/b.txt"),
+        ] {
+            let db = Db::new_at(&unique_db_path()).expect("db init");
+            db.upsert_known_folder(old).unwrap();
+            db.upsert_local_file(child, "H", 1, 0).unwrap();
+            db.upsert_remote_file(child, "H", "rev", 0, None).unwrap();
+
+            let stranded = db.move_index_subtree(old, new).expect("move subtree");
+
+            let tail = &child[old.len() + 1..];
+            let expected = format!("{new}/{tail}");
+            let locals: Vec<String> = db
+                .list_local_files()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.relative_path)
+                .collect();
+            assert_eq!(
+                locals,
+                vec![expected.clone()],
+                "prefix {old:?}: the child must land at {expected:?}, not be mangled"
+            );
+            assert!(
+                db.get_remote_file(&expected).unwrap().is_some(),
+                "prefix {old:?}: the remote row must travel too"
+            );
+            assert_eq!(stranded, 0, "prefix {old:?}: nothing may be left behind");
+        }
+    }
+
+    /// The subtree match is BINARY: `LIKE` is ASCII case-insensitive and this one DELETES.
+    #[test]
+    fn remove_remote_subtree_does_not_match_a_different_case() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_remote_file("Docs/keep.txt", "H", "rev", 0, None)
+            .unwrap();
+        db.upsert_remote_file("docs/other.txt", "H", "rev", 0, None)
+            .unwrap();
+
+        db.remove_remote_subtree("Docs").unwrap();
+
+        assert!(db.get_remote_file("Docs/keep.txt").unwrap().is_none());
+        assert!(
+            db.get_remote_file("docs/other.txt").unwrap().is_some(),
+            "a differently-cased sibling subtree must survive — this statement deletes"
         );
     }
 

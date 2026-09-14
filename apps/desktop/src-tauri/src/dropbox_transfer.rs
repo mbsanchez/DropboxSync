@@ -1098,7 +1098,11 @@ pub(crate) fn record_upload_result(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeleteOutcome {
     Deleted,
-    AlreadyGoneOrConflict,
+    /// Dropbox does not have the path. Drop the job **and** the remote index row.
+    AlreadyGone,
+    /// The `parent_rev` precondition failed because the file was restored or changed on the
+    /// server. Drop the job; Dropbox still has the path, so the row is true and stays.
+    RevConflict,
     Error,
 }
 
@@ -1215,6 +1219,7 @@ pub(crate) fn rederive_refused_move(
     state: &AppState,
     from_relative: &str,
     to_relative: &str,
+    source_may_still_exist: bool,
 ) -> AppResult<()> {
     // Read the shape against the SOURCE: nothing has been written, so the index still
     // describes the pre-rename world and `from_relative` is the path that answers reliably.
@@ -1327,6 +1332,17 @@ pub(crate) fn rederive_refused_move(
     // and returns 0 — verified, not assumed. And settling the debt clears the notice by
     // itself, because `delete_remote_file_internal` calls `remove_remote_subtree` on success.
     state.db.remove_local_file(from_relative)?;
+    // ...unless the refusal itself proves Dropbox does NOT have the source.
+    //
+    // `from_lookup/not_found` is the first entry in `PERMANENT`, and it means exactly that: a
+    // stale index made the correlator propose a move of a path Dropbox no longer holds.
+    // Keeping the remote row then leaves a phantom that nothing can clear — every deletion
+    // path is driven from the local index, which no longer has it either — and a phantom row
+    // permanently refuses any future rename INTO that path, because both correlators guard on
+    // `get_remote_file(destination).is_some()`.
+    if !source_may_still_exist {
+        state.db.remove_remote_file(from_relative)?;
+    }
     Ok(())
 }
 
@@ -1559,7 +1575,7 @@ pub(crate) fn move_remote_file_internal(
         // this ticket measured that and then discarded the body that says so, and a stale
         // `rev` is not inert: `process_local_file_deletion` passes it as `delete_parent_rev`,
         // a mismatched parent_rev makes `delete_v2` answer `path_write/conflict`, and
-        // `classify_delete_response` maps that to AlreadyGoneOrConflict — so the job is
+        // `classify_delete_response` maps that to RevConflict — so the job is
         // dropped as a no-op, the local row goes, Dropbox keeps the file, and the next sweep
         // downloads it back. The user's deletion undoes itself. "Rename a file, then think
         // better of it and delete it" is ordinary behaviour, not a corner.
@@ -1611,7 +1627,11 @@ pub(crate) fn move_remote_file_internal(
             // **Files only, and the delete is caused by the upload rather than ordered after
             // it** — both of those are load-bearing, and both cost a review round to learn.
             // See `rederive_refused_move`.
-            rederive_refused_move(state, from_relative, to_relative)?;
+            // `from_lookup/not_found` is the one permanent marker that says the SOURCE is
+            // not on Dropbox. Every other one is about the destination or the shape of the
+            // move, and leaves the source in place.
+            let source_may_still_exist = !body.contains("from_lookup/not_found");
+            rederive_refused_move(state, from_relative, to_relative, source_may_still_exist)?;
             tracing::warn!(
                 from = %from_relative,
                 to = %to_relative,
@@ -1627,26 +1647,65 @@ pub(crate) fn move_remote_file_internal(
     }
 }
 
-/// Classifies a `files/delete_v2` response. `AlreadyGoneOrConflict` means
-/// treat as a no-op and drop the job: the target is already gone
-/// (`not_found`) OR a `parent_rev` precondition failed because the file was
-/// restored/changed on the server (`path_write/conflict`). Anything else on a
-/// failure status is a real `Error`.
+/// Classifies a `files/delete_v2` response.
+///
+/// **`AlreadyGone` and `RevConflict` are separate outcomes, and conflating them stranded a
+/// row forever.** Both mean "drop the job", but they say opposite things about the remote:
+///
+/// - `AlreadyGone` (`not_found`) — Dropbox does **not** have the path. The remote index row
+///   for it is wrong and must go, or it becomes a phantom that nothing can ever remove:
+///   every deletion path is driven from the local index, which no longer has the path either.
+///   A phantom row permanently refuses any future rename INTO that path, because both
+///   correlators guard on `get_remote_file(destination).is_some()`.
+/// - `RevConflict` (`path_write/conflict`) — the `parent_rev` precondition failed because the
+///   file was restored or changed on the server. Dropbox **does** have it, so the row stays.
+///
+/// Anything else on a failure status is a real `Error`.
 pub(crate) fn classify_delete_response(status_success: bool, body: &str) -> DeleteOutcome {
     if status_success {
         return DeleteOutcome::Deleted;
     }
     if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
-        return DeleteOutcome::AlreadyGoneOrConflict;
+        return DeleteOutcome::AlreadyGone;
     }
     // parent_rev mismatch: Dropbox has no dedicated DeleteError tag for it
     // (verified against files.stone). Best-available signal is the contiguous
     // `path_write/conflict` error_summary. Match defensively; confirm the exact
     // live body via manual QA before closing.
     if body.contains("path_write/conflict") {
-        return DeleteOutcome::AlreadyGoneOrConflict;
+        return DeleteOutcome::RevConflict;
     }
     DeleteOutcome::Error
+}
+
+/// Applies a non-success `files/delete_v2` outcome to the index, and says whether the job is
+/// settled. Split out of the network call for the same reason `classify_delete_response` was:
+/// the live path is manual-QA-only, and this is the half that writes durable state.
+///
+/// The two no-op outcomes are **not** interchangeable, and treating them as one left a phantom
+/// row for a path Dropbox does not have — a row nothing could ever clear, because every
+/// deletion path is driven from the local index, which no longer had the path either.
+pub(crate) fn apply_delete_outcome(
+    state: &AppState,
+    relative: &str,
+    outcome: DeleteOutcome,
+) -> AppResult<bool> {
+    match outcome {
+        // Dropbox does not have it. The job is a no-op, but the remote row is a lie and must
+        // go with it, or it permanently refuses any future rename INTO this path — both
+        // correlators guard on `get_remote_file(destination).is_some()`.
+        DeleteOutcome::AlreadyGone => {
+            tracing::info!(rel = %relative, "remote delete skipped: already gone — dropping job and clearing the remote index row");
+            state.db.remove_remote_subtree(relative)?;
+            Ok(true)
+        }
+        // The file is back on the server under a different rev, so the row is true. Keep it.
+        DeleteOutcome::RevConflict => {
+            tracing::info!(rel = %relative, "remote delete skipped: rev-conflict (restored on server) — dropping job, row kept");
+            Ok(true)
+        }
+        DeleteOutcome::Deleted | DeleteOutcome::Error => Ok(false),
+    }
 }
 
 /// Performs a live `files/delete_v2` call against the Dropbox API; manual-QA-only
@@ -1685,11 +1744,7 @@ pub(crate) fn delete_remote_file_internal(
         let body = resp
             .text()
             .unwrap_or_else(|_| "<unreadable body>".to_string());
-        if matches!(
-            classify_delete_response(false, &body),
-            DeleteOutcome::AlreadyGoneOrConflict
-        ) {
-            tracing::info!(rel = %relative, "remote delete skipped: already gone or rev-conflict (restored on server) — dropping job");
+        if apply_delete_outcome(state, relative, classify_delete_response(false, &body))? {
             return Ok(());
         }
         return Err(AppError::Dropbox {
@@ -2234,14 +2289,26 @@ mod tests {
                 false,
                 r#"{"error_summary":"path_lookup/not_found/..","error":{".tag":"path_lookup"}}"#
             ),
-            DeleteOutcome::AlreadyGoneOrConflict
+            DeleteOutcome::AlreadyGone
         );
         assert_eq!(
             classify_delete_response(
                 false,
                 r#"{"error_summary":"path/not_found/..","error":{".tag":"path"}}"#
             ),
-            DeleteOutcome::AlreadyGoneOrConflict
+            DeleteOutcome::AlreadyGone
+        );
+    }
+
+    /// `AlreadyGone` clears the remote row; `RevConflict` keeps it. Conflating them left a
+    /// phantom row for a path Dropbox does not have, and nothing could ever remove it.
+    #[test]
+    fn the_two_delete_noop_outcomes_are_not_the_same_outcome() {
+        assert_ne!(
+            classify_delete_response(false, r#"{"error_summary":"path_lookup/not_found/.."}"#),
+            classify_delete_response(false, r#"{"error_summary":"path_write/conflict/.."}"#),
+            "both drop the job, but they say opposite things about whether Dropbox has the \
+             path — and only one of them licenses clearing the index row"
         );
     }
 
@@ -2255,7 +2322,7 @@ mod tests {
         let body = r#"{"error_summary":"path_write/conflict/..","error":{".tag":"path_write","path_write":{".tag":"conflict","conflict":{".tag":"file"}}}}"#;
         assert_eq!(
             classify_delete_response(false, body),
-            DeleteOutcome::AlreadyGoneOrConflict
+            DeleteOutcome::RevConflict
         );
     }
 

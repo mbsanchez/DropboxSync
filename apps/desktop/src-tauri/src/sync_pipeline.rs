@@ -548,7 +548,25 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         // until the next full scan — up to five minutes, and suppressible by the mass-deletion
         // breaker — and anything asking "is this a file?" got the stale answer yes. That is
         // what let a real folder move take the file branch in `rederive_refused_move`.
-        state.db.remove_local_file(rel)?;
+        //
+        // **The row is converted into the deletion it implies, not merely dropped.** Dropping
+        // it was worse than leaving it: the full scan used to turn that stale row into a
+        // remote `delete` of the old file, which is what FREES the path — and Dropbox cannot
+        // hold a file and a folder at the same name, so without it every child upload into
+        // the new folder is rejected, five times, then permanently. Removing the row removed
+        // the only pass that unblocked the subtree.
+        //
+        // `process_local_file_deletion` is the right vehicle: it honours the dehydration and
+        // registration-grace guards and captures `delete_parent_rev`, none of which a bare
+        // `remove_local_file` does.
+        // Gated on the row actually existing: this loop runs for EVERY present directory, and
+        // `process_local_file_deletion` does not require a local row — calling it unguarded
+        // enqueued a remote `delete` for every directory in the batch, including ones that had
+        // never been tracked files. Caught by `a_refused_folder_move_falls_back_instead_of_
+        // looping`, which saw a spurious delete of the rename destination.
+        if state.db.get_local_file(rel)?.is_some() {
+            enqueued += process_local_file_deletion(state, &tracked_root, rel)?;
+        }
         state.db.upsert_known_folder(rel)?;
         for entry in WalkDir::new(absolute).into_iter().flatten() {
             if !entry.file_type().is_file() {
@@ -3577,7 +3595,7 @@ mod tests {
         );
 
         // Dropbox refuses it permanently.
-        crate::dropbox_transfer::rederive_refused_move(state, "old.txt", "new.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(state, "old.txt", "new.txt", true).unwrap();
         let upload_id = state
             .db
             .list_recent_jobs(50)
@@ -4034,7 +4052,7 @@ mod tests {
 
         // Dropbox refuses it permanently — `cant_move_shared_folder`, which renaming a shared
         // folder produces every time — and the job completes.
-        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
         let move_id = state
             .db
             .list_recent_jobs(50)
@@ -4093,8 +4111,8 @@ mod tests {
         }
 
         // Both refused onto the same destination. The second is declined, keeping its rows.
-        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt").unwrap();
-        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt", true).unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt", true).unwrap();
         assert!(
             state.db.get_local_file("b.txt").unwrap().is_some(),
             "precondition: the declined source keeps its rows"
@@ -4276,7 +4294,7 @@ mod tests {
             .upsert_remote_file("Docs/a.txt", "H", "rev1", 0, Some("id:A"))
             .unwrap();
 
-        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers").unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
         assert_eq!(
             state.db.list_refused_moves().unwrap().len(),
             1,
@@ -4341,6 +4359,15 @@ mod tests {
             state.db.get_local_file("Notes").unwrap().is_none(),
             "the stale file row must go the moment the path is known to be a directory"
         );
+        // And it must go as the DELETION it implies, not be silently dropped. Dropbox cannot
+        // hold a file and a folder at the same name, so without this the child uploads into
+        // the new folder are rejected five times and then fail permanently — and dropping the
+        // row removed the full-scan pass that used to free the path.
+        assert_eq!(
+            delete_jobs(&state),
+            vec!["Notes".to_string()],
+            "the old remote file must be queued for deletion, or the new subtree can never sync"
+        );
         assert!(state
             .db
             .list_known_folders()
@@ -4368,6 +4395,52 @@ mod tests {
             state.db.list_refused_moves().unwrap().len(),
             1,
             "a tracked subfolder is still a trace of the refused parent"
+        );
+    }
+
+    /// The `known_folders` clause's EXACT half, which is the one that fires for an ordinary
+    /// refused folder move.
+    ///
+    /// I added `a_refusal_survives_on_a_tracked_subfolder_alone` last round with the doc
+    /// "both halves exist and only one was pinned" — and the same defect was one level down
+    /// inside the block it fixed: that clause is itself a two-way `||`, and only its PREFIX
+    /// half was pinned. The other test seeds a folder row and then removes it, so it only
+    /// exercises the negative direction.
+    #[test]
+    fn a_refusal_survives_on_the_folder_row_itself() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state.db.record_refused_move("Docs", "Papers").unwrap();
+        // The folder row at the exact path, and nothing beneath it in either index.
+        state.db.upsert_known_folder("Docs").unwrap();
+
+        state.db.prune_stale_refused_moves().unwrap();
+
+        assert_eq!(
+            state.db.list_refused_moves().unwrap().len(),
+            1,
+            "the folder is still tracked, so the correlator can still propose the pair"
+        );
+    }
+
+    /// A database read error while describing a stranded rename must take the branch that
+    /// asserts least — it must not tell the user Dropbox holds both names.
+    #[test]
+    fn an_unreadable_destination_row_does_not_assert_presence() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (upload_id, _) = refused_file_move(&root, &state);
+        state.db.mark_job_completed(upload_id).unwrap();
+
+        // No remote row for the destination: the same state a read error resolves to, since
+        // the `Err` arm is specified to behave as "not on Dropbox".
+        super::refresh_queue_depth_internal(&state).expect("refresh");
+
+        let err = last_error(&state).expect("the user must be told");
+        assert!(
+            !err.contains("Dropbox holds both names"),
+            "absence of knowledge is not presence: {err}"
         );
     }
 
