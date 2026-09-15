@@ -3817,6 +3817,36 @@ mod tests {
         );
     }
 
+    /// An upload must never overwrite content this client has never indexed.
+    ///
+    /// Every upload sends `mode: overwrite`, and the identical-content guard is gated on a
+    /// local index row — so a path with no row, which is precisely one we have never seen,
+    /// skipped the guard entirely. Reached through the `to/conflict` recovery: a collaborator
+    /// creates a file, the user renames onto that name before the delta lands, `move_v2` is
+    /// refused, and the recovery uploaded over another person's file with no conflict row and
+    /// no log line.
+    ///
+    /// The destination here is `.cloudsc`, which returns `Ok(())` at the top of
+    /// `upload_local_file_internal` before any network call — so this test cannot reach the
+    /// guard. It is here to state that gap explicitly rather than leave it implied: the guard
+    /// itself is pinned by `an_upload_over_unknown_remote_content_is_refused` below, which
+    /// calls the DB-level precondition directly.
+    #[test]
+    fn a_path_with_no_local_row_is_the_state_the_overwrite_guard_defends() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        let (_upload_id, _) = refused_file_move(&root, &state);
+
+        // This is the precondition the guard keys on, and `refused_file_move` asserts the
+        // pipeline really produces it.
+        assert!(
+            state.db.get_local_file("new.txt").unwrap().is_none(),
+            "a refused move's destination has no local row — which is what made the \
+             identical-content guard structurally skippable"
+        );
+    }
+
     /// The other message branch: Dropbox is observed to hold BOTH names.
     ///
     /// Only the "could not be removed" wording was pinned; forcing `destination_on_dropbox`

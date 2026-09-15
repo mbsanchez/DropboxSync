@@ -187,6 +187,10 @@ impl Db {
         tx.execute("DELETE FROM local_file_index", [])?;
         tx.execute("DELETE FROM remote_file_index", [])?;
         tx.execute("DELETE FROM sync_jobs", [])?;
+        // DBSYNC-99's table. A surviving refusal names relative paths, so after a folder
+        // change a colliding pair suppresses a legitimate rename correlation in the NEW
+        // folder. Added here when the table was added; the next table needs the same line.
+        tx.execute("DELETE FROM refused_moves", [])?;
         tx.execute("DELETE FROM sync_conflicts", [])?;
         tx.execute("DELETE FROM known_folders", [])?;
         // Drop the cursor-delta cursor so remote change detection re-seeds
@@ -1001,11 +1005,17 @@ impl Db {
         delete_parent_rev: Option<&str>,
     ) -> AppResult<bool> {
         let now = Utc::now().to_rfc3339();
-        let conn = self
+        let mut conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
-        conn.execute(
+        // The INSERT and the read-back that decides `took_the_debt` must be ONE transaction.
+        // Apart, a concurrent drain flipping the row to `done` between them makes the SELECT
+        // return nothing, the caller concludes "another upload already owes a different
+        // source", records a refusal and keeps the source's index rows — while the row it
+        // just wrote is the one holding the debt.
+        let tx = conn.transaction()?;
+        tx.execute(
             "
             INSERT INTO sync_jobs(job_type, source_path, target_path, on_success_delete_path, on_success_delete_rev, status, attempt_count, next_retry_at, created_at, updated_at)
             VALUES('upload', ?1, ?1, ?2, ?3, 'queued', 0, NULL, ?4, ?4)
@@ -1020,7 +1030,7 @@ impl Db {
             ",
             params![upload_path, delete_path, delete_parent_rev, now],
         )?;
-        let owed: Option<String> = conn
+        let owed: Option<String> = tx
             .query_row(
                 "SELECT on_success_delete_path FROM sync_jobs WHERE job_type='upload' AND target_path=?1 AND status IN ('queued','retry_wait','running')",
                 params![upload_path],
@@ -1028,7 +1038,9 @@ impl Db {
             )
             .optional()?
             .flatten();
-        Ok(owed.as_deref() == Some(delete_path))
+        let took = owed.as_deref() == Some(delete_path);
+        tx.commit()?;
+        Ok(took)
     }
 
     /// Read the deletion an upload job owes its source, **without** clearing it.
@@ -2459,6 +2471,26 @@ mod tests {
             "only an upload can owe a deletion; honouring this row would delete a path \
              because a field was set on the wrong job"
         );
+    }
+
+    /// `reset_sync_state` must clear every table the index owns, including the ones added
+    /// later. A surviving refusal names relative paths, so after a folder change a colliding
+    /// pair suppresses a legitimate rename correlation in the NEW folder.
+    #[test]
+    fn reset_sync_state_clears_refused_moves_too() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.set_sync_folder("/tmp/whatever").unwrap();
+        db.record_refused_move("Docs", "Papers").unwrap();
+        db.upsert_local_file("a.txt", "H", 1, 0).unwrap();
+
+        db.reset_sync_state().expect("reset");
+
+        assert!(
+            db.list_refused_moves().unwrap().is_empty(),
+            "a table added after this function was written is exactly the one that gets \
+             forgotten here"
+        );
+        assert!(db.list_local_files().unwrap().is_empty());
     }
 
     /// A non-ASCII folder rename must not mangle its subtree.

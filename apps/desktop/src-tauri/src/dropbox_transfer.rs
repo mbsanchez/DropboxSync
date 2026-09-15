@@ -975,6 +975,52 @@ pub(crate) fn upload_local_file_internal(
 
     let token = get_access_token(state)?;
 
+    // **Never overwrite content this client has never seen.**
+    //
+    // Every upload sends `"mode": "overwrite"`, and the only guard against clobbering an
+    // unknown file was the identical-content check below — which is gated on a local index
+    // row. A path with no local row is, by definition, one we have never indexed, so the
+    // guard was structurally skipped exactly where it was most needed.
+    //
+    // That is reachable without timing luck. `correlate_renames` refuses a destination the
+    // index knows remotely, but that index is a mirror only as fresh as the last sweep, and
+    // `to/conflict` from `move_v2` IS the signal that the mirror was stale. A collaborator
+    // creates `Reports/Q3.xlsx`; before the delta lands the user renames a file onto that
+    // name; the move is refused; the recovery uploads — and another person's file is gone,
+    // with no conflict row, no notification and no log line saying anything was replaced.
+    //
+    // `settle_owed_source_deletion`'s doc used to claim the hashes would disagree and protect
+    // this. They cannot: the upload runs BEFORE the comparison and is what makes them agree.
+    if state.db.get_local_file(relative)?.is_none() {
+        if let Some(remote) = crate::remote_index::fetch_remote_file_metadata(state, relative)? {
+            let disk_hash = crate::path_util::hash_file(&local_path)
+                .map(|(h, _, _)| h)
+                .ok();
+            if upload_would_clobber_unknown_content(
+                false,
+                Some(&remote.content_hash),
+                disk_hash.as_deref(),
+            ) {
+                // Record what Dropbox actually holds, so the next scan reasons about the
+                // collision instead of re-proposing the same move, and refuse the job.
+                state.db.upsert_remote_file(
+                    relative,
+                    &remote.content_hash,
+                    &remote.rev,
+                    remote.modified_ts,
+                    remote.id.as_deref(),
+                )?;
+                tracing::error!(
+                    rel = %relative,
+                    "refusing to upload over content this client has never indexed — Dropbox holds a different file at this path"
+                );
+                return Err(AppError::Sync(format!(
+                    "upload refused: Dropbox already holds different content at {relative}, and this client has no record of it"
+                )));
+            }
+        }
+    }
+
     // Skip the upload when Dropbox already holds identical content. This avoids
     // re-uploading files that originated from Dropbox (e.g. after a sync-state
     // reset re-indexes existing downloads as "new" local files).
@@ -1363,10 +1409,13 @@ pub(crate) fn rederive_refused_move(
 /// unsatisfiable, left here after the code was fixed. See that function for why the local row
 /// is an optimisation and not evidence.)
 ///
-/// That also covers the case the classifier sends here most often. `to/conflict` means the
-/// destination is already taken on Dropbox — so a remote row for it can exist without this
-/// upload having done anything. If its content differs, the hashes disagree and the source
-/// stays: a duplicate the user can see and resolve, never a silent loss.
+/// **The `to/conflict` case is NOT protected by this comparison, and an earlier version of
+/// this doc claimed it was.** It said that if the destination's content differs the hashes
+/// disagree and the source stays. They cannot disagree: the upload runs BEFORE this check and
+/// is what makes them agree. The protection lives in `upload_local_file_internal`, which now
+/// refuses to overwrite content this client has never indexed — which is the only place it
+/// can live, because the ordinary scan would upload the renamed file even if this recovery
+/// enqueued nothing at all.
 ///
 /// **Never fails the job.** An owed deletion that cannot be enqueued leaves a duplicate on
 /// Dropbox; a `?` here would leave the job `running`, which `pick_next_due_job` never picks
@@ -1644,6 +1693,32 @@ pub(crate) fn move_remote_file_internal(
             status: status.as_u16(),
             message: format!("move {from_path} -> {to_path}: {body}"),
         }),
+    }
+}
+
+/// Would this upload replace content the client has never indexed?
+///
+/// Pure, so the decision is reachable without a network call — the same split as
+/// `classify_delete_response` and `apply_delete_outcome`, for the same reason.
+///
+/// `true` only when all three hold: we have **no local row** for the path (so we have never
+/// seen this file), Dropbox **does** hold something there, and its content differs from what
+/// is on disk. An unreadable local file counts as differing: not knowing is not a licence to
+/// overwrite.
+///
+/// A local row means the path is ours and the ordinary identical-content check applies. No
+/// remote content means there is nothing to clobber. Equal hashes mean the upload is a no-op.
+pub(crate) fn upload_would_clobber_unknown_content(
+    local_row_exists: bool,
+    remote_content_hash: Option<&str>,
+    disk_hash: Option<&str>,
+) -> bool {
+    if local_row_exists {
+        return false;
+    }
+    match remote_content_hash {
+        None => false,
+        Some(remote) => disk_hash != Some(remote),
     }
 }
 
@@ -2095,8 +2170,9 @@ mod tests {
     use super::{
         atomic_replace, choose_upload_strategy, classify_delete_response, classify_move_response,
         conflict_copy_with_content_exists, download_would_conflict, download_would_destroy_local,
-        emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome,
-        MoveOutcome, UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient,
+        upload_would_clobber_unknown_content, DeleteOutcome, MoveOutcome, UploadStrategy,
+        UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
@@ -2298,6 +2374,47 @@ mod tests {
             ),
             DeleteOutcome::AlreadyGone
         );
+    }
+
+    /// The guard that stops an upload destroying another person's file.
+    ///
+    /// Every upload sends `mode: overwrite`, and the identical-content check is gated on a
+    /// local index row — so a path we have never indexed skipped it entirely. Reached through
+    /// the `to/conflict` recovery, which uploads to a destination that by construction has no
+    /// local row.
+    #[test]
+    fn an_upload_over_unknown_remote_content_is_refused() {
+        // The dangerous case: never seen it, Dropbox has something, and it is not ours.
+        assert!(
+            upload_would_clobber_unknown_content(false, Some("THEIRS"), Some("OURS")),
+            "this is a collaborator's file and mode is overwrite"
+        );
+
+        // Unreadable locally is not a licence: not knowing is not agreement.
+        assert!(
+            upload_would_clobber_unknown_content(false, Some("THEIRS"), None),
+            "an unreadable local file must not license overwriting unknown content"
+        );
+
+        // A local row means the path is ours; the ordinary identical-content check applies.
+        assert!(
+            !upload_would_clobber_unknown_content(true, Some("THEIRS"), Some("OURS")),
+            "a tracked path is not unknown content, whatever the hashes say"
+        );
+
+        // Nothing on Dropbox: nothing to clobber.
+        assert!(!upload_would_clobber_unknown_content(
+            false,
+            None,
+            Some("OURS")
+        ));
+
+        // Same bytes: the upload is a no-op, not a clobber.
+        assert!(!upload_would_clobber_unknown_content(
+            false,
+            Some("SAME"),
+            Some("SAME")
+        ));
     }
 
     /// `AlreadyGone` clears the remote row; `RevConflict` keeps it. Conflating them left a
