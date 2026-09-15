@@ -104,7 +104,7 @@ fn compute_overlay_paths(state: &AppState) -> AppResult<HashMap<String, OverlayT
             continue;
         }
 
-        let tier = if job_paths.contains(&row.relative_path) {
+        let tier = if crate::sync_pipeline::covered_by_active_job(&row.relative_path, &job_paths) {
             OverlayTier::Syncing
         } else if conflict_paths.contains(&row.relative_path) {
             OverlayTier::OutOfSync
@@ -134,7 +134,7 @@ fn compute_overlay_paths(state: &AppState) -> AppResult<HashMap<String, OverlayT
             // An active job wins: a placeholder being hydrated should read as `syncing`,
             // not as still-online-only. `job_paths` is keyed by the same on-disk
             // relative path.
-            let tier = if job_paths.contains(&rel) {
+            let tier = if crate::sync_pipeline::covered_by_active_job(&rel, &job_paths) {
                 OverlayTier::Syncing
             } else {
                 OverlayTier::CloudOnly
@@ -321,7 +321,7 @@ mod tests {
             .expect("upsert local");
         state
             .db
-            .upsert_remote_file("Planilla.docx.cloudsc", "deadbeef", "rev1", 0)
+            .upsert_remote_file("Planilla.docx.cloudsc", "deadbeef", "rev1", 0, None)
             .expect("upsert remote");
 
         let paths = compute_overlay_paths(&state).expect("compute");
@@ -345,7 +345,7 @@ mod tests {
             .expect("upsert local");
         state
             .db
-            .upsert_remote_file("Anteproyecto.docx", "abc123", "rev1", 0)
+            .upsert_remote_file("Anteproyecto.docx", "abc123", "rev1", 0, None)
             .expect("upsert remote");
 
         let paths = compute_overlay_paths(&state).expect("compute");

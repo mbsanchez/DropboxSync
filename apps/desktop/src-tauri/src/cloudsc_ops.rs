@@ -369,7 +369,7 @@ fn create_remote_only_placeholder(
     }
     if let Err(e) = state
         .db
-        .upsert_remote_file(rel, content_hash, rev, modified_ts)
+        .upsert_remote_file(rel, content_hash, rev, modified_ts, None)
     {
         tracing::warn!(rel, error = %e, "remote-only placeholder: remote index upsert failed");
     }
@@ -1561,7 +1561,10 @@ mod tests {
         std::fs::write(sync.join("a.txt"), b"hello").unwrap();
         let (h, _, _) = hash_file(&sync.join("a.txt")).unwrap();
         state.db.upsert_local_file("a.txt", &h, 5, 0).unwrap();
-        state.db.upsert_remote_file("a.txt", &h, "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("a.txt", &h, "rev", 0, None)
+            .unwrap();
 
         let n = dehydrate_path_internal(&state, "a.txt").unwrap();
         assert_eq!(n, 1);
@@ -1586,7 +1589,7 @@ mod tests {
         // Remote hash differs → the local copy has unsynced changes.
         state
             .db
-            .upsert_remote_file("b.txt", "REMOTEHASH", "rev", 0)
+            .upsert_remote_file("b.txt", "REMOTEHASH", "rev", 0, None)
             .unwrap();
 
         let err = dehydrate_path_internal(&state, "b.txt").unwrap_err();
@@ -1611,7 +1614,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .upsert_remote_file("d.txt", "STALE_SYNCED", "rev", 0)
+            .upsert_remote_file("d.txt", "STALE_SYNCED", "rev", 0, None)
             .unwrap();
 
         let err = dehydrate_path_internal(&state, "d.txt").unwrap_err();
@@ -1628,7 +1631,10 @@ mod tests {
         std::fs::write(sync.join("c.txt"), b"data").unwrap();
         let (h, _, _) = hash_file(&sync.join("c.txt")).unwrap();
         state.db.upsert_local_file("c.txt", &h, 4, 0).unwrap();
-        state.db.upsert_remote_file("c.txt", &h, "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("c.txt", &h, "rev", 0, None)
+            .unwrap();
 
         dehydrate_path_internal(&state, "c.txt").unwrap();
 
@@ -1659,7 +1665,10 @@ mod tests {
             .db
             .upsert_local_file(rel, &h, bytes.len() as i64, 0)
             .unwrap();
-        state.db.upsert_remote_file(rel, &h, "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file(rel, &h, "rev", 0, None)
+            .unwrap();
     }
 
     #[test]
@@ -1707,7 +1716,7 @@ mod tests {
             .unwrap();
         state
             .db
-            .upsert_remote_file("dir/edited.txt", "REMOTE", "rev", 0)
+            .upsert_remote_file("dir/edited.txt", "REMOTE", "rev", 0, None)
             .unwrap();
 
         let err = dehydrate_path_internal(&state, "dir").unwrap_err();

@@ -11,8 +11,8 @@ use tauri::{Emitter, EventTarget};
 use crate::auth_session::get_access_token;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DropboxListFolderResponse, ListRemoteFolderResponse, RemoteEntry, SyncConflictEvent,
-    UploadProgressEvent, UploadSessionStartResponse,
+    DropboxListFolderResponse, ListRemoteFolderResponse, MoveV2Response, RemoteEntry,
+    SyncConflictEvent, UploadCommitResponse, UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
     create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed,
@@ -448,7 +448,7 @@ fn finish_upload_session(
     offset: u64,
     dropbox_path: &str,
     last_chunk: &[u8],
-) -> AppResult<()> {
+) -> AppResult<Option<UploadCommitResponse>> {
     let resp = client
         .post("https://content.dropboxapi.com/2/files/upload_session/finish")
         .bearer_auth(token)
@@ -485,7 +485,11 @@ fn finish_upload_session(
         });
     }
 
-    Ok(())
+    // The commit response is the file's metadata, carrying the `id`, `rev` and
+    // `content_hash` Dropbox just assigned. Returned rather than discarded so the caller can
+    // record the remote row — see `upload_local_file_internal`. Best-effort: a parse failure
+    // must never fail an upload that has already committed.
+    Ok(resp.json::<UploadCommitResponse>().ok())
 }
 
 /// Pure boundary check: is the chunk just read (`bytes_read` bytes, starting
@@ -746,8 +750,9 @@ fn upload_via_session(
     len: u64,
     dropbox_path: &str,
     job_id: i64,
-) -> AppResult<()> {
+) -> AppResult<Option<UploadCommitResponse>> {
     let client = &state.http_client;
+    let committed: Option<UploadCommitResponse>;
 
     let file_mtime = file
         .metadata()
@@ -800,9 +805,10 @@ fn upload_via_session(
                 finish_upload_session(client, token, &session_id, chunk_offset, dropbox_path, &[])
             });
             match result {
-                Ok(()) => {
+                Ok(meta) => {
                     state.db.clear_upload_checkpoint(job_id)?;
                     emit_upload_progress(dropbox_path, offset, len);
+                    committed = meta;
                     break;
                 }
                 Err(e) if !restarted && e.is_session_invalid() => {
@@ -838,10 +844,11 @@ fn upload_via_session(
                 )
             });
             match result {
-                Ok(()) => {
+                Ok(meta) => {
                     offset += n as u64;
                     state.db.clear_upload_checkpoint(job_id)?;
                     emit_upload_progress(dropbox_path, offset, len);
+                    committed = meta;
                     break;
                 }
                 Err(e) if !restarted && e.is_session_invalid() => {
@@ -899,7 +906,7 @@ fn upload_via_session(
         }
     }
 
-    Ok(())
+    Ok(committed)
 }
 
 pub(crate) fn upload_local_file_internal(
@@ -968,6 +975,52 @@ pub(crate) fn upload_local_file_internal(
 
     let token = get_access_token(state)?;
 
+    // **Never overwrite content this client has never seen.**
+    //
+    // Every upload sends `"mode": "overwrite"`, and the only guard against clobbering an
+    // unknown file was the identical-content check below — which is gated on a local index
+    // row. A path with no local row is, by definition, one we have never indexed, so the
+    // guard was structurally skipped exactly where it was most needed.
+    //
+    // That is reachable without timing luck. `correlate_renames` refuses a destination the
+    // index knows remotely, but that index is a mirror only as fresh as the last sweep, and
+    // `to/conflict` from `move_v2` IS the signal that the mirror was stale. A collaborator
+    // creates `Reports/Q3.xlsx`; before the delta lands the user renames a file onto that
+    // name; the move is refused; the recovery uploads — and another person's file is gone,
+    // with no conflict row, no notification and no log line saying anything was replaced.
+    //
+    // `settle_owed_source_deletion`'s doc used to claim the hashes would disagree and protect
+    // this. They cannot: the upload runs BEFORE the comparison and is what makes them agree.
+    if state.db.get_local_file(relative)?.is_none() {
+        if let Some(remote) = crate::remote_index::fetch_remote_file_metadata(state, relative)? {
+            let disk_hash = crate::path_util::hash_file(&local_path)
+                .map(|(h, _, _)| h)
+                .ok();
+            if upload_would_clobber_unknown_content(
+                false,
+                Some(&remote.content_hash),
+                disk_hash.as_deref(),
+            ) {
+                // Record what Dropbox actually holds, so the next scan reasons about the
+                // collision instead of re-proposing the same move, and refuse the job.
+                state.db.upsert_remote_file(
+                    relative,
+                    &remote.content_hash,
+                    &remote.rev,
+                    remote.modified_ts,
+                    remote.id.as_deref(),
+                )?;
+                tracing::error!(
+                    rel = %relative,
+                    "refusing to upload over content this client has never indexed — Dropbox holds a different file at this path"
+                );
+                return Err(AppError::Sync(format!(
+                    "upload refused: Dropbox already holds different content at {relative}, and this client has no record of it"
+                )));
+            }
+        }
+    }
+
     // Skip the upload when Dropbox already holds identical content. This avoids
     // re-uploading files that originated from Dropbox (e.g. after a sync-state
     // reset re-indexes existing downloads as "new" local files).
@@ -979,6 +1032,7 @@ pub(crate) fn upload_local_file_internal(
                     &remote.content_hash,
                     &remote.rev,
                     remote.modified_ts,
+                    remote.id.as_deref(),
                 )?;
                 return Ok(());
             }
@@ -1033,42 +1087,700 @@ pub(crate) fn upload_local_file_internal(
                     message: format!("upload for {dropbox_path}: {body}"),
                 });
             }
+            record_upload_result(state, relative, resp.json::<UploadCommitResponse>().ok());
         }
         UploadStrategy::Session => {
-            upload_via_session(state, &token, file, len, &dropbox_path, job_id)?;
+            let committed = upload_via_session(state, &token, file, len, &dropbox_path, job_id)?;
+            record_upload_result(state, relative, committed);
         }
     }
 
     Ok(())
 }
 
+/// Record what Dropbox says it now holds, immediately after an upload commits.
+///
+/// **Found by manual QA, not by a test.** Nothing used to write a `remote_file_index` row on
+/// the success path — only the skip-if-identical early return did — so after a real upload
+/// there was no remote row until the next full sweep. DBSYNC-99's content-agreement guard
+/// requires one, so it correctly refused to correlate, and a rename inside that window fell
+/// back to a delete plus a full re-upload and minted a fresh identity. Measured on a live
+/// account: the same file renamed twice, delete-plus-upload before a sweep and a clean move
+/// after, identity 10 → 11 in the first case and preserved in the second.
+///
+/// The window is exactly when a user is most likely to rename something — just after creating
+/// it. Slice 1 recorded that `files/upload` returns the full metadata including the `id`, and
+/// slice 2 deferred using it on the grounds that the sweep fills the row eventually. It does;
+/// arriving late is the defect.
+///
+/// Best-effort throughout: the bytes are already on Dropbox, and failing the job here would
+/// re-upload a file that is already there.
+pub(crate) fn record_upload_result(
+    state: &AppState,
+    relative: &str,
+    committed: Option<UploadCommitResponse>,
+) {
+    let Some(entry) = committed else {
+        tracing::warn!(rel = %relative, "upload committed but its metadata could not be parsed; the remote row waits for the next sweep");
+        return;
+    };
+    let (Some(hash), Some(rev)) = (entry.content_hash.as_deref(), entry.rev.as_deref()) else {
+        return;
+    };
+    let modified_ts = entry
+        .server_modified
+        .as_deref()
+        .map(crate::remote_index::parse_rfc3339_ts_to_unix)
+        .unwrap_or(0);
+    if let Err(e) =
+        state
+            .db
+            .upsert_remote_file(relative, hash, rev, modified_ts, entry.id.as_deref())
+    {
+        tracing::warn!(rel = %relative, error = %e, "upload committed but the remote row could not be recorded");
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeleteOutcome {
     Deleted,
-    AlreadyGoneOrConflict,
+    /// Dropbox does not have the path. Drop the job **and** the remote index row.
+    AlreadyGone,
+    /// The `parent_rev` precondition failed because the file was restored or changed on the
+    /// server. Drop the job; Dropbox still has the path, so the row is true and stays.
+    RevConflict,
     Error,
 }
 
-/// Classifies a `files/delete_v2` response. `AlreadyGoneOrConflict` means
-/// treat as a no-op and drop the job: the target is already gone
-/// (`not_found`) OR a `parent_rev` precondition failed because the file was
-/// restored/changed on the server (`path_write/conflict`). Anything else on a
-/// failure status is a real `Error`.
+/// What a failed `files/move_v2` response means for the job that issued it (DBSYNC-99).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MoveOutcome {
+    Moved,
+    /// The move cannot succeed and retrying will not change that. The desired end state is
+    /// still reachable, but **only because the caller undoes the index rewrite** — see
+    /// [`move_remote_file_internal`]. An earlier version of this doc said the next scan
+    /// re-derives the work; it does not, and believing it cost a data-loss defect.
+    ///
+    /// Two shapes were observed live on 2026-09-11, both HTTP 409, which is why this
+    /// classifier reads the body and not the status code:
+    /// - `from_lookup/not_found` — the source is gone. Someone else moved or deleted it.
+    /// - `to/conflict` — the destination is occupied. `autorename` is off deliberately;
+    ///   letting Dropbox pick a different name would silently desynchronise the two sides.
+    ///
+    /// The rest are from `RelocationError` and cannot be retried into success either, so
+    /// they take the fallback immediately rather than burning five attempts first.
+    /// `too_many_files` is the one a user will actually hit: `move_v2` is capped at 10,000
+    /// files, so a large folder rename lands here.
+    ///
+    /// Misclassifying costs attempts, not data. Since the index is not written until Dropbox
+    /// confirms, a permanent failure that lands in `Error` simply exhausts its retries and
+    /// leaves the index describing the pre-rename world — which is still what the server
+    /// holds. This list was briefly a data-safety boundary and is now an optimisation.
+    ///
+    /// Transient conditions stay out of this arm even when they look terminal — see the
+    /// list in `classify_move_response`.
+    NotApplicable,
+    /// Anything else on a failure status.
+    Error,
+}
+
+/// Classifies a `files/move_v2` response. Pure, so the decision is unit-testable without
+/// a network — the same split as [`classify_delete_response`], for the same reason: the
+/// live call can only be exercised by manual QA.
+///
+/// **Matches on `error_summary`, not on the status code.** Both failure shapes above come
+/// back as 409, so a classifier keyed on status cannot tell "the source vanished" from
+/// "the destination is taken" — nor either from a real error.
+pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOutcome {
+    if status_success {
+        return MoveOutcome::Moved;
+    }
+    // Permanent means "retrying cannot help", not merely "this attempt failed".
+    //
+    // `insufficient_quota` and `from_write/conflict` were briefly in this list and are not:
+    // quota clears when the user frees space, and a write conflict is a lock or an operation
+    // in flight. Routing them here would have undone the index rewrite and left the item to
+    // be re-uploaded — an upload that also needs the quota that was missing — while a plain
+    // retry would have cost nothing.
+    const PERMANENT: [&str; 6] = [
+        "from_lookup/not_found",
+        "to/conflict",
+        "too_many_files",
+        "cant_move_shared_folder",
+        "cant_nest_shared_folder",
+        "duplicated_or_nested_paths",
+    ];
+    if PERMANENT.iter().any(|marker| body.contains(marker)) {
+        return MoveOutcome::NotApplicable;
+    }
+    MoveOutcome::Error
+}
+
+/// Re-derive a refused move as the upload-plus-delete it replaces. **Files only.**
+///
+/// Extracted so the recovery can be tested: the network call around it is manual-QA-only.
+///
+/// # The delete is caused by the upload, not merely ordered after it
+///
+/// An earlier version of this enqueued both jobs and relied on the upload carrying the lower
+/// id. That was wrong, and the test written to defend it asserted the enqueue order rather
+/// than the property the order was standing in for. `pick_next_due_job` orders by id **among
+/// due jobs**; one transient upload failure parks the upload in `retry_wait` with a future
+/// `next_retry_at`, removing it from the candidate set entirely, and the delete drains first.
+/// The content then exists at neither path for as long as the backoff lasts.
+///
+/// So the deletion is not enqueued here at all. It rides on the upload row and is enqueued by
+/// the upload's success arm — see [`Db::enqueue_upload_then_delete`]. If the upload never
+/// succeeds, the source is never deleted: a duplicate on Dropbox, which the next scan can
+/// reconcile, instead of a window with no copy anywhere.
+///
+/// # Directories are refused, not recovered
+///
+/// A directory records the refusal and returns; no recovery is attempted. Recording it is not
+/// optional — declining silently makes the correlator re-propose the pair every scan, and the
+/// pair suppresses the very fallback that would carry the rename across. Three of the six
+/// permanent `RelocationError` markers are
+/// folder-only, `cant_move_shared_folder` among them, so a refused **folder** move is ordinary
+/// rather than a corner: renaming a shared folder hits it every time.
+///
+/// Neither half of the file recovery transfers. `upload_local_file_internal` opens its path as
+/// a file, so the upload cannot work; and the delete is recursive on a folder, so it would take
+/// the destination's children down with the source. Children that are dehydrated placeholders
+/// have no bytes on disk, so that is permanent loss — over the very population of placeholders
+/// this ticket's round-7 revert exists to protect.
+///
+/// The recovery a refused folder move deserves is a per-child re-derivation, which is a
+/// different piece of work with its own failure modes. It is tracked in DBSYNC-100.
+///
+/// # Known residual, deliberately accepted
+///
+/// If the materialization sweep plants a `.cloudsc` sidecar over the source before the delete
+/// drains, `delete_suppressed_by_dehydration` reads it as a dehydration and drops the delete —
+/// leaving the source on Dropbox as a duplicate. The content is safe at the destination, so
+/// this is a duplicate rather than a loss. Closing it means teaching the sweep about in-flight
+/// paths, which is a `.cloudsc` change: round 7 showed that doing it from here re-arms
+/// DBSYNC-62's evicted-placeholder recovery on Windows, because every CfAPI placeholder carries
+/// a local index row. Tracked in DBSYNC-101.
+pub(crate) fn rederive_refused_move(
+    state: &AppState,
+    from_relative: &str,
+    to_relative: &str,
+    source_may_still_exist: bool,
+) -> AppResult<()> {
+    // Read the shape against the SOURCE: nothing has been written, so the index still
+    // describes the pre-rename world and `from_relative` is the path that answers reliably.
+    //
+    // Three questions, not one. A single `known_folders` lookup decides a branch whose wrong
+    // answer is expensive: a directory that has lost its folder row — a partial prune, a
+    // half-applied subtree move — would fall into the file branch, where
+    // `enqueue_upload_then_delete` creates an upload whose `source_path` is a directory
+    // (`File::open` on a directory fails, so five attempts burn and the job sticks), the two
+    // `remove_*_file` calls are no-ops that strand every child row at the old prefix, and a
+    // RECURSIVE deletion of the source is owed to an upload that can never succeed. Index
+    // rows under the prefix, or a directory on disk, each answer the question on their own.
+    // Ask the filesystem about the path that still EXISTS.
+    //
+    // `from_relative` is gone from disk by definition — that is why it vanished — so it cannot
+    // answer. `to_relative` is on disk right now, and a directory rename produces a directory
+    // at the new name. That is the one decisive, non-stale signal available here.
+    //
+    // An earlier version instead vetoed on "the source has an exact `local_file_index` row,
+    // therefore it is a file". The premise is false and the pipeline produces the
+    // counterexample: `process_changed_paths` called `upsert_known_folder` for a path that had
+    // become a directory **without clearing a pre-existing file row at that path**, so a real
+    // folder kept a stale file row until the next full scan and took the file branch — an
+    // upload whose `source_path` is a directory, child rows stranded at the old prefix, and a
+    // recursive `delete_v2` owed to an upload that can never succeed. That veto also traded
+    // the safe default for the unsafe one: in the ambiguous state the directory branch does
+    // nothing destructive, and the file branch writes jobs and deletes rows.
+    let sync_folder = state.db.get_sync_folder()?;
+    let is_dir_on_disk = |rel: &str| -> bool {
+        sync_folder
+            .as_deref()
+            .and_then(|folder| safe_join(Path::new(folder), rel).ok())
+            .map(|abs| abs.is_dir())
+            .unwrap_or(false)
+    };
+    let moving_a_directory = is_dir_on_disk(to_relative)
+        || is_dir_on_disk(from_relative)
+        || state
+            .db
+            .list_known_folders()?
+            .iter()
+            .any(|folder| folder == from_relative)
+        || {
+            let prefix = format!("{from_relative}/");
+            state
+                .db
+                .list_local_files()?
+                .iter()
+                .any(|row| row.relative_path.starts_with(&prefix))
+        };
+    if moving_a_directory {
+        // Record the refusal, and that is not bookkeeping — it is the whole fix.
+        //
+        // Declining to recover writes nothing, so the correlator's inputs are byte-for-byte
+        // identical next scan and it proposes the same pair again: one live `move_v2` per
+        // tick, forever. And the pair is what SUPPRESSES the ordinary delete-plus-upload —
+        // `under_moved_dir` skips every path beneath the destination — so the rename never
+        // reaches Dropbox and edits under the renamed folder stop being uploaded at all,
+        // while the UI reads `synced`. An earlier version of this comment claimed doing
+        // nothing was "exactly what `main` does, and `main` loses nothing". It is not:
+        // `main` has no directory correlation, so the fallback runs there and converges.
+        state.db.record_refused_move(from_relative, to_relative)?;
+        tracing::warn!(
+            from = %from_relative,
+            to = %to_relative,
+            "remote folder move refused — recorded so the correlator steps aside and the ordinary delete-plus-upload runs; no folder recovery is attempted (DBSYNC-100)"
+        );
+        return Ok(());
+    }
+
+    let parent_rev = state.db.get_remote_file(from_relative)?.map(|r| r.rev);
+    let took_the_debt =
+        state
+            .db
+            .enqueue_upload_then_delete(to_relative, from_relative, parent_rev.as_deref())?;
+    if !took_the_debt {
+        // An upload for this destination already owes a different source. One upload can
+        // settle one source, so this one is not deferred — and its index rows must stay, or
+        // it becomes an orphan on Dropbox that nothing deletes and nothing indexes.
+        //
+        // Keeping the rows is what makes recording the refusal mandatory, and leaving that
+        // out reproduced the folder loop at file granularity: the correlator's inputs stay
+        // identical, so it re-proposes this exact pair on every scan — a live `move_v2` per
+        // tick — and the pair suppresses the fallback through `moved_from`/`moved_to`, while
+        // the overlay paints the source `Synced` although it no longer exists on disk.
+        // Bounded, because it ends when the other upload lands or exhausts; still the defect
+        // the directory branch above exists to prevent.
+        state.db.record_refused_move(from_relative, to_relative)?;
+        tracing::error!(
+            from = %from_relative,
+            to = %to_relative,
+            "a second refused move onto the same destination: this source is left indexed and on Dropbox rather than silently orphaned, and the pair is recorded so the correlator stops re-proposing it"
+        );
+        return Ok(());
+    }
+    // The LOCAL row goes: it is what the next scan would derive its own delete of the source
+    // from, unordered with respect to the upload, which is the race this shape exists to
+    // remove. It is also what `correlate_renames` needs at the source to re-propose the pair.
+    //
+    // **The REMOTE row stays, and removing it made the stranded notice unreachable.** It is
+    // the app's only record that Dropbox still holds the old name, and
+    // `unsettled_source_deletion` requires it — so dropping it here meant the notice could
+    // never fire for any refused move ever made. The doc claimed the sweep would re-index the
+    // path; it cannot. `reconcile_remote_snapshot_with_breaker`'s present loop, the delete
+    // sweep and `reconcile_remote_absent` are all driven by `for local in local_files`, so
+    // with no local row nothing ever asks about that path again.
+    //
+    // Keeping it is safe for the same reason: no deletion is derived from a remote row alone.
+    // `reconcile_remote_absent` with a remote row and no local row just drops the remote row
+    // and returns 0 — verified, not assumed. And settling the debt clears the notice by
+    // itself, because `delete_remote_file_internal` calls `remove_remote_subtree` on success.
+    state.db.remove_local_file(from_relative)?;
+    // ...unless the refusal itself proves Dropbox does NOT have the source.
+    //
+    // `from_lookup/not_found` is the first entry in `PERMANENT`, and it means exactly that: a
+    // stale index made the correlator propose a move of a path Dropbox no longer holds.
+    // Keeping the remote row then leaves a phantom that nothing can clear — every deletion
+    // path is driven from the local index, which no longer has it either — and a phantom row
+    // permanently refuses any future rename INTO that path, because both correlators guard on
+    // `get_remote_file(destination).is_some()`.
+    if !source_may_still_exist {
+        state.db.remove_remote_file(from_relative)?;
+    }
+    Ok(())
+}
+
+/// Settle the deletion an upload job owes the source of a move Dropbox refused — enqueuing it
+/// only once Dropbox is **actually holding the destination's bytes**.
+///
+/// `Ok(())` from [`upload_local_file_internal`] does not mean the bytes landed. Three of its
+/// returns are no-ops that leave nothing new on Dropbox: a `.cloudsc` path, a source that
+/// vanished before the upload (an atomic save, a file deleted right after being renamed), and
+/// a destination Dropbox already held identical content for. Treating all three as success
+/// would delete the source out from under the second one and leave the content nowhere — the
+/// same shape as the ordering defect this whole mechanism replaced, reintroduced one layer in.
+///
+/// So this asks the question directly instead of inferring it, via
+/// [`destination_holds_the_bytes`]: Dropbox must hold, at the new name, the bytes the user has
+/// there. Nothing weaker licenses removing the old name. (An earlier version of this paragraph
+/// said the remote row and the LOCAL row must agree — the exact requirement that made the gate
+/// unsatisfiable, left here after the code was fixed. See that function for why the local row
+/// is an optimisation and not evidence.)
+///
+/// **The `to/conflict` case is NOT protected by this comparison, and an earlier version of
+/// this doc claimed it was.** It said that if the destination's content differs the hashes
+/// disagree and the source stays. They cannot disagree: the upload runs BEFORE this check and
+/// is what makes them agree. The protection lives in `upload_local_file_internal`, which now
+/// refuses to overwrite content this client has never indexed — which is the only place it
+/// can live, because the ordinary scan would upload the renamed file even if this recovery
+/// enqueued nothing at all.
+///
+/// **Never fails the job.** An owed deletion that cannot be enqueued leaves a duplicate on
+/// Dropbox; a `?` here would leave the job `running`, which `pick_next_due_job` never picks
+/// again, and wedge the queue instead.
+pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destination: &str) {
+    let owed = match state.db.peek_deferred_source_delete(job_id) {
+        Ok(Some(owed)) => owed,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(job_id, error = %e, "could not read the deferred source deletion for a completed upload");
+            return;
+        }
+    };
+    let (source, parent_rev) = owed;
+
+    match destination_holds_the_bytes(state, destination) {
+        Ok(true) => match state.db.enqueue_delete_job(&source, parent_rev.as_deref()) {
+            // Clear only now, with the delete job in existence. Reading and clearing in one
+            // step meant every decline below destroyed the debt on first sight.
+            Ok(()) => {
+                if let Err(e) = state.db.clear_deferred_source_delete(job_id) {
+                    tracing::warn!(job_id, error = %e, "the source deletion was enqueued but its debt could not be cleared");
+                }
+                tracing::info!(
+                    job_id,
+                    source = %source,
+                    destination = %destination,
+                    "upload landed — enqueued the deletion of the move source it replaced"
+                );
+            }
+            Err(e) => tracing::error!(
+                job_id,
+                source = %source,
+                error = %e,
+                "upload landed but the move source could not be enqueued for deletion; it stays on Dropbox as a duplicate"
+            ),
+        },
+        Ok(false) => {
+            tracing::error!(
+                job_id,
+                source = %source,
+                destination = %destination,
+                "upload job finished without putting the destination's bytes on Dropbox — the move source is NOT deleted. Dropbox keeps it as a duplicate of the renamed file"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                job_id,
+                source = %source,
+                error = %e,
+                "could not confirm the destination's bytes are on Dropbox; the move source is left in place"
+            );
+        }
+    }
+}
+
+/// Does Dropbox hold, at `relative`, the bytes the user has there?
+///
+/// **The local index row is not required, and requiring it made this unsatisfiable.** The
+/// destination of a refused move has no `local_file_index` row and never gets one before the
+/// upload completes: `correlate_renames` pairs only a destination the local index does NOT
+/// contain, the scan's third pass skips `moved_to` paths so `process_local_file_change` never
+/// runs for it, `rederive_refused_move` removes the *source's* rows rather than creating the
+/// destination's, and `record_upload_result` writes `remote_file_index` only. An earlier
+/// version demanded that row, so this returned `false` for every refused move ever made and
+/// the whole deferred-deletion mechanism was inert in production. Two unit tests passed
+/// because each manufactured the row by hand — a state the pipeline does not produce — and a
+/// third passed vacuously, asserting no deletion in a setup that had no remote row either.
+///
+/// So the authority is the file on disk, which is what the upload just read. The index row is
+/// used when it happens to exist because hashing is not free, but its absence is not evidence.
+///
+/// A hash mismatch still withholds, which is what keeps the `to/conflict` case safe: a
+/// destination Dropbox already holds under somebody else's content fails the comparison
+/// rather than licensing the source's deletion.
+pub(crate) fn destination_holds_the_bytes(state: &AppState, relative: &str) -> AppResult<bool> {
+    let Some(remote) = state.db.get_remote_file(relative)? else {
+        return Ok(false);
+    };
+    if let Some(local) = state.db.get_local_file(relative)? {
+        return Ok(remote.content_hash == local.hash);
+    }
+    let Some(folder) = state.db.get_sync_folder()? else {
+        return Ok(false);
+    };
+    let absolute = safe_join(Path::new(&folder), relative)?;
+    // Never hash cloud-only content: opening a Windows placeholder triggers a download
+    // (DBSYNC-59), and a legacy `.cloudsc` sidecar means the bytes are not here either.
+    //
+    // BOTH halves, matching `delete_suppressed_by_dehydration`, which is the nearest analogue.
+    // An earlier version checked only the CfAPI attribute and its comment cited the
+    // neighbouring sites as precedent — while being weaker than them. It was also the reason
+    // I claimed this could not be tested on macOS, where `is_dehydrated_placeholder` is
+    // `#[cfg(windows)]` and constant `false`: the sidecar half is platform-independent, so
+    // adding it is what makes the guard both correct and pinnable here.
+    if crate::path_util::is_dehydrated_placeholder(&absolute)
+        || crate::sync_pipeline::placeholder_exists(Path::new(&folder), relative)
+    {
+        return Ok(false);
+    }
+    // Unreadable now — vanished, locked, permissions — is not proof of a match. Withhold: a
+    // duplicate on Dropbox is recoverable and a wrong deletion is not.
+    match crate::path_util::hash_file(&absolute) {
+        Ok((hash, _, _)) => Ok(remote.content_hash == hash),
+        Err(e) => {
+            tracing::warn!(rel = %relative, error = %e, "could not hash the move destination to confirm the upload landed");
+            Ok(false)
+        }
+    }
+}
+
+/// Make the index match a move Dropbox has already performed.
+///
+/// Separated from the network call so the rewrite is unit-testable — it is the one step that
+/// changes durable state, and the network path around it can only be exercised by hand.
+///
+/// **The shape is read before anything is written.** `known_folders` still describes the
+/// pre-rename world at this point, so `from_relative` answers reliably; an earlier design
+/// asked about the *destination* after rewriting, and was silently wrong whenever the folder
+/// row had moved since. Choosing the wrong branch here is not cosmetic: `move_index_row` on a
+/// folder touches nothing, leaving the whole subtree stranded at paths that no longer exist.
+pub(crate) fn apply_confirmed_move(
+    state: &AppState,
+    from_relative: &str,
+    to_relative: &str,
+) -> AppResult<()> {
+    let moving_a_directory = state
+        .db
+        .list_known_folders()?
+        .iter()
+        .any(|folder| folder == from_relative);
+
+    if moving_a_directory {
+        let stranded = state.db.move_index_subtree(from_relative, to_relative)?;
+        if stranded > 0 {
+            // The remote move already happened, so the index must be made to match. This is
+            // now a loud surprise rather than a data-safety decision — nothing is lost by it,
+            // because the bytes are already where the index is being pointed.
+            tracing::error!(
+                from = %from_relative,
+                to = %to_relative,
+                stranded,
+                "moved on Dropbox but the index subtree did not travel whole"
+            );
+        }
+    } else {
+        state.db.move_index_row(from_relative, to_relative)?;
+    }
+    Ok(())
+}
+
+/// Performs a live `files/move_v2` call and, **only if Dropbox accepted it**, rewrites the
+/// index to match. Manual-QA-only for the network path; the response classification is
+/// covered by the pure `classify_move_response` tests.
+///
+/// One request, one outcome — verified against a live account on 2026-09-11. That is the
+/// whole benefit over the delete-plus-upload it replaces, which left a window in which the
+/// file existed nowhere remotely.
+///
+/// **The order here is the whole design, and it took three rounds of review to get right.**
+/// The index used to be rewritten when the move was *enqueued*, which meant every failure
+/// path had to undo it — and each repair for that undo introduced a worse defect than the
+/// one it fixed: a refused move deleting the user's file, then a refused folder move deleting
+/// the folder from Dropbox and every file locally, then an "abandon" that suppressed the very
+/// fallback it deferred to. Six data-loss defects, all downstream of writing down an outcome
+/// before it happened.
+///
+/// Now nothing is written until Dropbox confirms. A failure needs no repair because nothing
+/// was changed: the index still describes the pre-rename world, which is still what the
+/// server holds, and once the job leaves the active set the ordinary scan re-derives a delete
+/// plus an upload — the behaviour a rename had before this ticket. That also demotes
+/// `classify_move_response` from a data-safety boundary to an optimisation: misclassifying a
+/// permanent failure as retryable now costs five attempts, not a file.
+pub(crate) fn move_remote_file_internal(
+    state: &AppState,
+    from_relative: &str,
+    to_relative: &str,
+) -> AppResult<()> {
+    let token = get_access_token(state)?;
+    let from_path = normalize_dropbox_path(from_relative)?;
+    let to_path = normalize_dropbox_path(to_relative)?;
+    let resp = state
+        .http_client
+        .post("https://api.dropboxapi.com/2/files/move_v2")
+        .bearer_auth(token.as_str())
+        .json(&serde_json::json!({
+            "from_path": from_path,
+            "to_path": to_path,
+            // Never autorename. A server-chosen name would leave Dropbox holding a file
+            // under a name the local index has never heard of.
+            "autorename": false
+        }))
+        .send()
+        .map_err(|e| {
+            AppError::Network(format!(
+                "move request failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
+
+    if resp.status().is_success() {
+        apply_confirmed_move(state, from_relative, to_relative)?;
+
+        // Refresh the row from the response rather than letting it carry the pre-move
+        // `rev`. Dropbox changes `rev` on a move while `content_hash` and `id` stay put —
+        // this ticket measured that and then discarded the body that says so, and a stale
+        // `rev` is not inert: `process_local_file_deletion` passes it as `delete_parent_rev`,
+        // a mismatched parent_rev makes `delete_v2` answer `path_write/conflict`, and
+        // `classify_delete_response` maps that to RevConflict — so the job is
+        // dropped as a no-op, the local row goes, Dropbox keeps the file, and the next sweep
+        // downloads it back. The user's deletion undoes itself. "Rename a file, then think
+        // better of it and delete it" is ordinary behaviour, not a corner.
+        //
+        // Best-effort: the move itself succeeded, and failing the job here would retry a
+        // move that is already done.
+        match resp.json::<MoveV2Response>() {
+            Ok(parsed) => {
+                let m = parsed.metadata;
+                if let (Some(hash), Some(rev)) = (m.content_hash.as_deref(), m.rev.as_deref()) {
+                    let ts = m
+                        .server_modified
+                        .as_deref()
+                        .map(crate::remote_index::parse_rfc3339_ts_to_unix)
+                        .unwrap_or(0);
+                    if let Err(e) =
+                        state
+                            .db
+                            .upsert_remote_file(to_relative, hash, rev, ts, m.id.as_deref())
+                    {
+                        tracing::warn!(rel = %to_relative, error = %e, "move succeeded but the remote row could not be refreshed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(rel = %to_relative, error = %e, "move succeeded but its metadata could not be parsed; the recorded rev is now stale")
+            }
+        }
+        return Ok(());
+    }
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .unwrap_or_else(|_| "<unreadable body>".to_string());
+    match classify_move_response(false, &body) {
+        MoveOutcome::NotApplicable => {
+            // Nothing to UNDO — the index was never touched, which is what makes a failed
+            // move incapable of losing data. But the work still has to be re-derived, and
+            // leaving that to the next scan is what three review rounds kept failing on:
+            // between this moment and that scan, the materialization sweep sees the source
+            // as a remote child with no local counterpart and plants a `.cloudsc` sidecar
+            // over it. `process_local_file_deletion` then reads that placeholder as a
+            // dehydration and drops the delete along with the index row that remembers the
+            // path, so the source stays on Dropbox forever and the user gets a duplicate.
+            //
+            // So re-derive it here, explicitly, instead of hoping a later scan wins the race.
+            //
+            // **Files only, and the delete is caused by the upload rather than ordered after
+            // it** — both of those are load-bearing, and both cost a review round to learn.
+            // See `rederive_refused_move`.
+            // `from_lookup/not_found` is the one permanent marker that says the SOURCE is
+            // not on Dropbox. Every other one is about the destination or the shape of the
+            // move, and leaves the source in place.
+            let source_may_still_exist = !body.contains("from_lookup/not_found");
+            rederive_refused_move(state, from_relative, to_relative, source_may_still_exist)?;
+            tracing::warn!(
+                from = %from_relative,
+                to = %to_relative,
+                body = %body,
+                "remote move not applicable — see the preceding line for what was re-derived"
+            );
+            Ok(())
+        }
+        _ => Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("move {from_path} -> {to_path}: {body}"),
+        }),
+    }
+}
+
+/// Would this upload replace content the client has never indexed?
+///
+/// Pure, so the decision is reachable without a network call — the same split as
+/// `classify_delete_response` and `apply_delete_outcome`, for the same reason.
+///
+/// `true` only when all three hold: we have **no local row** for the path (so we have never
+/// seen this file), Dropbox **does** hold something there, and its content differs from what
+/// is on disk. An unreadable local file counts as differing: not knowing is not a licence to
+/// overwrite.
+///
+/// A local row means the path is ours and the ordinary identical-content check applies. No
+/// remote content means there is nothing to clobber. Equal hashes mean the upload is a no-op.
+pub(crate) fn upload_would_clobber_unknown_content(
+    local_row_exists: bool,
+    remote_content_hash: Option<&str>,
+    disk_hash: Option<&str>,
+) -> bool {
+    if local_row_exists {
+        return false;
+    }
+    match remote_content_hash {
+        None => false,
+        Some(remote) => disk_hash != Some(remote),
+    }
+}
+
+/// Classifies a `files/delete_v2` response.
+///
+/// **`AlreadyGone` and `RevConflict` are separate outcomes, and conflating them stranded a
+/// row forever.** Both mean "drop the job", but they say opposite things about the remote:
+///
+/// - `AlreadyGone` (`not_found`) — Dropbox does **not** have the path. The remote index row
+///   for it is wrong and must go, or it becomes a phantom that nothing can ever remove:
+///   every deletion path is driven from the local index, which no longer has the path either.
+///   A phantom row permanently refuses any future rename INTO that path, because both
+///   correlators guard on `get_remote_file(destination).is_some()`.
+/// - `RevConflict` (`path_write/conflict`) — the `parent_rev` precondition failed because the
+///   file was restored or changed on the server. Dropbox **does** have it, so the row stays.
+///
+/// Anything else on a failure status is a real `Error`.
 pub(crate) fn classify_delete_response(status_success: bool, body: &str) -> DeleteOutcome {
     if status_success {
         return DeleteOutcome::Deleted;
     }
     if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
-        return DeleteOutcome::AlreadyGoneOrConflict;
+        return DeleteOutcome::AlreadyGone;
     }
     // parent_rev mismatch: Dropbox has no dedicated DeleteError tag for it
     // (verified against files.stone). Best-available signal is the contiguous
     // `path_write/conflict` error_summary. Match defensively; confirm the exact
     // live body via manual QA before closing.
     if body.contains("path_write/conflict") {
-        return DeleteOutcome::AlreadyGoneOrConflict;
+        return DeleteOutcome::RevConflict;
     }
     DeleteOutcome::Error
+}
+
+/// Applies a non-success `files/delete_v2` outcome to the index, and says whether the job is
+/// settled. Split out of the network call for the same reason `classify_delete_response` was:
+/// the live path is manual-QA-only, and this is the half that writes durable state.
+///
+/// The two no-op outcomes are **not** interchangeable, and treating them as one left a phantom
+/// row for a path Dropbox does not have — a row nothing could ever clear, because every
+/// deletion path is driven from the local index, which no longer had the path either.
+pub(crate) fn apply_delete_outcome(
+    state: &AppState,
+    relative: &str,
+    outcome: DeleteOutcome,
+) -> AppResult<bool> {
+    match outcome {
+        // Dropbox does not have it. The job is a no-op, but the remote row is a lie and must
+        // go with it, or it permanently refuses any future rename INTO this path — both
+        // correlators guard on `get_remote_file(destination).is_some()`.
+        DeleteOutcome::AlreadyGone => {
+            tracing::info!(rel = %relative, "remote delete skipped: already gone — dropping job and clearing the remote index row");
+            state.db.remove_remote_subtree(relative)?;
+            Ok(true)
+        }
+        // The file is back on the server under a different rev, so the row is true. Keep it.
+        DeleteOutcome::RevConflict => {
+            tracing::info!(rel = %relative, "remote delete skipped: rev-conflict (restored on server) — dropping job, row kept");
+            Ok(true)
+        }
+        DeleteOutcome::Deleted | DeleteOutcome::Error => Ok(false),
+    }
 }
 
 /// Performs a live `files/delete_v2` call against the Dropbox API; manual-QA-only
@@ -1107,11 +1819,7 @@ pub(crate) fn delete_remote_file_internal(
         let body = resp
             .text()
             .unwrap_or_else(|_| "<unreadable body>".to_string());
-        if matches!(
-            classify_delete_response(false, &body),
-            DeleteOutcome::AlreadyGoneOrConflict
-        ) {
-            tracing::info!(rel = %relative, "remote delete skipped: already gone or rev-conflict (restored on server) — dropping job");
+        if apply_delete_outcome(state, relative, classify_delete_response(false, &body))? {
             return Ok(());
         }
         return Err(AppError::Dropbox {
@@ -1221,14 +1929,15 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
     // The downloaded content hash IS the Dropbox content_hash (DBSYNC-9), which
     // is exactly what the deletion / should-download checks compare, so the row
     // is correct even if the best-effort metadata fetch (for rev/mtime) fails.
-    let (rev, remote_mtime) =
+    let (rev, remote_mtime, dropbox_id) =
         match crate::remote_index::fetch_remote_file_metadata(state, &relative) {
-            Ok(Some(meta)) => (meta.rev, meta.modified_ts),
-            _ => (String::new(), modified_ts),
+            Ok(Some(meta)) => (meta.rev, meta.modified_ts, meta.id),
+            _ => (String::new(), modified_ts, None),
         };
-    if let Err(e) = state
-        .db
-        .upsert_remote_file(&relative, &hash, &rev, remote_mtime)
+    if let Err(e) =
+        state
+            .db
+            .upsert_remote_file(&relative, &hash, &rev, remote_mtime, dropbox_id.as_deref())
     {
         tracing::warn!(file_path = %relative, error = %e, "failed recording remote provenance after hydrate");
     }
@@ -1459,10 +2168,11 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_replace, choose_upload_strategy, classify_delete_response,
+        atomic_replace, choose_upload_strategy, classify_delete_response, classify_move_response,
         conflict_copy_with_content_exists, download_would_conflict, download_would_destroy_local,
-        emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient, DeleteOutcome,
-        UploadStrategy, UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient,
+        upload_would_clobber_unknown_content, DeleteOutcome, MoveOutcome, UploadStrategy,
+        UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
@@ -1503,7 +2213,7 @@ mod tests {
         // the edit was detected. The file is NOT on disk — this is the unlink window.
         state
             .db
-            .upsert_remote_file("report.docx", "H1", "rev1", 0)
+            .upsert_remote_file("report.docx", "H1", "rev1", 0, None)
             .expect("seed remote");
         state
             .db
@@ -1655,14 +2365,67 @@ mod tests {
                 false,
                 r#"{"error_summary":"path_lookup/not_found/..","error":{".tag":"path_lookup"}}"#
             ),
-            DeleteOutcome::AlreadyGoneOrConflict
+            DeleteOutcome::AlreadyGone
         );
         assert_eq!(
             classify_delete_response(
                 false,
                 r#"{"error_summary":"path/not_found/..","error":{".tag":"path"}}"#
             ),
-            DeleteOutcome::AlreadyGoneOrConflict
+            DeleteOutcome::AlreadyGone
+        );
+    }
+
+    /// The guard that stops an upload destroying another person's file.
+    ///
+    /// Every upload sends `mode: overwrite`, and the identical-content check is gated on a
+    /// local index row — so a path we have never indexed skipped it entirely. Reached through
+    /// the `to/conflict` recovery, which uploads to a destination that by construction has no
+    /// local row.
+    #[test]
+    fn an_upload_over_unknown_remote_content_is_refused() {
+        // The dangerous case: never seen it, Dropbox has something, and it is not ours.
+        assert!(
+            upload_would_clobber_unknown_content(false, Some("THEIRS"), Some("OURS")),
+            "this is a collaborator's file and mode is overwrite"
+        );
+
+        // Unreadable locally is not a licence: not knowing is not agreement.
+        assert!(
+            upload_would_clobber_unknown_content(false, Some("THEIRS"), None),
+            "an unreadable local file must not license overwriting unknown content"
+        );
+
+        // A local row means the path is ours; the ordinary identical-content check applies.
+        assert!(
+            !upload_would_clobber_unknown_content(true, Some("THEIRS"), Some("OURS")),
+            "a tracked path is not unknown content, whatever the hashes say"
+        );
+
+        // Nothing on Dropbox: nothing to clobber.
+        assert!(!upload_would_clobber_unknown_content(
+            false,
+            None,
+            Some("OURS")
+        ));
+
+        // Same bytes: the upload is a no-op, not a clobber.
+        assert!(!upload_would_clobber_unknown_content(
+            false,
+            Some("SAME"),
+            Some("SAME")
+        ));
+    }
+
+    /// `AlreadyGone` clears the remote row; `RevConflict` keeps it. Conflating them left a
+    /// phantom row for a path Dropbox does not have, and nothing could ever remove it.
+    #[test]
+    fn the_two_delete_noop_outcomes_are_not_the_same_outcome() {
+        assert_ne!(
+            classify_delete_response(false, r#"{"error_summary":"path_lookup/not_found/.."}"#),
+            classify_delete_response(false, r#"{"error_summary":"path_write/conflict/.."}"#),
+            "both drop the job, but they say opposite things about whether Dropbox has the \
+             path — and only one of them licenses clearing the index row"
         );
     }
 
@@ -1676,7 +2439,7 @@ mod tests {
         let body = r#"{"error_summary":"path_write/conflict/..","error":{".tag":"path_write","path_write":{".tag":"conflict","conflict":{".tag":"file"}}}}"#;
         assert_eq!(
             classify_delete_response(false, body),
-            DeleteOutcome::AlreadyGoneOrConflict
+            DeleteOutcome::RevConflict
         );
     }
 
@@ -1698,6 +2461,39 @@ mod tests {
     #[test]
     fn classify_delete_response_malformed_or_empty_body_is_error() {
         assert_eq!(classify_delete_response(false, ""), DeleteOutcome::Error);
+    }
+
+    /// DBSYNC-99. The two failure bodies are verbatim from a live `files/move_v2` probe on
+    /// 2026-09-11 — the endpoint is called nowhere else in this codebase, so a classifier
+    /// written against invented bodies would have been a guess dressed as a decision.
+    #[test]
+    fn classify_move_reads_the_body_because_both_failures_are_409() {
+        assert_eq!(classify_move_response(true, ""), MoveOutcome::Moved);
+
+        // HTTP 409 — the source is gone.
+        let source_gone = r#"{"error":{".tag":"from_lookup","from_lookup":{".tag":"not_found"}},"error_summary":"from_lookup/not_found/"}"#;
+        assert_eq!(
+            classify_move_response(false, source_gone),
+            MoveOutcome::NotApplicable
+        );
+
+        // HTTP 409 — the destination is occupied. Same status, different meaning; a
+        // classifier keyed on the status code could not tell these apart, which is the
+        // lesson `classify_delete_response` already learned for `delete_v2`.
+        let destination_taken = r#"{"error":{".tag":"to","to":{".tag":"conflict","conflict":{".tag":"file"}}},"error_summary":"to/conflict/file/"}"#;
+        assert_eq!(
+            classify_move_response(false, destination_taken),
+            MoveOutcome::NotApplicable
+        );
+
+        // A real failure must stay a real failure, or a move job would be dropped for a
+        // reason that retrying would have fixed.
+        let rate_limited = r#"{"error_summary":"too_many_write_operations/"}"#;
+        assert_eq!(
+            classify_move_response(false, rate_limited),
+            MoveOutcome::Error
+        );
+        assert_eq!(classify_move_response(false, ""), MoveOutcome::Error);
     }
 
     #[test]

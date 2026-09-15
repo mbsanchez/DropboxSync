@@ -14,6 +14,17 @@ pub(crate) struct RemoteFileMeta {
     pub content_hash: String,
     pub rev: String,
     pub modified_ts: i64,
+    /// Dropbox's stable identifier for this item (DBSYNC-99).
+    ///
+    /// It rides in the **value**, deliberately. The obvious move was to rekey
+    /// `remote_by_path` by identifier, which would propagate to every consumer and every
+    /// iteration of the map; comparing ids across two snapshots detects a move just as
+    /// well and costs nothing structural. If File Provider's enumeration turns out to
+    /// need identifier-keyed lookup, that is DBSYNC-95's cost to carry, not this one's.
+    ///
+    /// `Option` is defensive only. A missing id must never disqualify an entry — see
+    /// `remote_meta_from_entry`.
+    pub id: Option<String>,
 }
 
 /// `app_config` key holding the persisted `list_folder` cursor for cursor-delta
@@ -57,6 +68,7 @@ pub(crate) fn delta_action_from_entry(entry: &DropboxEntry) -> DeltaAction {
                     content_hash,
                     rev,
                     modified_ts,
+                    id: entry.id.clone(),
                 },
             )
         }
@@ -119,6 +131,7 @@ pub(crate) fn fetch_remote_file_metadata(
             content_hash,
             rev,
             modified_ts,
+            id: entry.id,
         }));
     }
 
@@ -154,12 +167,17 @@ fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMet
         .as_deref()
         .map(parse_rfc3339_ts_to_unix)
         .unwrap_or(0);
+    // SAFETY (mass-delete): a missing `id` is deliberately NOT a reason to return None,
+    // unlike a missing hash or rev. A path absent from the returned map is read by the
+    // caller as "deleted remotely", so disqualifying entries on a field this function
+    // merely records would enqueue local deletions for files that are still there.
     Some((
         path_display.to_lowercase(),
         RemoteFileMeta {
             content_hash,
             rev,
             modified_ts,
+            id: entry.id.clone(),
         },
     ))
 }
@@ -220,6 +238,26 @@ pub(crate) fn fetch_all_remote_file_metadata(
         for entry in &entries_resp.entries {
             if let Some((path_key, meta)) = remote_meta_from_entry(entry) {
                 remote_by_path.insert(path_key, meta);
+                continue;
+            }
+            // DBSYNC-99: folders never enter the file index — `remote_meta_from_entry`
+            // rejects them, and they must keep being rejected, because a path absent from
+            // this map is read as "deleted remotely". But folders carry identifiers too
+            // (13 of 13 in the captured listing) and `known_folders` is where a folder
+            // rename will have to preserve one. Record it on the row we already have.
+            //
+            // Best-effort and behaviour-neutral by construction: the writer can only fill
+            // a NULL id on an existing row. It cannot insert, delete, or touch any column
+            // the pipeline reads today, so a failure here changes nothing.
+            if entry.tag == "folder" {
+                if let (Some(path_display), Some(id)) =
+                    (entry.path_display.as_deref(), entry.id.as_deref())
+                {
+                    let rel = path_display.trim_start_matches('/');
+                    if let Err(e) = state.db.set_known_folder_dropbox_id(rel, id) {
+                        tracing::warn!(rel, error = %e, "could not record folder identifier");
+                    }
+                }
             }
         }
 
@@ -311,7 +349,9 @@ fn reconcile_remote_snapshot_with_breaker(
     // PRESENT files: reconcile immediately, never gated by the breaker.
     for local in local_files {
         let rel = &local.relative_path;
-        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
+        if rel.ends_with(".cloudsc")
+            || crate::sync_pipeline::covered_by_active_job(rel, pending_targets)
+        {
             continue;
         }
         if let Some(remote_meta) = remote_by_path.get(&normalize_dropbox_path(rel)?.to_lowercase())
@@ -370,7 +410,9 @@ fn remote_sweep_delete_candidates(
 
     for local in local_files {
         let rel = &local.relative_path;
-        if rel.ends_with(".cloudsc") || pending_targets.contains(rel) {
+        if rel.ends_with(".cloudsc")
+            || crate::sync_pipeline::covered_by_active_job(rel, pending_targets)
+        {
             continue;
         }
         if remote_by_path.contains_key(&normalize_dropbox_path(rel)?.to_lowercase()) {
@@ -393,6 +435,14 @@ fn remote_sweep_delete_candidates(
 
 /// The set of relative paths with an in-flight job, so we don't enqueue a
 /// duplicate download/delete for a file already being processed.
+/// The paths every active job names.
+///
+/// Consumers must ask about them with `covered_by_active_job`, never `.contains()`: a queued
+/// folder move names only the two folder paths while everything underneath is equally in
+/// flight, and four checks in this module asked the exact question until round 5 of the
+/// DBSYNC-99 review. The sharpest was the delta's removal arm — a `Remove` for a descendant of
+/// a pending move went unfiltered and enqueued a `local_delete`, costing that descendant the
+/// identity this ticket exists to preserve.
 fn pending_job_targets(state: &AppState) -> AppResult<HashSet<String>> {
     // DBSYNC-31: single indexed SQL query instead of scanning list_recent_jobs(400).
     state.db.active_job_paths()
@@ -413,11 +463,15 @@ pub(crate) fn reconcile_remote_present(
         Some(prev) => prev.content_hash != remote_meta.content_hash,
     };
 
+    // DBSYNC-99: this is the path every remote observation flows through — the full
+    // snapshot and the cursor delta both land here — so writing the identifier here is
+    // the whole of the back-fill. No migration is needed: the next sweep fills every row.
     state.db.upsert_remote_file(
         rel,
         &remote_meta.content_hash,
         &remote_meta.rev,
         remote_meta.modified_ts,
+        remote_meta.id.as_deref(),
     )?;
 
     if should_download {
@@ -590,7 +644,9 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
         for entry in &resp.entries {
             match delta_action_from_entry(entry) {
                 DeltaAction::Upsert(rel, meta) => {
-                    if !rel.ends_with(".cloudsc") && !pending_targets.contains(&rel) {
+                    if !rel.ends_with(".cloudsc")
+                        && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
+                    {
                         enqueued += reconcile_remote_present(state, &rel, &meta)?;
                         // DBSYNC-59: surface a newly-appeared remote file as a native
                         // placeholder within seconds (targeted — just this file) instead
@@ -611,7 +667,9 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
                     }
                 }
                 DeltaAction::Remove(rel) => {
-                    if !rel.ends_with(".cloudsc") && !pending_targets.contains(&rel) {
+                    if !rel.ends_with(".cloudsc")
+                        && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
+                    {
                         enqueued += reconcile_remote_absent(state, &rel)?;
                         // DBSYNC-59: purge a legacy `.cloudsc` sidecar for the removed
                         // file now (CfAPI placeholders are removed by the local_delete
@@ -657,6 +715,7 @@ mod tests {
             rev: rev.map(str::to_string),
             server_modified: server_modified.map(str::to_string),
             size: None,
+            id: None,
         }
     }
 
@@ -704,6 +763,159 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Stable identity (DBSYNC-99 slice 2)
+    // ---------------------------------------------------------------------------
+
+    /// A real `files/list_folder` entry, captured against a live account on 2026-09-11
+    /// (DBSYNC-99 slice 1) from a throwaway file since deleted. Kept verbatim, extra
+    /// fields included, because the defect being fixed is precisely that `DropboxEntry`
+    /// declared six fields and carried no `deny_unknown_fields`, so serde dropped the
+    /// identifier without a word. A hand-trimmed literal would not exercise that.
+    const CAPTURED_FILE_ENTRY: &str = r#"{
+        ".tag": "file",
+        "client_modified": "2026-09-11T16:08:30Z",
+        "content_hash": "300e2819c817c3c5b767493bcef06813052d3526c9353756b99b445015ed2e18",
+        "id": "id:eTyPGjL6NDAAAAAAAAABwg",
+        "is_downloadable": true,
+        "name": "a.txt",
+        "path_display": "/dbsync99-probe/a.txt",
+        "path_lower": "/dbsync99-probe/a.txt",
+        "property_groups": [],
+        "rev": "65b374ba88e8456342f44",
+        "server_modified": "2026-09-11T16:08:30Z",
+        "size": 22
+    }"#;
+
+    /// The whole ticket rests on the identifier getting from the wire to the index.
+    /// `models.rs` is the single parse point for Dropbox metadata, so this walks the
+    /// real path: JSON → `DropboxEntry` → `RemoteFileMeta` → the stored row.
+    #[test]
+    fn a_dropbox_id_survives_the_parse_point_into_the_remote_index() {
+        let entry: DropboxEntry = serde_json::from_str(CAPTURED_FILE_ENTRY).expect("parse");
+        let (rel, meta) = remote_meta_from_entry(&entry).expect("indexable file");
+
+        assert_eq!(meta.id.as_deref(), Some("id:eTyPGjL6NDAAAAAAAAABwg"));
+
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file(
+                &rel,
+                &meta.content_hash,
+                &meta.rev,
+                meta.modified_ts,
+                meta.id.as_deref(),
+            )
+            .expect("upsert");
+
+        let row = state.db.get_remote_file(&rel).expect("get").expect("row");
+        assert_eq!(row.dropbox_id.as_deref(), Some("id:eTyPGjL6NDAAAAAAAAABwg"));
+    }
+
+    /// An identifier, once learned, must never be erased by a later write that does not
+    /// carry one. Several paths write the same row — the delta loop, `get_metadata`, the
+    /// placeholder sweep — and they do not all have an id in hand. Losing it silently
+    /// would make an item look brand new, which is the exact defect this ticket exists
+    /// to remove.
+    #[test]
+    fn an_id_less_upsert_never_erases_a_known_dropbox_id() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("a.txt", "H", "rev1", 0, Some("id:ABC"))
+            .expect("seed");
+
+        // The pre-existing four-argument writer: no id to offer.
+        state
+            .db
+            .upsert_remote_file("a.txt", "H2", "rev2", 5, None)
+            .expect("update");
+
+        let row = state
+            .db
+            .get_remote_file("a.txt")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.content_hash, "H2", "the content update must still land");
+        assert_eq!(
+            row.dropbox_id.as_deref(),
+            Some("id:ABC"),
+            "the id must survive"
+        );
+    }
+
+    /// Folders carry identifiers too — 13 of 13 in the captured listing — and a folder
+    /// rename is the expensive case this ticket exists to fix. The writer is an UPDATE
+    /// rather than an upsert on purpose: it must be incapable of creating a
+    /// `known_folders` row, because that table drives local deletion detection.
+    #[test]
+    fn a_folder_identifier_fills_an_existing_row_and_never_creates_one() {
+        let state = build_state();
+        state.db.upsert_known_folder("dir").expect("known");
+
+        assert!(
+            state
+                .db
+                .set_known_folder_dropbox_id("dir", "id:FOLDER")
+                .expect("set"),
+            "a known folder must take the identifier"
+        );
+        assert!(
+            !state
+                .db
+                .set_known_folder_dropbox_id("not-here", "id:GHOST")
+                .expect("set"),
+            "an unknown folder must be left alone, not invented"
+        );
+        assert_eq!(
+            state.db.list_known_folders().expect("list"),
+            vec!["dir".to_string()],
+            "the folder set must be untouched"
+        );
+
+        // Already identified: a second sweep must not overwrite it.
+        assert!(
+            !state
+                .db
+                .set_known_folder_dropbox_id("dir", "id:DIFFERENT")
+                .expect("set"),
+            "a stored identifier stays authoritative"
+        );
+    }
+
+    /// Dropbox cannot name an item it has never seen. A file created locally has no
+    /// remote row until its upload succeeds, and that window is unbounded when uploads
+    /// keep failing — so identity cannot be a thin mirror of Dropbox's id. Every local
+    /// row gets its own identifier at index time, allocated locally and **never derived
+    /// from the path**: Apple's SDK header warns an identifier may be recorded in system
+    /// logs, and a path is user data.
+    #[test]
+    fn every_local_row_gets_an_identity_dropbox_has_never_seen() {
+        let state = build_state();
+        state.db.upsert_local_file("a.txt", "h", 1, 0).expect("a");
+        state.db.upsert_local_file("b.txt", "h", 1, 0).expect("b");
+
+        let a = state.db.get_local_file("a.txt").expect("get").unwrap();
+        let b = state.db.get_local_file("b.txt").expect("get").unwrap();
+
+        let (Some(a_id), Some(b_id)) = (a.item_id, b.item_id) else {
+            panic!("every local row must carry an item_id");
+        };
+        assert_ne!(a_id, b_id, "identifiers must be distinct");
+
+        // Re-indexing the same path must not mint a new identity — that is what makes it
+        // an identity rather than a version.
+        state.db.upsert_local_file("a.txt", "h2", 2, 9).expect("re");
+        let again = state.db.get_local_file("a.txt").expect("get").unwrap();
+        assert_eq!(
+            again.item_id,
+            Some(a_id),
+            "identity must be stable in place"
+        );
+        assert_eq!(again.hash, "h2", "the content update must still land");
+    }
+
+    // ---------------------------------------------------------------------------
     // Cursor-delta remote change detection (DBSYNC-30)
     // ---------------------------------------------------------------------------
 
@@ -738,6 +950,534 @@ mod tests {
             .filter(|j| j.job_type == job_type)
             .filter_map(|j| j.target_path)
             .collect()
+    }
+
+    /// DBSYNC-99. Confirming a move has two shapes, and using the file one on a folder is not
+    /// cosmetic: `move_index_row` matches an exact path, so on a folder it touches nothing and
+    /// the whole subtree is left stranded at paths that no longer exist on disk. That mistake
+    /// was made once in this ticket and cost a data-loss defect, so the branch gets a test.
+    #[test]
+    fn confirming_a_move_picks_the_shape_from_the_source() {
+        let state = build_state();
+
+        // A folder: the subtree must travel.
+        state.db.upsert_known_folder("d").unwrap();
+        state.db.upsert_local_file("d/one.txt", "H", 1, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", "H", "rev", 0, Some("id:ONE"))
+            .unwrap();
+        let identity = state
+            .db
+            .get_local_file("d/one.txt")
+            .unwrap()
+            .unwrap()
+            .item_id;
+
+        crate::dropbox_transfer::apply_confirmed_move(&state, "d", "e").unwrap();
+
+        assert_eq!(state.db.list_known_folders().unwrap(), vec!["e"]);
+        assert!(
+            state.db.get_local_file("d/one.txt").unwrap().is_none(),
+            "the descendant must not be stranded at the old path"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_local_file("e/one.txt")
+                .unwrap()
+                .unwrap()
+                .item_id,
+            identity,
+            "and it keeps its identity"
+        );
+
+        // A file: the single row travels and no folder is invented.
+        state.db.upsert_local_file("solo.txt", "H", 1, 0).unwrap();
+        crate::dropbox_transfer::apply_confirmed_move(&state, "solo.txt", "renamed.txt").unwrap();
+        assert!(state.db.get_local_file("solo.txt").unwrap().is_none());
+        assert!(state.db.get_local_file("renamed.txt").unwrap().is_some());
+        assert_eq!(state.db.list_known_folders().unwrap(), vec!["e"]);
+    }
+
+    /// DBSYNC-99, found by manual QA against a live account rather than by any test here.
+    ///
+    /// Nothing wrote a `remote_file_index` row on the upload success path, so after a real
+    /// upload there was no remote row until the next full sweep — and the content-agreement
+    /// guard needs one, so a rename inside that window fell back to a delete plus a full
+    /// re-upload and minted a fresh identity. The window is exactly when a user renames
+    /// something: just after creating it.
+    #[test]
+    fn an_upload_records_what_dropbox_says_it_now_holds() {
+        let state = build_state();
+        // The real shape of a `files/upload` 200, captured on 2026-09-11.
+        let raw = r#"{
+            "client_modified": "2026-09-11T16:08:30Z",
+            "content_hash": "300e2819c817c3c5b767493bcef06813052d3526c9353756b99b445015ed2e18",
+            "id": "id:eTyPGjL6NDAAAAAAAAABwg",
+            "name": "a.txt",
+            "path_display": "/qa/a.txt",
+            "rev": "65b374ba88e8456342f44",
+            "server_modified": "2026-09-11T16:08:30Z",
+            "size": 22
+        }"#;
+        // No `.tag` — this is the real shape, and parsing it as a `DropboxEntry` fails.
+        let entry: crate::models::UploadCommitResponse = serde_json::from_str(raw).expect("parse");
+        crate::dropbox_transfer::record_upload_result(&state, "qa/a.txt", Some(entry));
+
+        let row = state
+            .db
+            .get_remote_file("qa/a.txt")
+            .expect("get")
+            .expect("the row must exist the moment the upload commits");
+        assert_eq!(
+            row.content_hash,
+            "300e2819c817c3c5b767493bcef06813052d3526c9353756b99b445015ed2e18"
+        );
+        assert_eq!(row.rev, "65b374ba88e8456342f44");
+        assert_eq!(row.dropbox_id.as_deref(), Some("id:eTyPGjL6NDAAAAAAAAABwg"));
+
+        // An unparseable response must not write a row and must not panic — the bytes are
+        // already on Dropbox, so failing here would re-upload a file that is already there.
+        crate::dropbox_transfer::record_upload_result(&state, "qa/b.txt", None);
+        assert!(state.db.get_remote_file("qa/b.txt").expect("get").is_none());
+    }
+
+    /// DBSYNC-99 round 5. The sweep's skip test asked `.contains()` where the hazard is
+    /// prefix-shaped: a queued `move d → e` names only `d` and `e`, while every descendant is
+    /// equally mid-relocation. Reconciling one of them against a snapshot that does not list
+    /// it enqueues work against a path the move is about to vacate.
+    ///
+    /// Mutating this guard left the suite green until this test existed.
+    #[test]
+    fn the_sweep_skips_descendants_of_a_pending_move() {
+        let state = build_state();
+        state.db.upsert_local_file("d/one.txt", "H", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("d/one.txt", "H", "rev", 0, Some("id:ONE"))
+            .unwrap();
+
+        // The snapshot DOES list it, with different content — so without the guard the
+        // present-branch would reconcile and enqueue a download against a path the move is
+        // about to vacate. A first version of this test left the snapshot empty, which never
+        // reaches the present branch at all: it asserted nothing about the guard it names,
+        // and said so only under mutation.
+        let mut remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        remote_by_path.insert(
+            "/d/one.txt".to_string(),
+            RemoteFileMeta {
+                content_hash: "DIFFERENT".to_string(),
+                rev: "rev2".to_string(),
+                modified_ts: 9,
+                id: Some("id:ONE".to_string()),
+            },
+        );
+        // A queued folder move names the two folder paths, never the descendants.
+        let pending: HashSet<String> = ["d".to_string(), "e".to_string()].into_iter().collect();
+
+        let enqueued = reconcile_remote_snapshot_with_breaker(
+            &state,
+            &state.db.list_local_files().unwrap(),
+            &remote_by_path,
+            &pending,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enqueued, 0,
+            "nothing may be enqueued for a path mid-relocation"
+        );
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "and least of all a local delete, which costs the descendant its identity"
+        );
+    }
+
+    /// A refused move is re-derived here and now, in an order that matters.
+    ///
+    /// Three review rounds were spent leaving this to the next scan. Between the refusal and
+    /// that scan the materialization sweep plants a `.cloudsc` sidecar over the source, and
+    /// `process_local_file_deletion` reads a placeholder as a dehydration — dropping the
+    /// delete along with the index row that remembers the path. The source stayed on Dropbox
+    /// forever and the user got a duplicate instead of a rename.
+    ///
+    /// **The assertion that matters is that the delete does not exist yet.** The previous
+    /// version of this test asserted `upload.id < delete.id` — the order the two jobs were
+    /// *enqueued* in. That is a proxy, and the property it stood for is about the order they
+    /// *drain* in, which id order does not decide: `pick_next_due_job` orders by id among the
+    /// jobs that are DUE, and a `retry_wait` job with a future `next_retry_at` is not due.
+    /// The test passed with that defect fully present. `refused_move_survives_a_transient_
+    /// upload_failure` below is the falsifier it should have been.
+    #[test]
+    fn a_refused_file_move_enqueues_the_upload_and_owes_the_delete() {
+        let state = build_state();
+        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt", true).unwrap();
+
+        assert_eq!(
+            job_targets(&state, "upload"),
+            vec!["new.txt".to_string()],
+            "the destination must be uploaded"
+        );
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "and the source must NOT yet be queued for deletion — it is owed by the upload, \
+             not scheduled beside it"
+        );
+
+        // The LOCAL row goes, so a later scan does not derive its own delete of the source —
+        // which would be unordered against the upload.
+        assert!(state.db.get_local_file("old.txt").unwrap().is_none());
+        // The REMOTE row stays, and that is load-bearing: it is the app's only record that
+        // Dropbox still holds the old name, and `unsettled_source_deletion` requires it.
+        // Dropping it made the stranded notice unreachable for every refused move ever made,
+        // because nothing can restore it — every sweep that could is driven from the local
+        // index, which no longer has the path either.
+        assert!(
+            state.db.get_remote_file("old.txt").unwrap().is_some(),
+            "the record that Dropbox still holds the old name must survive"
+        );
+
+        let upload = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload")
+            .unwrap();
+
+        // `source_path` is what actually gets uploaded (`process_sync_queue_internal`'s upload
+        // arm dispatches on it) AND what the landing gate is evaluated against. Nothing
+        // asserted it before, so binding it to the delete path instead — which uploads the old
+        // name and gates the wrong destination, a total inversion of the feature — survived
+        // the whole suite.
+        assert_eq!(
+            upload.source_path.as_deref(),
+            Some("new.txt"),
+            "the upload's source_path is the DESTINATION: it is the path uploaded and the path \
+             the landing gate checks"
+        );
+
+        // The upload owes the deletion, carrying the rev captured before the row was dropped.
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload.id).unwrap(),
+            Some(("old.txt".to_string(), Some("rev1".to_string())))
+        );
+        // Peeking does NOT consume it. Read-and-clear in one step meant every way the caller
+        // can decline destroyed the debt on first sight.
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload.id).unwrap(),
+            Some(("old.txt".to_string(), Some("rev1".to_string()))),
+            "a peek must leave the debt intact — only a settled deletion clears it"
+        );
+        state.db.clear_deferred_source_delete(upload.id).unwrap();
+        assert_eq!(
+            state.db.peek_deferred_source_delete(upload.id).unwrap(),
+            None
+        );
+    }
+
+    /// A directory that has lost its `known_folders` row is still a directory.
+    ///
+    /// The shape used to be decided by that single lookup, and the wrong answer is expensive:
+    /// the file branch would create an upload whose `source_path` is a directory — `File::open`
+    /// on a directory fails, so five attempts burn and the job sticks — while the two
+    /// `remove_*_file` calls are no-ops that strand every child row at the old prefix, and a
+    /// RECURSIVE deletion of the source is owed to an upload that can never succeed.
+    ///
+    /// Index rows under the prefix answer the question on their own.
+    #[test]
+    fn a_directory_without_a_folder_row_does_not_take_the_file_branch() {
+        let state = build_state();
+        // Deliberately NO `upsert_known_folder("Docs")` — a partial prune, a half-applied
+        // subtree move, any path that leaves the rows behind but not the folder.
+        state.db.upsert_local_file("Docs/a.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("Docs/a.txt", "H", "rev1", 0, Some("id:A"))
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
+
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "an upload of a directory path cannot work and owes a recursive delete"
+        );
+        assert!(
+            state
+                .db
+                .list_refused_moves()
+                .unwrap()
+                .contains(&("Docs".to_string(), "Papers".to_string())),
+            "it must take the directory branch, refusal recorded and all"
+        );
+        assert!(state.db.get_remote_file("Docs/a.txt").unwrap().is_some());
+    }
+
+    /// The DESTINATION on disk decides the shape, even with no index evidence at all.
+    ///
+    /// It is the only path that still exists — the source vanished, that is why we are here —
+    /// so it is the only non-stale signal available. With every index clause silent, removing
+    /// this one sent a real folder into the file branch: an upload whose `source_path` is a
+    /// directory, and a recursive delete owed to it.
+    #[test]
+    fn the_destination_being_a_directory_on_disk_decides_the_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state();
+        state
+            .db
+            .set_sync_folder(dir.path().to_string_lossy().as_ref())
+            .unwrap();
+        // The destination exists on disk as a directory. Nothing else says so: no
+        // `known_folders` row, no rows under the prefix, source gone from disk.
+        std::fs::create_dir_all(dir.path().join("Papers")).unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
+
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "no upload: `File::open` on a directory cannot work and the delete owed would be \
+             recursive"
+        );
+        assert!(state
+            .db
+            .list_refused_moves()
+            .unwrap()
+            .contains(&("Docs".to_string(), "Papers".to_string())));
+        std::mem::drop(dir);
+    }
+
+    /// `AlreadyGone` clears the remote row; `RevConflict` keeps it. Same job outcome, opposite
+    /// statements about Dropbox — and conflating them is what created the phantom.
+    #[test]
+    fn only_a_genuine_not_found_clears_the_remote_row() {
+        use crate::dropbox_transfer::{apply_delete_outcome, DeleteOutcome};
+
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("gone.txt", "H", "rev", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("gone.txt/child.txt", "H", "rev", 0, None)
+            .unwrap();
+        assert!(apply_delete_outcome(&state, "gone.txt", DeleteOutcome::AlreadyGone).unwrap());
+        assert!(
+            state.db.get_remote_file("gone.txt").unwrap().is_none(),
+            "Dropbox does not have it, so the row is a phantom and must go"
+        );
+        assert!(
+            state
+                .db
+                .get_remote_file("gone.txt/child.txt")
+                .unwrap()
+                .is_none(),
+            "and so must the subtree, since delete_v2 on a folder is recursive"
+        );
+
+        state
+            .db
+            .upsert_remote_file("back.txt", "H", "rev", 0, None)
+            .unwrap();
+        assert!(apply_delete_outcome(&state, "back.txt", DeleteOutcome::RevConflict).unwrap());
+        assert!(
+            state.db.get_remote_file("back.txt").unwrap().is_some(),
+            "the file is back on the server under a new rev, so the row is TRUE and stays"
+        );
+
+        assert!(
+            !apply_delete_outcome(&state, "back.txt", DeleteOutcome::Error).unwrap(),
+            "a real error does not settle the job"
+        );
+    }
+
+    /// When the refusal says the SOURCE is not on Dropbox, its remote row must go.
+    ///
+    /// `from_lookup/not_found` is the first permanent marker and means exactly that: a stale
+    /// index made the correlator propose a move of a path Dropbox no longer holds. Keeping the
+    /// remote row then left a phantom nothing could clear — every deletion path is driven from
+    /// the local index, which no longer has it either — and a phantom permanently refuses any
+    /// future rename INTO that path, because both correlators guard on
+    /// `get_remote_file(destination).is_some()`.
+    #[test]
+    fn a_source_dropbox_does_not_have_leaves_no_phantom_row() {
+        let state = build_state();
+        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+
+        // `source_may_still_exist = false` — the refusal was `from_lookup/not_found`.
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt", false)
+            .unwrap();
+
+        assert!(
+            state.db.get_remote_file("old.txt").unwrap().is_none(),
+            "a row for a path Dropbox does not have is a phantom that blocks every future \
+             rename into it"
+        );
+    }
+
+    /// An EMPTY tracked folder is still a directory.
+    ///
+    /// The `known_folders` clause is the original mechanism and the one that fires for every
+    /// real folder refusal — and it was entirely unpinned, because every other directory test
+    /// also seeds child index rows, so the prefix clause shadowed it. Both could be dead at
+    /// once with the suite green. This case has nothing under it and nothing on disk, so only
+    /// the folder row can answer.
+    #[test]
+    fn an_empty_tracked_folder_is_still_a_directory() {
+        let state = build_state();
+        state.db.upsert_known_folder("Empty").unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Empty", "Renamed", true).unwrap();
+
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "no upload: the path is a directory and `File::open` on one cannot work"
+        );
+        assert!(state
+            .db
+            .list_refused_moves()
+            .unwrap()
+            .contains(&("Empty".to_string(), "Renamed".to_string())));
+    }
+
+    /// ...and a tracked FILE is not a directory, whatever is left under its name.
+    ///
+    /// Leftover rows under `Notes/` — a directory that used to live at that name, a partial
+    /// prune — made the prefix clause answer "directory" for a tracked file at `Notes`. The
+    /// rename then silently degraded to delete-plus-upload, which is the whole regression this
+    /// ticket removes, under a `warn!` claiming a folder move was refused. An exact
+    /// `local_file_index` row settles it: a directory never has one.
+    #[test]
+    fn a_tracked_file_is_not_a_directory_however_stale_the_rows_beneath_it() {
+        let state = build_state();
+        state.db.upsert_local_file("Notes", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("Notes", "H", "rev1", 0, Some("id:N"))
+            .unwrap();
+        // Stale descendants of a directory that once lived at this name.
+        state
+            .db
+            .upsert_local_file("Notes/old.txt", "H2", 5, 0)
+            .unwrap();
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "Notes", "Notes2", true).unwrap();
+
+        // The ambiguous state resolves to DIRECTORY, on purpose, and this test was inverted to
+        // say so. It previously asserted the file answer, on the premise that a directory
+        // never has an exact `local_file_index` row — which is false, and the pipeline
+        // produces the counterexample, so a real folder took the file branch.
+        //
+        // The two mistakes are not symmetrical. Answering "file" for a directory enqueues an
+        // upload of a directory path that burns five attempts and sticks, strands every child
+        // row, and owes a RECURSIVE delete. Answering "directory" for a file costs one
+        // wasteful delete-plus-upload. When the evidence is genuinely ambiguous, take the
+        // answer whose failure is cheap.
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "ambiguous evidence must not reach the file branch, which is the destructive one"
+        );
+        assert!(state
+            .db
+            .list_refused_moves()
+            .unwrap()
+            .contains(&("Notes".to_string(), "Notes2".to_string())));
+        assert!(
+            state.db.get_local_file("Notes").unwrap().is_some(),
+            "and nothing is dropped: the directory branch writes no index changes"
+        );
+    }
+
+    /// One upload can settle one source. A second refused move onto the same destination must
+    /// not silently replace the first debt.
+    ///
+    /// The `DO UPDATE` used to overwrite it. A→X refused, then B→X refused, left the upload
+    /// owing only B while A's index rows were already gone — an orphan on Dropbox that nothing
+    /// would ever delete or index. A's rows must therefore survive the refusal.
+    #[test]
+    fn a_second_refused_move_onto_one_destination_does_not_replace_the_first_debt() {
+        let state = build_state();
+        for (path, id) in [("a.txt", "id:A"), ("b.txt", "id:B")] {
+            state.db.upsert_local_file(path, "H", 5, 0).unwrap();
+            state
+                .db
+                .upsert_remote_file(path, "H", "rev1", 0, Some(id))
+                .unwrap();
+        }
+
+        crate::dropbox_transfer::rederive_refused_move(&state, "a.txt", "x.txt", true).unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "b.txt", "x.txt", true).unwrap();
+
+        let upload_id = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload")
+            .unwrap()
+            .id;
+        assert_eq!(
+            state
+                .db
+                .peek_deferred_source_delete(upload_id)
+                .unwrap()
+                .map(|(p, _)| p),
+            Some("a.txt".to_string()),
+            "the first debt stands"
+        );
+        assert!(
+            state.db.get_remote_file("b.txt").unwrap().is_some(),
+            "and the source whose deletion was NOT taken stays indexed, or it becomes an \
+             orphan on Dropbox that nothing deletes and nothing knows about"
+        );
+        assert!(state.db.get_local_file("b.txt").unwrap().is_some());
+    }
+
+    /// The failure that broke the id-order design, reproduced.
+    ///
+    /// One transient upload failure — a 429, a 5xx, a file locked by another process — parks
+    /// the upload in `retry_wait` with a future `next_retry_at`. It is then not in the due set
+    /// at all, so its lower id decides nothing. Under the previous design the delete was
+    /// already `queued` and became the next due job: Dropbox lost the source while the only
+    /// other copy was still on its way up, for as long as the backoff lasted.
+    ///
+    /// Nothing may be due here. The source stays on Dropbox until the bytes have landed.
+    #[test]
+    fn refused_move_survives_a_transient_upload_failure() {
+        let state = build_state();
+        state.db.upsert_local_file("old.txt", "H", 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("old.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+        crate::dropbox_transfer::rederive_refused_move(&state, "old.txt", "new.txt", true).unwrap();
+
+        let upload = state.db.pick_next_due_job().unwrap().unwrap();
+        assert_eq!(upload.job_type, "upload");
+        let far_future = (chrono::Utc::now() + chrono::Duration::seconds(120)).to_rfc3339();
+        state
+            .db
+            .mark_job_retry_wait(upload.id, 1, &far_future, Some("429"))
+            .unwrap();
+
+        let due = state.db.pick_next_due_job().unwrap();
+        assert!(
+            due.is_none(),
+            "while the upload is backing off, NOTHING may be due — a delete of the source \
+             here removes the one copy Dropbox still has. Got: {:?}",
+            due.map(|j| (j.job_type, j.target_path))
+        );
     }
 
     #[test]
@@ -789,7 +1529,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_deletes_when_local_matches_last_synced() {
         let state = build_state();
-        state.db.upsert_remote_file("a.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("a.txt", "H", "rev", 0, None)
+            .unwrap();
         state.db.upsert_local_file("a.txt", "H", 3, 0).unwrap();
 
         let n = reconcile_remote_absent(&state, "a.txt").unwrap();
@@ -811,7 +1554,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_does_nothing_while_the_row_is_marked_for_rescan() {
         let state = build_state();
-        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("c.txt", "H", "rev", 0, None)
+            .unwrap();
         // Seeded the way production does it: a real row, then marked. `upsert_local_file`
         // now refuses an empty hash in debug, so this is the only route.
         state.db.upsert_local_file("c.txt", "H2", 3, 0).unwrap();
@@ -833,7 +1579,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_keeps_diverged_local_as_conflict() {
         let state = build_state();
-        state.db.upsert_remote_file("b.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("b.txt", "H", "rev", 0, None)
+            .unwrap();
         state
             .db
             .upsert_local_file("b.txt", "DIFFERENT", 3, 0)
@@ -848,7 +1597,10 @@ mod tests {
     #[test]
     fn reconcile_remote_absent_no_local_just_drops_remote_row() {
         let state = build_state();
-        state.db.upsert_remote_file("c.txt", "H", "rev", 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("c.txt", "H", "rev", 0, None)
+            .unwrap();
 
         let n = reconcile_remote_absent(&state, "c.txt").unwrap();
         assert_eq!(n, 0);
@@ -869,7 +1621,7 @@ mod tests {
         let state = build_state();
         state
             .db
-            .upsert_remote_file("e.txt", "OLD", "rev0", 0)
+            .upsert_remote_file("e.txt", "OLD", "rev0", 0, None)
             .unwrap();
         state.db.upsert_local_file("e.txt", "OLD", 3, 0).unwrap();
 
@@ -877,6 +1629,7 @@ mod tests {
             content_hash: "NEW".to_string(),
             rev: "rev1".to_string(),
             modified_ts: 0,
+            id: None,
         };
         let n = reconcile_remote_present(&state, "e.txt", &meta).unwrap();
         assert_eq!(n, 1);
@@ -897,7 +1650,7 @@ mod tests {
         let state = build_state();
         state
             .db
-            .upsert_remote_file("f.txt", "SAME", "rev0", 0)
+            .upsert_remote_file("f.txt", "SAME", "rev0", 0, None)
             .unwrap();
         state.db.upsert_local_file("f.txt", "SAME", 3, 0).unwrap();
 
@@ -905,6 +1658,7 @@ mod tests {
             content_hash: "SAME".to_string(),
             rev: "rev0".to_string(),
             modified_ts: 0,
+            id: None,
         };
         let n = reconcile_remote_present(&state, "f.txt", &meta).unwrap();
         assert_eq!(n, 0);
@@ -921,7 +1675,10 @@ mod tests {
         // `local_delete` candidates.
         for i in 0..30 {
             let rel = format!("f{i}.txt");
-            state.db.upsert_remote_file(&rel, "H", "rev", 0).unwrap();
+            state
+                .db
+                .upsert_remote_file(&rel, "H", "rev", 0, None)
+                .unwrap();
             state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
         }
         let local_files = state.db.list_local_files().unwrap();
@@ -970,7 +1727,7 @@ mod tests {
         // via reconcile_remote_absent, never counted toward the breaker).
         state
             .db
-            .upsert_remote_file("diverged.txt", "H", "rev", 0)
+            .upsert_remote_file("diverged.txt", "H", "rev", 0, None)
             .unwrap();
         state
             .db
@@ -987,7 +1744,7 @@ mod tests {
         // Present in this sweep's snapshot: excluded from `absent` entirely.
         state
             .db
-            .upsert_remote_file("present.txt", "H", "rev", 0)
+            .upsert_remote_file("present.txt", "H", "rev", 0, None)
             .unwrap();
         state
             .db
@@ -998,7 +1755,7 @@ mod tests {
         // otherwise be a clean delete candidate.
         state
             .db
-            .upsert_remote_file("pending.txt", "H", "rev", 0)
+            .upsert_remote_file("pending.txt", "H", "rev", 0, None)
             .unwrap();
         state
             .db
@@ -1013,6 +1770,7 @@ mod tests {
                 content_hash: "H".to_string(),
                 rev: "rev".to_string(),
                 modified_ts: 0,
+                id: None,
             },
         );
         let mut pending_targets: HashSet<String> = HashSet::new();
@@ -1046,7 +1804,10 @@ mod tests {
         let state = build_state();
         for i in 0..30 {
             let rel = format!("g{i}.txt");
-            state.db.upsert_remote_file(&rel, "H", "rev", 0).unwrap();
+            state
+                .db
+                .upsert_remote_file(&rel, "H", "rev", 0, None)
+                .unwrap();
             state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
         }
         let local_files = state.db.list_local_files().unwrap();

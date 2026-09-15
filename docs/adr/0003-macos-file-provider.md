@@ -50,14 +50,13 @@ and moves. **We capture no identifier of any kind** — the deserialization stru
 has exactly six fields (`.tag`, `path_display`, `content_hash`, `rev`, `server_modified`, `size`)
 and it is the only parse point for Dropbox metadata. *Verified at the struct.*
 
-> **Unverified premise, flagged.** The plan assumes Dropbox supplies a stable `id:` on every
-> entry. **That has never been observed here.** What was checked is that `DropboxEntry` carries
-> no `deny_unknown_fields`, so serde silently drops fields it does not declare — which establishes
-> only that *if* an id arrives, it is discarded. No recorded response, test fixture or JSON literal
-> anywhere under `src/` contains an `id` field. Dropbox's HTTP documentation could not be cited
-> either: like Apple's, the page is a JavaScript application and renders as navigation and footer
-> only. It is probably true. It is not evidence, and everything below that prices it as cheap
-> depends on it.
+> **Premise, flagged when written and answered on 2026-09-11.** The plan assumed Dropbox supplies
+> a stable `id:` on every entry, and at the time **that had never been observed here** — only that
+> `DropboxEntry` carries no `deny_unknown_fields`, so serde silently drops undeclared fields, which
+> established merely that *if* an id arrived it was discarded. It has since been observed directly
+> against a live account: every entry carries one, on files and folders, and it survives both
+> rename and move. See *Not verified* for the observations. The flag is kept rather than deleted
+> because the gap between "probably true" and "measured" is what this ADR was built to respect.
 
 **Five tables carry identity, not three** *(DBSYNC-96, correcting this ADR's original claim of
 "all three index tables")*. `local_file_index`, `remote_file_index` and `known_folders` are the
@@ -141,7 +140,7 @@ mounts and the App Group is authorized at runtime — not this ADR, and not the 
 
 | Work | Size |
 | --- | --- |
-| Capture Dropbox's `id:` — one field on `DropboxEntry` | trivial **if** the id is in the response — see the unverified premise above; a different plan if it is not |
+| Capture Dropbox's `id:` — one field on `DropboxEntry` | trivial; the id is in the response, on files and folders, and survives rename and move (verified 2026-09-11, DBSYNC-99) |
 | `dropbox_id` column on five tables + migration | small; the `add_column_if_missing` pattern exists |
 | 9 identifier-addressed storage methods beside the 9 path-addressed ones | small; 9 of `db.rs`'s 47 |
 | 14 single-parameter engine call sites | medium |
@@ -182,10 +181,15 @@ Three reasons, in order of weight:
 shape. Nothing else found so far is capable of flipping the direction: the collection work is heavy
 but bounded, and the local identity space is design work rather than a migration.
 
-**Note the awkwardness:** this threshold and the unverified premise above are the same fact. The
-decision therefore rests its escape hatch on the one question it did not answer. That is tolerable
-only because answering it is cheap — one API call — and because the first implementation ticket
-cannot get far without doing so.
+**This threshold was tested on 2026-09-11 and not met.** The id is present on both files and
+folders and survives rename and move, so the escape hatch stays shut. The paragraph stays as
+written: a threshold deleted the moment it is cleared teaches the next reader nothing about what
+this decision was willing to be wrong about.
+
+**Note the awkwardness it carried until then:** the threshold and the flagged premise above were
+the same fact, so the decision rested its escape hatch on the one question it had not answered.
+That was tolerable only because answering it was cheap — one API call — and because the first
+implementation ticket could not get far without doing so. That is exactly how it was closed.
 
 **That threshold was written after the numbers were known, not before.** DBSYNC-96's plan required
 the opposite, and the same agent produced both the findings and the threshold, so there was no
@@ -227,18 +231,35 @@ folder relocation with its onboarding consequences.
 which is how a premise came to be asserted in one part of this document and doubted in another;
 merged deliberately, so that finding one list means finding the whole list.
 
-### The identity premise — the one that could amend this decision
+### ~~The identity premise~~ — answered 2026-09-11 (DBSYNC-99 slice 1)
 
-**Whether Dropbox returns an `id:` at all**, for files or folders, and whether it survives rename
-and move. What was checked is only that `DropboxEntry` carries no `deny_unknown_fields`, so serde
-discards fields it does not declare: *if* an id arrives, it is dropped. Nothing under `src/` — no
-recorded response, fixture or JSON literal — contains an `id` field. Neither Dropbox's nor Apple's
-HTTP documentation could be cited: both render as JavaScript applications and yield navigation and
-footer only.
+**This was the one open question that could have amended this decision. It is now closed, and the
+answer is yes.** Observed against a live account, not inferred from documentation — neither
+Dropbox's nor Apple's HTTP docs could be cited, as both render as JavaScript applications and
+yield navigation and footer only.
 
-**This is the same fact as the amendment threshold.** The decision rests its escape hatch on its
-one unanswered question. Tolerable only because answering it costs one API call, and because the
-first implementation ticket cannot get far without doing so. **Answer it first in DBSYNC-95.**
+A recursive `files/list_folder` returned **76 entries, and every one carried an `id`** — 63 of 63
+files and 13 of 13 folders. The shape is `"id": "id:eTyPGjL6NDAAAAAAAAAAAg"`.
+
+Stability was established by doing it, on a throwaway file and folder since deleted:
+
+| Observation | `id` before → after |
+| --- | --- |
+| Rename a file (`a.txt` → `b.txt`) | unchanged |
+| Move a file to another folder | unchanged |
+| Rename a folder | unchanged |
+| Move a folder into another folder | unchanged |
+
+Two findings beyond the question asked:
+
+- **`files/upload` returns the full metadata including the `id`.** The response body is discarded
+  today on both upload paths, so an identifier is available at upload time for the cost of parsing
+  what is already being received — no follow-up `get_metadata` is needed to adopt it.
+- **`rev` changes on a move**, while `content_hash` and `id` do not. Anything comparing `rev` will
+  read a move as a modification; `id` is the only field that holds still.
+
+The consequence for this ADR: the sizing below no longer carries a conditional, and the escape
+hatch it reserved is not exercised. **The decision stands as recorded.**
 
 ### Apple's identifier stability requirement
 
