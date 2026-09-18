@@ -4080,7 +4080,10 @@ mod tests {
             "precondition: the first scan pairs the folder rename"
         );
 
-        // Dropbox refuses it permanently — `cant_move_shared_folder`, which renaming a shared
+        // Dropbox refuses it permanently. `cant_move_shared_folder` is the marker named here,
+        // but note it has never been observed live: manual QA renamed an owned shared folder
+        // and Dropbox performed the move. The refusal shape is what this test pins; which
+        // marker produces it is unverified. The comment this replaced said renaming a shared
         // folder produces every time — and the job completes.
         crate::dropbox_transfer::rederive_refused_move(&state, "Docs", "Papers", true).unwrap();
         let move_id = state

@@ -1240,8 +1240,15 @@ pub(crate) fn classify_move_response(status_success: bool, body: &str) -> MoveOu
 /// optional — declining silently makes the correlator re-propose the pair every scan, and the
 /// pair suppresses the very fallback that would carry the rename across. Three of the six
 /// permanent `RelocationError` markers are
-/// folder-only, `cant_move_shared_folder` among them, so a refused **folder** move is ordinary
-/// rather than a corner: renaming a shared folder hits it every time.
+/// folder-only, `cant_move_shared_folder` among them.
+///
+/// **How reachable that is, is NOT known, and an earlier version of this comment asserted it
+/// confidently and wrongly.** It said renaming a shared folder hits `cant_move_shared_folder`
+/// every time. Manual QA against a real account on 2026-09-17 renamed a folder the account
+/// owner had shared, and Dropbox performed the move: one `move_v2`, subtree travelled, all
+/// three `dropbox_id`s preserved, no refusal. So that marker needs some other condition —
+/// being the recipient of a share rather than its owner, or a nested shared folder — and
+/// nobody has observed it. None of the six permanent markers has ever been seen live.
 ///
 /// Neither half of the file recovery transfers. `upload_local_file_internal` opens its path as
 /// a file, so the upload cannot work; and the delete is recursive on a folder, so it would take
