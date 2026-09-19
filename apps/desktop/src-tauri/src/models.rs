@@ -66,6 +66,29 @@ pub(crate) struct DropboxLongpollResponse {
     pub backoff: Option<u64>,
 }
 
+/// The 200 body of `files/upload` and `upload_session/finish` (DBSYNC-99).
+///
+/// A **bare** `FileMetadata`, with no `.tag` — unlike `list_folder` entries, which are union
+/// members, and unlike `move_v2`, which wraps one under `metadata`. Deserializing it as a
+/// `DropboxEntry` fails on the missing `.tag`, and because the caller treats a parse failure
+/// as best-effort that failure would have been silent: the remote row simply would not have
+/// been written and the fix would have been a no-op. Caught by its test before it shipped.
+#[derive(Deserialize)]
+pub(crate) struct UploadCommitResponse {
+    pub id: Option<String>,
+    pub content_hash: Option<String>,
+    pub rev: Option<String>,
+    pub server_modified: Option<String>,
+}
+
+/// The 200 body of `files/move_v2` and `files/create_folder_v2`: the moved item's
+/// metadata under a `metadata` key (DBSYNC-99). Reusing `DropboxEntry` for the inner
+/// value means a `rev` change on a move is recorded rather than discarded.
+#[derive(Deserialize)]
+pub(crate) struct MoveV2Response {
+    pub metadata: DropboxEntry,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct DropboxEntry {
     #[serde(rename = ".tag")]
@@ -75,6 +98,12 @@ pub(crate) struct DropboxEntry {
     pub rev: Option<String>,
     pub server_modified: Option<String>,
     pub size: Option<i64>,
+    /// Dropbox's stable item identifier, e.g. `id:eTyPGjL6NDAAAAAAAAABwg` (DBSYNC-99).
+    /// Present on every `file` and `folder` entry and unchanged by a rename or a move —
+    /// verified against a live account on 2026-09-11, which is the observation ADR-0003
+    /// was waiting on. `Option` because `deleted` entries carry no metadata, not because
+    /// a live item might lack one.
+    pub id: Option<String>,
 }
 
 #[derive(Serialize)]
