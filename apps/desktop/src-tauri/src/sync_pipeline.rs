@@ -14,8 +14,7 @@ use crate::models::SyncTickResult;
 use crate::overlay_state;
 use crate::path_util::{
     backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
-    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, relpath_under,
-    safe_join,
+    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, relpath_under, safe_join,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
 use crate::state::AppState;

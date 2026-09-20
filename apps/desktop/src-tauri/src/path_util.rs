@@ -855,7 +855,10 @@ mod tests {
         let weird = relpath_under(root, Path::new("/sync/root/a\\b.txt")).expect("relpath");
         let genuine = relpath_under(root, Path::new("/sync/root/a/b.txt")).expect("relpath");
 
-        assert_eq!(weird, "a\\b.txt", "the backslash must survive as part of the name");
+        assert_eq!(
+            weird, "a\\b.txt",
+            "the backslash must survive as part of the name"
+        );
         assert_eq!(genuine, "a/b.txt");
         assert_ne!(
             weird, genuine,

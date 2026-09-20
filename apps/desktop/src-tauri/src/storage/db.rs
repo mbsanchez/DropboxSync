@@ -2381,6 +2381,10 @@ mod tests {
     /// The storage layer used to rewrite `\` to `/` in twelve accessors, so a key
     /// carrying a backslash never survived a round trip. Every producer now hands it
     /// an already-canonical key and it stores the bytes it is given.
+    /// Unix-only: the premise is a filename containing a backslash, which cannot exist
+    /// on Windows. There `debug_assert_canonical_key` correctly rejects such a key —
+    /// it caught this very test on the first CI run, which is the guard working.
+    #[cfg(not(windows))]
     #[test]
     fn a_key_containing_a_backslash_survives_a_round_trip() {
         let db = Db::new_at(&unique_db_path()).expect("db init");
@@ -2404,6 +2408,10 @@ mod tests {
     /// contents. They used to collapse onto one `TEXT PRIMARY KEY`, alternating
     /// ownership of the row on every scan and each re-uploading over the other —
     /// silent content loss for whichever lost the race.
+    /// Unix-only: the premise is a filename containing a backslash, which cannot exist
+    /// on Windows. There `debug_assert_canonical_key` correctly rejects such a key —
+    /// it caught this very test on the first CI run, which is the guard working.
+    #[cfg(not(windows))]
     #[test]
     fn two_files_that_differ_only_by_a_backslash_are_two_rows() {
         let db = Db::new_at(&unique_db_path()).expect("db init");
@@ -2431,6 +2439,10 @@ mod tests {
     /// Deleting the unrelated folder `a` issues a recursive removal of the `a/`
     /// subtree. The root file named `a\b.txt` is not in that subtree — it only looked
     /// like it was, because the rewrite turned its backslash into a separator.
+    /// Unix-only: the premise is a filename containing a backslash, which cannot exist
+    /// on Windows. There `debug_assert_canonical_key` correctly rejects such a key —
+    /// it caught this very test on the first CI run, which is the guard working.
+    #[cfg(not(windows))]
     #[test]
     fn removing_a_subtree_spares_a_sibling_whose_name_merely_contains_a_backslash() {
         let db = Db::new_at(&unique_db_path()).expect("db init");
@@ -2459,7 +2471,8 @@ mod tests {
     fn moving_a_subtree_still_moves_every_child() {
         let db = Db::new_at(&unique_db_path()).expect("db init");
 
-        db.upsert_local_file("d/one.txt", "H1", 3, 0).expect("upsert");
+        db.upsert_local_file("d/one.txt", "H1", 3, 0)
+            .expect("upsert");
         db.upsert_local_file("d/sub/two.txt", "H2", 3, 0)
             .expect("upsert");
         // A sibling sharing the prefix must NOT be swept along.
@@ -2467,7 +2480,10 @@ mod tests {
             .expect("upsert");
 
         let stranded = db.move_index_subtree("d", "e").expect("move subtree");
-        assert_eq!(stranded, 0, "no row may be left behind under the old prefix");
+        assert_eq!(
+            stranded, 0,
+            "no row may be left behind under the old prefix"
+        );
 
         assert!(db.get_local_file("e/one.txt").unwrap().is_some());
         assert!(db.get_local_file("e/sub/two.txt").unwrap().is_some());

@@ -1695,7 +1695,10 @@ mod tests {
     /// "the index holds a key the pipeline would not write today" — a legacy or poisoned
     /// row. Building it through the pipeline would be building a different scenario.
     fn plant_poisoned_row(state: &AppState, rel: &str) {
-        state.db.upsert_remote_file(rel, "H", "rev", 0, None).unwrap();
+        state
+            .db
+            .upsert_remote_file(rel, "H", "rev", 0, None)
+            .unwrap();
         state.db.upsert_local_file(rel, "H", 3, 0).unwrap();
         assert!(
             normalize_dropbox_path(rel).is_err(),
@@ -1739,7 +1742,10 @@ mod tests {
     fn a_neighbour_still_reconciles_beside_an_unnormalizable_row() {
         let state = build_state();
         plant_poisoned_row(&state, "a/../escape.txt");
-        state.db.upsert_remote_file("ok.txt", "H", "rev", 0, None).unwrap();
+        state
+            .db
+            .upsert_remote_file("ok.txt", "H", "rev", 0, None)
+            .unwrap();
         state.db.upsert_local_file("ok.txt", "H", 3, 0).unwrap();
 
         let local_files = state.db.list_local_files().unwrap();
@@ -1767,7 +1773,10 @@ mod tests {
     fn the_whole_sweep_survives_an_unnormalizable_row() {
         let state = build_state();
         plant_poisoned_row(&state, "a/../escape.txt");
-        state.db.upsert_remote_file("ok.txt", "H", "rev", 0, None).unwrap();
+        state
+            .db
+            .upsert_remote_file("ok.txt", "H", "rev", 0, None)
+            .unwrap();
         state.db.upsert_local_file("ok.txt", "H", 3, 0).unwrap();
 
         let local_files = state.db.list_local_files().unwrap();
