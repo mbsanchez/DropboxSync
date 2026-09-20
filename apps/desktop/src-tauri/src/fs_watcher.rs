@@ -15,7 +15,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
 use crate::error::{AppError, AppResult};
-use crate::path_util::{is_ignored_local_path, validate_relative};
+use crate::path_util::{is_ignored_local_path, relpath_under, validate_relative};
 use crate::state::AppState;
 
 /// Keeps the debouncer (its OS watch + worker thread) alive for the app's
@@ -152,12 +152,10 @@ pub(crate) fn map_event_path(
     let canon_n = normalize_verbatim(canon_root);
     let conf_n = normalize_verbatim(configured_root);
 
-    let rel = abs_n
-        .strip_prefix(&canon_n)
-        .ok()
-        .or_else(|| abs_n.strip_prefix(&conf_n).ok())?;
+    let rel = relpath_under(&canon_n, &abs_n)
+        .or_else(|_| relpath_under(&conf_n, &abs_n))
+        .ok()?;
 
-    let rel = rel.to_string_lossy().replace('\\', "/");
     let rel = rel.trim_start_matches('/').to_string();
     if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
         return None;

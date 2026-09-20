@@ -81,6 +81,38 @@ impl AppError {
         }
     }
 
+    /// Is this a path Dropbox will never accept, however many times we try?
+    ///
+    /// Written against a **recorded live response**, not the API spec (DBSYNC-104
+    /// slice 1). Uploading a path containing a backslash returns, verbatim:
+    ///
+    /// ```text
+    /// HTTP 409
+    /// {"error":{".tag":"path","reason":{".tag":"malformed_path","malformed_path":null},
+    ///  "upload_session_id":"pid_upload_session:..."},"error_summary":"path/malformed_path/"}
+    /// ```
+    ///
+    /// That matters: DBSYNC-99 shipped a `RelocationError` classifier written from the
+    /// spec, not one of whose permanent markers has ever been observed live, and one
+    /// arm of which turned out to be wrong and had to be retracted. This marker was
+    /// produced by an actual call against a real account.
+    ///
+    /// Retrying such a job burns five attempts and then reports a generic permanent
+    /// sync error. The name is the problem and no amount of waiting changes it, so the
+    /// job is failed on the first attempt with a message that says which file and why.
+    ///
+    /// Narrow on purpose: a bare 409 is NOT enough. Dropbox uses 409 for ordinary,
+    /// recoverable path conflicts too, and treating those as permanent would strand
+    /// files that would have synced on the next tick.
+    pub(crate) fn is_unrepresentable_path(&self) -> bool {
+        match self {
+            AppError::Dropbox { status, message } => {
+                *status == 409 && message.contains("malformed_path")
+            }
+            _ => false,
+        }
+    }
+
     /// Does this error indicate a Dropbox upload session that is no longer
     /// usable (expired/closed/offset mismatch), as opposed to a transient
     /// transport failure or an unrelated 4xx/5xx? Used by
@@ -270,5 +302,52 @@ mod tests {
         .is_hard_auth());
         assert!(!AppError::Network("connection reset".into()).is_hard_auth());
         assert!(!AppError::Auth("some other auth hiccup".into()).is_hard_auth());
+    }
+
+    /// DBSYNC-104 slice 6. The body below is the VERBATIM 409 recorded from a live
+    /// `files/upload` of a path containing a backslash, against a real account. Writing
+    /// the classifier against a recorded response rather than the API spec is the whole
+    /// point of the probe that preceded this slice.
+    #[test]
+    fn a_malformed_path_rejection_is_permanent() {
+        let recorded = AppError::Dropbox {
+            status: 409,
+            message: "upload for /probe-a\\b.txt: {\"error\":{\".tag\":\"path\",\
+                      \"reason\":{\".tag\":\"malformed_path\",\"malformed_path\":null},\
+                      \"upload_session_id\":\"pid_upload_session:ABIL\"},\
+                      \"error_summary\":\"path/malformed_path/\"}"
+                .to_string(),
+        };
+
+        assert!(recorded.is_unrepresentable_path());
+        assert!(
+            !recorded.is_transient(),
+            "a permanently-unacceptable path must never be retried as a blip"
+        );
+    }
+
+    /// Narrowness is the safety property here. Dropbox uses 409 for ordinary,
+    /// recoverable path conflicts; classifying those as permanent would strand files
+    /// that would have synced on the next tick.
+    #[test]
+    fn an_ordinary_conflict_is_not_treated_as_unrepresentable() {
+        for message in [
+            "upload for /a.txt: {\"error_summary\":\"path/conflict/file/\"}",
+            "upload for /a.txt: {\"error_summary\":\"path/insufficient_space/\"}",
+            "upload for /a.txt: {\"error_summary\":\"too_many_write_operations\"}",
+        ] {
+            let err = AppError::Dropbox {
+                status: 409,
+                message: message.to_string(),
+            };
+            assert!(
+                !err.is_unrepresentable_path(),
+                "a bare 409 must not be permanent: {message}"
+            );
+        }
+
+        // Nor is any non-Dropbox error, whatever it says.
+        assert!(!AppError::Other("malformed_path".into()).is_unrepresentable_path());
+        assert!(!AppError::Network("reset".into()).is_unrepresentable_path());
     }
 }

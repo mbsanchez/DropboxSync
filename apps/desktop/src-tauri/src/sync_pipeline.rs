@@ -14,7 +14,8 @@ use crate::models::SyncTickResult;
 use crate::overlay_state;
 use crate::path_util::{
     backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
-    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, safe_join,
+    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, relpath_under,
+    safe_join,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
 use crate::state::AppState;
@@ -248,11 +249,7 @@ fn process_local_file_change(
             // of skipping this branch.
             if covered_by_active_job(relative, pending_targets) {
                 let conflicted_path = create_conflicted_copy(absolute)?;
-                let conflicted_rel = conflicted_path
-                    .strip_prefix(tracked_root)
-                    .map_err(|e| AppError::Io(e.to_string()))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let conflicted_rel = relpath_under(tracked_root, &conflicted_path)?;
                 state.db.add_conflict(
                     relative,
                     relative,
@@ -412,7 +409,12 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     let mut rels: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for p in paths {
+        // Separator fold is Windows-only (DBSYNC-104): on macOS `\\` is a filename byte,
+        // and folding it here aliased two distinct files onto one key.
+        #[cfg(windows)]
         let rel = p.replace('\\', "/");
+        #[cfg(not(windows))]
+        let rel = p.to_string();
         let rel = rel.trim_start_matches('/').to_string();
         if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
             continue;
@@ -572,8 +574,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             if !entry.file_type().is_file() {
                 continue;
             }
-            let child_rel = match entry.path().strip_prefix(&tracked_root) {
-                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
+            let child_rel = match relpath_under(&tracked_root, entry.path()) {
+                Ok(r) => r,
                 Err(_) => continue,
             };
             if child_rel.ends_with(".cloudsc") || is_ignored_local_path(&child_rel) {
@@ -1202,14 +1205,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         let absolute = entry.path().to_path_buf();
-        let relative = absolute
-            .strip_prefix(&tracked_root)
-            .map_err(|e| AppError::Io(e.to_string()))?
-            .to_string_lossy()
-            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
-            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
-            // '/'-stored row and the scan re-uploads it every tick.
-            .replace('\\', "/");
+        let relative = relpath_under(&tracked_root, &absolute)?;
 
         if relative.ends_with(".cloudsc") {
             continue;
@@ -1248,14 +1244,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         let absolute = entry.path().to_path_buf();
-        let relative = absolute
-            .strip_prefix(&tracked_root)
-            .map_err(|e| AppError::Io(e.to_string()))?
-            .to_string_lossy()
-            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
-            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
-            // '/'-stored row and the scan re-uploads it every tick.
-            .replace('\\', "/");
+        let relative = relpath_under(&tracked_root, &absolute)?;
 
         if relative.is_empty() {
             continue; // skip the sync root itself
@@ -1505,8 +1494,20 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             );
         }
         Err(err) => {
-            if attempt >= max_attempts {
-                let msg = format!("job {} failed: {err}", job.id);
+            // DBSYNC-104: a path Dropbox will never accept is not worth five attempts.
+            // Fail it now, and say which file and why instead of reporting a generic
+            // permanent sync error four backoffs later. Verified live: an upload whose
+            // path contains a backslash returns 409 `path/malformed_path`.
+            let unrepresentable = err.is_unrepresentable_path();
+            if unrepresentable || attempt >= max_attempts {
+                let msg = if unrepresentable {
+                    format!(
+                        "\"{job_path}\" cannot sync: Dropbox rejects this file name. \
+                         Rename it — a backslash (\\) is not allowed in a Dropbox path."
+                    )
+                } else {
+                    format!("job {} failed: {err}", job.id)
+                };
                 tracing::error!(
                     job_id = job.id,
                     job_type = %job.job_type,

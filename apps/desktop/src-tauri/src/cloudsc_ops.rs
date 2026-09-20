@@ -1057,8 +1057,9 @@ fn dehydrate_folder_cfapi(
         if !entry.file_type().is_file() {
             continue;
         }
-        let file_rel = match entry.path().strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+        // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
+        let file_rel = match relpath_under(root, entry.path()) {
+            Ok(r) => r,
             Err(_) => continue,
         };
         if file_rel.ends_with(".cloudsc") || is_ignored_local_path(&file_rel) {
@@ -1134,8 +1135,9 @@ fn dehydrate_folder_collapse(
         if !ft.is_file() {
             continue; // symlink/other — left in place; it blocks the collapse (→ degrade)
         }
-        let file_rel = match entry.path().strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+        // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
+        let file_rel = match relpath_under(root, entry.path()) {
+            Ok(r) => r,
             Err(_) => continue,
         };
         if file_rel.ends_with(".cloudsc") {

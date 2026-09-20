@@ -354,8 +354,17 @@ fn reconcile_remote_snapshot_with_breaker(
         {
             continue;
         }
-        if let Some(remote_meta) = remote_by_path.get(&normalize_dropbox_path(rel)?.to_lowercase())
-        {
+        // Skip-and-log, not `?` (DBSYNC-104): propagating here aborted the whole batch,
+        // so one path the helper could not normalise stopped downloads and delete
+        // reconciliation for every other file. Same pattern as `cloudsc_ops`.
+        let key = match normalize_dropbox_path(rel) {
+            Ok(p) => p.to_lowercase(),
+            Err(error) => {
+                tracing::warn!(rel = %rel, error = %error, "skipping unnormalizable path in remote sweep");
+                continue;
+            }
+        };
+        if let Some(remote_meta) = remote_by_path.get(&key) {
             enqueued += reconcile_remote_present(state, rel, remote_meta)?;
         }
     }
@@ -415,7 +424,22 @@ fn remote_sweep_delete_candidates(
         {
             continue;
         }
-        if remote_by_path.contains_key(&normalize_dropbox_path(rel)?.to_lowercase()) {
+        // SAFETY (mass-delete): this skip MUST stay above the `absent.push` below.
+        // `absent` is read by the caller as "deleted remotely" and enqueues a
+        // `local_delete`, so a path we cannot normalize must leave the loop here, not
+        // fall through. Skipping costs one unreconciled file; treating it as absent
+        // would delete a file that is present on both sides.
+        //
+        // It used to be `?`, which aborted the whole sweep for every other file
+        // (DBSYNC-104).
+        let key = match normalize_dropbox_path(rel) {
+            Ok(p) => p.to_lowercase(),
+            Err(error) => {
+                tracing::warn!(rel = %rel, error = %error, "skipping unnormalizable path in delete sweep");
+                continue;
+            }
+        };
+        if remote_by_path.contains_key(&key) {
             continue; // present — handled by the caller's other loop.
         }
 
@@ -1663,6 +1687,109 @@ mod tests {
         let n = reconcile_remote_present(&state, "f.txt", &meta).unwrap();
         assert_eq!(n, 0);
         assert!(job_targets(&state, "download").is_empty());
+    }
+
+    // ── DBSYNC-104: one unnormalizable row must not delete itself or stop the sweep ──
+
+    /// The row is planted directly, deliberately. The premise of this test is exactly
+    /// "the index holds a key the pipeline would not write today" — a legacy or poisoned
+    /// row. Building it through the pipeline would be building a different scenario.
+    fn plant_poisoned_row(state: &AppState, rel: &str) {
+        state.db.upsert_remote_file(rel, "H", "rev", 0, None).unwrap();
+        state.db.upsert_local_file(rel, "H", 3, 0).unwrap();
+        assert!(
+            normalize_dropbox_path(rel).is_err(),
+            "{rel:?} must be unnormalizable or this test proves nothing"
+        );
+    }
+
+    /// The whole safety argument of the skip is its POSITION: it sits above the
+    /// `absent.push`, so an unnormalizable path leaves the loop instead of being read
+    /// as "deleted remotely". If it ever moves below that line, this test goes red —
+    /// which is the point, because the alternative is deleting a file that is present
+    /// on both sides.
+    #[test]
+    fn an_unnormalizable_row_is_never_a_delete_candidate() {
+        let state = build_state();
+        plant_poisoned_row(&state, "a/../escape.txt");
+
+        let local_files = state.db.list_local_files().unwrap();
+        let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        let pending_targets: HashSet<String> = HashSet::new();
+
+        let (absent, delete_candidates) =
+            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
+                .expect("an unnormalizable path must not abort the sweep");
+
+        assert!(
+            absent.is_empty(),
+            "the unnormalizable path must not be reported absent — `absent` enqueues local deletes, got {absent:?}"
+        );
+        assert_eq!(
+            delete_candidates, 0,
+            "nothing may be counted as a delete candidate"
+        );
+    }
+
+    /// The other half: the poisoned row must not take its neighbours down with it.
+    /// Before the fix the `?` propagated, so one such row returned `Err` for the whole
+    /// batch — no downloads, no delete reconciliation, no remote-present updates, for
+    /// every other file, indefinitely.
+    #[test]
+    fn a_neighbour_still_reconciles_beside_an_unnormalizable_row() {
+        let state = build_state();
+        plant_poisoned_row(&state, "a/../escape.txt");
+        state.db.upsert_remote_file("ok.txt", "H", "rev", 0, None).unwrap();
+        state.db.upsert_local_file("ok.txt", "H", 3, 0).unwrap();
+
+        let local_files = state.db.list_local_files().unwrap();
+        assert_eq!(local_files.len(), 2, "both rows are tracked");
+
+        let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        let pending_targets: HashSet<String> = HashSet::new();
+
+        let (absent, delete_candidates) =
+            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
+                .expect("the batch must survive one bad row");
+
+        assert_eq!(
+            absent,
+            vec!["ok.txt".to_string()],
+            "the healthy neighbour is still reconciled, and only it"
+        );
+        assert_eq!(delete_candidates, 1);
+    }
+
+    /// The PRESENT loop has its own copy of the same `?`, and `remote_sweep_delete_candidates`
+    /// is itself called with `?` from this function — so fixing only one of the two left the
+    /// abort fully intact. This drives the outer function to prove both were fixed.
+    #[test]
+    fn the_whole_sweep_survives_an_unnormalizable_row() {
+        let state = build_state();
+        plant_poisoned_row(&state, "a/../escape.txt");
+        state.db.upsert_remote_file("ok.txt", "H", "rev", 0, None).unwrap();
+        state.db.upsert_local_file("ok.txt", "H", 3, 0).unwrap();
+
+        let local_files = state.db.list_local_files().unwrap();
+        let mut remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        remote_by_path.insert(
+            "/ok.txt".to_string(),
+            RemoteFileMeta {
+                content_hash: "H".to_string(),
+                rev: "rev".to_string(),
+                modified_ts: 0,
+                id: None,
+            },
+        );
+        let pending_targets: HashSet<String> = HashSet::new();
+
+        reconcile_remote_snapshot_with_breaker(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+        )
+        .expect("one unnormalizable row must not abort the whole sweep");
     }
 
     // ── DBSYNC-64: mass-deletion circuit breaker, remote→local (sweep) ─────────

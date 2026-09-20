@@ -22,7 +22,6 @@ pub(crate) fn resolve_cloudsc_rel_path(state: &AppState, abs: &Path) -> AppResul
         .canonicalize()
         .map_err(|e| AppError::Io(format!("invalid sync folder: {e}")))?;
     let rel = relpath_under(&sync_canon, &abs_canon)?;
-    let rel = rel.replace('\\', "/");
     if !rel.ends_with(".cloudsc") {
         return Err(AppError::Sync("not a .cloudsc placeholder".to_string()));
     }

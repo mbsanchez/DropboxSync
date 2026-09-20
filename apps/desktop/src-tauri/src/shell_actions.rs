@@ -143,7 +143,7 @@ fn validate_under_root(state: &AppState, abs: &Path) -> AppResult<String> {
     let abs_canon = abs
         .canonicalize()
         .map_err(|e| AppError::Io(format!("invalid path: {e}")))?;
-    Ok(relpath_under(&sync_canon, &abs_canon)?.replace('\\', "/"))
+    relpath_under(&sync_canon, &abs_canon)
 }
 
 /// Handle a parsed action delivered by the OS (single-instance / cold start).
