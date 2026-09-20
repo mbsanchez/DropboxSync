@@ -83,8 +83,8 @@ impl AppError {
 
     /// Is this a path Dropbox will never accept, however many times we try?
     ///
-    /// Written against a **recorded live response**, not the API spec (DBSYNC-104
-    /// slice 1). Uploading a path containing a backslash returns, verbatim:
+    /// Written against a **recorded live response** (DBSYNC-104 slice 1). Uploading a
+    /// path containing a backslash returns, verbatim:
     ///
     /// ```text
     /// HTTP 409
@@ -94,20 +94,41 @@ impl AppError {
     ///
     /// That matters: DBSYNC-99 shipped a `RelocationError` classifier written from the
     /// spec, not one of whose permanent markers has ever been observed live, and one
-    /// arm of which turned out to be wrong and had to be retracted. This marker was
-    /// produced by an actual call against a real account.
+    /// arm of which turned out to be wrong and had to be retracted.
     ///
-    /// Retrying such a job burns five attempts and then reports a generic permanent
-    /// sync error. The name is the problem and no amount of waiting changes it, so the
-    /// job is failed on the first attempt with a message that says which file and why.
+    /// **Matches the `error_summary` key, not a bare substring.** `AppError::Dropbox`'s
+    /// `message` is composed as `format!("upload for {path}: {body}")`, so the user's own
+    /// path is inside the haystack: a file named `malformed_path.txt` would otherwise turn
+    /// any 409 — `path/not_found` on a queued download, say — into a permanent failure.
+    /// Deciding by looking at the wrong bytes is the bug class this whole ticket is about,
+    /// so the marker is anchored to the JSON key that only Dropbox can write.
     ///
-    /// Narrow on purpose: a bare 409 is NOT enough. Dropbox uses 409 for ordinary,
-    /// recoverable path conflicts too, and treating those as permanent would strand
-    /// files that would have synced on the next tick.
+    /// Narrow on the status too: a bare 409 is NOT enough. Dropbox uses 409 for ordinary,
+    /// recoverable path conflicts, and treating those as permanent would strand files that
+    /// would have synced on the next tick.
+    ///
+    /// **`malformed_path` is broader than the backslash that was probed.** It is Dropbox's
+    /// general "this path does not satisfy the required format": illegal characters
+    /// (`< > : " | ? *` as well as `\`), a trailing space or period, an over-long component.
+    /// All of them are permanent and all are fixed by renaming, so one classification is
+    /// right — but the user-facing message must describe the tag, not the one cause that
+    /// happened to be probed. See `unrepresentable_path_message`.
+    /// **Recorded from `files/upload`; consumed by every job type.** Review M3 is right
+    /// that the other endpoints' bodies were never observed. The asymmetry is safe in one
+    /// direction only, and that is why it is acceptable: an endpoint that returns the same
+    /// 409 + `error_summary` shape is classified correctly, and one that returns anything
+    /// else (a 400, a different tag) simply falls through to the ordinary attempt budget —
+    /// exactly the behaviour that existed before this classifier. So an unobserved shape
+    /// costs a worse message, never a wrong permanent failure.
+    ///
+    /// For moves specifically, `classify_move_response` runs first and has no
+    /// `malformed_path` arm, so a rejected destination reaches here only if that classifier
+    /// surfaces the status and body unchanged. Unverified, and deliberately left that way
+    /// rather than guessed at: the next probe that touches `move_v2` should record it.
     pub(crate) fn is_unrepresentable_path(&self) -> bool {
         match self {
             AppError::Dropbox { status, message } => {
-                *status == 409 && message.contains("malformed_path")
+                *status == 409 && message.contains(r#""error_summary":"path/malformed_path"#)
             }
             _ => false,
         }
@@ -324,6 +345,34 @@ mod tests {
             !recorded.is_transient(),
             "a permanently-unacceptable path must never be retried as a blip"
         );
+    }
+
+    /// Review H2(a). `message` is composed as `format!("upload for {path}: {body}")`, so
+    /// the user's own path sits inside the haystack. A bare `contains("malformed_path")`
+    /// meant a file NAMED `malformed_path.txt` turned any 409 into a permanent failure —
+    /// deciding by looking at the wrong bytes, which is the bug class this ticket is about.
+    /// Anchoring to the `error_summary` key fixes it: only Dropbox writes that.
+    #[test]
+    fn a_file_named_after_the_marker_does_not_forge_a_permanent_failure() {
+        let path_only = AppError::Dropbox {
+            status: 409,
+            message: "download for /Docs/malformed_path.txt: \
+                      {\"error_summary\":\"path/not_found/\"}"
+                .to_string(),
+        };
+        assert!(
+            !path_only.is_unrepresentable_path(),
+            "the marker must come from Dropbox's response, not from the user's filename"
+        );
+
+        // Even a folder engineered to look like the whole tag must not match.
+        let adversarial = AppError::Dropbox {
+            status: 409,
+            message: "upload for /path/malformed_path/x.txt: \
+                      {\"error_summary\":\"path/conflict/file/\"}"
+                .to_string(),
+        };
+        assert!(!adversarial.is_unrepresentable_path());
     }
 
     /// Narrowness is the safety property here. Dropbox uses 409 for ordinary,

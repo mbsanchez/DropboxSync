@@ -16,9 +16,9 @@ use crate::error::{AppError, AppResult};
 /// matched as `.DS_Store` and silently never synced.
 pub(crate) fn should_ignore_local_path(relative: &str) -> bool {
     #[cfg(windows)]
-    let p = relative.replace('\\', "/");
+    let p: &str = &relative.replace('\\', "/");
     #[cfg(not(windows))]
-    let p = relative.to_string();
+    let p: &str = relative;
     p == ".DS_Store"
         || p.ends_with("/.DS_Store")
         || p.starts_with("._")
@@ -172,10 +172,16 @@ pub(crate) fn is_dehydrated_placeholder(abs: &Path) -> bool {
     }
 }
 
-/// The single place an absolute path becomes a relative index key.
+/// The single place an **absolute local path** becomes a relative index key.
 ///
-/// Every producer of a key goes through here (DBSYNC-104). The storage layer relies
-/// on that: it no longer normalizes separators itself, it asserts that callers have.
+/// Every local producer goes through here (DBSYNC-104). The storage layer relies on that:
+/// it no longer normalizes separators itself, it asserts that callers have.
+///
+/// Remote keys have a second, independent source: `path_display` from the Dropbox API,
+/// stripped of its leading `/` in `remote_index` and `cloudsc_ops`. Those never reach this
+/// function and do not need to — a Dropbox path is `/`-canonical by construction. Review
+/// L1 flagged an earlier version of this comment for claiming otherwise, which mattered
+/// because this claim is the justification for deleting the storage layer's own rewrites.
 pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
     let rel = absolute
         .strip_prefix(sync_folder)
@@ -200,11 +206,38 @@ pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<St
     Ok(rel)
 }
 
-/// True if `input` contains a path-traversal component (`..`) — checked against
-/// both `/` and `\` separators — or an embedded NUL byte. Such inputs must never
-/// be used to build a Dropbox path or a local filesystem path (DBSYNC-27).
+/// True if `input` contains a path-traversal component (`..`) or an embedded NUL byte.
+/// Such inputs must never be used to build a Dropbox path or a local filesystem path
+/// (DBSYNC-27).
+///
+/// The NUL check is unconditional. The separator set is not: `\` counts as a separator
+/// only on Windows (DBSYNC-104).
+///
+/// On Unix `\` is a legal filename byte, so `a\..\c.txt` is ONE component, not three.
+/// Treating it as a traversal rejected a legal file that the pipeline had already indexed
+/// and enqueued — the upload then failed with `AppError::Sync`, which is not an
+/// `AppError::Dropbox` and so escapes the permanent-path classifier, burning five attempts
+/// and reporting a generic error. That is precisely the outcome the classifier exists to
+/// remove. The row was also permanently unnormalizable, so both remote sweeps logged a
+/// warning for it on every tick, forever.
+///
+/// Nothing is given up by gating it. Measured: `Path::join` treats every such name as a
+/// single component, so even `a\..\..\..\etc\passwd` stays under the sync root, and
+/// `safe_join`'s `starts_with(root)` check confirms it. Dropbox rejects the name anyway
+/// with `path/malformed_path`, which is now classified as permanent and reported with a
+/// message the user can act on — a strictly better outcome than a local rejection.
+///
+/// Do NOT "fix" this back to an unconditional split: the `/`-only split on Unix and the
+/// both-separator split on Windows are each correct for their platform's filename rules.
 fn has_traversal(input: &str) -> bool {
-    input.contains('\0') || input.split(['/', '\\']).any(|c| c == "..")
+    if input.contains('\0') {
+        return true;
+    }
+    #[cfg(windows)]
+    let separators: &[char] = &['/', '\\'];
+    #[cfg(not(windows))]
+    let separators: &[char] = &['/'];
+    input.split(separators).any(|c| c == "..")
 }
 
 /// True if `input` is an OS-absolute path that has no business appearing as a
@@ -692,7 +725,6 @@ mod tests {
         for bad in [
             "../etc/passwd",
             "Cocina/../../secret",
-            "..\\Windows\\System32",
             "a/../../b",
             "with\0null",
         ] {
@@ -705,7 +737,14 @@ mod tests {
         // Drive and UNC prefixes are a Windows concept (DBSYNC-104). There they can
         // replace the base in `PathBuf::push`; on Unix they are ordinary filename bytes
         // that `Path::join` keeps under the root.
-        for drive_shaped in ["C:\\Windows", "C:/Windows", "\\\\server\\share"] {
+        // `..\Windows\System32` is a traversal on Windows and ONE legal filename on Unix
+        // (DBSYNC-104). Grouped with the drive shapes below for the same reason.
+        for drive_shaped in [
+            "C:\\Windows",
+            "C:/Windows",
+            "\\\\server\\share",
+            "..\\Windows\\System32",
+        ] {
             let got = normalize_dropbox_path(drive_shaped);
             if cfg!(windows) {
                 assert!(got.is_err(), "expected rejection for {drive_shaped:?}");
@@ -805,21 +844,36 @@ mod tests {
     #[test]
     fn safe_join_refuses_to_escape_root() {
         let root = Path::new("/sync/root");
-        for bad in [
-            "../outside",
-            "a/../../b",
-            "/abs/path",
-            "..",
-            "x\0y",
-            // A remote-derived child name carrying embedded separators (DBSYNC-27
-            // review finding #1: the `.cloudsc` placeholder write sink).
-            "..\\..\\evil.cloudsc",
-            "sub\\..\\..\\evil",
-        ] {
+        for bad in ["../outside", "a/../../b", "/abs/path", "..", "x\0y"] {
             assert!(
                 safe_join(root, bad).is_err(),
                 "safe_join must refuse {bad:?}"
             );
+        }
+
+        // A remote-derived child name carrying embedded backslashes (DBSYNC-27 review
+        // finding #1: the `.cloudsc` placeholder write sink). On Windows these are
+        // traversals and must be refused. On Unix each is ONE legal filename
+        // (DBSYNC-104) — so the safety property is not "refused" but "cannot escape",
+        // which is what `safe_join` actually guarantees. Assert that directly.
+        for backslashed in ["..\\..\\evil.cloudsc", "sub\\..\\..\\evil"] {
+            let joined = safe_join(root, backslashed);
+            assert_eq!(
+                joined.is_err(),
+                cfg!(windows),
+                "{backslashed:?} must be refused on Windows and accepted on Unix"
+            );
+            if let Ok(joined) = joined {
+                assert!(
+                    joined.starts_with(root),
+                    "{backslashed:?} joined outside the root: {joined:?}"
+                );
+                assert_eq!(
+                    joined.components().count(),
+                    root.components().count() + 1,
+                    "{backslashed:?} must be exactly one component under the root"
+                );
+            }
         }
     }
 

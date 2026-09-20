@@ -1472,7 +1472,8 @@ mod tests {
         let root = PathBuf::from("/sync/root");
         let dir = root.join("Cocina").join("Pizza");
         let rel = relpath_under(&root, &dir).expect("relpath");
-        // `normalize_dropbox_path` itself converts OS separators to '/'.
+        // `relpath_under` already yields a '/'-canonical key; `normalize_dropbox_path`
+        // only adds the leading '/'. It converts separators on Windows only (DBSYNC-104).
         assert_eq!(normalize_dropbox_path(&rel).unwrap(), "/Cocina/Pizza");
     }
 

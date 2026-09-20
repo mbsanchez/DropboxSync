@@ -90,8 +90,13 @@ pub struct Db {
     data_dir: PathBuf,
 }
 
-/// Debug-only contract check: every index key reaching the storage layer has already
-/// been canonicalized by [`crate::path_util::relpath_under`], the single producer.
+/// Debug-only contract check: every index key reaching the storage layer is already
+/// `/`-canonical.
+///
+/// Local keys get that from [`crate::path_util::relpath_under`], the single local
+/// producer. Remote keys come from Dropbox `path_display` stripped of its leading `/`,
+/// which is `/`-canonical by construction and never passes through `relpath_under`
+/// (review L1 corrected an earlier comment that claimed one source for both).
 ///
 /// This layer used to rewrite `\` to `/` itself, in twelve accessors (DBSYNC-45) — a
 /// second, independent normalization boundary. On macOS, where `\` is a legal byte in
@@ -238,6 +243,7 @@ impl Db {
     /// on disk and Dropbox has not named it yet. The identifier is filled in later by
     /// [`Self::set_known_folder_dropbox_id`].
     pub fn upsert_known_folder(&self, relative_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(relative_path);
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -295,6 +301,7 @@ impl Db {
     }
 
     pub fn remove_known_folder(&self, relative_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .write
             .lock()

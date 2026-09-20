@@ -1691,9 +1691,18 @@ mod tests {
 
     // ── DBSYNC-104: one unnormalizable row must not delete itself or stop the sweep ──
 
-    /// The row is planted directly, deliberately. The premise of this test is exactly
-    /// "the index holds a key the pipeline would not write today" — a legacy or poisoned
-    /// row. Building it through the pipeline would be building a different scenario.
+    /// The row is planted directly, deliberately.
+    ///
+    /// Review M1 rejected an earlier version of this comment, which claimed the pipeline
+    /// could not write such a key — at the time it could: `a\..\c.txt` is one legal macOS
+    /// filename that `has_traversal` split into a traversal, so an ordinary file became a
+    /// permanently-unnormalizable row. That is fixed at the source (DBSYNC-104 H3), and on
+    /// Unix the remaining rejections — a `..` component between `/`s, an embedded NUL —
+    /// are not producible as filenames. So the claim is true NOW, and only because the
+    /// underlying defect was fixed rather than worked around here.
+    ///
+    /// Building this through the pipeline would therefore build a different scenario, and
+    /// on Unix could not build this one at all.
     fn plant_poisoned_row(state: &AppState, rel: &str) {
         state
             .db
