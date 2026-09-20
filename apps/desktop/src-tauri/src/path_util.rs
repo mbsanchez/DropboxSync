@@ -178,10 +178,11 @@ pub(crate) fn is_dehydrated_placeholder(abs: &Path) -> bool {
 /// it no longer normalizes separators itself, it asserts that callers have.
 ///
 /// Remote keys have a second, independent source: `path_display` from the Dropbox API,
-/// stripped of its leading `/` in `remote_index` and `cloudsc_ops`. Those never reach this
-/// function and do not need to — a Dropbox path is `/`-canonical by construction. Review
-/// L1 flagged an earlier version of this comment for claiming otherwise, which mattered
-/// because this claim is the justification for deleting the storage layer's own rewrites.
+/// stripped of its leading `/` in `remote_index`, `cloudsc_ops` and `dropbox_transfer`.
+/// Those never reach this function and do not need to — a Dropbox path is `/`-canonical by
+/// construction. Review L1 flagged an earlier version of this comment for claiming
+/// otherwise, which mattered because this claim is the justification for deleting the
+/// storage layer's own rewrites.
 pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
     let rel = absolute
         .strip_prefix(sync_folder)
@@ -276,6 +277,10 @@ fn is_os_absolute(input: &str) -> bool {
 /// input that could escape the intended tree. Returns an error for paths that
 /// contain `..`, NUL bytes, or an OS-absolute prefix instead of silently
 /// building a traversing path (DBSYNC-27). A leading `/` is preserved.
+///
+/// The `..` and OS-absolute checks are separator-sensitive and therefore platform-gated —
+/// see [`has_traversal`] and [`is_os_absolute`]. On Unix `is_os_absolute` is always false.
+/// The NUL check is unconditional.
 pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
     if has_traversal(input) || is_os_absolute(input) {
         return Err(AppError::Sync(format!("rejected unsafe path: {input:?}")));
@@ -301,7 +306,22 @@ pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
 /// NUL byte, and not absolute (no leading `/` or `\`, no drive/UNC prefix).
 /// Used before joining any remote-derived path onto the local sync folder.
 pub(crate) fn validate_relative(rel: &str) -> AppResult<()> {
-    if has_traversal(rel) || is_os_absolute(rel) || rel.starts_with('/') || rel.starts_with('\\') {
+    // A leading `\` is a root marker on Windows and an ordinary first byte of a filename
+    // on Unix, so it is gated like every other separator rule in this file (DBSYNC-104,
+    // review round 2). Ungated, a legal macOS root file named `\x.txt` was indexed and
+    // enqueued and then rejected here, inside `safe_join`, as `AppError::Sync` — which is
+    // not an `AppError::Dropbox`, so it escaped the permanent-path classifier and burned
+    // five attempts for a generic error. That is the same failure shape `has_traversal`
+    // had, one byte along.
+    //
+    // Containment is unaffected: `safe_join`'s `starts_with(root)` check still applies, and
+    // `root.join("\\x.txt")` on Unix is one component under the root.
+    #[cfg(windows)]
+    let os_root_marker = rel.starts_with('\\');
+    #[cfg(not(windows))]
+    let os_root_marker = false;
+
+    if has_traversal(rel) || is_os_absolute(rel) || rel.starts_with('/') || os_root_marker {
         return Err(AppError::Sync(format!(
             "rejected unsafe relative path: {rel:?}"
         )));
@@ -789,27 +809,22 @@ mod tests {
         // Rejected on every platform. `\\unc\\x` and `\\Windows` stay rejected here even
         // on Unix because `validate_relative` also refuses a leading separator outright,
         // and that check is deliberately NOT platform-gated.
-        for bad in [
-            "..",
-            "../x",
-            "a/../../b",
-            "/etc/passwd",
-            "\\Windows",
-            "\\\\unc\\x",
-            "x\0y",
-        ] {
+        for bad in ["..", "../x", "a/../../b", "/etc/passwd", "x\0y"] {
             assert!(
                 validate_relative(bad).is_err(),
                 "expected rejection for {bad:?}"
             );
         }
 
-        // Windows-only: a drive prefix. On Unix `C:\\x` is one legal filename.
-        let got = validate_relative("C:\\x");
-        if cfg!(windows) {
-            assert!(got.is_err(), "expected rejection for \"C:\\\\x\"");
-        } else {
-            assert!(got.is_ok(), "C:\\x is a legal Unix filename");
+        // Windows-only: a drive prefix, a UNC prefix, and a leading `\` root marker. On
+        // Unix each of these is one legal filename, and `safe_join` — not a rejection here
+        // — is what keeps them under the root (DBSYNC-104).
+        for windows_only in ["C:\\x", "\\Windows", "\\\\unc\\x"] {
+            assert_eq!(
+                validate_relative(windows_only).is_err(),
+                cfg!(windows),
+                "{windows_only:?} must be refused on Windows and accepted on Unix"
+            );
         }
     }
 

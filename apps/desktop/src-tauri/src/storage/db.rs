@@ -112,6 +112,14 @@ pub struct Db {
 ///
 /// `debug_assert!` compiles out in release. This is a development guard that makes a
 /// bypassing caller fail loudly in tests and dev builds — not a runtime enforcement.
+///
+/// And it is a **no-op on Unix**, where a backslash is legitimate data: it only has teeth
+/// in the `rust (windows-latest)` CI job, not on the macOS dev machine (review round 2).
+/// It earned that keep immediately — it caught three of this branch's own tests on its
+/// first Windows run.
+///
+/// `enqueue_job`, `enqueue_delete_job` and `record_refused_move` also take index keys and
+/// are not asserted. Pre-existing, and left as it is rather than widened silently.
 #[inline]
 fn debug_assert_canonical_key(_relative_path: &str) {
     #[cfg(windows)]

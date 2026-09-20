@@ -1493,58 +1493,7 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             );
         }
         Err(err) => {
-            // DBSYNC-104: the path the message should name is the one Dropbox rejected.
-            // For a move that is the DESTINATION — `job_path` prefers `source_path`, so a
-            // rename of `x.txt` to `a\b.txt` would otherwise tell the user that `x.txt`
-            // contains a backslash, which it does not.
-            let offending_path = job
-                .target_path
-                .as_deref()
-                .filter(|_| job.job_type == "move")
-                .unwrap_or(&job_path);
-
-            match classify_job_failure(&err, attempt, max_attempts) {
-                JobFailure::Permanent(reason) => {
-                    let msg = match reason {
-                        PermanentReason::UnrepresentablePath => {
-                            unrepresentable_path_message(offending_path)
-                        }
-                        PermanentReason::AttemptsExhausted => {
-                            format!("job {} failed: {err}", job.id)
-                        }
-                    };
-                    tracing::error!(
-                        job_id = job.id,
-                        job_type = %job.job_type,
-                        path = %offending_path,
-                        attempt,
-                        error = %err,
-                        reason = reason.as_log_str(),
-                        "sync job failed permanently"
-                    );
-                    state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
-                }
-                JobFailure::Retry => {
-                    let wait_secs = backoff_seconds(attempt);
-                    let retry_at = (Utc::now() + Duration::seconds(wait_secs)).to_rfc3339();
-                    let msg = format!(
-                        "job {} retry scheduled in {}s (attempt {}): {err}",
-                        job.id, wait_secs, attempt
-                    );
-                    tracing::warn!(
-                        job_id = job.id,
-                        job_type = %job.job_type,
-                        path = %job_path,
-                        attempt,
-                        wait_secs,
-                        error = %err,
-                        "sync job failed; retry scheduled"
-                    );
-                    state
-                        .db
-                        .mark_job_retry_wait(job.id, attempt, &retry_at, Some(&msg))?;
-                }
-            }
+            apply_job_failure(state, &job, attempt, max_attempts, &err)?;
         }
     }
 
@@ -1552,6 +1501,84 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     // from the DB, so per-job success no longer masks still-failed jobs.
     refresh_queue_depth_internal(state)?;
     Ok(true)
+}
+
+/// Record a failed job: decide retry-or-give-up, write the row, log it.
+///
+/// **Extracted so the behaviour can be asserted against a real `Db`** (DBSYNC-104, review
+/// round 2). An earlier attempt extracted only the *decision* into `classify_job_failure`
+/// and tested that; the review then replaced the drain's call site with the old logic and
+/// the whole suite stayed green — the user-visible behaviour could be deleted from
+/// production without a single test noticing. Moving the DB write in here shrinks the
+/// untested surface to one line in `process_sync_queue_internal`: `apply_job_failure(...)`.
+fn apply_job_failure(
+    state: &AppState,
+    job: &crate::storage::db::SyncJobRow,
+    attempt: i64,
+    max_attempts: i64,
+    err: &AppError,
+) -> AppResult<()> {
+    let job_path = job
+        .source_path
+        .as_deref()
+        .or(job.target_path.as_deref())
+        .unwrap_or("");
+
+    // The path the message should name is the one Dropbox rejected. For a move that is the
+    // DESTINATION — `job_path` prefers `source_path`, so renaming `x.txt` to `a\b.txt` would
+    // otherwise tell the user that `x.txt` contains a backslash, which it does not.
+    //
+    // Currently reachable only as a log field: `move_v2` reports destination problems under
+    // `to/…` and `from_lookup/…`, never `path/…`, and the permanent marker is anchored to
+    // `path/malformed_path` — so a move cannot take the `UnrepresentablePath` arm until a
+    // real `move_v2` rejection body is recorded and the marker widened (review round 2).
+    let offending_path = job
+        .target_path
+        .as_deref()
+        .filter(|_| job.job_type == "move")
+        .unwrap_or(job_path);
+
+    match classify_job_failure(err, attempt, max_attempts) {
+        JobFailure::Permanent(reason) => {
+            let msg = match reason {
+                PermanentReason::UnrepresentablePath => {
+                    unrepresentable_path_message(offending_path)
+                }
+                PermanentReason::AttemptsExhausted => format!("job {} failed: {err}", job.id),
+            };
+            tracing::error!(
+                job_id = job.id,
+                job_type = %job.job_type,
+                path = %offending_path,
+                attempt,
+                error = %err,
+                reason = reason.as_log_str(),
+                "sync job failed permanently"
+            );
+            state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
+        }
+        JobFailure::Retry => {
+            let wait_secs = backoff_seconds(attempt);
+            let retry_at = (Utc::now() + Duration::seconds(wait_secs)).to_rfc3339();
+            let msg = format!(
+                "job {} retry scheduled in {}s (attempt {}): {err}",
+                job.id, wait_secs, attempt
+            );
+            tracing::warn!(
+                job_id = job.id,
+                job_type = %job.job_type,
+                path = %job_path,
+                attempt,
+                wait_secs,
+                error = %err,
+                "sync job failed; retry scheduled"
+            );
+            state
+                .db
+                .mark_job_retry_wait(job.id, attempt, &retry_at, Some(&msg))?;
+        }
+    }
+    Ok(())
 }
 
 /// Why a job is being failed rather than retried.
@@ -2282,10 +2309,14 @@ mod tests {
         );
     }
 
-    /// The AC's actual words were "the job does not re-enter the retry queue". Assert that
-    /// at the layer where it is true: `pick_next_due_job` must not hand a `failed` row back.
+    /// Review round 2 rejected an earlier version of this test: it called `mark_job_failed`
+    /// by hand and then `pick_next_due_job`, which re-asserts a `Db` property that holds
+    /// with this feature deleted entirely — and it survived a mutation that removed the
+    /// feature from production. This one drives `apply_job_failure`, the function the drain
+    /// actually calls, so the row, the attempt count and the message are consequences of
+    /// the code under test.
     #[test]
-    fn a_permanently_failed_job_is_not_picked_up_again() {
+    fn an_unacceptable_path_is_failed_at_attempt_one_with_a_message_and_never_re_queued() {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
 
@@ -2293,38 +2324,68 @@ mod tests {
             .db
             .enqueue_job("upload", None, Some("a\\b.txt"))
             .unwrap();
-        let id = state
-            .db
-            .pick_next_due_job()
-            .unwrap()
-            .expect("queued job")
-            .id;
+        let job = state.db.pick_next_due_job().unwrap().expect("queued job");
 
-        state
-            .db
-            .mark_job_failed(
-                id,
-                1,
-                Some(&super::unrepresentable_path_message("a\\b.txt")),
-            )
-            .unwrap();
+        let rejected = crate::error::AppError::Dropbox {
+            status: 409,
+            message: "upload for /a\\b.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
+                      {\".tag\":\"malformed_path\",\"malformed_path\":null}},\
+                      \"error_summary\":\"path/malformed_path/\"}"
+                .to_string(),
+        };
 
-        assert!(
-            state.db.pick_next_due_job().unwrap().is_none(),
-            "a permanently failed job must not be handed out again"
-        );
+        // Attempt 1 of 5 — an ordinary error here would be parked in `retry_wait`.
+        super::apply_job_failure(&state, &job, 1, 5, &rejected).expect("apply");
 
         let row = state
             .db
             .list_recent_jobs(10)
             .unwrap()
             .into_iter()
-            .find(|j| j.id == id)
+            .find(|j| j.id == job.id)
             .expect("row");
-        assert_eq!(row.status, "failed");
+        assert_eq!(row.status, "failed", "must not be parked in retry_wait");
         assert_eq!(
             row.attempt_count, 1,
             "failed at the first attempt, not the fifth"
+        );
+
+        let err = row.last_error.expect("a message the user can act on");
+        assert!(err.contains("a\\b.txt"), "must name the file: {err}");
+        assert!(err.contains("Rename it"), "must say what to do: {err}");
+
+        assert!(
+            state.db.pick_next_due_job().unwrap().is_none(),
+            "the job must not re-enter the retry queue"
+        );
+    }
+
+    /// The other side of the same function: an ordinary failure still gets its full budget.
+    /// Without this, failing everything at attempt 1 would also satisfy the test above.
+    #[test]
+    fn an_ordinary_failure_is_still_parked_for_retry_at_attempt_one() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        state
+            .db
+            .enqueue_job("upload", None, Some("ordinary.txt"))
+            .unwrap();
+        let job = state.db.pick_next_due_job().unwrap().expect("queued job");
+
+        let transient = crate::error::AppError::Network("connection reset".to_string());
+        super::apply_job_failure(&state, &job, 1, 5, &transient).expect("apply");
+
+        let row = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .expect("row");
+        assert_eq!(
+            row.status, "retry_wait",
+            "a transient error must keep its attempt budget"
         );
     }
 

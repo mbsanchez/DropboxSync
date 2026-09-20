@@ -103,6 +103,12 @@ impl AppError {
     /// Deciding by looking at the wrong bytes is the bug class this whole ticket is about,
     /// so the marker is anchored to the JSON key that only Dropbox can write.
     ///
+    /// The anchor is in fact self-defeating for a forger, which is stronger than merely
+    /// unlikely (review round 2): the literal `"error_summary":"path/malformed_path`
+    /// contains both `"` and `:`, and Dropbox rejects a name containing either — so any
+    /// path able to forge the marker is itself unrepresentable, and the classification
+    /// would be right anyway.
+    ///
     /// Narrow on the status too: a bare 409 is NOT enough. Dropbox uses 409 for ordinary,
     /// recoverable path conflicts, and treating those as permanent would strand files that
     /// would have synced on the next tick.
