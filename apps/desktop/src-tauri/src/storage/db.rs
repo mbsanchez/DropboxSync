@@ -90,6 +90,46 @@ pub struct Db {
     data_dir: PathBuf,
 }
 
+/// Debug-only contract check: every index key reaching the storage layer is already
+/// `/`-canonical.
+///
+/// Local keys get that from [`crate::path_util::relpath_under`], the single local
+/// producer. Remote keys come from Dropbox `path_display` stripped of its leading `/`,
+/// which is `/`-canonical by construction and never passes through `relpath_under`
+/// (review L1 corrected an earlier comment that claimed one source for both).
+///
+/// This layer used to rewrite `\` to `/` itself, in twelve accessors (DBSYNC-45) — a
+/// second, independent normalization boundary. On macOS, where `\` is a legal byte in
+/// a filename, that silently merged two distinct files onto one `TEXT PRIMARY KEY`:
+/// a root file named `a\b.txt` and the genuine `a/b.txt` inside folder `a` shared a
+/// row, each re-uploaded over the other, and deleting folder `a` destroyed the remote
+/// copy of the other file. Gating those twelve rewrites would have left the next
+/// missed one re-aliasing in silence, so the rewrites are gone and the invariant moved
+/// to the producer (DBSYNC-104).
+///
+/// Windows-only: there `\` cannot occur in a name, so its presence means a caller
+/// bypassed `relpath_under`. On Unix a backslash is legitimate data and passes through.
+///
+/// `debug_assert!` compiles out in release. This is a development guard that makes a
+/// bypassing caller fail loudly in tests and dev builds — not a runtime enforcement.
+///
+/// And it is a **no-op on Unix**, where a backslash is legitimate data: it only has teeth
+/// in the `rust (windows-latest)` CI job, not on the macOS dev machine (review round 2).
+/// It earned that keep immediately — it caught three of this branch's own tests on its
+/// first Windows run.
+///
+/// `enqueue_job`, `enqueue_delete_job` and `record_refused_move` also take index keys and
+/// are not asserted. Pre-existing, and left as it is rather than widened silently.
+#[inline]
+fn debug_assert_canonical_key(_relative_path: &str) {
+    #[cfg(windows)]
+    debug_assert!(
+        !_relative_path.contains('\\'),
+        "index key {_relative_path:?} is not '/'-canonical: \
+         build it with path_util::relpath_under"
+    );
+}
+
 impl Db {
     pub fn new() -> AppResult<Self> {
         Self::new_at(&db_path()?)
@@ -211,6 +251,7 @@ impl Db {
     /// on disk and Dropbox has not named it yet. The identifier is filled in later by
     /// [`Self::set_known_folder_dropbox_id`].
     pub fn upsert_known_folder(&self, relative_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(relative_path);
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -255,7 +296,7 @@ impl Db {
         relative_path: &str,
         dropbox_id: &str,
     ) -> AppResult<bool> {
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .write
             .lock()
@@ -268,6 +309,7 @@ impl Db {
     }
 
     pub fn remove_known_folder(&self, relative_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .write
             .lock()
@@ -393,7 +435,7 @@ impl Db {
     pub fn get_local_file(&self, relative_path: &str) -> AppResult<Option<FileIndexRow>> {
         // Canonicalize path separators to '/' so local (OS-native '\' on Windows)
         // and remote (Dropbox '/') keys match — DBSYNC-45.
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .read
             .lock()
@@ -510,7 +552,7 @@ impl Db {
         size_bytes: i64,
         modified_ts: i64,
     ) -> AppResult<()> {
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -579,8 +621,8 @@ impl Db {
     /// dropping the redundant duplicate is correct, because both describe the same work on
     /// the same path.
     pub fn move_index_row(&self, old_path: &str, new_path: &str) -> AppResult<()> {
-        let old_path = old_path.replace('\\', "/");
-        let new_path = new_path.replace('\\', "/");
+        debug_assert_canonical_key(old_path);
+        debug_assert_canonical_key(new_path);
         let now = Utc::now().to_rfc3339();
         let mut conn = self
             .write
@@ -649,10 +691,11 @@ impl Db {
     /// table rather than a thousand. Every descendant keeps its identity, its content hash
     /// and its Dropbox id.
     ///
-    /// Boundary-safe via `LIKE ... ESCAPE`, the same idiom as
-    /// [`Self::remove_remote_subtree`] and for the same reason: `d` and `d-other` share a
-    /// prefix, so the match is on `d/` plus the exact row, never on `d` alone. `%`, `_` and
-    /// `!` in the path are escaped so they are treated literally.
+    /// Boundary-safe via `substr`, the same idiom as [`Self::remove_remote_subtree`] and
+    /// for the same reason: `d` and `d-other` share a prefix, so the match is on `d/` plus
+    /// the exact row, never on `d` alone. `substr` compares BINARY, so no `%`/`_`/`!`
+    /// escaping is needed and, unlike `LIKE`, it does not disagree with `=` on case — see
+    /// the note in the body.
     ///
     /// One transaction. A half-rewritten subtree — some children under the new name, some
     /// under the old — would be worse than one that never moved.
@@ -663,8 +706,8 @@ impl Db {
     /// silently orphaning rows that kept their identity at a path no longer on disk. The
     /// caller decides what a non-zero count means; it is not this method's to swallow.
     pub fn move_index_subtree(&self, old_prefix: &str, new_prefix: &str) -> AppResult<usize> {
-        let old_prefix = old_prefix.replace('\\', "/");
-        let new_prefix = new_prefix.replace('\\', "/");
+        debug_assert_canonical_key(old_prefix);
+        debug_assert_canonical_key(new_prefix);
         let now = Utc::now().to_rfc3339();
 
         // **The offset is computed in SQL, in characters, and it must stay that way.**
@@ -783,7 +826,7 @@ impl Db {
     }
 
     pub fn remove_local_file(&self, relative_path: &str) -> AppResult<()> {
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .write
             .lock()
@@ -796,7 +839,7 @@ impl Db {
     }
 
     pub fn get_remote_file(&self, relative_path: &str) -> AppResult<Option<RemoteFileIndexRow>> {
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .read
             .lock()
@@ -842,7 +885,7 @@ impl Db {
         modified_ts: i64,
         dropbox_id: Option<&str>,
     ) -> AppResult<()> {
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -872,7 +915,7 @@ impl Db {
     }
 
     pub fn remove_remote_file(&self, relative_path: &str) -> AppResult<()> {
-        let relative_path = relative_path.replace('\\', "/");
+        debug_assert_canonical_key(relative_path);
         let conn = self
             .write
             .lock()
@@ -888,12 +931,12 @@ impl Db {
     /// under it (`prefix/...`). A folder delete on Dropbox is recursive, so its
     /// whole subtree of remote rows must go too — otherwise the materialization
     /// sweep re-creates placeholders for the (now-deleted) descendants, forcing
-    /// the "delete a folder twice" behavior. Boundary-safe via `LIKE ... ESCAPE`
+    /// the "delete a folder twice" behavior. Boundary-safe via `substr`
     /// so a sibling like `prefix-other` is never matched and `%`/`_`/accents in
     /// the path are treated literally. For a plain file `prefix` this is
     /// equivalent to `remove_remote_file` (no `prefix/...` descendants exist).
     pub fn remove_remote_subtree(&self, prefix: &str) -> AppResult<()> {
-        let prefix = prefix.replace('\\', "/");
+        debug_assert_canonical_key(prefix);
         let conn = self
             .write
             .lock()
@@ -2346,6 +2389,124 @@ mod tests {
             .query_map([], |r| r.get::<_, String>(0))
             .expect("query");
         rows.collect::<Result<Vec<_>, _>>().expect("collect")
+    }
+
+    // ── DBSYNC-104: a backslash is data, not a separator ──────────────────────
+
+    /// The storage layer used to rewrite `\` to `/` in twelve accessors, so a key
+    /// carrying a backslash never survived a round trip. Every producer now hands it
+    /// an already-canonical key and it stores the bytes it is given.
+    /// Unix-only: the premise is a filename containing a backslash, which cannot exist
+    /// on Windows. There `debug_assert_canonical_key` correctly rejects such a key —
+    /// it caught this very test on the first CI run, which is the guard working.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_key_containing_a_backslash_survives_a_round_trip() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.upsert_local_file("a\\b.txt", "H", 3, 0).expect("upsert");
+
+        let row = db
+            .get_local_file("a\\b.txt")
+            .expect("query")
+            .expect("the row must be readable under the key it was written with");
+        assert_eq!(row.relative_path, "a\\b.txt");
+
+        assert!(
+            db.get_local_file("a/b.txt").expect("query").is_none(),
+            "the backslash name must not be reachable under the genuine nested key"
+        );
+    }
+
+    /// The CRITICAL defect. A root file literally named `a\b.txt` and the genuine
+    /// `a/b.txt` inside folder `a` are two different files with two different
+    /// contents. They used to collapse onto one `TEXT PRIMARY KEY`, alternating
+    /// ownership of the row on every scan and each re-uploading over the other —
+    /// silent content loss for whichever lost the race.
+    /// Unix-only: the premise is a filename containing a backslash, which cannot exist
+    /// on Windows. There `debug_assert_canonical_key` correctly rejects such a key —
+    /// it caught this very test on the first CI run, which is the guard working.
+    #[cfg(not(windows))]
+    #[test]
+    fn two_files_that_differ_only_by_a_backslash_are_two_rows() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.upsert_local_file("a\\b.txt", "HASH_WEIRD", 3, 0)
+            .expect("upsert");
+        db.upsert_local_file("a/b.txt", "HASH_GENUINE", 5, 0)
+            .expect("upsert");
+
+        let rows = db.list_local_files().expect("list");
+        assert_eq!(rows.len(), 2, "two distinct files must be two rows");
+
+        assert_eq!(
+            db.get_local_file("a\\b.txt").unwrap().unwrap().hash,
+            "HASH_WEIRD"
+        );
+        assert_eq!(
+            db.get_local_file("a/b.txt").unwrap().unwrap().hash,
+            "HASH_GENUINE",
+            "neither file may overwrite the other's content"
+        );
+    }
+
+    /// The destructive consequence, and the most valuable assertion in the slice.
+    /// Deleting the unrelated folder `a` issues a recursive removal of the `a/`
+    /// subtree. The root file named `a\b.txt` is not in that subtree — it only looked
+    /// like it was, because the rewrite turned its backslash into a separator.
+    /// Unix-only: the premise is a filename containing a backslash, which cannot exist
+    /// on Windows. There `debug_assert_canonical_key` correctly rejects such a key —
+    /// it caught this very test on the first CI run, which is the guard working.
+    #[cfg(not(windows))]
+    #[test]
+    fn removing_a_subtree_spares_a_sibling_whose_name_merely_contains_a_backslash() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.upsert_remote_file("a\\b.txt", "HASH_WEIRD", "rev1", 0, None)
+            .expect("upsert");
+        db.upsert_remote_file("a/b.txt", "HASH_GENUINE", "rev2", 0, None)
+            .expect("upsert");
+
+        db.remove_remote_subtree("a").expect("remove subtree");
+
+        assert!(
+            db.get_remote_file("a/b.txt").unwrap().is_none(),
+            "the genuine child of folder `a` is removed"
+        );
+        assert!(
+            db.get_remote_file("a\\b.txt").unwrap().is_some(),
+            "the root file named `a\\\\b.txt` is NOT inside folder `a` and must survive"
+        );
+    }
+
+    /// Regression guard. `move_index_subtree` carries a history — its byte-vs-character
+    /// `substr` offset silently mangled non-ASCII child paths (DBSYNC-99 round 13) — so
+    /// prove the ordinary subtree move still works after the rewrite was removed.
+    #[test]
+    fn moving_a_subtree_still_moves_every_child() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.upsert_local_file("d/one.txt", "H1", 3, 0)
+            .expect("upsert");
+        db.upsert_local_file("d/sub/two.txt", "H2", 3, 0)
+            .expect("upsert");
+        // A sibling sharing the prefix must NOT be swept along.
+        db.upsert_local_file("d-other/three.txt", "H3", 3, 0)
+            .expect("upsert");
+
+        let stranded = db.move_index_subtree("d", "e").expect("move subtree");
+        assert_eq!(
+            stranded, 0,
+            "no row may be left behind under the old prefix"
+        );
+
+        assert!(db.get_local_file("e/one.txt").unwrap().is_some());
+        assert!(db.get_local_file("e/sub/two.txt").unwrap().is_some());
+        assert!(db.get_local_file("d/one.txt").unwrap().is_none());
+        assert!(
+            db.get_local_file("d-other/three.txt").unwrap().is_some(),
+            "a prefix-sharing sibling must not be moved"
+        );
     }
 
     /// A unique temp DB file path so tests never touch the production database.

@@ -1057,8 +1057,9 @@ fn dehydrate_folder_cfapi(
         if !entry.file_type().is_file() {
             continue;
         }
-        let file_rel = match entry.path().strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+        // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
+        let file_rel = match relpath_under(root, entry.path()) {
+            Ok(r) => r,
             Err(_) => continue,
         };
         if file_rel.ends_with(".cloudsc") || is_ignored_local_path(&file_rel) {
@@ -1134,8 +1135,9 @@ fn dehydrate_folder_collapse(
         if !ft.is_file() {
             continue; // symlink/other — left in place; it blocks the collapse (→ degrade)
         }
-        let file_rel = match entry.path().strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+        // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
+        let file_rel = match relpath_under(root, entry.path()) {
+            Ok(r) => r,
             Err(_) => continue,
         };
         if file_rel.ends_with(".cloudsc") {
@@ -1470,7 +1472,8 @@ mod tests {
         let root = PathBuf::from("/sync/root");
         let dir = root.join("Cocina").join("Pizza");
         let rel = relpath_under(&root, &dir).expect("relpath");
-        // `normalize_dropbox_path` itself converts OS separators to '/'.
+        // `relpath_under` already yields a '/'-canonical key; `normalize_dropbox_path`
+        // only adds the leading '/'. It converts separators on Windows only (DBSYNC-104).
         assert_eq!(normalize_dropbox_path(&rel).unwrap(), "/Cocina/Pizza");
     }
 

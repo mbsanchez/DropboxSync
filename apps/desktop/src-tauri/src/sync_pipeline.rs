@@ -14,7 +14,7 @@ use crate::models::SyncTickResult;
 use crate::overlay_state;
 use crate::path_util::{
     backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
-    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, safe_join,
+    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, relpath_under, safe_join,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
 use crate::state::AppState;
@@ -248,11 +248,7 @@ fn process_local_file_change(
             // of skipping this branch.
             if covered_by_active_job(relative, pending_targets) {
                 let conflicted_path = create_conflicted_copy(absolute)?;
-                let conflicted_rel = conflicted_path
-                    .strip_prefix(tracked_root)
-                    .map_err(|e| AppError::Io(e.to_string()))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let conflicted_rel = relpath_under(tracked_root, &conflicted_path)?;
                 state.db.add_conflict(
                     relative,
                     relative,
@@ -412,7 +408,12 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     let mut rels: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for p in paths {
+        // Separator fold is Windows-only (DBSYNC-104): on macOS `\\` is a filename byte,
+        // and folding it here aliased two distinct files onto one key.
+        #[cfg(windows)]
         let rel = p.replace('\\', "/");
+        #[cfg(not(windows))]
+        let rel = p.to_string();
         let rel = rel.trim_start_matches('/').to_string();
         if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
             continue;
@@ -572,8 +573,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             if !entry.file_type().is_file() {
                 continue;
             }
-            let child_rel = match entry.path().strip_prefix(&tracked_root) {
-                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
+            let child_rel = match relpath_under(&tracked_root, entry.path()) {
+                Ok(r) => r,
                 Err(_) => continue,
             };
             if child_rel.ends_with(".cloudsc") || is_ignored_local_path(&child_rel) {
@@ -1202,14 +1204,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         let absolute = entry.path().to_path_buf();
-        let relative = absolute
-            .strip_prefix(&tracked_root)
-            .map_err(|e| AppError::Io(e.to_string()))?
-            .to_string_lossy()
-            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
-            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
-            // '/'-stored row and the scan re-uploads it every tick.
-            .replace('\\', "/");
+        let relative = relpath_under(&tracked_root, &absolute)?;
 
         if relative.ends_with(".cloudsc") {
             continue;
@@ -1248,14 +1243,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         let absolute = entry.path().to_path_buf();
-        let relative = absolute
-            .strip_prefix(&tracked_root)
-            .map_err(|e| AppError::Io(e.to_string()))?
-            .to_string_lossy()
-            // Canonicalize to '/' so the in-memory key matches the '/'-normalized
-            // index (DBSYNC-45); otherwise a hydrated file's '\'-key misses the
-            // '/'-stored row and the scan re-uploads it every tick.
-            .replace('\\', "/");
+        let relative = relpath_under(&tracked_root, &absolute)?;
 
         if relative.is_empty() {
             continue; // skip the sync root itself
@@ -1505,37 +1493,7 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             );
         }
         Err(err) => {
-            if attempt >= max_attempts {
-                let msg = format!("job {} failed: {err}", job.id);
-                tracing::error!(
-                    job_id = job.id,
-                    job_type = %job.job_type,
-                    path = %job_path,
-                    attempt,
-                    error = %err,
-                    "sync job failed (max attempts reached)"
-                );
-                state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
-            } else {
-                let wait_secs = backoff_seconds(attempt);
-                let retry_at = (Utc::now() + Duration::seconds(wait_secs)).to_rfc3339();
-                let msg = format!(
-                    "job {} retry scheduled in {}s (attempt {}): {err}",
-                    job.id, wait_secs, attempt
-                );
-                tracing::warn!(
-                    job_id = job.id,
-                    job_type = %job.job_type,
-                    path = %job_path,
-                    attempt,
-                    wait_secs,
-                    error = %err,
-                    "sync job failed; retry scheduled"
-                );
-                state
-                    .db
-                    .mark_job_retry_wait(job.id, attempt, &retry_at, Some(&msg))?;
-            }
+            apply_job_failure(state, &job, attempt, max_attempts, &err)?;
         }
     }
 
@@ -1543,6 +1501,142 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     // from the DB, so per-job success no longer masks still-failed jobs.
     refresh_queue_depth_internal(state)?;
     Ok(true)
+}
+
+/// Record a failed job: decide retry-or-give-up, write the row, log it.
+///
+/// **Extracted so the behaviour can be asserted against a real `Db`** (DBSYNC-104, review
+/// round 2). An earlier attempt extracted only the *decision* into `classify_job_failure`
+/// and tested that; the review then replaced the drain's call site with the old logic and
+/// the whole suite stayed green — the user-visible behaviour could be deleted from
+/// production without a single test noticing. Moving the DB write in here shrinks the
+/// untested surface to one line in `process_sync_queue_internal`: `apply_job_failure(...)`.
+fn apply_job_failure(
+    state: &AppState,
+    job: &crate::storage::db::SyncJobRow,
+    attempt: i64,
+    max_attempts: i64,
+    err: &AppError,
+) -> AppResult<()> {
+    let job_path = job
+        .source_path
+        .as_deref()
+        .or(job.target_path.as_deref())
+        .unwrap_or("");
+
+    // The path the message should name is the one Dropbox rejected. For a move that is the
+    // DESTINATION — `job_path` prefers `source_path`, so renaming `x.txt` to `a\b.txt` would
+    // otherwise tell the user that `x.txt` contains a backslash, which it does not.
+    //
+    // Currently reachable only as a log field: `move_v2` reports destination problems under
+    // `to/…` and `from_lookup/…`, never `path/…`, and the permanent marker is anchored to
+    // `path/malformed_path` — so a move cannot take the `UnrepresentablePath` arm until a
+    // real `move_v2` rejection body is recorded and the marker widened (review round 2).
+    let offending_path = job
+        .target_path
+        .as_deref()
+        .filter(|_| job.job_type == "move")
+        .unwrap_or(job_path);
+
+    match classify_job_failure(err, attempt, max_attempts) {
+        JobFailure::Permanent(reason) => {
+            let msg = match reason {
+                PermanentReason::UnrepresentablePath => {
+                    unrepresentable_path_message(offending_path)
+                }
+                PermanentReason::AttemptsExhausted => format!("job {} failed: {err}", job.id),
+            };
+            tracing::error!(
+                job_id = job.id,
+                job_type = %job.job_type,
+                path = %offending_path,
+                attempt,
+                error = %err,
+                reason = reason.as_log_str(),
+                "sync job failed permanently"
+            );
+            state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
+        }
+        JobFailure::Retry => {
+            let wait_secs = backoff_seconds(attempt);
+            let retry_at = (Utc::now() + Duration::seconds(wait_secs)).to_rfc3339();
+            let msg = format!(
+                "job {} retry scheduled in {}s (attempt {}): {err}",
+                job.id, wait_secs, attempt
+            );
+            tracing::warn!(
+                job_id = job.id,
+                job_type = %job.job_type,
+                path = %job_path,
+                attempt,
+                wait_secs,
+                error = %err,
+                "sync job failed; retry scheduled"
+            );
+            state
+                .db
+                .mark_job_retry_wait(job.id, attempt, &retry_at, Some(&msg))?;
+        }
+    }
+    Ok(())
+}
+
+/// Why a job is being failed rather than retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermanentReason {
+    /// Dropbox will never accept this path, so waiting cannot help (DBSYNC-104).
+    UnrepresentablePath,
+    /// An otherwise-retryable error that has used up its attempts.
+    AttemptsExhausted,
+}
+
+impl PermanentReason {
+    pub(crate) fn as_log_str(self) -> &'static str {
+        match self {
+            PermanentReason::UnrepresentablePath => "unrepresentable_path",
+            PermanentReason::AttemptsExhausted => "attempts_exhausted",
+        }
+    }
+}
+
+/// What to do with a failed job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobFailure {
+    Permanent(PermanentReason),
+    Retry,
+}
+
+/// The whole retry-or-give-up decision, as a pure function of the error and the attempt
+/// count (DBSYNC-104).
+///
+/// Extracted from the drain deliberately. The behaviour it encodes — "a path Dropbox will
+/// never accept is not worth five attempts" — shipped once with no test that reached it:
+/// disabling the branch left the suite entirely green, because the only coverage was on
+/// the classifier in isolation. A pure function can be asserted directly, so the decision
+/// is constrained rather than merely commented.
+pub(crate) fn classify_job_failure(err: &AppError, attempt: i64, max_attempts: i64) -> JobFailure {
+    if err.is_unrepresentable_path() {
+        // No backoff will make Dropbox accept this name. Retrying costs five attempts
+        // and then reports a generic permanent error instead of a fixable one.
+        return JobFailure::Permanent(PermanentReason::UnrepresentablePath);
+    }
+    if attempt >= max_attempts {
+        return JobFailure::Permanent(PermanentReason::AttemptsExhausted);
+    }
+    JobFailure::Retry
+}
+
+/// The user-facing text for a path Dropbox refuses to store.
+///
+/// Worded from the `malformed_path` tag rather than from the one cause that was probed.
+/// The tag also covers `< > : " | ? *`, a trailing space or period, and over-long
+/// components — naming only the backslash would tell someone with a file called
+/// `report?.txt` to remove a character that is not there.
+pub(crate) fn unrepresentable_path_message(path: &str) -> String {
+    format!(
+        "\"{path}\" cannot sync: Dropbox will not accept this file name. \
+         Rename it — names cannot contain \\ / : ? * \" < > |, or end with a space or a period."
+    )
 }
 
 /// Whether `p` is **confirmed** absent, as opposed to merely unreadable (DBSYNC-56).
@@ -2166,6 +2260,239 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    // ── DBSYNC-104 H1: the retry-or-give-up decision is asserted, not just commented ──
+
+    /// Review H1: the behaviour change shipped once with NO test that reached it —
+    /// disabling the branch left the whole suite green, because the only coverage was on
+    /// the classifier in isolation. The decision is now a pure function so it can be
+    /// asserted directly. Mutating it reddens these tests.
+    #[test]
+    fn a_path_dropbox_will_never_accept_fails_on_the_first_attempt() {
+        let rejected = crate::error::AppError::Dropbox {
+            status: 409,
+            message: "upload for /a\\b.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
+                      {\".tag\":\"malformed_path\",\"malformed_path\":null}},\
+                      \"error_summary\":\"path/malformed_path/\"}"
+                .to_string(),
+        };
+
+        assert_eq!(
+            super::classify_job_failure(&rejected, 1, 5),
+            super::JobFailure::Permanent(super::PermanentReason::UnrepresentablePath),
+            "attempt 1 of 5 must still be permanent — no backoff makes Dropbox accept it"
+        );
+        // And at every other attempt count, for the same reason.
+        for attempt in [2, 3, 4, 5] {
+            assert!(matches!(
+                super::classify_job_failure(&rejected, attempt, 5),
+                super::JobFailure::Permanent(super::PermanentReason::UnrepresentablePath)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_ordinary_error_still_retries_until_its_attempts_run_out() {
+        let transient = crate::error::AppError::Network("connection reset".to_string());
+
+        for attempt in [1, 2, 3, 4] {
+            assert_eq!(
+                super::classify_job_failure(&transient, attempt, 5),
+                super::JobFailure::Retry,
+                "attempt {attempt} of 5 must still retry"
+            );
+        }
+        assert_eq!(
+            super::classify_job_failure(&transient, 5, 5),
+            super::JobFailure::Permanent(super::PermanentReason::AttemptsExhausted)
+        );
+    }
+
+    /// Review round 2 rejected an earlier version of this test: it called `mark_job_failed`
+    /// by hand and then `pick_next_due_job`, which re-asserts a `Db` property that holds
+    /// with this feature deleted entirely — and it survived a mutation that removed the
+    /// feature from production. This one drives `apply_job_failure`, the function the drain
+    /// actually calls, so the row, the attempt count and the message are consequences of
+    /// the code under test.
+    #[test]
+    fn an_unacceptable_path_is_failed_at_attempt_one_with_a_message_and_never_re_queued() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        state
+            .db
+            .enqueue_job("upload", None, Some("a\\b.txt"))
+            .unwrap();
+        let job = state.db.pick_next_due_job().unwrap().expect("queued job");
+
+        let rejected = crate::error::AppError::Dropbox {
+            status: 409,
+            message: "upload for /a\\b.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
+                      {\".tag\":\"malformed_path\",\"malformed_path\":null}},\
+                      \"error_summary\":\"path/malformed_path/\"}"
+                .to_string(),
+        };
+
+        // Attempt 1 of 5 — an ordinary error here would be parked in `retry_wait`.
+        super::apply_job_failure(&state, &job, 1, 5, &rejected).expect("apply");
+
+        let row = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .expect("row");
+        assert_eq!(row.status, "failed", "must not be parked in retry_wait");
+        assert_eq!(
+            row.attempt_count, 1,
+            "failed at the first attempt, not the fifth"
+        );
+
+        let err = row.last_error.expect("a message the user can act on");
+        assert!(err.contains("a\\b.txt"), "must name the file: {err}");
+        assert!(err.contains("Rename it"), "must say what to do: {err}");
+
+        assert!(
+            state.db.pick_next_due_job().unwrap().is_none(),
+            "the job must not re-enter the retry queue"
+        );
+    }
+
+    /// The other side of the same function: an ordinary failure still gets its full budget.
+    /// Without this, failing everything at attempt 1 would also satisfy the test above.
+    #[test]
+    fn an_ordinary_failure_is_still_parked_for_retry_at_attempt_one() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        state
+            .db
+            .enqueue_job("upload", None, Some("ordinary.txt"))
+            .unwrap();
+        let job = state.db.pick_next_due_job().unwrap().expect("queued job");
+
+        let transient = crate::error::AppError::Network("connection reset".to_string());
+        super::apply_job_failure(&state, &job, 1, 5, &transient).expect("apply");
+
+        let row = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .expect("row");
+        assert_eq!(
+            row.status, "retry_wait",
+            "a transient error must keep its attempt budget"
+        );
+    }
+
+    /// Review H2(b): `malformed_path` is Dropbox's general "name does not satisfy the
+    /// format" tag — illegal characters, trailing space or period, over-long components —
+    /// not only the backslash that happened to be probed. A message naming just the
+    /// backslash tells someone with `report?.txt` to remove a character that is not there.
+    #[test]
+    fn the_unrepresentable_message_names_the_file_and_describes_the_rule() {
+        let msg = super::unrepresentable_path_message("Informes/report?.txt");
+
+        assert!(
+            msg.contains("Informes/report?.txt"),
+            "must name the file: {msg}"
+        );
+        assert!(msg.contains("Rename it"), "must say what to do: {msg}");
+        assert!(
+            msg.contains('?') && msg.contains('*') && msg.contains('|'),
+            "must describe the rule, not only the backslash: {msg}"
+        );
+    }
+
+    /// Review H3: `a\..\c.txt` is ONE legal macOS filename, but `has_traversal` split on
+    /// `\` unconditionally and called it a traversal. The pipeline indexed the file and
+    /// enqueued an upload anyway, and that upload then failed with `AppError::Sync` —
+    /// which is not an `AppError::Dropbox`, so it escaped the permanent-path classifier,
+    /// burned five attempts and reported a generic error. The row was also permanently
+    /// unnormalizable, so both remote sweeps logged a warning for it on every tick.
+    ///
+    /// Drives the real scan against real files, because the defect was in the gap between
+    /// what the index accepted and what `normalize_dropbox_path` would later reject.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_name_that_looks_like_a_traversal_is_an_ordinary_file() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let sync = tmp.path().join("synced");
+
+        std::fs::write(sync.join("a\\..\\c.txt"), b"one legal name").expect("write");
+        super::scan_local_changes_only(&state).expect("scan");
+
+        let rows: Vec<String> = state
+            .db
+            .list_local_files()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.relative_path)
+            .collect();
+        assert_eq!(rows, vec!["a\\..\\c.txt".to_string()]);
+
+        // The gap that caused the defect: indexed, but rejected downstream.
+        assert!(
+            crate::path_util::normalize_dropbox_path("a\\..\\c.txt").is_ok(),
+            "an indexed path must be normalizable, or it fails outside the classifier's reach"
+        );
+        assert!(crate::path_util::validate_relative("a\\..\\c.txt").is_ok());
+
+        // And the real safety property still holds: it cannot escape the root.
+        let joined = crate::path_util::safe_join(&sync, "a\\..\\c.txt").expect("joins");
+        assert!(joined.starts_with(&sync));
+
+        // A genuine traversal is still refused, on both platforms.
+        assert!(crate::path_util::normalize_dropbox_path("a/../../etc/passwd").is_err());
+        assert!(crate::path_util::validate_relative("../escape").is_err());
+    }
+
+    // ── DBSYNC-104 M5: the headline fix, driven through the real pipeline ──
+
+    /// Review M5: every other test of the aliasing fix passes a literal key to `Db`, so
+    /// ungating `relpath_under` reddened exactly one unit test and none of the storage
+    /// ones. This walks a real directory instead: two files on disk that differ only by
+    /// `\` versus `/` must become two rows and two independent upload jobs.
+    #[cfg(not(windows))]
+    #[test]
+    fn two_files_differing_only_by_a_backslash_scan_into_two_rows_and_two_jobs() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let sync = tmp.path().join("synced");
+
+        // The genuine nested file, and a root file whose NAME contains a backslash.
+        std::fs::create_dir_all(sync.join("a")).expect("mkdir");
+        std::fs::write(sync.join("a").join("b.txt"), b"genuine").expect("write");
+        std::fs::write(sync.join("a\\b.txt"), b"weird bytes").expect("write");
+
+        super::scan_local_changes_only(&state).expect("scan");
+
+        let mut rows: Vec<String> = state
+            .db
+            .list_local_files()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.relative_path)
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec!["a/b.txt".to_string(), "a\\b.txt".to_string()],
+            "two distinct files must produce two distinct index rows"
+        );
+
+        let mut targets = job_targets(&state, "upload");
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec!["a/b.txt".to_string(), "a\\b.txt".to_string()],
+            "each file must get its own upload job, not one overwriting the other"
+        );
     }
 
     fn job_targets(state: &AppState, job_type: &str) -> Vec<String> {

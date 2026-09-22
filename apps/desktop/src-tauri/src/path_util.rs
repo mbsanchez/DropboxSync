@@ -8,8 +8,17 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 
+/// OS junk that must never be synced. Matching is done on a `/`-canonical view of
+/// the path.
+///
+/// The separator fold is Windows-only (DBSYNC-104): `\\` is a legal byte in a macOS
+/// filename, and folding it here meant a root file genuinely named `a\\.DS_Store` was
+/// matched as `.DS_Store` and silently never synced.
 pub(crate) fn should_ignore_local_path(relative: &str) -> bool {
-    let p = relative.replace('\\', "/");
+    #[cfg(windows)]
+    let p: &str = &relative.replace('\\', "/");
+    #[cfg(not(windows))]
+    let p: &str = relative;
     p == ".DS_Store"
         || p.ends_with("/.DS_Store")
         || p.starts_with("._")
@@ -50,7 +59,11 @@ pub(crate) fn is_editor_temp_path(relative: &str) -> bool {
 /// - Exact relative path (contains `/`), e.g. `Notes/scratch.txt` — matches only
 ///   that exact path, not any other file with the same basename.
 pub(crate) fn matches_ignore_globs(relative: &str, globs: &[String]) -> bool {
+    // Separator fold is Windows-only (DBSYNC-104) — see `should_ignore_local_path`.
+    #[cfg(windows)]
     let rel_lower = relative.replace('\\', "/").to_ascii_lowercase();
+    #[cfg(not(windows))]
+    let rel_lower = relative.to_ascii_lowercase();
     let basename_lower = rel_lower.rsplit('/').next().unwrap_or(&rel_lower);
 
     globs.iter().any(|pattern| {
@@ -159,40 +172,115 @@ pub(crate) fn is_dehydrated_placeholder(abs: &Path) -> bool {
     }
 }
 
+/// The single place an **absolute local path** becomes a relative index key.
+///
+/// Every local producer goes through here (DBSYNC-104). The storage layer relies on that:
+/// it no longer normalizes separators itself, it asserts that callers have.
+///
+/// Remote keys have a second, independent source: `path_display` from the Dropbox API,
+/// stripped of its leading `/` in `remote_index`, `cloudsc_ops` and `dropbox_transfer`.
+/// Those never reach this function and do not need to — a Dropbox path is `/`-canonical by
+/// construction. Review L1 flagged an earlier version of this comment for claiming
+/// otherwise, which mattered because this claim is the justification for deleting the
+/// storage layer's own rewrites.
 pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
-    Ok(absolute
+    let rel = absolute
         .strip_prefix(sync_folder)
         .map_err(|e| AppError::Other(format!("failed to compute relative path: {e}")))?
         .to_string_lossy()
-        // Canonicalize to '/' (Dropbox convention) so relative-path keys match
-        // across the local index, remote index and placeholder logic on Windows,
-        // where `to_string_lossy` yields '\' separators (DBSYNC-45).
-        .replace('\\', "/"))
+        .into_owned();
+
+    // Canonicalize to '/' (Dropbox convention) so relative-path keys match across the
+    // local index, remote index and placeholder logic on Windows, where
+    // `to_string_lossy` yields '\' separators (DBSYNC-45).
+    //
+    // Windows ONLY, and deliberately so (DBSYNC-104). `\` cannot occur in a Windows
+    // filename, so there the rewrite can only ever hit a separator. On macOS it is a
+    // legal byte in a name, and rewriting it unconditionally made a root file literally
+    // named `a\b.txt` and the genuine `a/b.txt` inside folder `a` collapse onto one
+    // `TEXT PRIMARY KEY`: they alternated ownership of the row and each re-uploaded over
+    // the other, and deleting the unrelated folder `a` issued a recursive `delete_v2`
+    // that destroyed the remote copy of the other file.
+    #[cfg(windows)]
+    let rel = rel.replace('\\', "/");
+
+    Ok(rel)
 }
 
-/// True if `input` contains a path-traversal component (`..`) — checked against
-/// both `/` and `\` separators — or an embedded NUL byte. Such inputs must never
-/// be used to build a Dropbox path or a local filesystem path (DBSYNC-27).
+/// True if `input` contains a path-traversal component (`..`) or an embedded NUL byte.
+/// Such inputs must never be used to build a Dropbox path or a local filesystem path
+/// (DBSYNC-27).
+///
+/// The NUL check is unconditional. The separator set is not: `\` counts as a separator
+/// only on Windows (DBSYNC-104).
+///
+/// On Unix `\` is a legal filename byte, so `a\..\c.txt` is ONE component, not three.
+/// Treating it as a traversal rejected a legal file that the pipeline had already indexed
+/// and enqueued — the upload then failed with `AppError::Sync`, which is not an
+/// `AppError::Dropbox` and so escapes the permanent-path classifier, burning five attempts
+/// and reporting a generic error. That is precisely the outcome the classifier exists to
+/// remove. The row was also permanently unnormalizable, so both remote sweeps logged a
+/// warning for it on every tick, forever.
+///
+/// Nothing is given up by gating it. Measured: `Path::join` treats every such name as a
+/// single component, so even `a\..\..\..\etc\passwd` stays under the sync root, and
+/// `safe_join`'s `starts_with(root)` check confirms it. Dropbox rejects the name anyway
+/// with `path/malformed_path`, which is now classified as permanent and reported with a
+/// message the user can act on — a strictly better outcome than a local rejection.
+///
+/// Do NOT "fix" this back to an unconditional split: the `/`-only split on Unix and the
+/// both-separator split on Windows are each correct for their platform's filename rules.
 fn has_traversal(input: &str) -> bool {
-    input.contains('\0') || input.split(['/', '\\']).any(|c| c == "..")
+    if input.contains('\0') {
+        return true;
+    }
+    #[cfg(windows)]
+    let separators: &[char] = &['/', '\\'];
+    #[cfg(not(windows))]
+    let separators: &[char] = &['/'];
+    input.split(separators).any(|c| c == "..")
 }
 
 /// True if `input` is an OS-absolute path that has no business appearing as a
-/// path relative to the sync root: a Windows drive prefix (`C:\`, `C:/`) or a
-/// UNC path (`\\server`). A single leading `/` is intentionally NOT treated as
-/// absolute here — it is the legitimate Dropbox root convention.
+/// path relative to the sync root: a Windows drive prefix (`C:\`, `C:/`, and the
+/// drive-*relative* `C:foo`) or a UNC path (`\\server`). A single leading `/` is
+/// intentionally NOT treated as absolute here — it is the legitimate Dropbox root
+/// convention.
+///
+/// **Windows only** (DBSYNC-104). On Unix, `:` and `\` are legal filename bytes and
+/// none of these forms can escape: `Path::join` keeps every one of them under the
+/// root (measured). Applying the check there rejected ordinary macOS names such as
+/// `C:notas.txt` and `D:2024/informe.pdf`, and because the rejection propagated out
+/// of the remote sweep loop, one such file stopped reconciliation — downloads, delete
+/// reconciliation, remote-present updates — for every other file, indefinitely.
 fn is_os_absolute(input: &str) -> bool {
-    let bytes = input.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return true; // Windows drive-absolute, e.g. `C:\Users` or `C:/Users`
+    #[cfg(windows)]
+    {
+        // Deliberately NOT requiring a separator after the colon, despite what an
+        // earlier version of this comment implied. On Windows `C:foo` is drive-relative
+        // and `PathBuf::push` replaces the base for it exactly as it does for `C:\foo`,
+        // so demanding `C:\` or `C:/` here would open the escape this function closes.
+        let bytes = input.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return true;
+        }
+        input.starts_with("\\\\") // UNC path, e.g. `\\server\share`
     }
-    input.starts_with("\\\\") // UNC path, e.g. `\\server\share`
+    #[cfg(not(windows))]
+    {
+        let _ = input;
+        false
+    }
 }
 
 /// Turn a relative path into a Dropbox API path (`/`-prefixed), rejecting any
 /// input that could escape the intended tree. Returns an error for paths that
 /// contain `..`, NUL bytes, or an OS-absolute prefix instead of silently
 /// building a traversing path (DBSYNC-27). A leading `/` is preserved.
+///
+/// The `..` and OS-absolute checks are separator-sensitive and therefore platform-gated —
+/// see [`has_traversal`] and [`is_os_absolute`]. On Unix `is_os_absolute` is always false.
+/// The NUL check is unconditional.
 pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
     if has_traversal(input) || is_os_absolute(input) {
         return Err(AppError::Sync(format!("rejected unsafe path: {input:?}")));
@@ -200,8 +288,13 @@ pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
     if input.is_empty() {
         return Ok(String::new());
     }
-    // Windows relative paths use `\` separators; Dropbox requires `/`.
+    // Windows relative paths use `\` separators; Dropbox requires `/`. Windows-only
+    // (DBSYNC-104): after `relpath_under` the key already arrives `/`-canonical, so on
+    // Unix this fold could only ever corrupt a legal filename.
+    #[cfg(windows)]
     let forward = input.replace('\\', "/");
+    #[cfg(not(windows))]
+    let forward = input.to_string();
     Ok(if forward.starts_with('/') {
         forward
     } else {
@@ -213,7 +306,22 @@ pub(crate) fn normalize_dropbox_path(input: &str) -> AppResult<String> {
 /// NUL byte, and not absolute (no leading `/` or `\`, no drive/UNC prefix).
 /// Used before joining any remote-derived path onto the local sync folder.
 pub(crate) fn validate_relative(rel: &str) -> AppResult<()> {
-    if has_traversal(rel) || is_os_absolute(rel) || rel.starts_with('/') || rel.starts_with('\\') {
+    // A leading `\` is a root marker on Windows and an ordinary first byte of a filename
+    // on Unix, so it is gated like every other separator rule in this file (DBSYNC-104,
+    // review round 2). Ungated, a legal macOS root file named `\x.txt` was indexed and
+    // enqueued and then rejected here, inside `safe_join`, as `AppError::Sync` — which is
+    // not an `AppError::Dropbox`, so it escaped the permanent-path classifier and burned
+    // five attempts for a generic error. That is the same failure shape `has_traversal`
+    // had, one byte along.
+    //
+    // Containment is unaffected: `safe_join`'s `starts_with(root)` check still applies, and
+    // `root.join("\\x.txt")` on Unix is one component under the root.
+    #[cfg(windows)]
+    let os_root_marker = rel.starts_with('\\');
+    #[cfg(not(windows))]
+    let os_root_marker = false;
+
+    if has_traversal(rel) || is_os_absolute(rel) || rel.starts_with('/') || os_root_marker {
         return Err(AppError::Sync(format!(
             "rejected unsafe relative path: {rel:?}"
         )));
@@ -381,8 +489,9 @@ mod tests {
 
     use super::{
         backoff_seconds, hash_file, is_builtin_ignored_local_path, is_dehydrated_placeholder,
-        is_ignored_local_path, matches_ignore_globs, normalize_dropbox_path, safe_join,
-        set_user_ignore_globs, should_ignore_local_path, validate_relative, DROPBOX_BLOCK_SIZE,
+        is_ignored_local_path, matches_ignore_globs, normalize_dropbox_path, relpath_under,
+        safe_join, set_user_ignore_globs, should_ignore_local_path, validate_relative,
+        DROPBOX_BLOCK_SIZE,
     };
 
     #[test]
@@ -617,23 +726,26 @@ mod tests {
         );
         // A leading '/' is the Dropbox root convention and must be preserved.
         assert_eq!(normalize_dropbox_path("/Cocina").unwrap(), "/Cocina");
-        // Windows separators are canonicalised to '/'.
+        // Windows separators are canonicalised to '/' — on Windows. On Unix (DBSYNC-104)
+        // a backslash is a legal filename byte, so `Cocina\Pizza` is ONE name and folding
+        // it would alias it onto the genuine `Cocina/Pizza` above.
         assert_eq!(
             normalize_dropbox_path("Cocina\\Pizza").unwrap(),
-            "/Cocina/Pizza"
+            if cfg!(windows) {
+                "/Cocina/Pizza"
+            } else {
+                "/Cocina\\Pizza"
+            }
         );
     }
 
     #[test]
     fn normalize_rejects_traversal_payloads() {
+        // Rejected on every platform: traversal and NUL are never a filename.
         for bad in [
             "../etc/passwd",
             "Cocina/../../secret",
-            "..\\Windows\\System32",
             "a/../../b",
-            "C:\\Windows",
-            "C:/Windows",
-            "\\\\server\\share",
             "with\0null",
         ] {
             assert!(
@@ -641,6 +753,52 @@ mod tests {
                 "expected rejection for {bad:?}"
             );
         }
+
+        // Drive and UNC prefixes are a Windows concept (DBSYNC-104). There they can
+        // replace the base in `PathBuf::push`; on Unix they are ordinary filename bytes
+        // that `Path::join` keeps under the root.
+        // `..\Windows\System32` is a traversal on Windows and ONE legal filename on Unix
+        // (DBSYNC-104). Grouped with the drive shapes below for the same reason.
+        for drive_shaped in [
+            "C:\\Windows",
+            "C:/Windows",
+            "\\\\server\\share",
+            "..\\Windows\\System32",
+        ] {
+            let got = normalize_dropbox_path(drive_shaped);
+            if cfg!(windows) {
+                assert!(got.is_err(), "expected rejection for {drive_shaped:?}");
+            } else {
+                assert!(
+                    got.is_ok(),
+                    "{drive_shaped:?} is a legal Unix name and must not be rejected"
+                );
+            }
+        }
+    }
+
+    /// DBSYNC-104. `C:notas.txt` and `D:2024/informe.pdf` are legal, unremarkable macOS
+    /// filenames. They used to be rejected as Windows drive-absolute, and because the
+    /// rejection propagated out of the remote sweep loop, one such file stopped syncing
+    /// for every other file, indefinitely.
+    #[cfg(not(windows))]
+    #[test]
+    fn drive_letter_lookalikes_are_ordinary_unix_filenames() {
+        assert_eq!(
+            normalize_dropbox_path("C:notas.txt").expect("legal macOS name"),
+            "/C:notas.txt"
+        );
+        assert_eq!(
+            normalize_dropbox_path("D:2024/informe.pdf").expect("legal macOS name"),
+            "/D:2024/informe.pdf"
+        );
+        assert!(validate_relative("C:notas.txt").is_ok());
+        assert!(validate_relative("D:2024/informe.pdf").is_ok());
+
+        // And they still resolve under the root rather than escaping it.
+        let root = Path::new("/sync/root");
+        let joined = safe_join(root, "C:notas.txt").expect("stays under root");
+        assert!(joined.starts_with(root));
     }
 
     #[test]
@@ -648,19 +806,24 @@ mod tests {
         assert!(validate_relative("Cocina/Pizza").is_ok());
         assert!(validate_relative("a/b/c.txt").is_ok());
 
-        for bad in [
-            "..",
-            "../x",
-            "a/../../b",
-            "/etc/passwd",
-            "\\Windows",
-            "C:\\x",
-            "\\\\unc\\x",
-            "x\0y",
-        ] {
+        // Rejected on every platform. `\\unc\\x` and `\\Windows` stay rejected here even
+        // on Unix because `validate_relative` also refuses a leading separator outright,
+        // and that check is deliberately NOT platform-gated.
+        for bad in ["..", "../x", "a/../../b", "/etc/passwd", "x\0y"] {
             assert!(
                 validate_relative(bad).is_err(),
                 "expected rejection for {bad:?}"
+            );
+        }
+
+        // Windows-only: a drive prefix, a UNC prefix, and a leading `\` root marker. On
+        // Unix each of these is one legal filename, and `safe_join` — not a rejection here
+        // — is what keeps them under the root (DBSYNC-104).
+        for windows_only in ["C:\\x", "\\Windows", "\\\\unc\\x"] {
+            assert_eq!(
+                validate_relative(windows_only).is_err(),
+                cfg!(windows),
+                "{windows_only:?} must be refused on Windows and accepted on Unix"
             );
         }
     }
@@ -696,21 +859,36 @@ mod tests {
     #[test]
     fn safe_join_refuses_to_escape_root() {
         let root = Path::new("/sync/root");
-        for bad in [
-            "../outside",
-            "a/../../b",
-            "/abs/path",
-            "..",
-            "x\0y",
-            // A remote-derived child name carrying embedded separators (DBSYNC-27
-            // review finding #1: the `.cloudsc` placeholder write sink).
-            "..\\..\\evil.cloudsc",
-            "sub\\..\\..\\evil",
-        ] {
+        for bad in ["../outside", "a/../../b", "/abs/path", "..", "x\0y"] {
             assert!(
                 safe_join(root, bad).is_err(),
                 "safe_join must refuse {bad:?}"
             );
+        }
+
+        // A remote-derived child name carrying embedded backslashes (DBSYNC-27 review
+        // finding #1: the `.cloudsc` placeholder write sink). On Windows these are
+        // traversals and must be refused. On Unix each is ONE legal filename
+        // (DBSYNC-104) — so the safety property is not "refused" but "cannot escape",
+        // which is what `safe_join` actually guarantees. Assert that directly.
+        for backslashed in ["..\\..\\evil.cloudsc", "sub\\..\\..\\evil"] {
+            let joined = safe_join(root, backslashed);
+            assert_eq!(
+                joined.is_err(),
+                cfg!(windows),
+                "{backslashed:?} must be refused on Windows and accepted on Unix"
+            );
+            if let Ok(joined) = joined {
+                assert!(
+                    joined.starts_with(root),
+                    "{backslashed:?} joined outside the root: {joined:?}"
+                );
+                assert_eq!(
+                    joined.components().count(),
+                    root.components().count() + 1,
+                    "{backslashed:?} must be exactly one component under the root"
+                );
+            }
         }
     }
 
@@ -727,5 +905,91 @@ mod tests {
             mtime > 0,
             "modified timestamp must be non-zero for a newly created file"
         );
+    }
+
+    /// DBSYNC-104. A root file literally named `a\b.txt` and the genuine `a/b.txt`
+    /// inside folder `a` are two different files with two different contents. Before
+    /// the fix, `relpath_under` rewrote every `\` to `/` on every platform, so both
+    /// produced the key `a/b.txt` — one row in a `TEXT PRIMARY KEY`, each file
+    /// re-uploading over the other, and a recursive `delete_v2` of `/a` destroying the
+    /// remote copy of the backslash-named one.
+    ///
+    /// `\` is a legal byte in a macOS filename and cannot occur in a Windows one, so
+    /// the rewrite belongs behind `#[cfg(windows)]` and nowhere else.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_in_a_name_is_not_a_separator_on_unix() {
+        let root = Path::new("/sync/root");
+
+        let weird = relpath_under(root, Path::new("/sync/root/a\\b.txt")).expect("relpath");
+        let genuine = relpath_under(root, Path::new("/sync/root/a/b.txt")).expect("relpath");
+
+        assert_eq!(
+            weird, "a\\b.txt",
+            "the backslash must survive as part of the name"
+        );
+        assert_eq!(genuine, "a/b.txt");
+        assert_ne!(
+            weird, genuine,
+            "two distinct files must not collapse onto one index key"
+        );
+    }
+
+    /// Regression guard on the common case: gating the rewrite must not stop ordinary
+    /// nested paths from producing `/`-separated keys, which every consumer relies on.
+    #[test]
+    fn ordinary_nested_paths_still_produce_forward_slash_keys() {
+        let root = Path::new("/sync/root");
+
+        assert_eq!(
+            relpath_under(root, Path::new("/sync/root/Cocina/Pizza.txt")).expect("relpath"),
+            "Cocina/Pizza.txt"
+        );
+        assert_eq!(
+            relpath_under(root, Path::new("/sync/root/a/b/c/d.txt")).expect("relpath"),
+            "a/b/c/d.txt"
+        );
+        // The sync root itself is the empty key, as several callers depend on.
+        assert_eq!(relpath_under(root, root).expect("relpath"), "");
+    }
+
+    /// A path outside the root is an error, not a silently-wrong key. Every call site
+    /// converted in DBSYNC-104 relies on this staying an `Err` so its own
+    /// skip-or-propagate choice keeps working.
+    #[test]
+    fn a_path_outside_the_root_is_an_error() {
+        assert!(relpath_under(Path::new("/sync/root"), Path::new("/etc/passwd")).is_err());
+    }
+
+    /// DBSYNC-104. Each of these predicates folded `\` to `/` before matching, so on
+    /// macOS — where `\` is a legal filename byte — a name containing one was matched
+    /// as though it were a nested path. The consequence is a file that is silently
+    /// never synced, or one that matches an ignore rule meant for something else.
+    #[cfg(not(windows))]
+    #[test]
+    fn matching_predicates_do_not_treat_a_backslash_as_a_separator() {
+        // A root file genuinely named `a\.DS_Store` is not `.DS_Store`.
+        assert!(
+            !should_ignore_local_path("a\\.DS_Store"),
+            "a legal macOS filename must not be matched as OS junk"
+        );
+        assert!(should_ignore_local_path(".DS_Store"));
+        assert!(should_ignore_local_path("sub/.DS_Store"));
+
+        // Same for `._` resource forks: `a\._x` is one name, not `a/._x`.
+        assert!(!should_ignore_local_path("a\\._x"));
+        assert!(should_ignore_local_path("a/._x"));
+
+        // A user glob naming a nested path must not catch a root file whose name
+        // merely contains a backslash.
+        let globs = vec!["Notes/scratch.txt".to_string()];
+        assert!(!matches_ignore_globs("Notes\\scratch.txt", &globs));
+        assert!(matches_ignore_globs("Notes/scratch.txt", &globs));
+
+        // The basename form must not be fooled either: the basename of `a\b.log` is
+        // the whole name, not `b.log`.
+        let by_name = vec!["b.log".to_string()];
+        assert!(!matches_ignore_globs("a\\b.log", &by_name));
+        assert!(matches_ignore_globs("a/b.log", &by_name));
     }
 }
