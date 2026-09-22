@@ -660,7 +660,10 @@ fn correlate_directory_renames(
 
     for old in vanished {
         if !known_folders.iter().any(|f| f == old) {
-            continue; // not a directory we were tracking
+            // `trace!`, not `debug!`: `vanished` is mostly files, so this fires on the
+            // ordinary path and would drown the refusals that matter (DBSYNC-106).
+            tracing::trace!(rel = %old, "not correlating a directory rename: not a tracked folder");
+            continue;
         }
         let prefix = format!("{old}/");
         let descendants: Vec<(&str, i64, &str)> = known
@@ -679,6 +682,7 @@ fn correlate_directory_renames(
             })
             .collect();
         if descendants.is_empty() {
+            tracing::debug!(rel = %old, "not correlating a directory rename: no tracked descendants");
             continue;
         }
 
@@ -689,10 +693,14 @@ fn correlate_directory_renames(
         // symmetrical, and anything added to one belongs in the other.
 
         // A row marked for rescan carries no content to compare against.
-        if descendants
+        if let Some((child, _, _)) = descendants
             .iter()
-            .any(|(_, _, hash)| *hash == crate::storage::db::Db::HASH_NEEDS_RESCAN)
+            .find(|(_, _, hash)| *hash == crate::storage::db::Db::HASH_NEEDS_RESCAN)
         {
+            tracing::debug!(
+                rel = %old, child = %child,
+                "not correlating a directory rename: a descendant is marked for rescan"
+            );
             continue;
         }
         // Queued work already names these paths, and a move reorders the world underneath
@@ -724,6 +732,10 @@ fn correlate_directory_renames(
             // it was never deleted on Dropbox, a bogus move was enqueued, and `d`'s rows
             // were orphaned in the index. Single-child folders are the common case.
             if known_folders.iter().any(|f| f == new) {
+                tracing::debug!(
+                    from = %old, to = %new,
+                    "not correlating a directory rename: the destination is already a known folder"
+                );
                 continue;
             }
             // Dropbox has already refused exactly this pair, permanently. Proposing it again
@@ -741,14 +753,21 @@ fn correlate_directory_renames(
             // same I/O — it just stops throwing away half of what the stat returned.
             // Hashing would be stronger and is still deliberately avoided: it would cost
             // what the re-upload being avoided costs.
-            let all_present = descendants.iter().all(|(child, size_bytes, _)| {
+            // `find` rather than `all`, so the refusal can name the offending child: one
+            // child out of N refuses the whole rename, and which one is the whole question
+            // when reading this back from a log (DBSYNC-106).
+            let missing = descendants.iter().find(|(child, size_bytes, _)| {
                 let tail = &child[prefix.len()..];
                 match std::fs::symlink_metadata(new_absolute.join(tail)) {
-                    Ok(m) => m.is_file() && m.len() == *size_bytes as u64,
-                    Err(_) => false,
+                    Ok(m) => !(m.is_file() && m.len() == *size_bytes as u64),
+                    Err(_) => true,
                 }
             });
-            if !all_present {
+            if let Some((child, size_bytes, _)) = missing {
+                tracing::debug!(
+                    from = %old, to = %new, child = %child, expected_size = size_bytes,
+                    "not correlating a directory rename: a descendant is missing under the destination or changed size"
+                );
                 continue;
             }
             // Dropbox must hold THESE BYTES for every descendant — content agreement, not
@@ -762,7 +781,7 @@ fn correlate_directory_renames(
             // The destination must also be free in the remote index, for the same reason the
             // file correlator checks it: a path Dropbox holds but that was never downloaded
             // has a remote row and no local row, and the rewrite would collide with it.
-            let mut usable = true;
+            let mut unusable: Option<(&str, &str)> = None;
             for (child, _, hash) in &descendants {
                 let tail = &child[prefix.len()..];
                 let destination = format!("{new}/{tail}");
@@ -770,12 +789,20 @@ fn correlate_directory_renames(
                     state.db.get_remote_file(child)?,
                     Some(remote) if remote.content_hash == *hash
                 );
-                if !holds_our_bytes || state.db.get_remote_file(&destination)?.is_some() {
-                    usable = false;
+                if !holds_our_bytes {
+                    unusable = Some((child, "Dropbox does not hold this child's current bytes"));
+                    break;
+                }
+                if state.db.get_remote_file(&destination)?.is_some() {
+                    unusable = Some((child, "the destination path already has a remote row"));
                     break;
                 }
             }
-            if !usable {
+            if let Some((child, why)) = unusable {
+                tracing::debug!(
+                    from = %old, to = %new, child = %child, reason = why,
+                    "not correlating a directory rename: a descendant is not relocatable"
+                );
                 continue;
             }
             claimed_new.insert(new.as_str());
@@ -1326,12 +1353,58 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     Ok(enqueued_jobs)
 }
 
+/// Feed the watcher's deferred paths through the correlating path, before the full scan.
+///
+/// **This is what makes deferral real rather than a promise** (DBSYNC-106). Re-delivering on
+/// "the next batch" only helps if another filesystem event ever arrives; when someone renames
+/// a folder and then walks away, none does. `scan_local_changes_only` cannot correlate — it
+/// uploads the new prefix and propagates the old one as deletions, which is the defect — so
+/// the deferred paths must go through `process_changed_paths` first, while the pairing is
+/// still visible.
+///
+/// Extracted so it can be asserted against a real `Db`. `scan_local_changes_internal` needs an
+/// access token for its remote half, so a test cannot reach this through it; leaving the drain
+/// inline would have left the behaviour untestable, which is how DBSYNC-104 shipped a feature
+/// that could be deleted from production with the suite still green.
+///
+/// Never fails the scan. A failure here loses the rename pairing, not the content: the full
+/// scan still runs and still converges. The log says which happened.
+fn drain_deferred_watcher_paths(state: &AppState) -> usize {
+    let deferred = crate::fs_watcher::take_pending();
+    if deferred.is_empty() {
+        return 0;
+    }
+    tracing::info!(
+        count = deferred.len(),
+        "draining deferred watcher paths before the full scan"
+    );
+    match process_changed_paths(state, &deferred) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "draining deferred watcher paths failed; a rename may be missed"
+            );
+            0
+        }
+    }
+}
+
 /// A full scan: the local half, then the remote refresh, then the bookkeeping.
 ///
 /// The remote half needs an access token, so this is the entry point for production and
 /// NOT the one to reach for from a test that only cares about local decisions.
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
-    let enqueued_jobs = scan_local_changes_only(state)?;
+    // DBSYNC-106: drain anything the watcher had to defer because the gate was held, BEFORE
+    // the uncorrelated full scan runs.
+    //
+    // This is what makes the deferral real rather than a promise. Re-delivery on "the next
+    // batch" only helps if another filesystem event ever arrives; when the user renames a
+    // folder and then walks away, none does. `scan_local_changes_only` below cannot
+    // correlate — it would upload the new prefix and delete the old, which is the defect —
+    // so the deferred paths must go through `process_changed_paths` first, while the pairing
+    // is still visible.
+    let enqueued_jobs = drain_deferred_watcher_paths(state) + scan_local_changes_only(state)?;
     let remote_enqueued = refresh_remote_index_and_enqueue_downloads_internal(state)?;
 
     {
@@ -1932,7 +2005,7 @@ pub(crate) fn full_sync_cycle(state: &AppState) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
@@ -1960,7 +2033,7 @@ mod tests {
     /// short-circuits (no network call) whenever `local_file_index` is empty,
     /// which it stays here since we enqueue jobs directly instead of going
     /// through the local file scan.
-    fn build_state(root: &std::path::Path) -> AppState {
+    pub(crate) fn build_state(root: &std::path::Path) -> AppState {
         let sync_folder = root.join("synced");
         std::fs::create_dir_all(&sync_folder).expect("create sync folder");
         let db_path = root.join("db").join("app.db");
@@ -2504,6 +2577,97 @@ mod tests {
             .filter(|j| j.job_type == job_type)
             .filter_map(|j| j.target_path)
             .collect()
+    }
+
+    // ── DBSYNC-106: a rename deferred by a busy gate is still correlated ──────
+
+    /// The defect: `on_debounced_batch` dropped the whole batch when the sync gate was
+    /// held, on the promise that "the periodic fallback or the next batch will pick these
+    /// paths up". Both halves are false for a rename — `scan_local_changes_only` does not
+    /// correlate, and FSEvents does not redeliver — so the rename degraded into uploading
+    /// the new prefix and deleting the old, splitting the folder across two names.
+    ///
+    /// Drives the real drain against a real `Db`, with the folder already on disk under its
+    /// new name. The index is seeded directly rather than by scanning, for the same reason
+    /// `a_directory_rename_is_billed_as_one_move` does: a scan would leave an upload queued
+    /// for the child, and queued work legitimately refuses correlation. The premise here is
+    /// a folder that was already in sync when it was renamed.
+    #[test]
+    fn a_rename_deferred_by_a_busy_gate_still_becomes_a_move() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        // On disk under the NEW name; the index and Dropbox still hold the old one.
+        std::fs::create_dir_all(root.join("Papers")).unwrap();
+        std::fs::write(root.join("Papers/a.txt"), b"payload").unwrap();
+        state.db.upsert_known_folder("Docs").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("Papers/a.txt")).unwrap();
+        state
+            .db
+            .upsert_local_file("Docs/a.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("Docs/a.txt", &hash, "rev1", mtime, None)
+            .unwrap();
+
+        // The watcher's batch lost the gate, so the paths were deferred instead of processed.
+        let _ = crate::fs_watcher::take_pending();
+        crate::fs_watcher::remember_dropped(&[
+            "Docs".to_string(),
+            "Papers".to_string(),
+            "Papers/a.txt".to_string(),
+        ]);
+
+        // The gate frees; the deferred paths are drained through the correlating path.
+        super::drain_deferred_watcher_paths(&state);
+
+        assert_eq!(
+            move_jobs(&state),
+            vec![("Docs".to_string(), "Papers".to_string())],
+            "the deferred rename must still be correlated as one move"
+        );
+
+        // The point of the ticket: no bytes re-uploaded, nothing deleted from the old name.
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "a correlated rename must not re-upload anything: {:?}",
+            job_targets(&state, "upload")
+        );
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "a correlated rename must not delete the old prefix: {:?}",
+            job_targets(&state, "delete")
+        );
+    }
+
+    /// The deferral must be consumed. If the drain left the paths in place they would be
+    /// replayed on every tick, re-proposing a move for a folder that has already moved.
+    #[test]
+    fn draining_consumes_the_deferred_paths() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        crate::fs_watcher::remember_dropped(&["whatever.txt".to_string()]);
+        super::drain_deferred_watcher_paths(&state);
+
+        assert!(
+            crate::fs_watcher::take_pending().is_empty(),
+            "the drain must leave the pending set empty"
+        );
+    }
+
+    /// With nothing deferred the drain is inert — it must not walk anything or enqueue
+    /// anything, since it runs on every periodic tick.
+    #[test]
+    fn draining_nothing_enqueues_nothing() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let _ = crate::fs_watcher::take_pending();
+
+        assert_eq!(super::drain_deferred_watcher_paths(&state), 0);
+        assert!(state.db.list_recent_jobs(10).unwrap().is_empty());
     }
 
     #[test]
