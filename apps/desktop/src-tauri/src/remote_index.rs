@@ -249,6 +249,9 @@ pub(crate) fn fetch_all_remote_file_metadata(
             // Best-effort and behaviour-neutral by construction: the writer can only fill
             // a NULL id on an existing row. It cannot insert, delete, or touch any column
             // the pipeline reads today, so a failure here changes nothing.
+            // This is the ONLY writer, and there is no reader yet — see
+            // `Db::set_known_folder_dropbox_id`, which records why that is deliberate and
+            // the two coverage holes any future reader has to allow for (DBSYNC-106).
             if entry.tag == "folder" {
                 if let (Some(path_display), Some(id)) =
                     (entry.path_display.as_deref(), entry.id.as_deref())

@@ -291,6 +291,31 @@ impl Db {
     ///
     /// Returns whether a row was updated, so a caller can tell "filled it in" from
     /// "no such folder locally" — which is not an error.
+    ///
+    /// # Written, and deliberately not read yet
+    ///
+    /// **Nothing in the crate reads `known_folders.dropbox_id`.** That is on purpose, not an
+    /// oversight, and it is recorded here so the next reader does not have to guess
+    /// (DBSYNC-106). Captured as groundwork for:
+    ///
+    /// - **DBSYNC-95** (macOS File Provider), which addresses items by stable identifier.
+    ///   ADR-0003 already counts capturing the id as work done.
+    /// - **DBSYNC-102** (remote→local drift). A repair pass comparing recorded ids against
+    ///   current paths has real value *in that direction*, where both sides have an id.
+    ///
+    /// It does **not** help local→remote rename correlation, and DBSYNC-106 considered and
+    /// rejected it for that: correlation pairs a local path that vanished with a local path
+    /// that appeared, and the appeared path has never existed on Dropbox, so there is no
+    /// second id to match. `correlate_renames` documents the same thing for files.
+    ///
+    /// # Two coverage holes, for whoever writes the first reader
+    ///
+    /// A reader must not assume the column is populated:
+    ///
+    /// 1. **The delta path never fills it.** `delta_action_from_entry` ignores every folder
+    ///    entry, so identifiers arrive only from the periodic full recursive sweep.
+    /// 2. **A fresh install has none.** The sweep early-returns when `local_file_index` is
+    ///    empty, so no folder gets an identifier until at least one file is indexed.
     pub fn set_known_folder_dropbox_id(
         &self,
         relative_path: &str,
