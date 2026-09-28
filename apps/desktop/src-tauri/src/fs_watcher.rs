@@ -38,43 +38,70 @@ const PENDING_MAX: usize = 4096;
 
 const DEBOUNCE_MS: u64 = 500;
 
-/// Serialises tests that touch [`PENDING`].
+/// Serialises tests that touch [`PENDING`], directly OR indirectly.
 ///
 /// The set is process-wide by design — it survives across watcher batches — so tests in any
-/// module that drain or fill it race each other under the default parallel harness. Every
-/// such test takes this first. Found the hard way: the tests passed until two more were
-/// added, and the failure was scheduling, not logic.
+/// module that drain or fill it race each other under the default parallel harness.
+///
+/// **Take it with [`pending_test_guard`], never by locking this directly.** Review of PR #167
+/// found ten tests holding it and four more reaching `take_pending` *indirectly*, through
+/// `run_sync_tick_internal` → `scan_local_changes_internal` → `drain_deferred_watcher_paths`,
+/// none of which took it. The suite was green only because the real window is microseconds;
+/// widening it by 800 ms turned one of them red. "It passes" was scheduling luck twice over.
 #[cfg(test)]
 pub(crate) static PENDING_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+/// Take [`PENDING_TEST_GUARD`], surviving poisoning.
+///
+/// `Mutex::lock` returns a `Result`, and `let _g = GUARD.lock();` binds the `Err` on a
+/// poisoned mutex — **holding no lock at all**. A `Mutex<()>` is poisoned by a panic in any
+/// guarded test, i.e. by any failure of these tests, so the first honest red would silently
+/// de-serialise every other one and turn a single failure into a cascade. There is no state
+/// behind this mutex to be corrupted by a panic, so recovering the guard is always right.
+#[cfg(test)]
+pub(crate) fn pending_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PENDING_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn pending_cell() -> &'static Mutex<HashSet<String>> {
     PENDING.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Remember a batch the gate refused. Best-effort: a poisoned lock loses the paths rather
-/// than panicking the debouncer thread, and says so.
+/// Remember a batch the gate refused.
+///
+/// **The batch is the unit, all or nothing.** An earlier version truncated mid-batch with
+/// `take(room)`, which was wrong twice over (review of PR #167): it kept the OLDEST
+/// deferrals and discarded the rename the user had just performed, and truncating mid-batch
+/// could record a rename by halves — source kept, destination dropped. On the next drain
+/// that source is a vanished folder with no candidate destination, so it is propagated as a
+/// real recursive remote `delete_v2` while the destination is uploaded in full by the same
+/// tick's scan. It converges, but through a destructive operation and a full re-upload, for
+/// no benefit over dropping the batch.
+///
+/// Refusing the whole batch keeps the invariant the doc on [`PENDING`] claims: a remembered
+/// batch is complete.
+///
+/// Best-effort on a poisoned lock: the paths are lost rather than panicking the debouncer
+/// thread, and it says so.
 pub(crate) fn remember_dropped(rels: &[String]) {
     let Ok(mut guard) = pending_cell().lock() else {
         tracing::error!("pending-rename lock poisoned; dropped batch is lost");
         return;
     };
-    let room = PENDING_MAX.saturating_sub(guard.len());
-    if room == 0 {
+    // Count what this batch would actually ADD: a path already held costs no room, so a
+    // batch that is mostly re-deferrals is not refused for nothing.
+    let new_paths = rels.iter().filter(|r| !guard.contains(*r)).count();
+    if guard.len() + new_paths > PENDING_MAX {
         tracing::warn!(
+            held = guard.len(),
+            batch = rels.len(),
             cap = PENDING_MAX,
-            "pending-rename set is full; dropping paths. A rename may be missed"
+            "pending-rename set would overflow; dropping this batch WHOLE. A rename may be missed"
         );
         return;
     }
-    for rel in rels.iter().take(room) {
+    for rel in rels {
         guard.insert(rel.clone());
-    }
-    if rels.len() > room {
-        tracing::warn!(
-            skipped = rels.len() - room,
-            cap = PENDING_MAX,
-            "pending-rename set hit its cap; some paths dropped"
-        );
     }
 }
 
@@ -277,7 +304,7 @@ mod tests {
     /// than thrown away.
     #[test]
     fn a_batch_that_loses_the_gate_is_remembered_not_discarded() {
-        let _serial = super::PENDING_TEST_GUARD.lock();
+        let _serial = super::pending_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("synced");
         std::fs::create_dir_all(root.join("Docs")).expect("mkdir");
@@ -315,7 +342,7 @@ mod tests {
     /// does not redeliver (DBSYNC-106).
     #[test]
     fn a_deferred_batch_is_returned_once_and_then_forgotten() {
-        let _serial = super::PENDING_TEST_GUARD.lock();
+        let _serial = super::pending_test_guard();
         let _ = take_pending(); // other tests share the process-wide set
 
         remember_dropped(&["a/b.txt".to_string(), "a".to_string()]);
@@ -333,7 +360,7 @@ mod tests {
     /// paths can arrive in different batches.
     #[test]
     fn consecutive_deferrals_accumulate() {
-        let _serial = super::PENDING_TEST_GUARD.lock();
+        let _serial = super::pending_test_guard();
         let _ = take_pending();
 
         remember_dropped(&["old".to_string()]);
@@ -347,7 +374,7 @@ mod tests {
     /// linearly under a contended gate.
     #[test]
     fn a_repeated_path_is_held_once() {
-        let _serial = super::PENDING_TEST_GUARD.lock();
+        let _serial = super::pending_test_guard();
         let _ = take_pending();
 
         remember_dropped(&["same".to_string()]);
@@ -355,27 +382,41 @@ mod tests {
         assert_eq!(take_pending(), vec!["same".to_string()]);
     }
 
-    /// The bound is the whole reason this is safe to add: a gate held for a long time must
-    /// not grow a buffer without limit. Past the cap, paths are dropped — and the drop is
-    /// logged, which is a bounded miss that announces itself.
+    /// The bound is what makes this safe to add: a gate held for a long time must not grow a
+    /// buffer without limit. **The unit is the batch, not the path** — an earlier version
+    /// truncated mid-batch, which kept the oldest deferrals and discarded the rename just
+    /// performed, and could record a rename by halves: source kept, destination dropped. That
+    /// half-record turns into a real recursive remote delete on the next drain.
     #[test]
-    fn the_pending_set_is_bounded() {
-        let _serial = super::PENDING_TEST_GUARD.lock();
+    fn an_oversized_batch_is_refused_whole_rather_than_truncated() {
+        let _serial = super::pending_test_guard();
         let _ = take_pending();
 
-        let many: Vec<String> = (0..PENDING_MAX + 500).map(|i| format!("f{i}")).collect();
-        remember_dropped(&many);
-        let held = take_pending();
-        assert_eq!(
-            held.len(),
-            PENDING_MAX,
-            "the set must stop at its cap, not grow to the input size"
+        let too_many: Vec<String> = (0..PENDING_MAX + 1).map(|i| format!("f{i}")).collect();
+        remember_dropped(&too_many);
+        assert!(
+            take_pending().is_empty(),
+            "a batch that cannot fit must be refused whole, leaving no half-recorded rename"
         );
 
-        // And once full, a further deferral adds nothing rather than pushing it over.
-        remember_dropped(&many);
-        remember_dropped(&["one-more".to_string()]);
-        assert!(take_pending().len() <= PENDING_MAX);
+        // One that fits is kept entire.
+        let fits: Vec<String> = (0..10).map(|i| format!("g{i}")).collect();
+        remember_dropped(&fits);
+        assert_eq!(take_pending().len(), 10);
+    }
+
+    /// A batch of paths already held costs no room, so a re-deferral is not refused for
+    /// nothing once the set is near its cap.
+    #[test]
+    fn re_deferring_paths_already_held_does_not_count_against_the_cap() {
+        let _serial = super::pending_test_guard();
+        let _ = take_pending();
+
+        let full: Vec<String> = (0..PENDING_MAX).map(|i| format!("h{i}")).collect();
+        remember_dropped(&full);
+        // The very same batch again: nothing new, so it must be accepted, not refused.
+        remember_dropped(&full);
+        assert_eq!(take_pending().len(), PENDING_MAX);
     }
 
     use std::path::Path;

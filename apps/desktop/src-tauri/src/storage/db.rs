@@ -269,6 +269,71 @@ impl Db {
         Ok(())
     }
 
+    /// Record, permanently, which tracked folders have ever held an indexed descendant.
+    ///
+    /// # Why this is a stored fact and not a derived one
+    ///
+    /// `correlate_directory_renames` must tell two things apart that look identical from a
+    /// `known_folders` row alone (DBSYNC-106):
+    ///
+    /// - **a folder in its own right** — a real, separate folder. Pairing a vanished source
+    ///   with it produces a bogus move: the source's deletion is suppressed so it is never
+    ///   deleted on Dropbox, and its index rows are orphaned.
+    /// - **a rename destination** — the same files under a new name. Its descendants are
+    ///   still filed under the SOURCE prefix until the move is applied, so it owns no rows.
+    ///
+    /// Asking "does it own index rows right now" is not enough, and that narrowing was a
+    /// defect: a real folder whose only child is deleted and later recreated has a
+    /// `known_folders` row and, for the window before that child is re-indexed, no rows —
+    /// and in that window it was permitted as a rename destination. The same window opens if
+    /// a scan commits the folder row and then fails before indexing the children.
+    ///
+    /// Membership cannot carry this meaning either. `upsert_known_folder` registers every
+    /// directory seen on disk, including a rename destination, the moment anything looks.
+    /// One row cannot mean both "tracked" and "definitely not a rename destination" — that
+    /// is the sentinel-with-two-meanings shape this project has hit before, so the second
+    /// meaning gets its own named column instead of a second reading of the first.
+    ///
+    /// **Never cleared.** A folder that has once held content of its own is not a rename
+    /// destination afterwards, whatever its current contents.
+    ///
+    /// One statement for the whole table, so the cost is per scan rather than per file.
+    /// `substr`/`length` count CHARACTERS in SQLite and are used consistently here — the
+    /// byte-versus-character trap that corrupted `move_index_subtree` in DBSYNC-99.
+    pub fn mark_known_folders_owning_content(&self) -> AppResult<usize> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let marked = conn.execute(
+            "
+                UPDATE known_folders SET owns_content = 1
+                WHERE owns_content = 0
+                  AND EXISTS (
+                        SELECT 1 FROM local_file_index
+                        WHERE substr(relative_path, 1, length(known_folders.relative_path) + 1)
+                              = known_folders.relative_path || '/'
+                      )
+                ",
+            [],
+        )?;
+        Ok(marked)
+    }
+
+    /// The folders flagged by [`Self::mark_known_folders_owning_content`] — those that have
+    /// ever held an indexed descendant, and so can never be a rename destination.
+    pub fn list_known_folders_owning_content(&self) -> AppResult<Vec<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT relative_path FROM known_folders WHERE owns_content = 1 ORDER BY relative_path",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_known_folders(&self) -> AppResult<Vec<String>> {
         let conn = self
             .read
@@ -1966,6 +2031,14 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     // rows pick up an `item_id` the next time their path is indexed.
     add_column_if_missing(conn, "remote_file_index", "dropbox_id", "TEXT")?;
     add_column_if_missing(conn, "known_folders", "dropbox_id", "TEXT")?;
+    // DBSYNC-106: "this folder is a folder in its own right", as opposed to "a directory we
+    // have seen on disk". See `mark_known_folders_owning_content`.
+    add_column_if_missing(
+        conn,
+        "known_folders",
+        "owns_content",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(conn, "local_file_index", "item_id", "INTEGER")?;
 
     // ...and rows that predate the column get their identity here, rather than waiting to
