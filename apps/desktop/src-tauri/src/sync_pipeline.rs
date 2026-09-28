@@ -2005,7 +2005,7 @@ pub(crate) fn full_sync_cycle(state: &AppState) {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
@@ -2033,7 +2033,7 @@ pub(crate) mod tests {
     /// short-circuits (no network call) whenever `local_file_index` is empty,
     /// which it stays here since we enqueue jobs directly instead of going
     /// through the local file scan.
-    pub(crate) fn build_state(root: &std::path::Path) -> AppState {
+    fn build_state(root: &std::path::Path) -> AppState {
         let sync_folder = root.join("synced");
         std::fs::create_dir_all(&sync_folder).expect("create sync folder");
         let db_path = root.join("db").join("app.db");

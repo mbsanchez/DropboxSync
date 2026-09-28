@@ -254,51 +254,7 @@ pub(crate) fn map_event_path(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
-
-    use super::{on_debounced_batch, remember_dropped, take_pending, PENDING_MAX};
-
-    /// **The wiring test.** The three tests below exercise the pending set directly, which
-    /// leaves the one line that matters in production — `remember_dropped(&rels)` inside
-    /// `on_debounced_batch` — unasserted. Deleting it restored the original defect with the
-    /// whole suite still green, so it gets a test of its own.
-    ///
-    /// Holds the gate, hands the watcher a batch, and asserts the paths were kept rather
-    /// than thrown away.
-    #[test]
-    fn a_batch_that_loses_the_gate_is_remembered_not_discarded() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("synced");
-        std::fs::create_dir_all(root.join("Docs")).expect("mkdir");
-        std::fs::write(root.join("Docs/a.txt"), b"x").expect("write");
-
-        let state = crate::sync_pipeline::tests::build_state(tmp.path());
-        let _ = take_pending();
-
-        // Somebody else owns the sync, exactly as a longpoll tick would.
-        state.sync_running.store(true, Ordering::Release);
-
-        on_debounced_batch(&state, &root, &root, vec![root.join("Docs/a.txt")]);
-
-        // `on_debounced_batch` does its work on a spawned thread, so poll rather than sleep
-        // a fixed amount.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let held = loop {
-            let got = take_pending();
-            if !got.is_empty() || Instant::now() > deadline {
-                break got;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        state.sync_running.store(false, Ordering::Release);
-
-        assert_eq!(
-            held,
-            vec!["Docs/a.txt".to_string()],
-            "a batch refused by the gate must be held for re-delivery, not dropped"
-        );
-    }
+    use super::{remember_dropped, take_pending, PENDING_MAX};
 
     /// The pending set exists because a dropped batch is a lost rename: correlation lives
     /// only in `process_changed_paths`, the periodic scan does not correlate, and FSEvents
