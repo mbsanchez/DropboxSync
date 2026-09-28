@@ -731,10 +731,37 @@ fn correlate_directory_renames(
             // its own `README.md` — be paired as a rename: `d`'s deletion was suppressed so
             // it was never deleted on Dropbox, a bogus move was enqueued, and `d`'s rows
             // were orphaned in the index. Single-child folders are the common case.
-            if known_folders.iter().any(|f| f == new) {
+            // A rename destination cannot be a folder that is ALREADY A TRACKED FOLDER IN ITS
+            // OWN RIGHT — a different folder that happens to contain files with matching
+            // names. Measured: without this, `d` and `e`, two real folders each with its own
+            // `README.md`, pair as a rename; `d`'s deletion is suppressed so it is never
+            // deleted on Dropbox, a bogus move is enqueued, and `d`'s rows are orphaned.
+            // Guard 8 does NOT cover it — that guard refuses when the destination already has
+            // a REMOTE row, and a folder created locally and never uploaded has none.
+            //
+            // **The question is "does the destination own index rows", not "is it in
+            // `known_folders`"** (DBSYNC-106). Membership was too broad: `upsert_known_folder`
+            // registers every directory seen on disk, from the full scan and from pass three
+            // of this very function, so the destination of a rename acquired a row the moment
+            // anything looked at the disk — and from then on the pair could never correlate,
+            // on any later tick. Measured before and after: with membership, a rename whose
+            // destination had been registered produced an upload plus a delete of the source,
+            // permanently. That is the defect this ticket is about.
+            //
+            // Index rows are the sharper question and they are what the old comment meant by
+            // "a different folder": a genuine separate folder has its own descendants in
+            // `local_file_index`; a rename destination has none, because its files are still
+            // indexed under the source prefix until the move is applied.
+            let new_prefix = format!("{new}/");
+            let destination_owns_rows = known.iter().any(|row| {
+                row.relative_path.starts_with(&new_prefix)
+                    && !row.relative_path.ends_with(".cloudsc")
+                    && !is_ignored_local_path(&row.relative_path)
+            });
+            if destination_owns_rows {
                 tracing::debug!(
                     from = %old, to = %new,
-                    "not correlating a directory rename: the destination is already a known folder"
+                    "not correlating a directory rename: the destination is a tracked folder in its own right"
                 );
                 continue;
             }
@@ -2716,6 +2743,111 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|j| (j.job_type, j.target_path))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Guard 5's own defect, which had NO test until now: two real folders, `d` and `e`,
+    /// each with its own `README.md`, must not pair as a rename. Measured — remove the guard
+    /// and this produces `moves=[("d","e")]`: `d` is never deleted on Dropbox and its rows
+    /// are orphaned in the index.
+    ///
+    /// `e` here is local-only, which is exactly the case guard 8 cannot catch: that guard
+    /// refuses when the destination already has a REMOTE row, and a folder created locally
+    /// and never uploaded has none. So guard 5 is load-bearing, not redundant — which is why
+    /// DBSYNC-106 changed the question it asks rather than deleting it.
+    #[test]
+    fn two_real_folders_are_not_paired_as_a_rename() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        // `e`: a real, separate folder, on disk and in the index, never uploaded.
+        std::fs::create_dir_all(root.join("e")).unwrap();
+        std::fs::write(root.join("e/README.md"), b"eeee").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("e/README.md")).unwrap();
+        state.db.upsert_known_folder("e").unwrap();
+        state
+            .db
+            .upsert_local_file("e/README.md", &hash, size, mtime)
+            .unwrap();
+
+        // `d`: tracked, synced, same-size content, just deleted on disk.
+        state.db.upsert_known_folder("d").unwrap();
+        state
+            .db
+            .upsert_local_file("d/README.md", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("d/README.md", &hash, "rev1", mtime, None)
+            .unwrap();
+
+        process_changed_paths(
+            &state,
+            &["d".to_string(), "e".to_string(), "e/README.md".to_string()],
+        )
+        .expect("process");
+
+        assert!(
+            move_jobs(&state).is_empty(),
+            "two separate folders must never be paired as a rename: {:?}",
+            move_jobs(&state)
+        );
+    }
+
+    /// The defect DBSYNC-106 is about, at the guard that caused it.
+    ///
+    /// `upsert_known_folder` registers every directory seen on disk — from the full scan and
+    /// from pass three of `process_changed_paths` itself — so a rename destination acquired a
+    /// `known_folders` row the moment anything looked at the disk. Guard 5 then refused the
+    /// pair **for good**. Measured before the fix: no move, an upload of the destination, a
+    /// delete of the source, and a second tick did not heal it.
+    #[test]
+    fn a_rename_still_correlates_when_the_destination_was_already_registered() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::create_dir_all(root.join("Papers")).unwrap();
+        std::fs::write(root.join("Papers/a.txt"), b"payload").unwrap();
+        state.db.upsert_known_folder("Docs").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&root.join("Papers/a.txt")).unwrap();
+        state
+            .db
+            .upsert_local_file("Docs/a.txt", &hash, size, mtime)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("Docs/a.txt", &hash, "rev1", mtime, None)
+            .unwrap();
+
+        // What a full scan, or an earlier pass three, would already have done.
+        state.db.upsert_known_folder("Papers").unwrap();
+
+        process_changed_paths(
+            &state,
+            &[
+                "Docs".to_string(),
+                "Papers".to_string(),
+                "Papers/a.txt".to_string(),
+            ],
+        )
+        .expect("process");
+
+        assert_eq!(
+            move_jobs(&state),
+            vec![("Docs".to_string(), "Papers".to_string())],
+            "a registered destination must not permanently disqualify the rename"
+        );
+        assert!(
+            job_targets(&state, "upload").is_empty(),
+            "the rename must not re-upload: {:?}",
+            job_targets(&state, "upload")
+        );
+        assert!(
+            job_targets(&state, "delete").is_empty(),
+            "the rename must not delete the source: {:?}",
+            job_targets(&state, "delete")
         );
     }
 
