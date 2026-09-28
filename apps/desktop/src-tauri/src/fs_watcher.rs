@@ -48,7 +48,18 @@ const DEBOUNCE_MS: u64 = 500;
 /// `run_sync_tick_internal` → `scan_local_changes_internal` → `drain_deferred_watcher_paths`,
 /// none of which took it. The suite was green only because the real window is microseconds;
 /// widening it by 800 ms turned one of them red. "It passes" was scheduling luck twice over.
-#[cfg(test)]
+///
+/// # Not `#[cfg(test)]`, deliberately
+///
+/// This and [`pending_test_guard`] exist only for tests, but they are **not** gated on
+/// `cfg(test)`, because a `#[cfg(test)]` item used from another module's tests breaks the
+/// Windows test binary: it fails to load with `STATUS_ENTRYPOINT_NOT_FOUND` before a single
+/// test runs, naming nothing. Bisected on CI twice (DBSYNC-106) — once for
+/// `sync_pipeline::tests` being made `pub(crate)` so this module could reach its
+/// `build_state`, and again for this guard, which is the same hazard in the other direction.
+///
+/// The cost is one `Mutex<()>` in the release binary. Do not "tidy" this by adding the
+/// attribute back.
 pub(crate) static PENDING_TEST_GUARD: Mutex<()> = Mutex::new(());
 
 /// Take [`PENDING_TEST_GUARD`], surviving poisoning.
@@ -58,7 +69,7 @@ pub(crate) static PENDING_TEST_GUARD: Mutex<()> = Mutex::new(());
 /// guarded test, i.e. by any failure of these tests, so the first honest red would silently
 /// de-serialise every other one and turn a single failure into a cascade. There is no state
 /// behind this mutex to be corrupted by a panic, so recovering the guard is always right.
-#[cfg(test)]
+#[allow(dead_code)] // test-only caller; see PENDING_TEST_GUARD for why it is not cfg(test)
 pub(crate) fn pending_test_guard() -> std::sync::MutexGuard<'static, ()> {
     PENDING_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
 }
