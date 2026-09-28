@@ -295,6 +295,41 @@ mod tests {
 
     use super::{on_debounced_batch, remember_dropped, take_pending, PENDING_MAX};
 
+    /// A minimal `AppState` on a temp database.
+    ///
+    /// **Deliberately duplicated rather than borrowed from `sync_pipeline::tests`.** Making
+    /// that module `pub(crate)` so this one could reach its `build_state` was measured to
+    /// break the Windows test binary outright: `rust (windows-latest)` failed with
+    /// `STATUS_ENTRYPOINT_NOT_FOUND` before a single test ran, while `windows-app` — the
+    /// production binary, which has no test code — passed. Bisected to exactly this change
+    /// (DBSYNC-106): removing it turned Windows green with everything else identical.
+    ///
+    /// Twenty duplicated lines are cheaper than a cross-module `#[cfg(test)]` dependency
+    /// that only one platform rejects, and rejects in a way that names no test.
+    fn build_state(root: &std::path::Path) -> crate::state::AppState {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let sync_folder = root.join("synced");
+        std::fs::create_dir_all(&sync_folder).expect("create sync folder");
+        let db_path = root.join("db").join("app.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).expect("create db dir");
+        let db = crate::storage::db::Db::new_at(&db_path).expect("db init");
+        db.set_sync_folder(&sync_folder.to_string_lossy())
+            .expect("set sync folder");
+        crate::state::AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: Arc::new(db),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        }
+    }
+
     /// **The wiring test.** The three tests below exercise the pending set directly, which
     /// leaves the one line that matters in production — `remember_dropped(&rels)` inside
     /// `on_debounced_batch` — unasserted. Deleting it restored the original defect with the
@@ -310,7 +345,7 @@ mod tests {
         std::fs::create_dir_all(root.join("Docs")).expect("mkdir");
         std::fs::write(root.join("Docs/a.txt"), b"x").expect("write");
 
-        let state = crate::sync_pipeline::tests::build_state(tmp.path());
+        let state = build_state(tmp.path());
         let _ = take_pending();
 
         // Somebody else owns the sync, exactly as a longpoll tick would.
