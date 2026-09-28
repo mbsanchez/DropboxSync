@@ -2594,6 +2594,7 @@ pub(crate) mod tests {
     /// a folder that was already in sync when it was renamed.
     #[test]
     fn a_rename_deferred_by_a_busy_gate_still_becomes_a_move() {
+        let _serial = crate::fs_watcher::PENDING_TEST_GUARD.lock();
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
         let root = sync_root(&state);
@@ -2642,10 +2643,87 @@ pub(crate) mod tests {
         );
     }
 
+    /// Re-delivery replays a *path*, never a remembered state. The plan for this slice said
+    /// `process_changed_paths` re-reads the disk "so this should hold by construction;
+    /// assert it rather than assume it" — and "holds by construction" is the shape of claim
+    /// this ticket family keeps disproving, so here it is asserted.
+    ///
+    /// The file changes again between the deferral and the drain. What lands in the index
+    /// must be what is on disk now, not what was there when the batch was refused.
+    #[test]
+    fn a_redelivered_path_is_processed_against_current_disk_state() {
+        let _serial = crate::fs_watcher::PENDING_TEST_GUARD.lock();
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("a.txt"), b"first").unwrap();
+        let (stale_hash, stale_size, _) = crate::path_util::hash_file(&root.join("a.txt")).unwrap();
+
+        let _ = crate::fs_watcher::take_pending();
+        crate::fs_watcher::remember_dropped(&["a.txt".to_string()]);
+
+        // ... and the file is edited again before the gate frees.
+        std::fs::write(root.join("a.txt"), b"second, and a different length").unwrap();
+        let (fresh_hash, fresh_size, _) = crate::path_util::hash_file(&root.join("a.txt")).unwrap();
+        assert_ne!(
+            stale_hash, fresh_hash,
+            "the test needs the content to differ"
+        );
+
+        super::drain_deferred_watcher_paths(&state);
+
+        let row = state
+            .db
+            .get_local_file("a.txt")
+            .unwrap()
+            .expect("the re-delivered path must be indexed");
+        assert_eq!(
+            row.hash, fresh_hash,
+            "the index must hold the bytes on disk at drain time, not at deferral time"
+        );
+        assert_eq!(row.size_bytes, fresh_size);
+        assert_ne!(row.size_bytes, stale_size);
+    }
+
+    /// The other half: a path deferred and then deleted before the drain. Re-delivery must
+    /// not resurrect it or invent work for a file that is not there.
+    #[test]
+    fn a_redelivered_path_that_vanished_before_the_drain_enqueues_nothing() {
+        let _serial = crate::fs_watcher::PENDING_TEST_GUARD.lock();
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+
+        std::fs::write(root.join("gone.txt"), b"briefly").unwrap();
+        let _ = crate::fs_watcher::take_pending();
+        crate::fs_watcher::remember_dropped(&["gone.txt".to_string()]);
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+
+        super::drain_deferred_watcher_paths(&state);
+
+        assert!(
+            state.db.get_local_file("gone.txt").unwrap().is_none(),
+            "a file that never reached the index must not be indexed by re-delivery"
+        );
+        assert!(
+            state.db.list_recent_jobs(10).unwrap().is_empty(),
+            "no job may be enqueued for a path that is not on disk: {:?}",
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .map(|j| (j.job_type, j.target_path))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The deferral must be consumed. If the drain left the paths in place they would be
     /// replayed on every tick, re-proposing a move for a folder that has already moved.
     #[test]
     fn draining_consumes_the_deferred_paths() {
+        let _serial = crate::fs_watcher::PENDING_TEST_GUARD.lock();
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
 
@@ -2662,6 +2740,7 @@ pub(crate) mod tests {
     /// anything, since it runs on every periodic tick.
     #[test]
     fn draining_nothing_enqueues_nothing() {
+        let _serial = crate::fs_watcher::PENDING_TEST_GUARD.lock();
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
         let _ = crate::fs_watcher::take_pending();

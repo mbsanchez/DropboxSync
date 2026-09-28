@@ -38,6 +38,15 @@ const PENDING_MAX: usize = 4096;
 
 const DEBOUNCE_MS: u64 = 500;
 
+/// Serialises tests that touch [`PENDING`].
+///
+/// The set is process-wide by design — it survives across watcher batches — so tests in any
+/// module that drain or fill it race each other under the default parallel harness. Every
+/// such test takes this first. Found the hard way: the tests passed until two more were
+/// added, and the failure was scheduling, not logic.
+#[cfg(test)]
+pub(crate) static PENDING_TEST_GUARD: Mutex<()> = Mutex::new(());
+
 fn pending_cell() -> &'static Mutex<HashSet<String>> {
     PENDING.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -268,6 +277,7 @@ mod tests {
     /// than thrown away.
     #[test]
     fn a_batch_that_loses_the_gate_is_remembered_not_discarded() {
+        let _serial = super::PENDING_TEST_GUARD.lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("synced");
         std::fs::create_dir_all(root.join("Docs")).expect("mkdir");
@@ -305,6 +315,7 @@ mod tests {
     /// does not redeliver (DBSYNC-106).
     #[test]
     fn a_deferred_batch_is_returned_once_and_then_forgotten() {
+        let _serial = super::PENDING_TEST_GUARD.lock();
         let _ = take_pending(); // other tests share the process-wide set
 
         remember_dropped(&["a/b.txt".to_string(), "a".to_string()]);
@@ -322,6 +333,7 @@ mod tests {
     /// paths can arrive in different batches.
     #[test]
     fn consecutive_deferrals_accumulate() {
+        let _serial = super::PENDING_TEST_GUARD.lock();
         let _ = take_pending();
 
         remember_dropped(&["old".to_string()]);
@@ -335,6 +347,7 @@ mod tests {
     /// linearly under a contended gate.
     #[test]
     fn a_repeated_path_is_held_once() {
+        let _serial = super::PENDING_TEST_GUARD.lock();
         let _ = take_pending();
 
         remember_dropped(&["same".to_string()]);
@@ -347,6 +360,7 @@ mod tests {
     /// logged, which is a bounded miss that announces itself.
     #[test]
     fn the_pending_set_is_bounded() {
+        let _serial = super::PENDING_TEST_GUARD.lock();
         let _ = take_pending();
 
         let many: Vec<String> = (0..PENDING_MAX + 500).map(|i| format!("f{i}")).collect();
