@@ -72,7 +72,22 @@ jobs:
           # Distinct per job, or `rust` and `macos-app` evict each other and the cache
           # buys nothing. rust-cache appends the runner OS and arch to the key, so the
           # two matrix legs get separate caches without any help from us.
-          prefix-key: rust-checks
+          #
+          # `ImageVersion` is in the key because OS and arch are NOT enough. The runner
+          # image rolls independently of both, and a rolled image brings a different MSVC
+          # runtime. Restoring artifacts linked against the previous one produced a test
+          # binary that could not start at all:
+          #
+          #   exit code 0xc0000139, STATUS_ENTRYPOINT_NOT_FOUND
+          #
+          # Zero tests ran, and the log named no test, so it read as a mysterious Windows
+          # failure rather than a cache problem. Measured: the last green Windows run used
+          # image 20260907.229.1 and the first red one 20260922.246.2, with no change to
+          # Cargo.lock or to any dependency in between.
+          #
+          # The cost is one cold build per image roll. The alternative is a cache that can
+          # silently serve artifacts from a toolchain that is no longer installed.
+          prefix-key: rust-checks-${{ env.ImageVersion }}
           workspaces: apps/desktop/src-tauri
           # Only the default branch writes. A 10 GB budget shared by every open PR would
           # evict main's cache — the one every new PR starts from — to store caches that
@@ -143,7 +158,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: macos-app
+          # `ImageVersion` for the same reason as the `rust` job above: OS and arch do
+          # not change when the runner image rolls, but the toolchain it ships does.
+          prefix-key: macos-app-${{ env.ImageVersion }}
           workspaces: apps/desktop/src-tauri
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
@@ -216,7 +233,9 @@ jobs:
           # for tests, this one builds release through `tauri build`. They share almost no
           # artefacts, so a shared key would mean two jobs overwriting each other's cache
           # for no benefit.
-          prefix-key: windows-app
+          # `ImageVersion` for the same reason as the `rust` job above: OS and arch do
+          # not change when the runner image rolls, but the toolchain it ships does.
+          prefix-key: windows-app-${{ env.ImageVersion }}
           # Two workspaces. `shell-menu` is a SEPARATE cargo project — its own Cargo.toml
           # and Cargo.lock, referenced by no workspace — so rust-cache has to be told about
           # it explicitly or its target dir is never cached.
