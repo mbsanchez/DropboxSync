@@ -227,6 +227,17 @@ fn on_debounced_batch(
             remember_dropped(&rels);
             return;
         }
+        // Gated out of `cfg(test)` for exactly the reason `cloud_filter.rs` documents at
+        // length: a test that calls `on_debounced_batch` makes this call chain statically
+        // reachable in the `cargo test --lib` harness binary, which — unlike the shipped
+        // `.exe` — has no embedded manifest requesting ComCtl32 v6. The `tray-icon`/`muda`
+        // Windows backend statically imports `TaskDialogIndirect`, a ComCtl32 v6-only
+        // export, so the harness fails to LOAD at all: `STATUS_ENTRYPOINT_NOT_FOUND`, before
+        // a single test runs, naming nothing (DBSYNC-106).
+        //
+        // The tooltip is UI-only and not correctness-load-bearing here, so skipping it under
+        // test costs nothing. The shipped app is unaffected — it has the real manifest.
+        #[cfg(not(test))]
         crate::auth_session::refresh_tray_tooltip(&st);
         // Union in anything a previous batch lost to the gate, so a deferred rename is
         // correlated by the first batch that gets through (DBSYNC-106).
@@ -252,6 +263,7 @@ fn on_debounced_batch(
         }
         crate::sync_pipeline::drain_sync_queue(&st);
         st.sync_running.store(false, Ordering::Release);
+        #[cfg(not(test))]
         crate::auth_session::refresh_tray_tooltip(&st);
     });
 }
