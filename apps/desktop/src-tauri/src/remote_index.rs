@@ -1,4 +1,51 @@
-use std::collections::{HashMap, HashSet};
+//! Remote-side observation and reconciliation: turning a Dropbox `list_folder`
+//! snapshot or a cursor-delta batch into the local index's and `sync_jobs`' idea
+//! of truth.
+//!
+//! ## The standing invariant
+//!
+//! Two defects found in this area, eighteen months apart, turned out to be the
+//! same mistake wearing different clothes: trusting one piece of remote evidence
+//! before checking whether something else in hand contradicts it. Writing the
+//! rule down once, here, is what stops a fix for one from quietly reopening the
+//! other.
+//!
+//! > No remote-driven observation may destroy local content or index identity
+//! > while the same batch contains contradicting evidence, or while the path has
+//! > pending work.
+//!
+//! The first clause is **DBSYNC-102**: sharing a folder from the Dropbox web UI
+//! makes a `list_folder/continue` delta report its existing entries as `deleted`
+//! and then immediately re-add them. Applied one entry at a time, the re-add
+//! sits in the same batch as its own deletion and is invisible to the code that
+//! decides — the "safe remote-wins delete" arm fires anyway and every local copy
+//! is lost. The fix (`collapse_delta_entries`, below) resolves that contradiction
+//! across the whole batch before any single path's fate is decided. This clause
+//! protects against **acting on one path's evidence while a sibling entry in the
+//! same batch says otherwise.**
+//!
+//! The second clause is **DBSYNC-101**, still open: the materialization sweep
+//! can plant a `.cloudsc` sidecar over a path that has a pending delete queued
+//! against it, silently dropping that delete. This clause protects against
+//! **acting on a path while work already in flight for that same path has not
+//! finished** — the sidecar write does not check for pending work the way
+//! DBSYNC-102's collapse checks for contradicting batch evidence, but both are
+//! instances of the same rule: look before you destroy.
+//!
+//! DBSYNC-101 is fixed **after** DBSYNC-102, deliberately, not merely later in
+//! the backlog: DBSYNC-102's fix clears index rows that are stale or wrong, and
+//! several of DBSYNC-101's symptoms sit downstream of those rows being missing
+//! or stale in the first place. Fixing 101 first would mean building its
+//! pending-work check on top of index state this ticket is about to change out
+//! from under it. Writing the invariant here, once, in prose, is what keeps
+//! DBSYNC-101's eventual fix from re-deciding the batch-contradiction half of
+//! this rule differently than DBSYNC-102 already settled it — an unwritten
+//! marker gets a different answer from each reader, and two readers separated
+//! by months are exactly the case that produces a contradiction nobody notices
+//! until it ships.
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
 
@@ -75,6 +122,226 @@ pub(crate) fn delta_action_from_entry(entry: &DropboxEntry) -> DeltaAction {
         "deleted" => DeltaAction::Remove(rel),
         _ => DeltaAction::Ignore,
     }
+}
+
+/// Collapses one batch of raw delta entries into exactly one surviving entry per
+/// path, before any of them reach `apply_delta_entries` (DBSYNC-102 #173).
+///
+/// This is the fix. `apply_delta_entries` (#172) applies entries one at a time, so
+/// when Dropbox reports a path as `deleted` and then immediately re-adds it in the
+/// SAME page — exactly what happens when sharing a folder from the web converts it —
+/// the removal arm (`reconcile_remote_absent`) only ever sees one path at a time and
+/// takes its safe-looking remote-wins delete, with the re-add sitting right next to
+/// it invisible until it is too late to retract the already-queued job. Collapsing
+/// first removes the contradiction before either arm ever runs.
+///
+/// The rule bound at the architecture review is a SET predicate over the batch, not a
+/// temporal one:
+///
+/// > A path that appears as both a `deleted` entry and a file entry within the same
+/// > batch resolves to the file entry. The `deleted` entry is not actionable.
+///
+/// Deliberately **order-independent**: this does not implement "the last entry for a
+/// path wins". Dropbox's within-page entry ordering is not documented anywhere this
+/// project has found, so a last-wins rule would pass every observed sample while
+/// quietly depending on an unverified contract. Instead, for every path, ANY entry
+/// that resolves to `DeltaAction::Upsert` beats EVERY entry that resolves to
+/// `DeltaAction::Remove` for that same path, regardless of which one appears first in
+/// `entries`. See the removal/upsert test pair with reversed orderings below.
+///
+/// The winning upsert applies **unconditionally** — regardless of whether its content
+/// hash matches the index's last-synced one. This matters because a genuine remote
+/// edit can race a sharing conversion inside the same batch: if the collapse (or a
+/// naive fix) dropped both the `deleted` entry AND the upsert whenever a `deleted`
+/// entry existed for the path, a real content change would be silently lost instead
+/// of merely surviving a false deletion. `reconcile_remote_present` is left to decide
+/// whether a download is actually needed by comparing hashes itself, same as always.
+///
+/// Resolution per path:
+///
+/// | entries present for the path                  | result                      |
+/// |-------------------------------------------------|------------------------------|
+/// | `deleted` + `file` (either order)                | the `file` entry → Upsert    |
+/// | `file` only                                      | the `file` entry → Upsert    |
+/// | `deleted` only                                   | the `deleted` entry → Remove |
+/// | `folder`-tagged (or any other unrecognised tag)  | ignored — never enters the map |
+///
+/// Folder entries are dropped here rather than resolved against anything, which is
+/// safe only because `remote_file_index` holds no folder rows at all — DBSYNC-30
+/// scoped the cursor-delta index to files only. If that ever changes, this silent
+/// drop becomes a correctness bug, not just a missed case; it is written down here so
+/// a future reader does not have to rediscover it the hard way. (In practice this
+/// case needs no special-casing in the code below: `delta_action_from_entry` already
+/// maps a `folder` tag — and anything else it does not recognise — to `Ignore`, and
+/// `Ignore` never enters `winners`.)
+///
+/// Returns **references into `entries`**, not clones or a parallel `(entry, action)`
+/// structure, because the Windows-only placeholder-materialisation call inside
+/// `apply_delta_entries` needs `path_display`/`size` off the *raw* entry — `DeltaAction`
+/// and `RemoteFileMeta` carry neither. Keeping one representation (raw entries,
+/// resolved by path) all the way from the HTTP response to the Windows call avoids
+/// ending up with both a collapsed shape and a raw shape that could drift apart.
+///
+/// Note for a future reader who reaches for `Resolution` from outside this function:
+/// it does NOT leave this function. `apply_delta_entries` re-derives the action for
+/// each surviving entry via a second call to `delta_action_from_entry`, rather than
+/// trusting this function's internal `Upsert`/`Remove` tag — deliberately, since
+/// trusting it would mean carrying `Resolution` (or an equivalent) across the
+/// function boundary, which is exactly the second, parallel representation the
+/// paragraph above says not to introduce. The one piece of information this
+/// function's classification is NOT allowed to silently lose is "which entries are
+/// no longer actionable" (the per-path filtering), not "what their action was" —
+/// that part is cheap to recompute and `delta_action_from_entry` is pure, so
+/// recomputing it is not a correctness risk, only a second, trivial pass over data
+/// already in cache.
+///
+/// Returned in a deterministic order (lexicographic by the same case-INSENSITIVE key
+/// the collapse resolves on — see below) purely so a multi-path batch gives tests a
+/// stable `Vec` to assert against; nothing in `apply_delta_entries` depends on enqueue
+/// order.
+///
+/// ## Collapse key is `path_lower`, not `path_display` (DBSYNC-102 review finding)
+///
+/// Dropbox paths are case-insensitive, and Dropbox's own docs promise correct casing
+/// only on `path_display`'s LAST path component — an ANCESTOR folder's casing can
+/// legitimately drift between two entries for what both name as the same item (a
+/// rename of a parent folder elsewhere in the account, a client that cached an older
+/// display casing). Resolving on the case-preserved `rel` that `delta_action_from_entry`
+/// produces would then treat `Shared/Doc.txt`'s `deleted` entry and `shared/Doc.txt`'s
+/// re-add as two DIFFERENT paths instead of the same one — reopening exactly the
+/// DBSYNC-102 bug this function exists to close, just gated on ancestor-casing drift
+/// instead of same-batch ordering. The collapse therefore keys on `path_lower`, which
+/// Dropbox sends on every entry (`deleted` included) and which is already
+/// case-normalized, falling back to a lowercased `path_display` only for a hand-built
+/// entry that omits `path_lower` entirely (never observed from Dropbox itself).
+///
+/// This key is used ONLY to decide which entries are the same path; it is not a
+/// parallel representation that could drift from `rel`, and it never reaches
+/// `apply_delta_entries` — the winning entry is still applied under the case-preserved
+/// `rel` `delta_action_from_entry` derives from *its own* `path_display`, exactly as
+/// before. The residual this leaves: when the winning upsert's casing differs from an
+/// existing index row's (e.g. the index holds `Shared/Doc.txt` and the winning re-add's
+/// `path_display` is `shared/Doc.txt`), `reconcile_remote_present` looks up the new,
+/// differently-cased `rel` and finds no previous row, so it records a SECOND,
+/// differently-cased row rather than updating the first — no data is lost, but the
+/// index can end up holding two case-variant rows for one Dropbox item. That is a
+/// pre-existing limitation of the index being case-sensitive while Dropbox is not,
+/// not something introduced here, and it is out of scope for this ticket.
+///
+/// **Scope note:** this collapses one PAGE of one `apply_remote_delta` invocation, not
+/// the whole invocation. A `deleted` entry on page N and its re-add on page N+1 are
+/// NOT collapsed together by this function alone — accumulating every page of one
+/// invocation before collapsing is `apply_remote_delta`'s job (see its doc), which calls
+/// this function exactly once per invocation, over every page's accumulated entries.
+///
+/// ## A genuine delete can be silently suppressed (DBSYNC-102 review finding #3)
+///
+/// The set predicate this function implements is deliberately "any upsert beats every
+/// remove for that path", not "the temporally last entry wins" (see above). That means
+/// a batch like `[file X, deleted X]` — a genuine edit immediately followed by a
+/// genuine delete of the same path within one invocation — or
+/// `[deleted X, file X, deleted X]` resolves to the upsert, and the real, final delete
+/// is dropped with no download/no-op in its place: nothing downstream of this function
+/// ever learns a deletion was intended.
+///
+/// **The set predicate stays** — this was the rule bound at architecture review, and
+/// the asymmetry is deliberate: this failure mode is a missed delete, which the 300s
+/// snapshot sweep (`reconcile_remote_snapshot_with_breaker`) heals on its next pass by
+/// re-observing the path's true remote absence. "Last entry wins" would instead risk
+/// reopening the DBSYNC-102 bug this function exists to close, if Dropbox ever emits a
+/// re-add before its own deletion in the documented-nowhere within-page order. A missed
+/// delete that self-heals is the safer failure to accept than a live file deleted by a
+/// should-have-been-collapsed contradiction. Note the sweep's healing is itself gated by
+/// the DBSYNC-64 mass-deletion circuit breaker — unlike the delta path, which is never
+/// gated (see this module's doc on `reconcile_remote_snapshot_with_breaker`) — so a
+/// large batch of suppressed deletes can end up waiting on a user override before the
+/// sweep actually applies them, rather than healing unattended within one 300s pass.
+///
+/// What changes here is making the suppression VISIBLE instead of silent: every
+/// `deleted` entry whose path resolves to an Upsert is logged at `debug`, naming the
+/// path and the winning entry's `rev`; one `info`-level summary with the count fires
+/// per batch when any were suppressed, so a log sweep over `info` alone still shows
+/// that this happened without needing `debug` enabled.
+pub(crate) fn collapse_delta_entries(entries: &[DropboxEntry]) -> Vec<&DropboxEntry> {
+    enum Resolution<'a> {
+        Upsert(&'a DropboxEntry),
+        Remove(&'a DropboxEntry),
+    }
+
+    // Case-insensitive collapse key — see the doc above for why this must be
+    // `path_lower`, not the case-preserved `rel`. The winning entry's `rel` for
+    // actually applying the change is still derived case-preserved, below in
+    // `apply_delta_entries`, from the winning raw entry's own `path_display`.
+    fn collapse_key(entry: &DropboxEntry) -> Option<Cow<'_, str>> {
+        let path_display = entry.path_display.as_deref()?;
+        Some(match entry.path_lower.as_deref() {
+            Some(lower) => Cow::Borrowed(lower.trim_start_matches('/')),
+            None => Cow::Owned(path_display.trim_start_matches('/').to_lowercase()),
+        })
+    }
+
+    let mut winners: BTreeMap<Cow<'_, str>, Resolution<'_>> = BTreeMap::new();
+
+    for entry in entries {
+        let Some(key) = collapse_key(entry) else {
+            continue;
+        };
+
+        match delta_action_from_entry(entry) {
+            DeltaAction::Upsert(..) => {
+                // Unconditional: an Upsert always overwrites whatever is currently
+                // recorded for this path — including a Remove recorded earlier in
+                // this same loop — because the file entry wins regardless of order.
+                winners.insert(key, Resolution::Upsert(entry));
+            }
+            DeltaAction::Remove(_) => {
+                // `or_insert`, never a plain overwrite: if an Upsert for this path
+                // already won (processed earlier in this same loop), this Remove
+                // must NOT downgrade it back. If nothing has won yet, this Remove
+                // becomes the current winner, and a later Upsert for the same path
+                // will still overwrite it via the unconditional branch above.
+                winners.entry(key).or_insert(Resolution::Remove(entry));
+            }
+            DeltaAction::Ignore => {}
+        }
+    }
+
+    // DBSYNC-102 review finding #3: make a suppressed genuine delete visible. A
+    // second, cheap pass — rather than logging inline above — because a Remove
+    // processed early in the loop only learns it lost once a LATER Upsert for the
+    // same path overwrites it, and `winners` holds the final, settled resolution.
+    let mut suppressed = 0u32;
+    for entry in entries {
+        if !matches!(delta_action_from_entry(entry), DeltaAction::Remove(_)) {
+            continue;
+        }
+        let Some(key) = collapse_key(entry) else {
+            continue;
+        };
+        if let Some(Resolution::Upsert(winner)) = winners.get(&key) {
+            suppressed += 1;
+            tracing::debug!(
+                path = %key,
+                winning_rev = %winner.rev.as_deref().unwrap_or(""),
+                "remote delta collapse: suppressing a deleted entry in favour of a \
+                 same-batch upsert for the same path"
+            );
+        }
+    }
+    if suppressed > 0 {
+        tracing::info!(
+            suppressed,
+            "remote delta collapse: suppressed deleted entries in favour of a \
+             same-batch upsert for the same path(s)"
+        );
+    }
+
+    winners
+        .into_values()
+        .map(|resolution| match resolution {
+            Resolution::Upsert(entry) | Resolution::Remove(entry) => entry,
+        })
+        .collect()
 }
 
 /// True if a `list_folder/continue` response signals an invalidated cursor
@@ -617,13 +884,363 @@ pub(crate) fn seed_remote_delta_cursor(state: &AppState) -> AppResult<String> {
     Ok(cursor)
 }
 
-/// Apply the remote changes since the persisted cursor (DBSYNC-30): call
-/// `list_folder/continue`, apply each delta entry to `remote_file_index` via the
-/// shared guarded reconcilers, and advance + persist the cursor per page. On an
-/// invalidated cursor (`reset`), discard it and re-snapshot. Returns jobs
-/// enqueued. The caller drains the queue.
+/// Applies one invocation's worth of accumulated delta entries to the local index —
+/// the per-entry arm of `apply_remote_delta`, extracted so it can be driven by a test
+/// with synthetic entries and never touch the network (DBSYNC-102 #172).
+///
+/// First runs `collapse_delta_entries` over the WHOLE accumulated batch (DBSYNC-102
+/// #173/#174) so a path reported both `deleted` and re-added anywhere in the batch —
+/// whether in the same page or split across two — resolves to exactly one action —
+/// the file entry wins — before anything below ever sees it. `apply_remote_delta`
+/// guarantees every page of one invocation has already been accumulated into `entries`
+/// before this function is ever called; this function itself has no notion of pages.
+///
+/// Classifies each surviving entry, skips `.cloudsc` sidecars and anything
+/// `covered_by_active_job` (the prefix-shaped membership test — see its own doc comment
+/// for why a plain `.contains()` is wrong here: the sharpest DBSYNC-99 round-5
+/// regression was exactly this `Remove` arm letting a delete for a descendant of a
+/// pending folder move through unfiltered), then applies via the two shared
+/// reconcilers and, on Windows only, materialises a fresh placeholder / prunes a stale
+/// sidecar.
+///
+/// `covered_by_active_job` runs AFTER the collapse and is not replaced by it: the
+/// collapse only resolves a delete/re-add contradiction for a single path within this
+/// invocation's batch, it says nothing about paths an in-flight job already owns.
+///
+/// Takes the RAW `DropboxEntry` values, not `Vec<DeltaAction>`. `DeltaAction`
+/// and `RemoteFileMeta` carry neither `size` nor `path_display` — the
+/// Windows-only materialisation call below reads both off the raw entry
+/// (DBSYNC-59's near-instant placeholder path), and losing them would silently
+/// break that call with nothing on macOS to notice, since `#[cfg(windows)]`
+/// hides the breakage from every macOS-run test. Classifying inside this
+/// function, right where the raw entry is still in scope, keeps that data
+/// available without threading a second, parallel `(entry, action)` structure
+/// through the caller for a single Windows-only read. `collapse_delta_entries`
+/// preserves this: it hands back raw entry references, not a parallel shape.
+///
+/// `delta_action_from_entry`'s `rel` — what is actually applied below — is
+/// `path_display.trim_start_matches('/')`, deliberately **not** lowercased (unlike
+/// the snapshot path's `remote_meta_from_entry`); preserved here unchanged. This is
+/// distinct from `collapse_delta_entries`'s own map key, which DOES resolve on a
+/// lowercased `path_lower` internally (see its doc) purely to decide which entries
+/// contradict each other — that internal key never escapes the collapse, so it has
+/// no bearing on the case-preserved `rel` this function applies.
+///
+/// Performs no HTTP call and never reads the access token: every field it needs
+/// is already in `entries`. This is the only function in this module a test may
+/// call directly to exercise delta application — see the keychain-danger list on
+/// `apply_remote_delta` below for everything a test must still never call.
+///
+/// `pending_job_types` is **diagnostic only** (DBSYNC-102 #175): pairs of
+/// (covering path, `job_type`) for the same active jobs `pending_targets` already
+/// names, used ONLY to decide whether a drop on the upsert arm deserves the
+/// stale-delete warning below — see `pending_delete_covering`'s doc for why. It
+/// changes no decision `covered_by_active_job` makes; pass `&[]` wherever that
+/// context is not available (e.g. a test that only cares about the Remove arm).
+///
+/// Returns the number of jobs enqueued.
+pub(crate) fn apply_delta_entries(
+    state: &AppState,
+    entries: &[DropboxEntry],
+    pending_targets: &HashSet<String>,
+    pending_job_types: &[(String, String)],
+) -> AppResult<usize> {
+    let mut enqueued = 0usize;
+
+    for entry in collapse_delta_entries(entries) {
+        match delta_action_from_entry(entry) {
+            DeltaAction::Upsert(rel, meta) => {
+                if rel.ends_with(".cloudsc") {
+                    // Sidecar bookkeeping path, never actionable here — unchanged.
+                } else if crate::sync_pipeline::covered_by_active_job(&rel, pending_targets) {
+                    // DBSYNC-102 #175, diagnostic only: `covered_by_active_job` has
+                    // already made its decision — the upsert is dropped here exactly as
+                    // before this slice, with no change to that outcome. This block only
+                    // explains WHY, for the one case that matters: a `local_delete` for
+                    // this exact path (or an ancestor folder) is STILL active, so new
+                    // remote truth (this re-add) is being discarded while that deletion is
+                    // still in flight. This is a narrower leftover case than "any re-add
+                    // after a local_delete" — see `pending_delete_covering`'s doc for why
+                    // the ordinary case (delete already drained before the re-add arrives)
+                    // is NOT caught here and fires no warning at all. The fix for the
+                    // conflation is tracked separately as DBSYNC-109; this is only the
+                    // detector for the leftover slice.
+                    if let Some(covering_target) =
+                        crate::sync_pipeline::pending_delete_covering(&rel, pending_job_types)
+                    {
+                        tracing::warn!(
+                            dropped_path = %rel,
+                            covering_target = %covering_target,
+                            covering_job_type = "local_delete",
+                            "remote delta: new remote truth discarded — upsert dropped \
+                             while a local_delete is still pending for this path \
+                             (DBSYNC-109)"
+                        );
+                    }
+                } else {
+                    enqueued += reconcile_remote_present(state, &rel, &meta)?;
+                    // DBSYNC-59: surface a newly-appeared remote file as a native
+                    // placeholder within seconds (targeted — just this file) instead
+                    // of waiting for the 5-min indexer.
+                    #[cfg(windows)]
+                    {
+                        let path_display = entry.path_display.clone().unwrap_or_default();
+                        crate::cloudsc_ops::materialize_remote_only_file_if_absent(
+                            state,
+                            &rel,
+                            &path_display,
+                            &meta.content_hash,
+                            &meta.rev,
+                            entry.size.unwrap_or(0),
+                            meta.modified_ts,
+                        );
+                    }
+                }
+            }
+            DeltaAction::Remove(rel) => {
+                if !rel.ends_with(".cloudsc")
+                    && !crate::sync_pipeline::covered_by_active_job(&rel, pending_targets)
+                {
+                    enqueued += reconcile_remote_absent(state, &rel)?;
+                    // DBSYNC-59: purge a legacy `.cloudsc` sidecar for the removed
+                    // file now (CfAPI placeholders are removed by the local_delete
+                    // job above) instead of waiting for the 5-min prune.
+                    #[cfg(windows)]
+                    crate::cloudsc_ops::prune_cloudsc_sidecar_for(state, &rel);
+                }
+            }
+            DeltaAction::Ignore => {}
+        }
+    }
+
+    Ok(enqueued)
+}
+
+/// What one page-fetch attempt returned to `run_remote_delta`'s pagination loop
+/// (DBSYNC-102 #172/#174 testability seam). The production closure built inside
+/// `apply_remote_delta`, below, is the only thing that ever constructs a `Reset` from
+/// a real HTTP response; a test's fake page source constructs either variant
+/// directly, with no HTTP involved at all.
+pub(crate) enum DeltaFetchOutcome {
+    /// One page of `list_folder/continue`, already parsed.
+    Page(DropboxListFolderResponse),
+    /// The polled cursor was invalidated (HTTP 409 `reset`). Carries no pages: the
+    /// caller already knows how many it accumulated before this point.
+    Reset,
+}
+
+/// What one whole `run_remote_delta` invocation produced, reported back to the outer
+/// shell rather than acted on inside `run_remote_delta` itself — seeding a fresh
+/// snapshot after a reset is network I/O and stays in `apply_remote_delta` (DBSYNC-102
+/// #172 review finding: a network-free function a test drives directly must never
+/// itself decide to seed).
+pub(crate) enum DeltaRunOutcome {
+    /// Every page was fetched, the accumulated batch was collapsed and applied
+    /// exactly once, and the resulting cursor was persisted exactly once.
+    Applied { enqueued: usize },
+    /// A page fetch reported a cursor reset. Nothing accumulated so far was applied
+    /// or persisted — the caller must discard the cursor and reseed.
+    Reset {
+        pages_fetched: usize,
+        entries_discarded: usize,
+    },
+}
+
+/// The testable core of `apply_remote_delta` (DBSYNC-102 #172/#174 review finding).
+/// Takes an INJECTED page source — "fetch the page that follows this cursor" — instead
+/// of making the HTTP call itself, so a test can drive the REAL pagination,
+/// accumulation, collapse and cursor-persist logic with a fake source that never
+/// touches the network or the keychain, rather than re-performing that logic inline
+/// against its own fixture. `apply_remote_delta` below is the thin production shell:
+/// it owns the token fetch, the actual HTTP call, and — on a reported `Reset` — the
+/// reseed, which is genuine network I/O and does not belong in a function a test
+/// calls directly.
+///
+/// Owns, and owns EXACTLY ONCE per invocation (not once per page):
+///   - accumulating every page's entries into one `Vec` before collapsing any of them
+///     (DBSYNC-102 #174 — a `deleted` entry on page N and its re-add on page N+1 are
+///     only resolved by `collapse_delta_entries` if both are in the same call; applying
+///     page-by-page, the behaviour before this slice, let that split-page case through
+///     uncontested — the shape that cost 456 MB for a folder big enough to paginate its
+///     sharing-conversion delta)
+///   - the `pending_job_targets` read and the `Db::active_jobs_with_type` read
+///   - the single `apply_delta_entries` call, over the whole accumulated batch
+///   - the single cursor persist, after applying — never before, never per page
+///
+/// ## On a page-fetch error
+///
+/// Anything `fetch_page` returns as `Err` (other than a `Reset`, which is a distinct,
+/// non-error outcome) propagates immediately via `?`. Nothing accumulated so far is
+/// applied, and the cursor is NOT persisted — the previously-persisted cursor is still
+/// current, so the next invocation re-fetches and re-applies from there. Logs how many
+/// pages were fetched and how many entries were discarded before giving up (DBSYNC-102
+/// review finding #4), so an operator reading logs can tell a flaky-network retry from
+/// a silent stall; `remote_longpoll.rs`'s loop backs off on this `Err` using its
+/// existing backoff, so this log line is also the only place that records WHY.
+///
+/// ## On a reset
+///
+/// Returns `DeltaRunOutcome::Reset` with the same two counts, WITHOUT seeding a fresh
+/// snapshot itself — that is `apply_remote_delta`'s job, since seeding is network I/O
+/// this function must never perform.
+///
+/// ## Why the cursor is persisted once, not per page, and why that is still crash-safe
+///
+/// The per-page persist used to carry the comment "Advance + persist per page so a
+/// crash mid-stream resumes cleanly." That comment is now false — accumulation means
+/// nothing is applied, and nothing enters `remote_file_index`/`sync_jobs`, until every
+/// page has been fetched — so it is replaced, not left behind, with the reason the new
+/// placement is still crash-safe: **replay of the whole invocation is idempotent in the
+/// senses below, though not without two residual windows that predate, and are not
+/// fixed by, this slice.** If the app dies after fetching some pages but before this
+/// function returns, the persisted cursor is still the PREVIOUS one, so the next
+/// invocation re-fetches and re-applies the same pages from scratch. That is safe
+/// because:
+///   - `upsert_remote_file` (`storage/db.rs`) is a genuine upsert —
+///     `INSERT ... ON CONFLICT(relative_path) DO UPDATE SET ...` — so replaying the
+///     same remote-row writes converges to the same row, never a duplicate.
+///   - `Db::enqueue_job`'s partial-unique-index `ON CONFLICT` on `(job_type,
+///     target_path)` collapses a re-enqueue for a path that already has an ACTIVE job
+///     (`queued`/`retry_wait`/`running`) of the same type into an `UPDATE`, not a
+///     second row.
+///
+/// Two things that does NOT cover, stated here rather than left implicit so "replay is
+/// idempotent" is not read as "every replay is a no-op":
+///   - The `ON CONFLICT` guard's `WHERE` only matches those three ACTIVE statuses. If a
+///     replayed `local_delete` has already reached `failed` by the time the replay
+///     runs, the guard no longer matches it and the replay inserts a SECOND
+///     `local_delete` row for the same path — a harmless re-attempt of a legitimate
+///     delete (it never fabricates a delete that should not happen), but still a
+///     duplicate row. "No job is duplicated" would overclaim past this case.
+///   - `reconcile_remote_present` (unchanged by this ticket) writes the new remote row
+///     BEFORE enqueuing its download, not atomically with it. A crash between those two
+///     statements — a window that exists on every invocation, not something this
+///     accumulation change introduces or widens — leaves the next invocation's
+///     `should_download` check comparing against the already-advanced row, finding no
+///     difference, and never re-enqueueing the download. This ticket does not close
+///     that window; it is pre-existing and stays open.
+///
+/// A crash mid-stream therefore costs, at worst, the two residuals above on top of
+/// re-fetching pages — not an unbounded correctness loss. Proven for the ordinary case
+/// (no `failed` job, no crash between that write and that enqueue) by
+/// `apply_delta_entries_replaying_the_same_batch_is_idempotent` below, which drives
+/// `Db::enqueue_job` for real rather than asserting the conflict clause's text.
+fn run_remote_delta(
+    state: &AppState,
+    starting_cursor: &str,
+    mut fetch_page: impl FnMut(&str) -> AppResult<DeltaFetchOutcome>,
+) -> AppResult<DeltaRunOutcome> {
+    let mut cursor = starting_cursor.to_string();
+    // Accumulated across every page of this invocation; collapsed and applied once,
+    // below, after the fetch loop — never inside it. See the doc above for why.
+    let mut all_entries: Vec<DropboxEntry> = Vec::new();
+    let mut pages_fetched = 0usize;
+
+    loop {
+        match fetch_page(&cursor) {
+            Ok(DeltaFetchOutcome::Reset) => {
+                return Ok(DeltaRunOutcome::Reset {
+                    pages_fetched,
+                    entries_discarded: all_entries.len(),
+                });
+            }
+            Ok(DeltaFetchOutcome::Page(resp)) => {
+                pages_fetched += 1;
+                let has_more = resp.has_more;
+                cursor = resp.cursor;
+                all_entries.extend(resp.entries);
+                if !has_more {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pages_fetched,
+                    entries_discarded = all_entries.len(),
+                    error = %e,
+                    "remote delta: page fetch failed; discarding this invocation's \
+                     accumulated entries, cursor left unchanged"
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    // Collapse and apply the WHOLE invocation's entries in one call — this is the
+    // fix. One read of in-flight jobs is enough; see the doc above.
+    let pending_targets = pending_job_targets(state)?;
+    // DBSYNC-102 #175, diagnostic only: a second, sibling read of the same active-job
+    // set, this time keeping each job's `job_type` alongside its path.
+    // `covered_by_active_job` above keeps deciding over the plain `pending_targets`
+    // set — this is never fed into it and changes no decision. Cost: one extra
+    // indexed SQL query (`Db::active_jobs_with_type`, same WHERE clause and index as
+    // `active_job_paths`), run once per invocation — i.e. once per longpoll cycle, NOT
+    // once per upsert and NOT once per page — so its cost scales with how often the
+    // delta fires, not with the size of the batch it is applying.
+    //
+    // `pending_job_targets`/`active_jobs_with_type` are read exactly once here, not
+    // once per page: the per-page recomputation this replaces existed so that a job
+    // enqueued while applying page 1 was visible when page 2 was reconciled — each
+    // page used to be applied immediately after it was fetched. Now application
+    // happens exactly once, after every page has been fetched and before any of them
+    // has been applied, so there is no longer an "earlier page's application" for a
+    // later page's read to observe: the whole batch sees one consistent snapshot of
+    // in-flight jobs, taken right before that single application. A job enqueued by
+    // something else entirely (another sync pass, a user action) in between is still
+    // picked up next invocation.
+    let pending_job_types = state.db.active_jobs_with_type()?;
+    let enqueued = apply_delta_entries(state, &all_entries, &pending_targets, &pending_job_types)?;
+
+    // Persist once, after applying, not per page. Safe because replay is idempotent
+    // (see the doc above); what a crash costs is re-fetching pages, not correctness.
+    state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
+
+    Ok(DeltaRunOutcome::Applied { enqueued })
+}
+
+/// Apply the remote changes since the persisted cursor (DBSYNC-30): the thin
+/// production shell around `run_remote_delta` (DBSYNC-102 #172 review finding). Owns
+/// the token fetch, the actual `list_folder/continue` HTTP call, and the reseed after
+/// a reported cursor reset; `run_remote_delta` owns everything else (pagination,
+/// accumulation, collapse, apply, cursor persist) and is what a test drives directly
+/// with a fake page source instead of this function. Returns jobs enqueued. The
+/// caller drains the queue.
+///
+/// ## Memory cost of accumulating a whole delta in one `Vec`
+///
+/// `size_of::<DropboxEntry>()` (`models.rs`) is 160+ bytes measured on this build
+/// (`std::mem::size_of`, x86_64/aarch64 pointer width; the `path_lower` field added by
+/// the DBSYNC-102 case-drift fix adds one more `Option<String>` slot) — that is the
+/// inline cost per `Vec` slot alone, before counting the heap bytes each present
+/// `String` field allocates (`tag`, and for a `file` entry typically `path_display`,
+/// `path_lower`, `content_hash`, `rev`, `id` too — a `deleted` entry carries only
+/// `tag`+`path_display`+`path_lower`). A `file` entry's heap strings run roughly
+/// another 150-350 bytes (a 64-hex-char `content_hash` alone is 64 bytes, plus the two
+/// paths, `rev`, and `id`), so call it roughly 350-550 bytes resident per `file` entry
+/// and 250-350 bytes per `deleted` entry, all-in. This repo does not set an explicit
+/// `limit` on `list_folder/continue` (grep confirms no `"limit"` parameter on that
+/// call), so the entries-per-page figure is Dropbox's own default and not something
+/// this codebase pins down — the honest number to report is therefore the per-entry
+/// rate above, not a total that assumes an unverified page size. Concretely: ten
+/// thousand accumulated entries, already a delta far larger than the 13-file / 456 MB
+/// conversion this ticket exists for, costs on the order of 3-6 MB resident. The
+/// snapshot path (`fetch_all_remote_file_metadata`) already holds a whole account's
+/// metadata in a `HashMap` for the same reason, so there is precedent for holding a
+/// full remote listing in memory; a delta's accumulated `Vec` is smaller per-entry
+/// than that `HashMap` (no map overhead, no key duplication) and, by definition, only
+/// covers the changes since the last cursor, not the whole account.
+///
+/// **Never call this from a test.** It fetches the access token (`get_access_token`),
+/// which reads the real OS keychain and, with a token in hand, makes a live
+/// `list_folder/continue` request against the maintainer's real Dropbox account —
+/// `build_state()` leaves `token_cache` empty, so there is no fixture seam here, only
+/// the live fallback. Drive `run_remote_delta` directly instead, with a fake page
+/// source closure (DBSYNC-102 #172/#174) — that is the network-free seam this
+/// function's pagination/accumulation/collapse/persist logic now lives behind — or
+/// drive `apply_delta_entries` directly for a single already-collapsed batch with no
+/// pagination concerns at all.
 pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
-    let mut cursor = match state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY)? {
+    let starting_cursor = match state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY)? {
         Some(c) if !c.is_empty() => c,
         // No cursor yet: seed a fresh snapshot; the next longpoll continues from it.
         _ => {
@@ -634,11 +1251,8 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
 
     let token = get_access_token(state)?;
     let client = &state.http_client;
-    let mut enqueued = 0usize;
 
-    loop {
-        let pending_targets = pending_job_targets(state)?;
-
+    let outcome = run_remote_delta(state, &starting_cursor, |cursor| {
         let response = client
             .post("https://api.dropboxapi.com/2/files/list_folder/continue")
             .bearer_auth(token.as_str())
@@ -652,11 +1266,7 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
                 .text()
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
             if is_reset_error(status, &body) {
-                // Cursor invalidated: discard it and re-snapshot from scratch.
-                tracing::info!("remote delta cursor reset; re-snapshotting");
-                state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, "")?;
-                seed_remote_delta_cursor(state)?;
-                return Ok(enqueued);
+                return Ok(DeltaFetchOutcome::Reset);
             }
             return Err(AppError::Dropbox {
                 status,
@@ -667,61 +1277,33 @@ pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
         let resp: DropboxListFolderResponse = response
             .json()
             .map_err(|e| AppError::Other(format!("list_folder/continue parse failed: {e}")))?;
+        Ok(DeltaFetchOutcome::Page(resp))
+    })?;
 
-        for entry in &resp.entries {
-            match delta_action_from_entry(entry) {
-                DeltaAction::Upsert(rel, meta) => {
-                    if !rel.ends_with(".cloudsc")
-                        && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
-                    {
-                        enqueued += reconcile_remote_present(state, &rel, &meta)?;
-                        // DBSYNC-59: surface a newly-appeared remote file as a native
-                        // placeholder within seconds (targeted — just this file) instead
-                        // of waiting for the 5-min indexer.
-                        #[cfg(windows)]
-                        {
-                            let path_display = entry.path_display.clone().unwrap_or_default();
-                            crate::cloudsc_ops::materialize_remote_only_file_if_absent(
-                                state,
-                                &rel,
-                                &path_display,
-                                &meta.content_hash,
-                                &meta.rev,
-                                entry.size.unwrap_or(0),
-                                meta.modified_ts,
-                            );
-                        }
-                    }
-                }
-                DeltaAction::Remove(rel) => {
-                    if !rel.ends_with(".cloudsc")
-                        && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
-                    {
-                        enqueued += reconcile_remote_absent(state, &rel)?;
-                        // DBSYNC-59: purge a legacy `.cloudsc` sidecar for the removed
-                        // file now (CfAPI placeholders are removed by the local_delete
-                        // job above) instead of waiting for the 5-min prune.
-                        #[cfg(windows)]
-                        crate::cloudsc_ops::prune_cloudsc_sidecar_for(state, &rel);
-                    }
-                }
-                DeltaAction::Ignore => {}
+    match outcome {
+        DeltaRunOutcome::Applied { enqueued } => {
+            if enqueued > 0 {
+                tracing::info!(enqueued, "longpoll delta enqueued download/delete jobs");
             }
+            Ok(enqueued)
         }
-
-        // Advance + persist per page so a crash mid-stream resumes cleanly.
-        cursor = resp.cursor;
-        state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
-
-        if !resp.has_more {
-            break;
+        DeltaRunOutcome::Reset {
+            pages_fetched,
+            entries_discarded,
+        } => {
+            // Cursor invalidated: discard it and re-snapshot from scratch.
+            // `run_remote_delta` already discarded whatever it accumulated before
+            // reporting this, so there is nothing further to roll back here.
+            tracing::info!(
+                pages_fetched,
+                entries_discarded,
+                "remote delta cursor reset; re-snapshotting"
+            );
+            state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, "")?;
+            seed_remote_delta_cursor(state)?;
+            Ok(0)
         }
     }
-
-    if enqueued > 0 {
-        tracing::info!(enqueued, "longpoll delta enqueued download/delete jobs");
-    }
-    Ok(enqueued)
 }
 
 #[cfg(test)]
@@ -738,6 +1320,11 @@ mod tests {
         DropboxEntry {
             tag: "file".to_string(),
             path_display: path_display.map(str::to_string),
+            // Matches what Dropbox actually sends: path_lower is always the
+            // lowercased path_display, same casing drift or not. A test that
+            // needs to exercise mismatched/absent path_lower overrides the field
+            // on the returned value directly.
+            path_lower: path_display.map(|p| p.to_lowercase()),
             content_hash: content_hash.map(str::to_string),
             rev: rev.map(str::to_string),
             server_modified: server_modified.map(str::to_string),
@@ -1540,6 +2127,1150 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Delta application seam (DBSYNC-102 #172): `apply_delta_entries` is the
+    // network-free extraction of `apply_remote_delta`'s per-entry loop. Every test
+    // below drives it directly with synthetic `DropboxEntry` values — never
+    // `apply_remote_delta` itself, which fetches the access token and would make a
+    // live `list_folder/continue` call against the real account.
+    // ---------------------------------------------------------------------------
+
+    /// **DBSYNC-102 fix, proven at the seam.** Until slice #173 landed, this exact
+    /// input batch produced the data-loss defect described below; the assertions now
+    /// pin the FIXED outcome, not the defect — do not read this test as documenting a
+    /// live bug.
+    ///
+    /// Reproduces the share-conversion shape end to end at the seam: a single
+    /// `list_folder/continue` page reports a path as `deleted`, and immediately
+    /// re-adds it in the SAME page with the SAME content hash the local index already
+    /// has recorded for it — exactly what Dropbox sends when sharing converts an
+    /// existing folder (nothing about the bytes changed, only the folder's sharing
+    /// status). Before #173, `apply_delta_entries` walked `entries` strictly in order,
+    /// one at a time: by the time the `deleted` entry was applied, the re-add sitting
+    /// right next to it was not yet visible to `reconcile_remote_absent`, which only
+    /// ever saw one path at a time and therefore only ever saw "local hash ==
+    /// last-synced remote hash" — the condition for its safe-looking remote-wins
+    /// delete arm. `collapse_delta_entries` now runs first and resolves the
+    /// deleted+file contradiction to the file entry before either reconciler ever
+    /// sees the path, so the delete is never actionable in the first place.
+    ///
+    /// Asserted here: zero `local_delete` jobs, and the index row for the path
+    /// survives (both reconcilers would have removed it, directly or via the delete
+    /// job's eventual execution).
+    #[test]
+    fn apply_delta_entries_a_reshared_file_survives_its_own_delete_in_the_same_batch_dbsync_102() {
+        let state = build_state();
+        // Last-synced state: Dropbox and the local index already agree on hash "H".
+        state
+            .db
+            .upsert_remote_file("shared/hidratado.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/hidratado.txt", "H", 3, 0)
+            .unwrap();
+
+        // One list_folder/continue page, shaped exactly as Dropbox sends it on a
+        // sharing conversion: the existing entry tagged `deleted`, then the same path
+        // re-added right after with unchanged content (same hash, a fresh rev).
+        let mut deleted = file_entry(Some("/shared/hidratado.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let readded = file_entry(Some("/shared/hidratado.txt"), Some("H"), Some("rev2"), None);
+        let entries = vec![deleted, readded];
+
+        let enqueued = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 0,
+            "the collapse resolves deleted+file to the file entry: same hash means no \
+             download is needed either, so nothing is enqueued at all"
+        );
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "a path reported present again in the same batch must never reach \
+             reconcile_remote_absent's delete arm"
+        );
+        // Asserting the row ADVANCED to the re-add's rev, not merely that it still
+        // exists (DBSYNC-102 review finding #8): a mutation where the delete and the
+        // re-add instead cancelled each other out — neither applied — would leave the
+        // row at "rev1" and still pass an `is_some()`-only check.
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("shared/hidratado.txt")
+                .unwrap()
+                .expect(
+                    "the index row must survive a sharing conversion, not be \
+                         dropped with the deleted entry the collapse has already ruled \
+                         not actionable"
+                )
+                .rev,
+            "rev2",
+            "the row must advance to the re-add's rev — a delete/re-add pair that \
+             merely cancelled out (neither applied) would leave it stuck at rev1"
+        );
+    }
+
+    /// Mirror of the test above with the two entries swapped: the file entry arrives
+    /// FIRST in the page, the `deleted` entry SECOND. The resolution must be identical
+    /// either way — this is what "order-independent, not last-entry-wins" means in
+    /// practice. If `collapse_delta_entries` ever regressed to a last-wins rule, this
+    /// test (file-first) would start failing while the deleted-first test above kept
+    /// passing, which is exactly the asymmetry a last-wins implementation produces.
+    #[test]
+    fn apply_delta_entries_resolution_is_the_same_with_the_file_entry_first() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/order.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/order.txt", "H", 3, 0)
+            .unwrap();
+
+        let readded = file_entry(Some("/shared/order.txt"), Some("H"), Some("rev2"), None);
+        let mut deleted = file_entry(Some("/shared/order.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        // File entry listed BEFORE the deleted entry this time.
+        let entries = vec![readded, deleted];
+
+        let enqueued = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 0,
+            "file-first must resolve exactly like deleted-first"
+        );
+        assert!(job_targets(&state, "local_delete").is_empty());
+        // Same strengthening as the deleted-first test above (DBSYNC-102 review
+        // finding #8): the row must have advanced to the re-add's rev, not merely
+        // still exist, or a cancel-out mutation would pass silently.
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("shared/order.txt")
+                .unwrap()
+                .expect("row must survive")
+                .rev,
+            "rev2"
+        );
+    }
+
+    /// A genuine remote edit racing a sharing conversion inside the same batch must
+    /// still be downloaded. The upsert's hash ("H2") differs from the index's
+    /// last-synced hash ("H") — if a fix collapsed deleted+file by just dropping BOTH
+    /// entries whenever a `deleted` entry existed for the path (the "naive drop"
+    /// warned about in `collapse_delta_entries`'s doc), this real content change would
+    /// be silently lost instead of merely surviving a false deletion. The upsert must
+    /// win and `reconcile_remote_present` must still see it and decide a download is
+    /// owed, exactly as it would outside any sharing-conversion scenario.
+    #[test]
+    fn apply_delta_entries_upsert_wins_and_still_enqueues_a_download_for_a_genuine_edit() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/edited.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/edited.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/shared/edited.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        // Different hash: a genuine edit, not merely a re-add of the same bytes.
+        let edited = file_entry(Some("/shared/edited.txt"), Some("H2"), Some("rev2"), None);
+        let entries = vec![deleted, edited];
+
+        let enqueued = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 1,
+            "the upsert must win over the deleted entry regardless of hash match, and \
+             its differing hash means a download is genuinely owed"
+        );
+        assert_eq!(
+            job_targets(&state, "download"),
+            vec!["shared/edited.txt".to_string()],
+            "a real content change must still be downloaded, not silently dropped \
+             alongside the deleted entry it happens to share a path with"
+        );
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "no delete must ever be queued for a path the batch also reports as upserted"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("shared/edited.txt")
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "H2",
+            "the index row must advance to the new hash, same as any ordinary remote edit"
+        );
+    }
+
+    /// Case-drift regression (DBSYNC-102 #2 review finding). Dropbox paths are
+    /// case-insensitive, and Dropbox's docs only promise correct casing on
+    /// `path_display`'s LAST component — an ANCESTOR folder's casing can legitimately
+    /// drift between a `deleted` entry and its own re-add. This batch deletes
+    /// `/Shared/Doc.txt` and re-adds the SAME item as `/shared/Doc.txt` (the ancestor
+    /// `Shared`/`shared` drifted; the leaf `Doc.txt` did not) — exactly the shape a
+    /// sharing conversion can produce. Before keying the collapse on `path_lower`,
+    /// these resolved to two DIFFERENT map keys (`shared/doc.txt`'s case-preserved
+    /// `rel` differs from `Shared/Doc.txt`'s), so the `deleted` entry won uncontested
+    /// and the only physical file on a case-insensitive filesystem (APFS) was deleted
+    /// out from under the re-add. Asserted here: zero `local_delete` — the collapse
+    /// must recognise both entries as the SAME path despite the ancestor casing drift.
+    #[test]
+    fn apply_delta_entries_does_not_delete_a_path_whose_ancestor_casing_drifted_between_entries() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("Shared/Doc.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("Shared/Doc.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/Shared/Doc.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        // Same item, re-added with the ANCESTOR folder's casing drifted:
+        // "Shared" -> "shared". The leaf component ("Doc.txt") is unchanged, matching
+        // Dropbox's own guarantee that only the last component's casing is reliable.
+        let readded = file_entry(Some("/shared/Doc.txt"), Some("H"), Some("rev2"), None);
+        let entries = vec![deleted, readded];
+
+        let enqueued = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 0,
+            "same hash, same item: the collapse resolves deleted+file to the file entry \
+             despite the ancestor casing drift, so nothing needs downloading either"
+        );
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "a path whose ancestor casing merely drifted between the deleted entry and \
+             its own re-add must never be deleted — path_lower must still recognise \
+             them as the same item"
+        );
+        // Residual, documented on `collapse_delta_entries`: the winning entry applies
+        // under its OWN case-preserved `rel` ("shared/Doc.txt"), which differs from the
+        // existing index row's casing ("Shared/Doc.txt"). `reconcile_remote_present`
+        // therefore finds no previous row under the new casing and records a SECOND,
+        // differently-cased row — no data loss, but two rows for one Dropbox item. A
+        // pre-existing limitation of a case-sensitive index observing a case-insensitive
+        // remote, out of scope for this ticket.
+        assert!(
+            state
+                .db
+                .get_remote_file("shared/Doc.txt")
+                .unwrap()
+                .is_some(),
+            "the re-add is recorded under its own casing, even though that differs from \
+             the pre-existing row's — see the residual note above"
+        );
+    }
+
+    /// DBSYNC-99 round-5 regression guard, re-proven after the collapse (#173). A
+    /// removal for a path underneath a pending folder move must still be filtered by
+    /// `covered_by_active_job` — the collapse runs BEFORE that filter and is not a
+    /// replacement for it. There is no competing upsert for this path in the batch,
+    /// so the collapse hands the removal straight through unchanged; the filter is
+    /// what must stop it.
+    #[test]
+    fn apply_delta_entries_descendant_removal_still_filtered_after_collapse() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("pending/folder/child.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("pending/folder/child.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/pending/folder/child.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+
+        // The active job names the FOLDER being moved, not the child directly —
+        // `covered_by_active_job` is what has to recognise the child as covered.
+        let mut pending_targets = HashSet::new();
+        pending_targets.insert("pending/folder".to_string());
+
+        let enqueued = apply_delta_entries(&state, &[deleted], &pending_targets, &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 0,
+            "a removal for a descendant of a pending folder move must stay filtered"
+        );
+        assert!(job_targets(&state, "local_delete").is_empty());
+        assert!(
+            state
+                .db
+                .get_remote_file("pending/folder/child.txt")
+                .unwrap()
+                .is_some(),
+            "the row must survive while the covering job is still pending"
+        );
+    }
+
+    /// Folder-tag regression. A `folder`-tagged entry must never enter the
+    /// collapse's per-path resolution — `delta_action_from_entry` already maps it to
+    /// `Ignore`, and `Ignore` is dropped before it ever reaches `winners`. This is
+    /// safe only because `remote_file_index` holds no folder rows in production; the
+    /// row seeded here for "team" is deliberately unrealistic (a real folder would
+    /// never get one) so the test can actually fail if a future change ever lets a
+    /// folder entry be treated as a Remove — with no row, `reconcile_remote_absent`
+    /// would have returned `Ok(0)` either way and the test would prove nothing.
+    #[test]
+    fn apply_delta_entries_folder_tagged_entry_is_ignored_by_the_collapse() {
+        let state = build_state();
+        // Contrived: a remote row for a path that is, in this batch, folder-tagged.
+        // Real folders never have one; seeded only so a wrongly-resolved Remove would
+        // be visible as an enqueued local_delete instead of silently no-op'ing.
+        state
+            .db
+            .upsert_remote_file("team", "H", "rev1", 0, None)
+            .unwrap();
+        state.db.upsert_local_file("team", "H", 3, 0).unwrap();
+
+        let mut folder = file_entry(Some("/team"), None, None, None);
+        folder.tag = "folder".to_string();
+
+        let enqueued = apply_delta_entries(&state, &[folder], &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 0,
+            "a folder-tagged entry must never be resolved to a Remove"
+        );
+        assert!(job_targets(&state, "local_delete").is_empty());
+        assert!(
+            state.db.get_remote_file("team").unwrap().is_some(),
+            "the contrived row must be left untouched, proving the folder entry never \
+             reached reconcile_remote_absent"
+        );
+    }
+
+    /// The flip side of the folder-tag test above, and an explicit acceptance
+    /// criterion (DBSYNC-102 #173): Dropbox's `deleted` tag carries no indication of
+    /// whether the removed path used to be a file or a folder — there is nothing in
+    /// a `deleted` entry to distinguish the two. The collapse must still resolve it
+    /// to a `Remove`, not mistake "this path might have been a folder" for "ignore
+    /// this". (The removal is harmless in production for an actual folder path only
+    /// because `remote_file_index` never holds a folder row to delete — see the
+    /// comment on `collapse_delta_entries` — but that is a property of the
+    /// reconciler, not something the collapse is allowed to assume by special-casing
+    /// `deleted` entries itself.)
+    #[test]
+    fn apply_delta_entries_deleted_tag_resolves_to_removal_for_a_former_folder_path() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("was_a_folder/leftover_row", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("was_a_folder/leftover_row", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/was_a_folder/leftover_row"), None, None, None);
+        deleted.tag = "deleted".to_string();
+
+        let enqueued = apply_delta_entries(&state, &[deleted], &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 1,
+            "a deleted entry resolves to a removal regardless of whether the path \
+             used to be a file or a folder — there is no tag that says which"
+        );
+        assert_eq!(
+            job_targets(&state, "local_delete"),
+            vec!["was_a_folder/leftover_row".to_string()]
+        );
+    }
+
+    /// Direct unit test of `collapse_delta_entries` itself — no `AppState`, no
+    /// database, no `apply_delta_entries` in between — exercising the pure function
+    /// the acceptance criteria name explicitly. Covers the full resolution table in
+    /// one batch: deleted+file (upsert wins), file-only (upsert), deleted-only
+    /// (remove), and a folder entry (dropped, appears in neither the input's winner
+    /// set nor the output).
+    #[test]
+    fn collapse_delta_entries_resolves_the_full_table_in_one_batch() {
+        let mut deleted_and_readded = file_entry(Some("/a.txt"), None, None, None);
+        deleted_and_readded.tag = "deleted".to_string();
+        let readd = file_entry(Some("/a.txt"), Some("H"), Some("rev2"), None);
+
+        let file_only = file_entry(Some("/b.txt"), Some("H"), Some("rev1"), None);
+
+        let mut delete_only = file_entry(Some("/c.txt"), None, None, None);
+        delete_only.tag = "deleted".to_string();
+
+        let mut folder_only = file_entry(Some("/d"), None, None, None);
+        folder_only.tag = "folder".to_string();
+
+        let entries = vec![
+            deleted_and_readded,
+            readd,
+            file_only,
+            delete_only,
+            folder_only,
+        ];
+
+        let collapsed = collapse_delta_entries(&entries);
+
+        // Exactly two survivors: the "a.txt" upsert (not the delete) and "b.txt"'s
+        // upsert, plus "c.txt"'s removal. The folder entry at "d" never appears.
+        let mut actions: Vec<(String, bool)> = collapsed
+            .iter()
+            .map(|e| {
+                let rel = e.path_display.as_deref().unwrap().trim_start_matches('/');
+                (rel.to_string(), e.tag == "file")
+            })
+            .collect();
+        actions.sort();
+
+        assert_eq!(
+            actions,
+            vec![
+                ("a.txt".to_string(), true),
+                ("b.txt".to_string(), true),
+                ("c.txt".to_string(), false),
+            ],
+            "deleted+file resolves to the file entry for a.txt, file-only stays a \
+             file entry for b.txt, deleted-only stays a deleted entry for c.txt, and \
+             the folder entry at d never survives into the output at all"
+        );
+    }
+
+    /// DBSYNC-102 baseline — the regression guard that must survive slice #173
+    /// unchanged. A plain remote delete with NO re-add anywhere in the same batch must
+    /// still produce exactly one `local_delete`. The count is asserted, not mere
+    /// presence, because a real remote deletion that silently stops reaching disk is
+    /// worse than the bug this ticket fixes: it is silent and it accumulates. A future
+    /// batch collapse that is over-eager about "contradicting evidence" must not pass
+    /// this suite by suppressing a genuine, uncontradicted deletion.
+    #[test]
+    fn apply_delta_entries_plain_remove_with_no_readd_deletes_exactly_once() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("gone.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state.db.upsert_local_file("gone.txt", "H", 3, 0).unwrap();
+
+        let mut deleted = file_entry(Some("/gone.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+
+        let enqueued = apply_delta_entries(&state, &[deleted], &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, 1,
+            "a genuine, uncontradicted remote delete must still \
+             produce exactly one local_delete job"
+        );
+        assert_eq!(
+            job_targets(&state, "local_delete"),
+            vec!["gone.txt".to_string()]
+        );
+    }
+
+    /// DBSYNC-102 review finding #3: `[file X, deleted X]` — a genuine edit
+    /// immediately followed by a genuine delete of the SAME path within one batch —
+    /// is exactly the shape where the set predicate's "any upsert beats every remove"
+    /// rule suppresses a real deletion with no trace. The set predicate stays (see
+    /// `collapse_delta_entries`'s doc for why), but the suppression must now be
+    /// logged. Pins both halves: no delete is enqueued, AND the suppression is
+    /// actually logged — a silent suppression with nothing in the logs would pass
+    /// every other test in this file while leaving an operator with no way to tell a
+    /// missed delete happened at all.
+    #[test]
+    fn apply_delta_entries_logs_a_suppressed_delete_when_an_upsert_for_the_same_path_wins() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/edited_then_deleted.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/edited_then_deleted.txt", "H", 3, 0)
+            .unwrap();
+
+        let edited = file_entry(
+            Some("/shared/edited_then_deleted.txt"),
+            Some("H2"),
+            Some("rev2"),
+            None,
+        );
+        let mut deleted = file_entry(Some("/shared/edited_then_deleted.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let entries = vec![edited, deleted];
+
+        let log = captured_tracing_output(|| {
+            let enqueued = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+                .expect("apply_delta_entries must not touch the network");
+            assert_eq!(
+                enqueued, 1,
+                "the upsert wins and its differing hash means a download is owed; the \
+                 real delete that followed it in the batch is suppressed, not applied"
+            );
+        });
+
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "the set predicate suppresses the genuine delete in favour of the upsert \
+             that beat it in this batch"
+        );
+        assert!(
+            log.contains("DEBUG") && log.contains("suppressing a deleted entry"),
+            "the suppressed delete must be logged at debug, naming it as suppressed; \
+             got: {log}"
+        );
+        assert!(
+            log.contains("shared/edited_then_deleted.txt"),
+            "the debug log must name the suppressed path; got: {log}"
+        );
+        assert!(
+            log.contains("rev2"),
+            "the debug log must name the winning entry's rev; got: {log}"
+        );
+        assert!(
+            log.contains("INFO") && log.contains("suppressed deleted entries"),
+            "one info-level summary must also fire for this batch; got: {log}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // `run_remote_delta` (DBSYNC-102 #172/#174 review finding #1): the REAL
+    // pagination/accumulation/collapse/cursor-persist loop, driven through a fake
+    // page source closure. Unlike the fixture-only test this section replaces (which
+    // built two `Vec`s, `extend`ed them, and called `apply_delta_entries` once —
+    // re-performing the accumulation inline and testing its own fixture, not
+    // `apply_remote_delta`'s actual loop), every test below calls `run_remote_delta`
+    // itself. A fake page source never touches the network or the keychain: it is a
+    // plain closure over a pre-scripted `Vec` of outcomes, never `get_access_token`
+    // or an HTTP client.
+    // ---------------------------------------------------------------------------
+
+    /// Builds a fake page source from a pre-scripted sequence of outcomes, one per
+    /// call. Panics if `run_remote_delta` ever calls it more times than the test
+    /// scripted — a wrong call count is itself a defect worth failing loudly on,
+    /// not silently looping or returning a default.
+    fn scripted_page_source(
+        outcomes: Vec<AppResult<DeltaFetchOutcome>>,
+    ) -> impl FnMut(&str) -> AppResult<DeltaFetchOutcome> {
+        let mut outcomes = outcomes.into_iter();
+        move |_cursor| {
+            outcomes
+                .next()
+                .expect("fake page source called more times than this test scripted")
+        }
+    }
+
+    /// **DBSYNC-102 #174, the defect this slice exists for, proven at the real loop.**
+    /// `collapse_delta_entries` only resolves a `deleted` + re-add contradiction for
+    /// paths it sees TOGETHER, in the same call. Before this slice, `apply_remote_delta`
+    /// called `apply_delta_entries` once PER PAGE, so a `deleted` entry on page N and
+    /// its re-add on page N+1 were never in the same call and the collapse never saw
+    /// them together — exactly the shape that cost 456 MB for a share conversion big
+    /// enough to paginate.
+    ///
+    /// This also proves the cursor persist contract in the same test: the ONE persist
+    /// at the end lands on page 2's cursor, the LAST page's, never page 1's.
+    ///
+    /// Proof this test can fail: reverting `run_remote_delta` to apply-per-page (call
+    /// `apply_delta_entries` once per `DeltaFetchOutcome::Page`, inside the loop,
+    /// instead of accumulating into `all_entries` and applying once after the loop)
+    /// turns this back into the data-loss case — page 1's lone `deleted` entry has no
+    /// sibling to contradict it and enqueues the delete; page 2's lone re-add cannot
+    /// retract an already-enqueued job. Observed directly while writing this test (see
+    /// this slice's report); restored to the accumulate-then-apply-once form below
+    /// before landing, confirmed byte-identical by hash.
+    #[test]
+    fn run_remote_delta_resolves_a_delete_and_readd_split_across_two_pages() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/paginated.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/paginated.txt", "H", 3, 0)
+            .unwrap();
+
+        // "Page 1": the deleted entry only, has_more=true.
+        let mut deleted = file_entry(Some("/shared/paginated.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_after_page_1".to_string(),
+            has_more: true,
+        };
+        // "Page 2": the re-add, same content hash, has_more=false.
+        let readded = file_entry(Some("/shared/paginated.txt"), Some("H"), Some("rev2"), None);
+        let page_two = DropboxListFolderResponse {
+            entries: vec![readded],
+            cursor: "cursor_after_page_2".to_string(),
+            has_more: false,
+        };
+
+        let outcome = run_remote_delta(
+            &state,
+            "starting_cursor",
+            scripted_page_source(vec![
+                Ok(DeltaFetchOutcome::Page(page_one)),
+                Ok(DeltaFetchOutcome::Page(page_two)),
+            ]),
+        )
+        .expect("run_remote_delta must not error on an ordinary two-page fetch");
+
+        match outcome {
+            DeltaRunOutcome::Applied { enqueued } => assert_eq!(
+                enqueued, 0,
+                "accumulated across both pages, the collapse resolves deleted+file to \
+                 the file entry before either reconciler runs"
+            ),
+            DeltaRunOutcome::Reset { .. } => panic!("expected Applied, got Reset"),
+        }
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "a page-split deleted+re-add must never produce a local_delete once both \
+             pages are accumulated into the same collapse-and-apply call"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("shared/paginated.txt")
+                .unwrap()
+                .expect("the index row must survive a share conversion that paginates")
+                .rev,
+            "rev2",
+            "the row must advance to the re-add's rev, not merely still exist"
+        );
+        assert_eq!(
+            state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY).unwrap(),
+            Some("cursor_after_page_2".to_string()),
+            "the cursor must be persisted exactly once, to the LAST page's cursor"
+        );
+    }
+
+    /// DBSYNC-102 #1 review finding: a page-fetch error on a LATER page must discard
+    /// everything accumulated so far and leave the previously-persisted cursor
+    /// untouched — the next invocation re-fetches from where it was, not from
+    /// mid-batch. Page 1's genuine delete must never reach `sync_jobs` just because a
+    /// later page in the SAME invocation failed to fetch.
+    #[test]
+    fn run_remote_delta_page_fetch_error_on_a_later_page_discards_everything_and_leaves_the_cursor_untouched(
+    ) {
+        let state = build_state();
+        state
+            .db
+            .set_app_config(REMOTE_DELTA_CURSOR_KEY, "old_cursor")
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("gone.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state.db.upsert_local_file("gone.txt", "H", 3, 0).unwrap();
+
+        let mut deleted = file_entry(Some("/gone.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_after_page_1".to_string(),
+            has_more: true,
+        };
+
+        let result = run_remote_delta(
+            &state,
+            "old_cursor",
+            scripted_page_source(vec![
+                Ok(DeltaFetchOutcome::Page(page_one)),
+                Err(AppError::Network("simulated page 2 failure".to_string())),
+            ]),
+        );
+
+        assert!(
+            result.is_err(),
+            "a page-fetch error must propagate, not be swallowed"
+        );
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "page 1's delete must never be applied when a later page in the same \
+             invocation fails to fetch"
+        );
+        assert_eq!(
+            state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY).unwrap(),
+            Some("old_cursor".to_string()),
+            "the cursor must stay exactly where it was before this invocation — never \
+             advanced to page 1's cursor, which this invocation never got to persist"
+        );
+    }
+
+    /// DBSYNC-102 #1 review finding: a reset on a LATER page must discard every
+    /// earlier page's entries (nothing from page 1 is applied) and report the reset to
+    /// the caller, rather than seeding a fresh snapshot itself — seeding is network
+    /// I/O and belongs only in `apply_remote_delta`'s shell. This function's own
+    /// contract on a reset is simply: apply nothing, persist nothing, say how much was
+    /// thrown away.
+    #[test]
+    fn run_remote_delta_reset_on_a_later_page_discards_earlier_pages_and_reports_reset() {
+        let state = build_state();
+        state
+            .db
+            .set_app_config(REMOTE_DELTA_CURSOR_KEY, "old_cursor")
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("shared/resetting.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/resetting.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/shared/resetting.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_after_page_1".to_string(),
+            has_more: true,
+        };
+
+        let outcome = run_remote_delta(
+            &state,
+            "old_cursor",
+            scripted_page_source(vec![
+                Ok(DeltaFetchOutcome::Page(page_one)),
+                Ok(DeltaFetchOutcome::Reset),
+            ]),
+        )
+        .expect("a Reset outcome is Ok, not Err — it is a distinct, expected outcome");
+
+        match outcome {
+            DeltaRunOutcome::Reset {
+                pages_fetched,
+                entries_discarded,
+            } => {
+                assert_eq!(
+                    pages_fetched, 1,
+                    "exactly the one page fetched before reset"
+                );
+                assert_eq!(
+                    entries_discarded, 1,
+                    "page 1's single deleted entry, discarded"
+                );
+            }
+            DeltaRunOutcome::Applied { .. } => panic!("expected Reset, got Applied"),
+        }
+        assert!(
+            job_targets(&state, "local_delete").is_empty(),
+            "page 1's delete must never be applied when the invocation resets before \
+             completing"
+        );
+        assert_eq!(
+            state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY).unwrap(),
+            Some("old_cursor".to_string()),
+            "run_remote_delta never advances or clears the cursor itself on a reset — \
+             it only reports the reset upward. Clearing it to \"\" and reseeding is \
+             apply_remote_delta's job (network code a test cannot drive directly); this \
+             layer's contract is only that nothing it accumulated gets persisted"
+        );
+    }
+
+    /// DBSYNC-102 #1 review finding: the diagnostic warning must be fed the REAL
+    /// `Db::active_jobs_with_type` result, not a placeholder — a test that fails if
+    /// `run_remote_delta` were ever changed to pass `&[]` through instead of actually
+    /// querying. Seeds a genuine pending `local_delete` for the exact path a re-add
+    /// arrives for, so the DBSYNC-109 warning can only fire if the real query ran and
+    /// its result reached `apply_delta_entries` unmodified.
+    #[test]
+    fn run_remote_delta_feeds_the_real_active_jobs_with_type_into_the_stale_delete_warning() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/stale.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/stale.txt", "H", 3, 0)
+            .unwrap();
+        state
+            .db
+            .enqueue_job(
+                "local_delete",
+                Some("shared/stale.txt"),
+                Some("shared/stale.txt"),
+            )
+            .unwrap();
+
+        let readded = file_entry(Some("/shared/stale.txt"), Some("H2"), Some("rev2"), None);
+        let page = DropboxListFolderResponse {
+            entries: vec![readded],
+            cursor: "cursor_after_page_1".to_string(),
+            has_more: false,
+        };
+
+        let log = captured_tracing_output(|| {
+            let outcome = run_remote_delta(
+                &state,
+                "starting_cursor",
+                scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page))]),
+            )
+            .expect("run_remote_delta must not error");
+            match outcome {
+                DeltaRunOutcome::Applied { enqueued } => assert_eq!(
+                    enqueued, 0,
+                    "covered_by_active_job still drops the upsert, unchanged"
+                ),
+                DeltaRunOutcome::Reset { .. } => panic!("expected Applied, got Reset"),
+            }
+        });
+
+        assert!(
+            log.contains("WARN") && log.contains("discarded"),
+            "the DBSYNC-109 warning can only fire if run_remote_delta actually read \
+             Db::active_jobs_with_type and passed the REAL result through to \
+             apply_delta_entries rather than an empty placeholder; got: {log}"
+        );
+        assert!(
+            log.contains("shared/stale.txt"),
+            "the warning must name the dropped path; got: {log}"
+        );
+    }
+
+    /// **DBSYNC-102 #174, idempotent replay.** Justifies moving the cursor persist
+    /// from per-page to once-at-the-end: if the app crashes after fetching pages but
+    /// before this invocation returns, the cursor is still the PREVIOUS one, so the
+    /// next invocation re-fetches and re-applies the very same accumulated batch.
+    /// This drives `apply_delta_entries` — and through it, `Db::enqueue_job` and
+    /// `Db::upsert_remote_file` for REAL, against a real on-disk `Db`, never a mock of
+    /// either — twice with the identical batch and asserts no duplicate jobs and no
+    /// duplicate/divergent index state, which is the actual claim being relied on,
+    /// not merely that the second call does not error.
+    ///
+    /// The batch mixes a genuine delete (no re-add: `gone.txt`) with a genuine content
+    /// change (`edited.txt`, hash "H" -> "H2") so the test exercises both of
+    /// `apply_delta_entries`'s arms, not just one.
+    #[test]
+    fn apply_delta_entries_replaying_the_same_batch_is_idempotent() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("gone.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state.db.upsert_local_file("gone.txt", "H", 3, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("edited.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state.db.upsert_local_file("edited.txt", "H", 3, 0).unwrap();
+
+        let mut deleted = file_entry(Some("/gone.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let edited = file_entry(Some("/edited.txt"), Some("H2"), Some("rev2"), None);
+        let entries = vec![deleted, edited];
+
+        let first = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("first apply must not touch the network");
+        assert_eq!(
+            first, 2,
+            "first application: one local_delete for gone.txt, one download for \
+             edited.txt's genuine content change"
+        );
+        assert_eq!(
+            job_targets(&state, "local_delete"),
+            vec!["gone.txt".to_string()]
+        );
+        assert_eq!(
+            job_targets(&state, "download"),
+            vec!["edited.txt".to_string()]
+        );
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("edited.txt")
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "H2"
+        );
+
+        // Simulate a crash before the cursor was persisted: the SAME accumulated
+        // batch is replayed from scratch, exactly as `apply_remote_delta` would redo
+        // it on the next invocation since the cursor still points before this batch.
+        let second = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("replay must not touch the network");
+
+        // `Db::enqueue_job`'s partial-unique-index `ON CONFLICT(job_type, target_path)
+        // WHERE status IN ('queued','retry_wait','running')` means re-enqueuing
+        // local_delete for gone.txt collapses into an UPDATE of the existing row, not
+        // a second one (the ACTIVE case this test exercises — see `apply_remote_delta`'s
+        // doc for the `failed`-status residual this guard does NOT cover) — so even
+        // though `reconcile_remote_absent` unconditionally
+        // reports `Ok(1)` on this arm every time it is taken, no second row exists.
+        // `edited.txt`'s download does not even re-fire: `upsert_remote_file` already
+        // advanced the remote row to "H2" on the first pass, so the replay's
+        // `should_download` check (`prev.content_hash != remote_meta.content_hash`)
+        // is now false — the upsert itself is idempotent before enqueue is reached.
+        assert_eq!(
+            second, 1,
+            "replay re-takes the local_delete arm (enqueue_job's own idempotence is \
+             what prevents a duplicate row, not a short-circuit here), but the \
+             download arm is now a no-op because the remote row already reflects H2"
+        );
+
+        let local_deletes = job_targets(&state, "local_delete");
+        assert_eq!(
+            local_deletes,
+            vec!["gone.txt".to_string()],
+            "exactly one local_delete row for gone.txt after replay, not two — proves \
+             enqueue_job's ON CONFLICT collapse, not merely that replay did not error"
+        );
+        let downloads = job_targets(&state, "download");
+        assert_eq!(
+            downloads,
+            vec!["edited.txt".to_string()],
+            "exactly one download row for edited.txt, not two"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("edited.txt")
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "H2",
+            "replay converges to the same final index state, not a diverged one"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DBSYNC-102 #175 — the stale-delete-filter diagnostic, wired at the real site
+    // inside `apply_delta_entries`. `pending_delete_covering_*` in `sync_pipeline.rs`
+    // already proves the pure predicate's four cases in isolation; the tests below
+    // additionally prove the WIRING — that `apply_delta_entries` actually calls it at
+    // the right moment and actually emits the warning with the right fields — by
+    // capturing `tracing`'s real formatted output, not by inspecting internal state.
+    // ---------------------------------------------------------------------------
+
+    /// A `Write` implementation over a shared, clonable buffer, so a `tracing`
+    /// subscriber installed for the duration of one test's closure can be read back
+    /// afterwards. `tracing_subscriber::fmt`'s blanket `MakeWriter` impl for
+    /// `Fn() -> W where W: Write` means a closure cloning this struct is enough; no
+    /// new dependency, `tracing-subscriber` is already in `[dependencies]`.
+    #[derive(Clone)]
+    struct SharedBufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` with a `tracing` subscriber installed for the CURRENT THREAD only
+    /// (`tracing::subscriber::with_default` is thread-local, so this is safe under
+    /// the test runner's default parallelism) and returns everything it formatted,
+    /// as plain text.
+    fn captured_tracing_output(f: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let buf_for_writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBufWriter(buf_for_writer.clone()))
+            .with_ansi(false)
+            .without_time()
+            // DBSYNC-102 review finding #3's test needs `debug!` captured too, not
+            // only `warn!`/`info!`. The `fmt()` builder's maximum level defaults to
+            // INFO, so without this a `debug!` event is filtered out — verified by
+            // running that test alone with `--test-threads=1`, where it still fails.
+            // `with_default` below scopes the subscriber to this thread, so raising
+            // the level here does not leak into tests running in parallel.
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("tracing output must be valid utf-8")
+    }
+
+    /// The defect this slice detects, driven end to end: an upsert for
+    /// `shared/stale.txt` arrives while a `local_delete` for that exact path is
+    /// still pending (left over, in the real residual, from an EARLIER
+    /// `apply_remote_delta` invocation). `covered_by_active_job` drops it — same as
+    /// it always has, proven by the zero-enqueued/no-op assertions below — and this
+    /// slice's only addition is that the drop now says so.
+    #[test]
+    fn apply_delta_entries_warns_when_an_upsert_is_dropped_by_a_pending_local_delete() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/stale.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/stale.txt", "H", 3, 0)
+            .unwrap();
+
+        let readded = file_entry(Some("/shared/stale.txt"), Some("H2"), Some("rev2"), None);
+
+        let mut pending_targets = HashSet::new();
+        pending_targets.insert("shared/stale.txt".to_string());
+        let pending_job_types = vec![("shared/stale.txt".to_string(), "local_delete".to_string())];
+
+        let log = captured_tracing_output(|| {
+            let enqueued =
+                apply_delta_entries(&state, &[readded], &pending_targets, &pending_job_types)
+                    .expect("apply_delta_entries must not touch the network");
+            assert_eq!(
+                enqueued, 0,
+                "zero behaviour change: covered_by_active_job still drops the upsert, \
+                 exactly as it did before this slice"
+            );
+        });
+
+        assert!(
+            job_targets(&state, "download").is_empty(),
+            "no behaviour change: nothing is enqueued for the dropped path"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("shared/stale.txt")
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            "H",
+            "no behaviour change: the remote row is not advanced by a dropped upsert"
+        );
+        assert!(
+            log.contains("WARN"),
+            "the drop must be logged at warning level; got: {log}"
+        );
+        assert!(
+            log.contains("shared/stale.txt"),
+            "the warning must name the dropped path; got: {log}"
+        );
+        assert!(
+            log.contains("local_delete"),
+            "the warning must name the covering job's type; got: {log}"
+        );
+        assert!(
+            log.contains("discarded"),
+            "the warning must say plainly that new remote truth was discarded; got: {log}"
+        );
+    }
+
+    /// The flip side, and the acceptance criterion that there is "no new noise on the
+    /// normal double-enqueue path": the exact same drop, but the covering job is a
+    /// `download` instead of a `local_delete`. `covered_by_active_job` drops the
+    /// upsert exactly the same way — this is simply two jobs racing to reconcile the
+    /// same path — and that is NOT the DBSYNC-102/109 residual, so no warning is owed.
+    #[test]
+    fn apply_delta_entries_does_not_warn_when_the_covering_job_is_a_download() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/busy.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/busy.txt", "H", 3, 0)
+            .unwrap();
+
+        let readded = file_entry(Some("/shared/busy.txt"), Some("H2"), Some("rev2"), None);
+
+        let mut pending_targets = HashSet::new();
+        pending_targets.insert("shared/busy.txt".to_string());
+        let pending_job_types = vec![("shared/busy.txt".to_string(), "download".to_string())];
+
+        let log = captured_tracing_output(|| {
+            let enqueued =
+                apply_delta_entries(&state, &[readded], &pending_targets, &pending_job_types)
+                    .expect("apply_delta_entries must not touch the network");
+            assert_eq!(
+                enqueued, 0,
+                "the drop itself is identical regardless of the covering job's type"
+            );
+        });
+
+        assert!(
+            !log.contains("WARN"),
+            "a covering download must never produce this warning — no new noise on \
+             the ordinary double-enqueue path; got: {log}"
+        );
+    }
+
+    /// Prefix-shaped cover, proven at the wiring level (the pure version lives in
+    /// `sync_pipeline::tests::pending_delete_covering_warns_when_the_cover_is_an_ancestor_folder_delete`):
+    /// the pending `local_delete` names the PARENT FOLDER, not the dropped file's own
+    /// path — exactly the shape `covered_by_active_job` itself is prefix-shaped for
+    /// (DBSYNC-99 round 5). The warning must still fire and must name the folder as
+    /// the covering target, not the dropped file's own path.
+    #[test]
+    fn apply_delta_entries_warns_when_the_cover_is_an_ancestor_folder_local_delete() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/folder/child.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/folder/child.txt", "H", 3, 0)
+            .unwrap();
+
+        let readded = file_entry(
+            Some("/shared/folder/child.txt"),
+            Some("H2"),
+            Some("rev2"),
+            None,
+        );
+
+        // The active job names the FOLDER, not the child file directly.
+        let mut pending_targets = HashSet::new();
+        pending_targets.insert("shared/folder".to_string());
+        let pending_job_types = vec![("shared/folder".to_string(), "local_delete".to_string())];
+
+        let log = captured_tracing_output(|| {
+            let enqueued =
+                apply_delta_entries(&state, &[readded], &pending_targets, &pending_job_types)
+                    .expect("apply_delta_entries must not touch the network");
+            assert_eq!(
+                enqueued, 0,
+                "the descendant upsert is still dropped, unchanged"
+            );
+        });
+
+        assert!(
+            log.contains("WARN") && log.contains("discarded"),
+            "an ancestor folder's pending local_delete must still trigger the warning; \
+             got: {log}"
+        );
+        assert!(
+            log.contains("shared/folder/child.txt"),
+            "the warning must name the dropped descendant path; got: {log}"
+        );
+        assert!(
+            log.contains("covering_target=shared/folder ")
+                || log.contains("covering_target=shared/folder\n"),
+            "the warning must name the covering job's target as the FOLDER, not the \
+             descendant file's own path; got: {log}"
+        );
+    }
+
     #[test]
     fn is_reset_error_detects_reset_only() {
         assert!(is_reset_error(
@@ -1939,6 +3670,69 @@ mod tests {
             "neither absent file matches the diverged/never-indexed exclusion rules"
         );
         assert!(!is_mass_deletion(delete_candidates, local_files.len()));
+    }
+
+    /// DBSYNC-102 #176 — pins the documented contract at this module's doc on
+    /// `reconcile_remote_snapshot_with_breaker` (the delta path is "always
+    /// authoritative and never gated"): the DBSYNC-64 mass-delete breaker
+    /// (`is_mass_deletion`/`block_mass_deletion`) is invoked ONLY from that
+    /// snapshot-path function, never from `apply_delta_entries`/`apply_remote_delta`.
+    /// A delta batch of plain removals large enough to trip the breaker on the
+    /// snapshot path (`MASS_DELETE_ABSOLUTE == 200`, see `sync_pipeline.rs`) must
+    /// still apply every one of them, ungated, on the delta path.
+    ///
+    /// Proof this test can fail: temporarily gating the delta path's `Remove` arm
+    /// behind `is_mass_deletion`/`block_mass_deletion` the way the snapshot path is
+    /// gated turns `enqueued` into `0` and leaves all 200 `local_delete` jobs
+    /// missing — observed directly while writing this test, then reverted; the
+    /// delta path's ungated status is a deliberate contract (DBSYNC-64 scope
+    /// decision), not an oversight this test should "fix".
+    #[test]
+    fn apply_delta_entries_large_delta_batch_of_removals_is_ungated_by_the_mass_delete_breaker() {
+        let state = build_state();
+        const BATCH: usize = 200; // == MASS_DELETE_ABSOLUTE; blocked outright on the snapshot path.
+
+        let mut entries = Vec::with_capacity(BATCH);
+        for i in 0..BATCH {
+            let rel = format!("shared/{i}.txt");
+            state
+                .db
+                .upsert_remote_file(&rel, "H", "rev", 0, None)
+                .unwrap();
+            state.db.upsert_local_file(&rel, "H", 3, 0).unwrap();
+
+            let mut deleted = file_entry(Some(&format!("/{rel}")), None, None, None);
+            deleted.tag = "deleted".to_string();
+            entries.push(deleted);
+        }
+
+        let enqueued = apply_delta_entries(&state, &entries, &HashSet::new(), &[])
+            .expect("apply_delta_entries must not touch the network");
+
+        assert_eq!(
+            enqueued, BATCH,
+            "a delta batch this large must still apply every removal — the delta \
+             path has no breaker call to block it"
+        );
+        assert_eq!(job_targets(&state, "local_delete").len(), BATCH);
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_remote")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "the delta path must never set the remote-sweep breaker's pause flag"
+        );
+        assert!(
+            state
+                .db
+                .get_app_config("mass_delete_blocked_scan")
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty(),
+            "the delta path must never set the local-scan breaker's pause flag either"
+        );
     }
 
     #[test]

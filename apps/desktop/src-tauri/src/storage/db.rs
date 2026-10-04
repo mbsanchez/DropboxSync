@@ -1465,6 +1465,44 @@ impl Db {
         Ok(out)
     }
 
+    /// Every ACTIVE job's covering path (`target_path` or `source_path`, same union
+    /// and the same `('queued','retry_wait','running')` filter as `active_job_paths`
+    /// above) paired with its `job_type`. DBSYNC-102 #175: this exists ONLY for the
+    /// diagnostic that explains why `covered_by_active_job` dropped a delta upsert —
+    /// that filter itself keeps consuming `active_job_paths`'s plain
+    /// `HashSet<String>`, completely unchanged, because a path-only set cannot say
+    /// which of a `local_delete`, a `download` or an `upload` is covering a path, and
+    /// the diagnostic needs to tell those apart. Not a replacement for
+    /// `active_job_paths`; a sibling read, used nowhere near the production decision.
+    ///
+    /// A `Vec`, not a map: the same path can legitimately appear twice (once as a
+    /// `target_path` row, once as a different job's `source_path` row), and collapsing
+    /// those into a map keyed by path would silently pick one job's type over the
+    /// other's for a path that currently has two active jobs naming it.
+    pub fn active_jobs_with_type(&self) -> AppResult<Vec<(String, String)>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT target_path, job_type FROM sync_jobs
+              WHERE status IN ('queued','retry_wait','running') AND target_path IS NOT NULL AND target_path <> ''
+            UNION
+            SELECT source_path, job_type FROM sync_jobs
+              WHERE status IN ('queued','retry_wait','running') AND source_path IS NOT NULL AND source_path <> ''
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn list_recent_jobs(&self, limit: i64) -> AppResult<Vec<SyncJobRow>> {
         let conn = self
             .read
@@ -2695,6 +2733,51 @@ mod tests {
             uploads, 2,
             "a new active upload coexists with the completed one"
         );
+    }
+
+    /// DBSYNC-102 review finding #9: `active_jobs_with_type` has no test of its own —
+    /// selecting the wrong column, or returning nothing, would silently disable the
+    /// DBSYNC-109 diagnostic it exists for, with nothing to notice. Asserts its path
+    /// set is exactly `active_job_paths`'s for the same jobs (same union, same status
+    /// filter, so the two must never disagree), and that the type column really is
+    /// `job_type` — not e.g. `status`, which a copy-paste of the SQL above could
+    /// easily have selected instead and still returned a `String` per row.
+    ///
+    /// Uses a `move` job (`source_path` != `target_path`) specifically so the two
+    /// paths it contributes are independently checkable against their own, correct
+    /// `job_type` — a bug that transposed the two columns, or that always reported
+    /// the first job's type for every row, would still pass a same-path, same-type
+    /// fixture but fails this one.
+    #[test]
+    fn active_jobs_with_type_matches_active_job_paths_and_reports_the_real_job_type() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        db.enqueue_job("move", Some("old/dir"), Some("new/dir"))
+            .expect("enqueue move");
+        db.enqueue_job("download", Some("solo.txt"), Some("solo.txt"))
+            .expect("enqueue download");
+
+        let paths = db.active_job_paths().expect("active_job_paths");
+        let with_type = db.active_jobs_with_type().expect("active_jobs_with_type");
+
+        let typed_paths: std::collections::HashSet<String> =
+            with_type.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(
+            typed_paths, paths,
+            "active_jobs_with_type's path set must exactly match active_job_paths's \
+             for the same active jobs"
+        );
+
+        let type_of = |target: &str| -> &str {
+            with_type
+                .iter()
+                .find(|(p, _)| p == target)
+                .map(|(_, t)| t.as_str())
+                .unwrap_or_else(|| panic!("{target} missing from active_jobs_with_type"))
+        };
+        assert_eq!(type_of("old/dir"), "move");
+        assert_eq!(type_of("new/dir"), "move");
+        assert_eq!(type_of("solo.txt"), "download");
     }
 
     /// DBSYNC-99. `peek_deferred_source_delete` restricts itself to `upload` rows, and that

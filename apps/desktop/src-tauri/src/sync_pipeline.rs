@@ -158,6 +158,23 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
     placeholder_exists(root, rel) || crate::path_util::is_dehydrated_placeholder(&root.join(rel))
 }
 
+/// True when `path` is exactly `prefix`, or is a descendant of it (i.e. `prefix`
+/// followed by a `/` is a literal prefix of `path`). Compares the separator byte
+/// rather than building `format!("{prefix}/")`, because this runs once per
+/// candidate per active job on every scan of a large index.
+///
+/// The arithmetic alone — no decision about what "covered" MEANS for a caller.
+/// `covered_by_active_job` and `pending_delete_covering` each reimplemented this
+/// exact-or-separator-prefix check independently; this is the one shared helper
+/// both now call, so a future change to the boundary rule cannot drift between
+/// them by editing one copy and forgetting the other.
+fn path_covered_by(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.as_bytes()[prefix.len()] == b'/'
+            && path.starts_with(prefix))
+}
+
 /// Is `path` at, or underneath, any path an active job names?
 ///
 /// **The hazard this answers is prefix-shaped, and for four review rounds the guards were
@@ -170,16 +187,78 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
 ///
 /// One predicate, every call site. Anything that asks "is this path busy?" asks it here.
 ///
-/// Compares the separator byte rather than building `format!("{p}/")`, because this runs
-/// once per candidate per active job on every scan of a large index.
+/// The exact-or-separator-prefix arithmetic itself lives in `path_covered_by`, shared with
+/// `pending_delete_covering`; this function keeps its own decision — "any active job at all
+/// covers this path" — around that shared check.
 pub(crate) fn covered_by_active_job(path: &str, active: &HashSet<String>) -> bool {
-    if active.contains(path) {
-        return true;
-    }
-    active.iter().any(|prefix| {
-        path.len() > prefix.len()
-            && path.as_bytes()[prefix.len()] == b'/'
-            && path.starts_with(prefix.as_str())
+    active.iter().any(|prefix| path_covered_by(path, prefix))
+}
+
+/// **DBSYNC-102 #175 — diagnostic only, not a fix.** `covered_by_active_job` above
+/// answers one question — "does an active job already own this path, so don't
+/// double-enqueue" — but on the delta's UPSERT arm (`remote_index.rs`'s
+/// `apply_delta_entries`) that same answer is unintentionally also read as "ignore
+/// new remote truth about this path". Usually harmless: the covering job is a
+/// `download` or an `upload` that will itself reconcile the path shortly.
+///
+/// **What this predicate actually catches is narrower than "a re-add dropped
+/// because the earlier `local_delete` is still pending" might suggest.** In the
+/// normal case, `remote_longpoll.rs`'s `apply_and_drain` calls
+/// `sync_pipeline::drain_sync_queue` right after `apply_remote_delta` returns,
+/// inside the SAME `sync_running` gate — so the `local_delete` this invocation just
+/// enqueued for a deleted-and-not-re-added path has usually already RUN by the time
+/// the next `apply_remote_delta` invocation starts. A re-add arriving in that next
+/// invocation then takes the UNCOVERED path: `covered_by_active_job` sees nothing
+/// (the job is done, the row is gone), `reconcile_remote_present` finds no previous
+/// remote row to compare against, and the re-add is recorded with no download
+/// enqueued at all — the local copy stays gone, and this predicate never fires,
+/// because the drop it detects never happened.
+///
+/// This predicate only fires in the LEFTOVER cases, where the `local_delete` is
+/// still active when the re-add's invocation reads `pending_targets`: the delete
+/// backed off into `retry_wait`, the drain stopped after draining only its
+/// `SYNC_BATCH_CAP` jobs this tick and the delete was not among them, a drain call
+/// errored before reaching it, or a previously `failed` delete job was revived.
+/// DBSYNC-102's batch collapse (`collapse_delta_entries`) cannot reach any of these
+/// — it only resolves a delete/re-add contradiction within ONE invocation's batch,
+/// and every case above is split across two.
+///
+/// This predicate is PURE and answers only: given a path `covered_by_active_job`
+/// already dropped, is the covering job a pending `local_delete`? It does not call
+/// `covered_by_active_job`, does not run before it, and does not change what it
+/// decides — the drop has already happened by the time this is consulted. It exists
+/// purely so the caller can log the one case that is this residual and stay silent
+/// for the ordinary double-enqueue guard (a covering `download` or `upload`).
+///
+/// `pending` pairs each active job's covering path with its `job_type` —
+/// `covered_by_active_job`'s own `HashSet<String>` carries no type, so this is the
+/// smallest additional shape the diagnostic needs; see `Db::active_jobs_with_type`'s
+/// doc for why it is a sibling read, not a change to the set that filter consults.
+///
+/// Prefix semantics are intentionally identical to `covered_by_active_job`'s (both
+/// now share `path_covered_by`): a `local_delete` queued for a FOLDER still counts
+/// as covering a descendant file's path, for the same reason a pending folder move
+/// does there (DBSYNC-99 round 5).
+///
+/// The fix for the conflation itself — tracked as **DBSYNC-109** — is deliberately
+/// not here: that same filter also protects a descendant of a pending folder move, so
+/// changing its meaning on the upsert arm carries its own blast radius and belongs in
+/// its own ticket, and DBSYNC-109 also owns fixing the wider no-warning case described
+/// above, which this predicate structurally cannot detect. This predicate is one
+/// detector for one slice of the problem, not the fix.
+///
+/// Returns the covering `local_delete` job's target path when a warning is owed,
+/// `None` when the path is not covered by one at all (including: not covered by any
+/// pending job, or covered only by a `download`/`upload`).
+pub(crate) fn pending_delete_covering<'a>(
+    dropped_path: &str,
+    pending: &'a [(String, String)],
+) -> Option<&'a str> {
+    pending.iter().find_map(|(target, job_type)| {
+        if job_type != "local_delete" {
+            return None;
+        }
+        path_covered_by(dropped_path, target).then_some(target.as_str())
     })
 }
 
@@ -2058,6 +2137,7 @@ pub(crate) fn full_sync_cycle(state: &AppState) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
@@ -2066,9 +2146,9 @@ mod tests {
 
     use super::{
         block_mass_deletion, cleanup_stale_upload_state, clear_mass_delete_blocked,
-        is_mass_deletion, mass_delete_pause_active, process_changed_paths,
-        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_only, ConflictAction,
-        MassDeleteSource, SYNC_BATCH_CAP,
+        covered_by_active_job, is_mass_deletion, mass_delete_pause_active, pending_delete_covering,
+        process_changed_paths, resolve_conflict_internal, run_sync_tick_internal,
+        scan_local_changes_only, ConflictAction, MassDeleteSource, SYNC_BATCH_CAP,
     };
     use crate::state::AppState;
     use crate::storage::db::Db;
@@ -2103,6 +2183,142 @@ mod tests {
             sync_running: Arc::new(AtomicBool::new(false)),
             token_refresh_lock: Arc::new(Mutex::new(())),
             http_client: crate::state::build_http_client(),
+        }
+    }
+
+    // -------------------------------------------------------------------------------
+    // `pending_delete_covering` (DBSYNC-102 #175): pure predicate, no `AppState`, no
+    // database, no `AppState`-backed job at all. Exercises the four cases named in
+    // #175's acceptance criteria directly.
+    // -------------------------------------------------------------------------------
+
+    /// Covering job is exactly `local_delete` on the dropped path itself → warn, and
+    /// the returned covering target is that same path.
+    #[test]
+    fn pending_delete_covering_warns_when_the_covering_job_is_a_local_delete() {
+        let pending = vec![("shared/stale.txt".to_string(), "local_delete".to_string())];
+
+        assert_eq!(
+            pending_delete_covering("shared/stale.txt", &pending),
+            Some("shared/stale.txt"),
+            "a pending local_delete covering the exact dropped path must be reported"
+        );
+    }
+
+    /// Covering job is a `download` or an `upload` on the exact same path → no warn.
+    /// This is the ordinary double-enqueue guard `covered_by_active_job` exists for,
+    /// and it must stay silent — the whole point of this predicate is to NOT add noise
+    /// to that normal path.
+    #[test]
+    fn pending_delete_covering_does_not_warn_for_a_download_or_an_upload() {
+        let downloading = vec![("shared/busy.txt".to_string(), "download".to_string())];
+        assert_eq!(
+            pending_delete_covering("shared/busy.txt", &downloading),
+            None,
+            "a covering download must never be reported as this residual"
+        );
+
+        let uploading = vec![("shared/busy.txt".to_string(), "upload".to_string())];
+        assert_eq!(
+            pending_delete_covering("shared/busy.txt", &uploading),
+            None,
+            "a covering upload must never be reported as this residual"
+        );
+    }
+
+    /// The cover is prefix-shaped: the pending `local_delete` names an ANCESTOR
+    /// folder, not the dropped file's exact path — mirroring
+    /// `covered_by_active_job`'s own prefix semantics (DBSYNC-99 round 5) so a
+    /// `local_delete` queued for a folder still counts as covering a descendant.
+    #[test]
+    fn pending_delete_covering_warns_when_the_cover_is_an_ancestor_folder_delete() {
+        let pending = vec![("shared/folder".to_string(), "local_delete".to_string())];
+
+        assert_eq!(
+            pending_delete_covering("shared/folder/child.txt", &pending),
+            Some("shared/folder"),
+            "a local_delete queued for an ancestor folder must cover a descendant file, \
+             exactly like covered_by_active_job's own prefix rule"
+        );
+    }
+
+    /// Not covered by anything at all → no warn. Also guards the prefix test against
+    /// a false positive on a mere string-prefix (not a true path-separator boundary):
+    /// `shared/folder2.txt` shares the literal prefix `shared/folder` with the pending
+    /// delete's target but is NOT a descendant of it (no `/` at the boundary), so it
+    /// must not be reported.
+    #[test]
+    fn pending_delete_covering_does_not_warn_when_not_covered_at_all() {
+        let pending = vec![("shared/folder".to_string(), "local_delete".to_string())];
+
+        assert_eq!(
+            pending_delete_covering("unrelated/path.txt", &pending),
+            None,
+            "a path with no covering pending job at all must not be reported"
+        );
+        assert_eq!(
+            pending_delete_covering("shared/folder2.txt", &pending),
+            None,
+            "a literal string-prefix match that is not a true path-separator boundary \
+             must not be mistaken for a descendant"
+        );
+        assert_eq!(
+            pending_delete_covering("shared/anything.txt", &[]),
+            None,
+            "an empty pending list covers nothing"
+        );
+    }
+
+    /// DBSYNC-102 — `covered_by_active_job` and `pending_delete_covering` both answer
+    /// "is this path the prefix itself, or a path-separated descendant of it?". They
+    /// once carried two independent copies of that arithmetic, which could silently
+    /// disagree; both now call `path_covered_by`, so the boundary rule lives in one
+    /// place.
+    ///
+    /// What this test still pins is the rule itself, through both callers: every row
+    /// of the shared table is checked against a fixed `expected` value on each side.
+    /// Because the two sides now share the helper, an edit to `path_covered_by` moves
+    /// them together, so it is the per-row `expected` assertions that fire, not the
+    /// "they agree" one. That one would only fire if a caller stopped delegating to
+    /// the helper and grew its own rule again.
+    ///
+    /// Proof this test can fail: dropping the separator check in `path_covered_by`
+    /// (treating ANY shared string prefix as coverage) fails the
+    /// `"shared/folder2.txt"` vs `"shared/folder"` row on both sides.
+    #[test]
+    fn covered_by_active_job_and_pending_delete_covering_agree_on_the_prefix_rule() {
+        // (path, the single active/pending target, expect both to report "covered")
+        let cases: &[(&str, &str, bool)] = &[
+            ("shared/stale.txt", "shared/stale.txt", true), // exact match
+            ("shared/folder/child.txt", "shared/folder", true), // true descendant
+            ("shared/folder2.txt", "shared/folder", false), // literal prefix, no separator
+            ("unrelated/path.txt", "shared/folder", false), // unrelated entirely
+            ("shared/folder", "shared/folder/deeper", false), // path shorter than the target
+            ("shared", "shared/folder", false),             // ditto, boundary case
+            ("", "a", false),                               // empty path
+        ];
+
+        for (path, target, expected) in cases {
+            let mut active = HashSet::new();
+            active.insert(target.to_string());
+            let active_says = covered_by_active_job(path, &active);
+
+            let pending = vec![(target.to_string(), "local_delete".to_string())];
+            let pending_says = pending_delete_covering(path, &pending).is_some();
+
+            assert_eq!(
+                active_says, *expected,
+                "covered_by_active_job({path:?}, {{{target:?}}}) expected {expected}"
+            );
+            assert_eq!(
+                pending_says, *expected,
+                "pending_delete_covering({path:?}, [({target:?}, local_delete)]) expected {expected}"
+            );
+            assert_eq!(
+                active_says, pending_says,
+                "covered_by_active_job and pending_delete_covering disagree for \
+                 path={path:?} target={target:?} — their prefix rules have drifted apart"
+            );
         }
     }
 
