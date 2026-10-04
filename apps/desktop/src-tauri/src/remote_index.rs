@@ -4,8 +4,8 @@
 //!
 //! ## The standing invariant
 //!
-//! Two defects found in this area, eighteen months apart, turned out to be the
-//! same mistake wearing different clothes: trusting one piece of remote evidence
+//! Two defects found in this area turned out to be the same mistake wearing
+//! different clothes: trusting one piece of remote evidence
 //! before checking whether something else in hand contradicts it. Writing the
 //! rule down once, here, is what stops a fix for one from quietly reopening the
 //! other.
@@ -33,9 +33,9 @@
 //! instances of the same rule: look before you destroy.
 //!
 //! DBSYNC-101 is fixed **after** DBSYNC-102, deliberately, not merely later in
-//! the backlog: DBSYNC-102's fix clears index rows that are stale or wrong, and
-//! several of DBSYNC-101's symptoms sit downstream of those rows being missing
-//! or stale in the first place. Fixing 101 first would mean building its
+//! the backlog: the DBSYNC-102 defect cleared index rows that should have
+//! survived, and several of DBSYNC-101's symptoms sit downstream of those rows
+//! being missing in the first place. Fixing 101 first would mean building its
 //! pending-work check on top of index state this ticket is about to change out
 //! from under it. Writing the invariant here, once, in prose, is what keeps
 //! DBSYNC-101's eventual fix from re-deciding the batch-contradiction half of
@@ -228,11 +228,9 @@ pub(crate) fn delta_action_from_entry(entry: &DropboxEntry) -> DeltaAction {
 /// pre-existing limitation of the index being case-sensitive while Dropbox is not,
 /// not something introduced here, and it is out of scope for this ticket.
 ///
-/// **Scope note:** this collapses one PAGE of one `apply_remote_delta` invocation, not
-/// the whole invocation. A `deleted` entry on page N and its re-add on page N+1 are
-/// NOT collapsed together by this function alone — accumulating every page of one
-/// invocation before collapsing is `apply_remote_delta`'s job (see its doc), which calls
-/// this function exactly once per invocation, over every page's accumulated entries.
+/// **Scope note:** this function collapses whatever batch it is given. `run_remote_delta`
+/// passes it every page of one invocation, accumulated, so a `deleted` entry on page N
+/// and its re-add on page N+1 do collapse together.
 ///
 /// ## A genuine delete can be silently suppressed (DBSYNC-102 review finding #3)
 ///

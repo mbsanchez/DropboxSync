@@ -82,13 +82,10 @@ fn longpoll_loop(state: &AppState) {
         // 3. Longpoll (unauthenticated, long-blocking).
         match do_longpoll(state, &cursor) {
             Ok(resp) => {
-                // The longpoll request itself succeeded, but that is not yet a successful
-                // cycle: when it reports changes, the delta still has to apply. Resetting
-                // `err_backoff` here, before `apply_and_drain`, made every `DeltaFailed`
-                // start again from zero, so a persistent delta failure backed off a flat
-                // `next_backoff(0)` forever and never grew towards the cap. Reset only once
-                // the cycle has really succeeded: no changes, or the delta applied. A busy
-                // gate is neither success nor failure, so it leaves the backoff alone.
+                // Reset `err_backoff` only when the cycle succeeds: no changes, or the delta
+                // applied. A busy gate is neither, so it leaves the backoff alone — on
+                // purpose, so a gate taken by another sync between two delta failures
+                // cannot reset the growth.
                 if resp.changes {
                     match apply_and_drain(state) {
                         DrainOutcome::GateBusy => {
@@ -106,9 +103,7 @@ fn longpoll_loop(state: &AppState) {
                             // `sync_running` with no backoff, which can also starve the
                             // 300s `full_sync_cycle` sweep. Reuse the SAME backoff this
                             // loop already uses for a failed longpoll request, rather
-                            // than inventing a second mechanism. It grows across
-                            // consecutive failures because `err_backoff` is only reset
-                            // once a cycle actually succeeds (see above).
+                            // than inventing a second mechanism.
                             err_backoff = next_backoff(err_backoff);
                             std::thread::sleep(Duration::from_secs(err_backoff));
                         }
