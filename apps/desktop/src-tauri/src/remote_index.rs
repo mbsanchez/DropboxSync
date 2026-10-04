@@ -1123,11 +1123,23 @@ pub(crate) enum DeltaRunOutcome {
 /// (no `failed` job, no crash between that write and that enqueue) by
 /// `apply_delta_entries_replaying_the_same_batch_is_idempotent` below, which drives
 /// `Db::enqueue_job` for real rather than asserting the conflict clause's text.
+/// Sequence number for `run_remote_delta` invocations, so the debug log can say which
+/// invocation every raw entry arrived in.
+///
+/// DBSYNC-102's first fix assumed a share's `deleted` entries and their re-adds arrive
+/// in ONE delta, and collapsed the batch on that premise. Live QA showed the premise
+/// was false — the re-add came in a later invocation — and nothing in the log could
+/// have said so beforehand: an invocation that enqueues no job logged nothing at all,
+/// and no line ever recorded what Dropbox actually sent. These debug lines are what
+/// makes the batch shape observable instead of assumed.
+static DELTA_INVOCATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn run_remote_delta(
     state: &AppState,
     starting_cursor: &str,
     mut fetch_page: impl FnMut(&str) -> AppResult<DeltaFetchOutcome>,
 ) -> AppResult<DeltaRunOutcome> {
+    let invocation = DELTA_INVOCATION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let mut cursor = starting_cursor.to_string();
     // Accumulated across every page of this invocation; collapsed and applied once,
     // below, after the fetch loop — never inside it. See the doc above for why.
@@ -1144,6 +1156,27 @@ fn run_remote_delta(
             }
             Ok(DeltaFetchOutcome::Page(resp)) => {
                 pages_fetched += 1;
+                tracing::debug!(
+                    invocation,
+                    page = pages_fetched,
+                    entries = resp.entries.len(),
+                    has_more = resp.has_more,
+                    "remote delta: page received"
+                );
+                for entry in &resp.entries {
+                    // Raw, before classification or collapse: exactly what Dropbox sent.
+                    // Paths and revs only — nothing here is a credential.
+                    tracing::debug!(
+                        invocation,
+                        page = pages_fetched,
+                        tag = %entry.tag,
+                        path_lower = entry.path_lower.as_deref().unwrap_or("<none>"),
+                        path_display = entry.path_display.as_deref().unwrap_or("<none>"),
+                        rev = entry.rev.as_deref().unwrap_or("<none>"),
+                        id = entry.id.as_deref().unwrap_or("<none>"),
+                        "remote delta: raw entry"
+                    );
+                }
                 let has_more = resp.has_more;
                 cursor = resp.cursor;
                 all_entries.extend(resp.entries);
@@ -1192,6 +1225,16 @@ fn run_remote_delta(
     // Persist once, after applying, not per page. Safe because replay is idempotent
     // (see the doc above); what a crash costs is re-fetching pages, not correctness.
     state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
+
+    // Logged for EVERY invocation, including one that enqueues nothing: that silent case
+    // is exactly where DBSYNC-102's re-add went unseen.
+    tracing::debug!(
+        invocation,
+        pages_fetched,
+        entries = all_entries.len(),
+        enqueued,
+        "remote delta: invocation applied"
+    );
 
     Ok(DeltaRunOutcome::Applied { enqueued })
 }
@@ -2945,6 +2988,77 @@ mod tests {
         assert!(
             log.contains("shared/stale.txt"),
             "the warning must name the dropped path; got: {log}"
+        );
+    }
+
+    /// **DBSYNC-102, payload capture.** The first fix was designed around a batch shape
+    /// nobody had observed, and live QA disproved it. This pins the debug lines that make
+    /// the shape observable: every raw entry is logged with its invocation, page, tag and
+    /// `path_lower` before any classification, and an invocation that enqueues nothing is
+    /// still logged — that silent invocation is where the re-add went unseen.
+    ///
+    /// Proof this test can fail: deleting the per-entry `debug!` in `run_remote_delta`
+    /// fails the raw-entry assertions; deleting the end-of-invocation `debug!` fails the
+    /// `invocation applied` assertion.
+    #[test]
+    fn run_remote_delta_logs_every_raw_entry_and_every_invocation_even_when_nothing_is_enqueued() {
+        let state = build_state();
+        let mut deleted = file_entry(Some("/Shared/Gone.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let added = file_entry(Some("/Shared/New.txt"), Some("H"), Some("rev9"), None);
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_1".to_string(),
+            has_more: true,
+        };
+        let page_two = DropboxListFolderResponse {
+            entries: vec![added],
+            cursor: "cursor_2".to_string(),
+            has_more: false,
+        };
+
+        let log = captured_tracing_output(|| {
+            let outcome = run_remote_delta(
+                &state,
+                "starting_cursor",
+                scripted_page_source(vec![
+                    Ok(DeltaFetchOutcome::Page(page_one)),
+                    Ok(DeltaFetchOutcome::Page(page_two)),
+                ]),
+            )
+            .expect("run_remote_delta must not error");
+            match outcome {
+                DeltaRunOutcome::Applied { enqueued } => assert_eq!(
+                    enqueued, 0,
+                    "neither path is indexed, so nothing is enqueued — the silent case"
+                ),
+                DeltaRunOutcome::Reset { .. } => panic!("expected Applied, got Reset"),
+            }
+        });
+
+        let raw: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("remote delta: raw entry"))
+            .collect();
+        assert_eq!(raw.len(), 2, "one raw-entry line per entry; got: {log}");
+        assert!(
+            raw[0].contains("page=1")
+                && raw[0].contains("tag=deleted")
+                && raw[0].contains("path_lower=\"/shared/gone.txt\""),
+            "the deleted entry must be logged raw, with its page; got: {}",
+            raw[0]
+        );
+        assert!(
+            raw[1].contains("page=2")
+                && raw[1].contains("tag=file")
+                && raw[1].contains("path_lower=\"/shared/new.txt\"")
+                && raw[1].contains("rev=\"rev9\""),
+            "the file entry must be logged raw, with its page and rev; got: {}",
+            raw[1]
+        );
+        assert!(
+            log.contains("remote delta: invocation applied") && log.contains("enqueued=0"),
+            "an invocation that enqueues nothing must still be logged; got: {log}"
         );
     }
 
