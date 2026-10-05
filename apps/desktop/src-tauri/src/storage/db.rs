@@ -52,6 +52,24 @@ pub struct SyncJobRow {
     pub updated_at: String,
     pub last_error: Option<String>,
     pub delete_parent_rev: Option<String>,
+    /// DBSYNC-102 (#179): this `local_delete` was decided from a delta `deleted` entry
+    /// and deferred for the grace window rather than run immediately, because a share
+    /// conversion sends every child's delete and its re-add (same Dropbox id) in two
+    /// different `list_folder/continue` invocations ~3.45s apart — see
+    /// `remote_index::DELTA_DELETE_GRACE_SECS`. `true` means this row is NOT yet safe to
+    /// execute: it must be re-verified against the current remote/stored state before it
+    /// runs (consumed by slice #180's execution-time check). Meaning fixed here, once —
+    /// an unwritten sentinel gets a different reading from each caller.
+    ///
+    /// Deliberately a column, not `job_type` or `attempt_count==0`: a distinct `job_type`
+    /// would stop matching `enqueue_job`'s `ON CONFLICT(job_type, target_path)`, so a
+    /// repeated `deleted` observation for the same path would insert a SECOND, undeferred
+    /// row instead of refreshing this one; `attempt_count==0` is destroyed by the first
+    /// retry, silently reverting an already-deferred job to the pre-fix unconditional
+    /// delete on its next attempt. This column survives both — `mark_job_retry_wait`,
+    /// `mark_job_failed` and `recover_running_jobs` none of them mention it, by
+    /// construction (see each one's `UPDATE` statement).
+    pub delta_deferred: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -1511,7 +1529,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error, delete_parent_rev
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error, delete_parent_rev, delta_deferred
                 FROM sync_jobs
                 ORDER BY id DESC
                 LIMIT ?1
@@ -1531,6 +1549,7 @@ impl Db {
                 updated_at: row.get(7)?,
                 last_error: row.get(8)?,
                 delete_parent_rev: row.get(9)?,
+                delta_deferred: row.get::<_, i64>(10)? != 0,
             })
         })?;
 
@@ -1547,7 +1566,7 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "
-                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error, delete_parent_rev
+                SELECT id, job_type, source_path, target_path, status, attempt_count, next_retry_at, updated_at, last_error, delete_parent_rev, delta_deferred
                 FROM sync_jobs
                 WHERE status = 'queued' OR (status = 'retry_wait' AND (next_retry_at IS NULL OR next_retry_at <= ?1))
                 ORDER BY id ASC
@@ -1569,6 +1588,7 @@ impl Db {
                     updated_at: row.get(7)?,
                     last_error: row.get(8)?,
                     delete_parent_rev: row.get(9)?,
+                    delta_deferred: row.get::<_, i64>(10)? != 0,
                 })
             } else {
                 None
@@ -1641,6 +1661,165 @@ impl Db {
             params![id, attempt_count, last_error, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// DBSYNC-102 (#179): defer a just-enqueued, still-`queued` `local_delete` into the
+    /// grace window instead of letting it drain immediately. Called ONLY from the delta
+    /// call site, right after `reconcile_remote_absent` returns `Ok(1)` for the SAME
+    /// `target_path` — the row this call matches is the one that call just inserted (or
+    /// refreshed via `enqueue_job`'s collapse), so there is no race to another writer in
+    /// between: both run under the same `sync_running` gate on the longpoll thread.
+    ///
+    /// Scoped to `status='queued'` on purpose: a `running` job is already past the point
+    /// a row flip can stop it (the worker already read it and is acting on the disk), and
+    /// a job already in `retry_wait` is either already deferred (re-deferring it would
+    /// reset a real backoff clock to this weaker reason) or backing off from a genuine
+    /// prior failure that has nothing to do with this delta observation.
+    ///
+    /// Returns whether a row actually changed, so the caller can tell a defer from a
+    /// no-op (e.g. the job already drained to `running`/`done` before this call landed).
+    pub fn defer_delta_local_delete(
+        &self,
+        target_path: &str,
+        next_retry_at: &str,
+    ) -> AppResult<bool> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let changed = conn.execute(
+            "
+            UPDATE sync_jobs
+            SET status='retry_wait', next_retry_at=?2, delta_deferred=1, updated_at=?3
+            WHERE job_type='local_delete' AND target_path=?1 AND status='queued'
+            ",
+            params![target_path, next_retry_at, Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// DBSYNC-102 (#179): cancel a deferred `local_delete` because the delta's Upsert arm
+    /// observed a re-add at the SAME path carrying the SAME Dropbox id (or, with no
+    /// stored id, the same `content_hash` — DBSYNC-102 D3) within the grace window. This
+    /// is a conversion, not a deletion, so the job must never run.
+    ///
+    /// Scoped to `delta_deferred=1 AND status IN ('queued','retry_wait')`, never
+    /// `running`: a running job is past the point a row flip can stop it — by the time
+    /// this call could observe it, the worker already read the pre-flip row and may
+    /// already be unlinking the file. `queued` is included because the defer call and
+    /// this cancel call are not atomic with each other: a defer that raced behind a
+    /// `pick_next_due_job` read could, in principle, leave the row `queued` an instant
+    /// longer than expected, and this must still be able to cancel it then. Restricted to
+    /// `delta_deferred=1` so this can never cancel an ordinary, undeferred `local_delete`
+    /// enqueued by the ordinary sweep path (DBSYNC-64) — only a delta-deferred one.
+    ///
+    /// The row is DELETED, not marked `done`. A cancelled delete never happened, and
+    /// `list_recent_jobs` feeds the activity flyout, which renders every `local_delete`
+    /// as "Supprimé (retiré du remote)" — a `done` row would tell the user their file was
+    /// deleted after every share, when it is still there. Nothing reads a job's history
+    /// once it has left the active set (`active_job_paths`, `active_jobs_with_type`,
+    /// `count_active_jobs` and the overlay all filter on the active statuses), so removing
+    /// the row is equivalent for every consumer except the one that would have lied. The
+    /// cancellation itself is recorded at info level in the log by the caller.
+    ///
+    /// Returns whether a row actually changed.
+    pub fn cancel_deferred_local_delete(&self, target_path: &str) -> AppResult<bool> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let changed = conn.execute(
+            "
+            DELETE FROM sync_jobs
+            WHERE job_type='local_delete' AND target_path=?1 AND delta_deferred=1
+              AND status IN ('queued','retry_wait')
+            ",
+            params![target_path],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// DBSYNC-102 (#180): cancel a `local_delete` job that is currently `running`
+    /// because the job runner's own execution-time verification
+    /// (`dropbox_transfer::verify_and_delete_local_file_core`) just found the path
+    /// still exists on Dropbox. This is the one case `cancel_deferred_local_delete`'s
+    /// doc above says cannot be reached — "a running job is past the point a row flip
+    /// can stop it" — made reachable: the caller here IS the worker that owns this
+    /// exact row (`pick_next_due_job` flipped it to `running` for this one id, on this
+    /// same thread, just before calling in), not a second writer racing it from the
+    /// delta thread. There is no unlink to race against either — unlike an ordinary
+    /// `local_delete`, the deferred verification runs BEFORE any filesystem write, so
+    /// by the time this executes nothing has touched disk yet.
+    ///
+    /// Scoped to `id=?1 AND job_type='local_delete' AND status='running'` — defensive
+    /// narrowing, not a requirement the caller depends on: the id alone already
+    /// identifies a single row, but naming the expected `job_type`/`status` means a
+    /// future caller that passes the wrong id deletes nothing instead of deleting
+    /// whatever that id happens to be.
+    ///
+    /// Deleted outright, not marked `done` — the same choice `cancel_deferred_local_delete`
+    /// makes and for the same reason (see its doc): `list_recent_jobs` feeds the
+    /// activity flyout, which renders every `local_delete` row that ends `done` as
+    /// "Supprimé (retiré du remote)", and that is false for a file this verification
+    /// just confirmed is still there.
+    ///
+    /// Returns whether a row actually changed.
+    pub fn cancel_verified_local_delete(&self, id: i64) -> AppResult<bool> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let changed = conn.execute(
+            "DELETE FROM sync_jobs WHERE id=?1 AND job_type='local_delete' AND status='running'",
+            params![id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// DBSYNC-102 (review F2): drop a delta-deferred `local_delete` outright once it
+    /// has exhausted its retries, instead of leaving a `failed` row behind.
+    ///
+    /// Why dropping beats `mark_job_failed` here specifically: a `failed`
+    /// `delta_deferred` row pins the tray to a permanent Error state and renders a
+    /// row in the activity flyout for a deletion that never ran — and worse, it
+    /// stays the LOWEST-id `local_delete` for its path, so a later "Retry failed
+    /// jobs" press drains this stale row before any job the user created afterward
+    /// (e.g. an edit's `upload`), regardless of how old the observation behind it
+    /// is. Nothing is lost by dropping it instead: a genuine remote deletion is
+    /// re-derived by the periodic 300s snapshot sweep, which enqueues a fresh,
+    /// undeferred `local_delete` through the DBSYNC-64 breaker — this row was only
+    /// ever a 60s-early guess at that same outcome.
+    ///
+    /// (review P4, accepted trade-off, not fixed here): going through the breaker
+    /// means a LARGE remote folder delete that happened to occur during the outage
+    /// which exhausted this job's retries can now pause the whole sweep and ask the
+    /// user to confirm, rather than draining silently the way the original
+    /// deferred, undeferred-on-confirmation delete would have. This is the same
+    /// breaker every other inferred-absence delete already goes through
+    /// (`reconcile_remote_snapshot_with_breaker`'s own doc), so it is consistent
+    /// with the rest of the sweep rather than a new risk — just slower for this one
+    /// path than the 60s-early guess it replaces.
+    ///
+    /// Scoped to `id=?1 AND job_type='local_delete' AND delta_deferred=1` — the id
+    /// alone identifies one row, but naming the type/flag means a caller that passes
+    /// the wrong id (or a non-deferred `local_delete`) drops nothing instead of
+    /// dropping whatever that id happens to be. Deliberately not scoped to
+    /// `status='running'`: `apply_job_failure` is called with the job already
+    /// flipped to `running` by `pick_next_due_job` in production, but a test is free
+    /// to drive this against a hand-built row in any status.
+    ///
+    /// Returns whether a row actually changed. The caller logs the drop at `warn`
+    /// with the path and the attempt count.
+    pub fn drop_exhausted_deferred_local_delete(&self, id: i64) -> AppResult<bool> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let changed = conn.execute(
+            "DELETE FROM sync_jobs WHERE id=?1 AND job_type='local_delete' AND delta_deferred=1",
+            params![id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Resets jobs stuck in `running` (e.g. the app was killed mid-upload) back to
@@ -2232,6 +2411,16 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     add_column_if_missing(conn, "sync_jobs", "on_success_delete_path", "TEXT")?;
     add_column_if_missing(conn, "sync_jobs", "on_success_delete_rev", "TEXT")?;
 
+    // DBSYNC-102 (#179): see `SyncJobRow::delta_deferred`'s doc for what the flag means.
+    // Declared here, not in the rebuild's frozen column list, for the exact reason the
+    // comment above names — the next column goes here.
+    add_column_if_missing(
+        conn,
+        "sync_jobs",
+        "delta_deferred",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
     // DBSYNC-31: indexes for the hot job/conflict queries (previously full scans) and a
     // partial-unique guard so a path can never have two ACTIVE jobs of the same type.
     //
@@ -2501,6 +2690,7 @@ fn db_path() -> AppResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::Db;
+    use chrono::{Duration, Utc};
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3762,7 +3952,11 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("query");
-        for column in ["on_success_delete_path", "on_success_delete_rev"] {
+        for column in [
+            "on_success_delete_path",
+            "on_success_delete_rev",
+            "delta_deferred",
+        ] {
             assert!(
                 rebuilt_sql.contains(column),
                 "`{column}` must survive the rebuild — declare it in the additive block AFTER \
@@ -3780,6 +3974,170 @@ mod tests {
             before,
             "a second migrate over a rebuilt table must change nothing"
         );
+    }
+
+    /// DBSYNC-102 (#179): a database that already carries the modern `job_type`/`status`
+    /// CHECKs (so the rebuild above is skipped entirely) must still pick up
+    /// `delta_deferred` through the plain `add_column_if_missing` path, additively, with
+    /// existing rows defaulting to `0` (never-deferred) rather than `NULL`. Mirrors
+    /// `migrate_widens_a_narrower_job_type_check`'s shape, but for an additive column
+    /// rather than a CHECK.
+    #[test]
+    fn migrate_adds_delta_deferred_to_a_pre_existing_sync_jobs_table() {
+        let path = unique_db_path();
+        let mut conn = Connection::open(&path).expect("open");
+        // A `sync_jobs` already migrated up to the point this slice starts from: the
+        // modern CHECKs are present, but `delta_deferred` is not.
+        conn.execute_batch(
+            "CREATE TABLE sync_jobs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 job_type TEXT NOT NULL CHECK (job_type IN ('upload','download','delete','local_delete','hydrate_cloudsc','move')),
+                 source_path TEXT,
+                 target_path TEXT,
+                 status TEXT NOT NULL CHECK (status IN ('queued','running','retry_wait','done','failed')),
+                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                 next_retry_at TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO sync_jobs (job_type, source_path, target_path, status, attempt_count, created_at, updated_at)
+                 VALUES ('local_delete', 'pre_existing.txt', 'pre_existing.txt', 'queued', 0, 't', 't');",
+        )
+        .expect("plant a pre-delta_deferred table");
+
+        super::migrate(&mut conn).expect("migrate must add the column additively");
+
+        let has_column = conn
+            .prepare("PRAGMA table_info(sync_jobs)")
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query")
+            .filter_map(Result::ok)
+            .any(|name| name == "delta_deferred");
+        assert!(has_column, "delta_deferred must exist after migrate");
+
+        let default_value: i64 = conn
+            .query_row(
+                "SELECT delta_deferred FROM sync_jobs WHERE target_path = 'pre_existing.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read back the pre-existing row");
+        assert_eq!(
+            default_value, 0,
+            "a row written before the column existed must default to never-deferred, not NULL"
+        );
+
+        // Idempotent: a second migrate over a database that already has the column must
+        // not error (ALTER TABLE ADD COLUMN on an existing column fails loudly otherwise).
+        super::migrate(&mut conn).expect("second migrate must not fail");
+    }
+
+    /// DBSYNC-102 (review F7): `defer_delta_local_delete` must stay scoped to
+    /// `status='queued'`. Dropping that scope would re-defer a job that is already
+    /// `retry_wait` for a genuine prior failure (resetting a real backoff clock to
+    /// this weaker reason) or, worse, one already `running` — past the point a row
+    /// flip can stop the worker already acting on disk.
+    #[test]
+    fn defer_delta_local_delete_is_scoped_to_status_queued() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.enqueue_job("local_delete", Some("a.txt"), Some("a.txt"))
+            .unwrap();
+
+        // Positive control: a `queued` row IS deferred.
+        let future = (Utc::now() + Duration::seconds(60)).to_rfc3339();
+        assert!(
+            db.defer_delta_local_delete("a.txt", &future).unwrap(),
+            "a queued row must be deferrable"
+        );
+
+        // Flip it to `running` (same as `pick_next_due_job` does) and try again on a
+        // SEPARATE path to isolate the scope being tested.
+        db.enqueue_job("local_delete", Some("b.txt"), Some("b.txt"))
+            .unwrap();
+        let picked = db.pick_next_due_job().unwrap().expect("b.txt must be due");
+        assert_eq!(picked.target_path.as_deref(), Some("b.txt"));
+        assert!(
+            !db.defer_delta_local_delete("b.txt", &future).unwrap(),
+            "F7 DEMONSTRATED-BY-REGRESSION: a running row must not be deferrable \
+             after it has already started running"
+        );
+        let row = db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.target_path.as_deref() == Some("b.txt"))
+            .unwrap();
+        assert_eq!(row.status, "running");
+        assert!(!row.delta_deferred);
+    }
+
+    /// DBSYNC-102 (review F7): `cancel_deferred_local_delete` must stay scoped to
+    /// `delta_deferred=1` (never an ordinary, undeferred `local_delete` the sweep
+    /// enqueued) AND must exclude `running` (the worker already owns that row by
+    /// the time this could observe it).
+    #[test]
+    fn cancel_deferred_local_delete_is_scoped_to_delta_deferred_and_excludes_running() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+
+        // An ORDINARY (undeferred) local_delete in retry_wait — e.g. the periodic
+        // sweep's own backoff — must survive a cancel call for its path.
+        db.enqueue_job("local_delete", Some("ordinary.txt"), Some("ordinary.txt"))
+            .unwrap();
+        let ordinary = db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.target_path.as_deref() == Some("ordinary.txt"))
+            .unwrap();
+        let future = (Utc::now() + Duration::seconds(60)).to_rfc3339();
+        db.mark_job_retry_wait(ordinary.id, 1, &future, None)
+            .unwrap();
+        assert!(
+            !db.cancel_deferred_local_delete("ordinary.txt").unwrap(),
+            "F7 DEMONSTRATED-BY-REGRESSION: cancel must not touch an ordinary, \
+             undeferred local_delete"
+        );
+        assert!(
+            db.list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .any(|j| j.target_path.as_deref() == Some("ordinary.txt")),
+            "the ordinary sweep delete must survive"
+        );
+
+        // A DEFERRED local_delete that is already `running` must also survive —
+        // the one case explicitly excluded by this scope.
+        db.enqueue_job("local_delete", Some("running.txt"), Some("running.txt"))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(db.defer_delta_local_delete("running.txt", &past).unwrap());
+        let picked = db
+            .pick_next_due_job()
+            .unwrap()
+            .expect("running.txt must be due");
+        assert_eq!(picked.target_path.as_deref(), Some("running.txt"));
+        assert!(
+            !db.cancel_deferred_local_delete("running.txt").unwrap(),
+            "F7 DEMONSTRATED-BY-REGRESSION: cancel must not touch a deferred \
+             local_delete that is already running"
+        );
+        assert!(
+            db.list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .any(|j| j.target_path.as_deref() == Some("running.txt")),
+            "the running deferred delete must survive — only \
+             cancel_verified_local_delete may touch a running row"
+        );
+
+        // Positive control: a deferred, still-`retry_wait` row IS cancellable.
+        db.enqueue_job("local_delete", Some("deferred.txt"), Some("deferred.txt"))
+            .unwrap();
+        assert!(db
+            .defer_delta_local_delete("deferred.txt", &future)
+            .unwrap());
+        assert!(db.cancel_deferred_local_delete("deferred.txt").unwrap());
     }
 
     /// DBSYNC-56. The marker is the empty string, so an accidentally-blank hash written

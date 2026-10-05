@@ -19,8 +19,17 @@ const NAV_ITEMS: { id: Section; label: string; glyph: string }[] = [
 
 type EventKind = "upload" | "download" | "delete" | "conflict" | "auth" | "error" | "sync";
 
-function queueActionLabel(jobType: string): string {
-  switch (jobType) {
+/** DBSYNC-102 (review F6): a `local_delete` is only "Supprimé" once it has actually
+ * run. During the DBSYNC-102 grace window (and while its execution-time
+ * verification is in flight) its status is `queued`/`retry_wait`/`running` — a
+ * deletion that has not happened yet and, for a share conversion, never will. The
+ * past tense there told the user their file was gone while it was still on disk. */
+function isPendingJobStatus(status: string): boolean {
+  return status === "queued" || status === "retry_wait" || status === "running";
+}
+
+function queueActionLabel(job: SyncJob): string {
+  switch (job.jobType) {
     case "upload":
       return "Upload (local -> Dropbox)";
     case "download":
@@ -28,11 +37,22 @@ function queueActionLabel(jobType: string): string {
     case "delete":
       return "Supprimé sur Dropbox";
     case "local_delete":
+      // (review P6): only a job that actually finished (`status === "done"`) may
+      // read as completed — `failed` must not share that label. Before this fix,
+      // a failed local_delete (the job never ran) fell into the same "Supprimé"
+      // branch as a genuinely completed one, telling the user their file was
+      // deleted when it was not.
+      if (isPendingJobStatus(job.status)) {
+        return "Suppression en attente (retiré du remote)";
+      }
+      if (job.status === "failed") {
+        return "Suppression échouée (retiré du remote)";
+      }
       return "Supprimé (retiré du remote)";
     case "hydrate_cloudsc":
       return "Hydrate (.cloudsc)";
     default:
-      return jobType;
+      return job.jobType;
   }
 }
 
@@ -195,7 +215,7 @@ type RecentRowProps = { job: SyncJob };
 
 function RecentTransferRow({ job }: RecentRowProps) {
   const kind = jobEventKind(job);
-  const name = basename(job.targetPath) || queueActionLabel(job.jobType);
+  const name = basename(job.targetPath) || queueActionLabel(job);
   return (
     <li className="recent-row">
       <EventIcon kind={kind} />
@@ -234,7 +254,7 @@ type JobActivityRowProps = { job: SyncJob };
 function JobActivityRow({ job }: JobActivityRowProps) {
   const kind = jobEventKind(job);
   const name = basename(job.targetPath);
-  const main = name ? `${queueActionLabel(job.jobType)} — ${name}` : queueActionLabel(job.jobType);
+  const main = name ? `${queueActionLabel(job)} — ${name}` : queueActionLabel(job);
   return (
     <li className="activity-row">
       <EventIcon kind={kind} />
@@ -455,6 +475,12 @@ function FlyoutApp() {
   ).length;
   const doneJobCount = jobs.filter((job) => job.status === "done").length;
   const runTotal = pendingJobCount + doneJobCount;
+  // Note (DBSYNC-102 review, not fixed): a delta-deferred `local_delete` counts
+  // toward `pendingJobCount`/`runTotal` for its whole 60s grace window
+  // (`retry_wait`) before it is ever dispatched, so this label can read
+  // "0 sur N fichiers" and look stalled for up to a minute even though nothing
+  // is actually hung — it is just waiting out the grace period. Accepted; not
+  // worth a separate "waiting" state for one job type.
   const runProgressLabel =
     (status.syncRunning || pendingJobCount > 0) && runTotal > 0 ? `${doneJobCount} sur ${runTotal} fichiers` : null;
 

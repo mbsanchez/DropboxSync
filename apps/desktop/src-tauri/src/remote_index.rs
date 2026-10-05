@@ -47,7 +47,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 
 use crate::auth_session::get_access_token;
 use crate::error::{AppError, AppResult};
@@ -78,6 +78,35 @@ pub(crate) struct RemoteFileMeta {
 /// remote change detection (DBSYNC-30). Cleared by `reset_sync_state` (folder
 /// change) and on (re)login so the loop reseeds against the new state.
 pub(crate) const REMOTE_DELTA_CURSOR_KEY: &str = "remote_delta_cursor";
+
+/// DBSYNC-102 (#179): how long a delta-driven `local_delete` of hydrated content waits
+/// before it is allowed to run, so a share/un-share conversion's re-add (same Dropbox
+/// id, same path) has a chance to cancel it first.
+///
+/// Measured, not guessed: two live HITL captures on #177, one per direction, both
+/// recorded the re-add landing in the NEXT `list_folder/continue` invocation, **3.45s**
+/// (share) and **3.43s** (un-share) after the `deleted` half. 60s is roughly 17x that
+/// observed gap — generous headroom against a slower longpoll round-trip or a brief
+/// network hiccup between the two invocations, while still being short against a
+/// person's sense of "did my delete happen".
+///
+/// The cost of this number, stated plainly: a genuine remote delete of hydrated
+/// content now reaches disk up to 60s **later** than before this slice, not instantly.
+/// Slice #180's execution-time verification exists because 60s is a guess bounded by
+/// two observations, not a proof — if the re-add is ever slower than this (a much
+/// bigger share, a congested network), the grace elapses first and the job comes due;
+/// #180 is the last-resort check that still saves the file at that point.
+///
+/// **Known, documented, not fixed here** (review round): the 60s above is only when
+/// the job BECOMES DUE — `pick_next_due_job` is only ever consulted from a drain
+/// event (a longpoll change notification, a watcher event, or the periodic 300s
+/// sweep tick), not from a timer of its own. So a genuine web delete can take up to
+/// ~300s+60s to actually reach disk in the worst case, not 60s. With #180's F1 fix
+/// (`dropbox_transfer::file_unchanged_since_delta_check`) that longer window no
+/// longer risks losing an edit made during it — the delete still happens, just
+/// later than this constant alone suggests. Deliberately not fixed with a
+/// dedicated timer; that would be new machinery for a window F1 already made safe.
+const DELTA_DELETE_GRACE_SECS: i64 = 60;
 
 /// What a single `list_folder`/`continue` delta entry means for the local index.
 #[derive(Debug, PartialEq)]
@@ -606,6 +635,16 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
 /// `seed_remote_delta_cursor` — so the cursor-reset re-snapshot path (which runs
 /// with the full local index still intact) gets the exact same guard as the
 /// periodic sweep (DBSYNC-64 CTO fix). Returns jobs enqueued.
+///
+/// **Known, documented, not fixed here** (review round): this path infers absence
+/// from a snapshot, not from an explicit `deleted` delta entry, and it enqueues an
+/// ordinary, UNDEFERRED `local_delete` straight through `reconcile_remote_absent`
+/// — it never calls `defer_delta_local_delete`. If this sweep happens to land
+/// inside the ~3.45s window between a share conversion's delete and its re-add
+/// (the gap `DELTA_DELETE_GRACE_SECS` is sized from), it can infer the same false
+/// absence the cursor-delta path was fixed to tolerate, and the resulting delete
+/// runs immediately rather than waiting out a grace period. Pre-existing to this
+/// slice; left as-is.
 fn reconcile_remote_snapshot_with_breaker(
     state: &AppState,
     local_files: &[FileIndexRow],
@@ -929,12 +968,21 @@ pub(crate) fn seed_remote_delta_cursor(state: &AppState) -> AppResult<String> {
 /// call directly to exercise delta application — see the keychain-danger list on
 /// `apply_remote_delta` below for everything a test must still never call.
 ///
-/// `pending_job_types` is **diagnostic only** (DBSYNC-102 #175): pairs of
+/// `pending_job_types` was **diagnostic only** through DBSYNC-102 #175 (pairs of
 /// (covering path, `job_type`) for the same active jobs `pending_targets` already
-/// names, used ONLY to decide whether a drop on the upsert arm deserves the
-/// stale-delete warning below — see `pending_delete_covering`'s doc for why. It
-/// changes no decision `covered_by_active_job` makes; pass `&[]` wherever that
-/// context is not available (e.g. a test that only cares about the Remove arm).
+/// names), and is now ALSO load-bearing (#179): the Upsert arm below reads it,
+/// before `covered_by_active_job`, to find a pending `local_delete` at exactly this
+/// `rel` and decide whether this entry is the re-add that cancels it. Passing `&[]`
+/// is still safe for a test that only cares about the Remove arm or an ordinary
+/// Upsert — it just means "no deferred job can ever be found to cancel", which is
+/// the correct, conservative default — but it is no longer a no-op for every test.
+///
+/// `pending_targets` is cloned once, internally, at the top of this function (not
+/// per entry): a cancellation below has to remove exactly the cancelled path from
+/// the set `covered_by_active_job` consults for the REST of this same call, or the
+/// caller's original, unmodified snapshot would still cover it and drop this
+/// invocation's own re-add — the exact stale-snapshot trap #179 exists to close.
+/// The caller's `&HashSet<String>` argument is therefore unchanged by this call.
 ///
 /// Returns the number of jobs enqueued.
 pub(crate) fn apply_delta_entries(
@@ -944,62 +992,170 @@ pub(crate) fn apply_delta_entries(
     pending_job_types: &[(String, String)],
 ) -> AppResult<usize> {
     let mut enqueued = 0usize;
+    // DBSYNC-102 (#179): see the doc above for why this must be an owned, mutable,
+    // per-invocation copy rather than the borrowed snapshot the caller passed in.
+    let mut pending_targets: HashSet<String> = pending_targets.clone();
 
     for entry in collapse_delta_entries(entries) {
         match delta_action_from_entry(entry) {
             DeltaAction::Upsert(rel, meta) => {
                 if rel.ends_with(".cloudsc") {
                     // Sidecar bookkeeping path, never actionable here — unchanged.
-                } else if crate::sync_pipeline::covered_by_active_job(&rel, pending_targets) {
-                    // DBSYNC-102 #175, diagnostic only: `covered_by_active_job` has
-                    // already made its decision — the upsert is dropped here exactly as
-                    // before this slice, with no change to that outcome. This block only
-                    // explains WHY, for the one case that matters: a `local_delete` for
-                    // this exact path (or an ancestor folder) is STILL active, so new
-                    // remote truth (this re-add) is being discarded while that deletion is
-                    // still in flight. This is a narrower leftover case than "any re-add
-                    // after a local_delete" — see `pending_delete_covering`'s doc for why
-                    // the ordinary case (delete already drained before the re-add arrives)
-                    // is NOT caught here and fires no warning at all. The fix for the
-                    // conflation is tracked separately as DBSYNC-109; this is only the
-                    // detector for the leftover slice.
-                    if let Some(covering_target) =
-                        crate::sync_pipeline::pending_delete_covering(&rel, pending_job_types)
-                    {
-                        tracing::warn!(
-                            dropped_path = %rel,
-                            covering_target = %covering_target,
-                            covering_job_type = "local_delete",
-                            "remote delta: new remote truth discarded — upsert dropped \
-                             while a local_delete is still pending for this path \
-                             (DBSYNC-109)"
-                        );
-                    }
                 } else {
-                    enqueued += reconcile_remote_present(state, &rel, &meta)?;
-                    // DBSYNC-59: surface a newly-appeared remote file as a native
-                    // placeholder within seconds (targeted — just this file) instead
-                    // of waiting for the 5-min indexer.
-                    #[cfg(windows)]
+                    // DBSYNC-102 (#179, D1+D3) — cancel-on-re-add, BEFORE
+                    // `covered_by_active_job` below: if a `local_delete` is still
+                    // pending for exactly this path (not an ancestor folder — a
+                    // deferred `local_delete`'s `target_path` is always the exact
+                    // file `rel`, never a prefix), and this entry carries the same
+                    // Dropbox id the stored row already has — or, when the stored
+                    // row has no id on file, the same `content_hash` (D3 fallback,
+                    // for a row written before DBSYNC-99 back-filled ids) — then
+                    // this is a share/un-share conversion's re-add, not a new file,
+                    // and the deferred delete must never run.
+                    if pending_job_types
+                        .iter()
+                        .any(|(p, t)| p == &rel && t == "local_delete")
                     {
-                        let path_display = entry.path_display.clone().unwrap_or_default();
-                        crate::cloudsc_ops::materialize_remote_only_file_if_absent(
-                            state,
-                            &rel,
-                            &path_display,
-                            &meta.content_hash,
-                            &meta.rev,
-                            entry.size.unwrap_or(0),
-                            meta.modified_ts,
-                        );
+                        if let Some(stored) = state.db.get_remote_file(&rel)? {
+                            let id_matches = if let Some(stored_id) = stored.dropbox_id.as_deref() {
+                                meta.id.as_deref() == Some(stored_id)
+                            } else {
+                                stored.content_hash == meta.content_hash
+                            };
+                            if id_matches && state.db.cancel_deferred_local_delete(&rel)? {
+                                // Stale-set trap (#179): without this, the rest of
+                                // THIS invocation's loop would still see `rel` in
+                                // `pending_targets` and `covered_by_active_job`
+                                // would drop this very re-add — cancelling the DB
+                                // row does nothing to the snapshot already in hand.
+                                pending_targets.remove(&rel);
+                                tracing::info!(
+                                    path = %rel,
+                                    id = meta.id.as_deref().unwrap_or("<none>"),
+                                    "remote delta: cancelling deferred local_delete \
+                                     — re-add observed within the grace window \
+                                     (DBSYNC-102)"
+                                );
+                                // (review F3): the cancel proves the path still
+                                // exists, not that the on-disk bytes match it. If
+                                // the file was edited during the grace window — the
+                                // scan routes that edit to a conflicted copy and
+                                // writes the EDIT's hash into local_file_index[rel],
+                                // which this re-add would otherwise leave looking
+                                // "in sync" forever — enqueue the upload nothing
+                                // else will ever enqueue for `rel`. Same call the
+                                // scanner itself uses for a changed file.
+                                //
+                                // (review P2): but only when the re-add's OWN
+                                // `content_hash` still matches the stored one —
+                                // i.e. the remote content this re-add describes is
+                                // the same content that was last synced. `id_matches`
+                                // above only compared the identity (or, with no
+                                // stored id, already implies this by its D3
+                                // fallback); it says nothing about a SAME-id
+                                // collaborator edit landing on this exact re-add
+                                // (a different `content_hash` under the same id).
+                                // Enqueuing the upload in that case would overwrite
+                                // the collaborator's edit with overwrite-mode upload
+                                // before this client ever downloaded it. Leave it for
+                                // the sweep's download path instead, which has its
+                                // own conflict guard for a changed remote.
+                                if meta.content_hash == stored.content_hash {
+                                    if let Some(local) = state.db.get_local_file(&rel)? {
+                                        if local.hash != stored.content_hash {
+                                            state.db.enqueue_job(
+                                                "upload",
+                                                Some(&rel),
+                                                Some(&rel),
+                                            )?;
+                                            enqueued += 1;
+                                            tracing::info!(
+                                                path = %rel,
+                                                "remote delta: re-add cancelled a deferred \
+                                                 local_delete but the local copy diverged \
+                                                 during the grace window — enqueuing an \
+                                                 upload to reconcile it (DBSYNC-102 review F3)"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets) {
+                        // DBSYNC-102 #175, diagnostic only: `covered_by_active_job` has
+                        // already made its decision — the upsert is dropped here exactly as
+                        // before this slice, with no change to that outcome. This block only
+                        // explains WHY, for the one case that matters: a `local_delete` for
+                        // this exact path (or an ancestor folder) is STILL active, so new
+                        // remote truth (this re-add) is being discarded while that deletion is
+                        // still in flight. This is a narrower leftover case than "any re-add
+                        // after a local_delete" — see `pending_delete_covering`'s doc for why
+                        // the ordinary case (delete already drained before the re-add arrives)
+                        // is NOT caught here and fires no warning at all. The fix for the
+                        // conflation is tracked separately as DBSYNC-109; this is only the
+                        // detector for the leftover slice.
+                        if let Some(covering_target) =
+                            crate::sync_pipeline::pending_delete_covering(&rel, pending_job_types)
+                        {
+                            tracing::warn!(
+                                dropped_path = %rel,
+                                covering_target = %covering_target,
+                                covering_job_type = "local_delete",
+                                "remote delta: new remote truth discarded — upsert dropped \
+                                 while a local_delete is still pending for this path \
+                                 (DBSYNC-109)"
+                            );
+                        }
+                    } else {
+                        enqueued += reconcile_remote_present(state, &rel, &meta)?;
+                        // DBSYNC-59: surface a newly-appeared remote file as a native
+                        // placeholder within seconds (targeted — just this file) instead
+                        // of waiting for the 5-min indexer.
+                        #[cfg(windows)]
+                        {
+                            let path_display = entry.path_display.clone().unwrap_or_default();
+                            crate::cloudsc_ops::materialize_remote_only_file_if_absent(
+                                state,
+                                &rel,
+                                &path_display,
+                                &meta.content_hash,
+                                &meta.rev,
+                                entry.size.unwrap_or(0),
+                                meta.modified_ts,
+                            );
+                        }
                     }
                 }
             }
             DeltaAction::Remove(rel) => {
                 if !rel.ends_with(".cloudsc")
-                    && !crate::sync_pipeline::covered_by_active_job(&rel, pending_targets)
+                    && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
                 {
-                    enqueued += reconcile_remote_absent(state, &rel)?;
+                    let removed = reconcile_remote_absent(state, &rel)?;
+                    if removed == 1 {
+                        // DBSYNC-102 (#179, D1): `reconcile_remote_absent` just enqueued a
+                        // `local_delete` for hydrated content from a delta `deleted` entry
+                        // — defer it for the grace window rather than letting it drain
+                        // immediately, so a conversion's re-add (observed on the Upsert arm
+                        // above, possibly in a LATER invocation) can still cancel it. This is
+                        // the ONLY call site that defers: `reconcile_remote_snapshot_with_
+                        // breaker` (the full-sweep/reset path) calls the same
+                        // `reconcile_remote_absent` but never this defer — see that call
+                        // site, untouched by this slice.
+                        let next_retry_at =
+                            (Utc::now() + Duration::seconds(DELTA_DELETE_GRACE_SECS)).to_rfc3339();
+                        if state.db.defer_delta_local_delete(&rel, &next_retry_at)? {
+                            tracing::debug!(
+                                path = %rel,
+                                next_retry_at = %next_retry_at,
+                                "remote delta: deferring local_delete for the grace \
+                                 window (DBSYNC-102)"
+                            );
+                        }
+                    }
+                    enqueued += removed;
                     // DBSYNC-59: purge a legacy `.cloudsc` sidecar for the removed
                     // file now (CfAPI placeholders are removed by the local_delete
                     // job above) instead of waiting for the 5-min prune.
@@ -2625,6 +2781,31 @@ mod tests {
             job_targets(&state, "local_delete"),
             vec!["gone.txt".to_string()]
         );
+        // DBSYNC-102 (#179): updated, not weakened — the job this test already pinned
+        // at exactly one still exists exactly once, but the delta call site now defers
+        // it into the grace window instead of leaving it immediately runnable, so a
+        // same-path re-add arriving in a LATER invocation still has a chance to cancel
+        // it. `pick_next_due_job` must not hand this job to a worker yet.
+        let job = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete" && j.target_path.as_deref() == Some("gone.txt"))
+            .expect("the deferred job must still exist");
+        assert_eq!(
+            job.status, "retry_wait",
+            "a delta-driven local_delete of hydrated content must be deferred, not left queued"
+        );
+        assert!(job.delta_deferred, "the deferred marker must be set");
+        assert!(
+            job.next_retry_at.is_some(),
+            "a deferred job must carry a future retry time"
+        );
+        assert!(
+            state.db.pick_next_due_job().unwrap().is_none(),
+            "a job deferred into the grace window must not be due yet"
+        );
     }
 
     /// DBSYNC-102 review finding #3: `[file X, deleted X]` — a genuine edit
@@ -3165,6 +3346,629 @@ mod tests {
                 .content_hash,
             "H2",
             "replay converges to the same final index state, not a diverged one"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DBSYNC-102 #179 — grace period + cancel-on-re-add (D1, D3). Every test that
+    // spans the delete/re-add split calls `run_remote_delta` TWICE, once per
+    // invocation — a single-invocation test cannot exercise this fix at all, since
+    // the two live captures on #177 proved the two halves are NEVER in one
+    // invocation, for either direction. See `DELTA_DELETE_GRACE_SECS`'s doc for the
+    // measured gaps this grace period is sized against.
+    // ---------------------------------------------------------------------------
+
+    /// Finds the `local_delete` job for `target` (if any) among the most recent jobs,
+    /// so a test can inspect `status`/`delta_deferred`/`next_retry_at` directly instead
+    /// of only `job_targets`' bare path list.
+    fn local_delete_job(state: &AppState, target: &str) -> Option<crate::storage::db::SyncJobRow> {
+        state
+            .db
+            .list_recent_jobs(200)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete" && j.target_path.as_deref() == Some(target))
+    }
+
+    /// **The share shape, across two invocations — the defect this slice exists for.**
+    /// Invocation 1: `deleted` for the hydrated child (the folder's own `deleted` is
+    /// included for realism but resolves to `Ignore`/a no-op on folders, which carry no
+    /// index rows). Invocation 2, a SEPARATE `run_remote_delta` call: the folder and the
+    /// child re-added, the child carrying the SAME Dropbox id already stored in
+    /// `remote_file_index.dropbox_id`. The delete must be deferred after invocation 1,
+    /// cancelled during invocation 2, and the re-add recorded in invocation 2 — proving
+    /// the stale-`pending_targets`-snapshot fix, since without `.remove(&rel)` on the
+    /// cloned set, `covered_by_active_job` would still see invocation 2's OWN initial
+    /// snapshot (taken before the cancel) and drop the very re-add that just cancelled
+    /// the job it was "covered" by.
+    #[test]
+    fn share_conversion_across_two_invocations_defers_then_cancels_and_records_the_readd() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/child.txt", "H", "rev1", 0, Some("id:CHILD"))
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/child.txt", "H", 3, 0)
+            .unwrap();
+
+        // Invocation 1: delete-batch (folder + hydrated child).
+        let mut deleted_child = file_entry(Some("/shared/child.txt"), None, None, None);
+        deleted_child.tag = "deleted".to_string();
+        let mut deleted_folder = file_entry(Some("/shared"), None, None, None);
+        deleted_folder.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted_child, deleted_folder],
+            cursor: "cursor_after_delete".to_string(),
+            has_more: false,
+        };
+        let outcome1 = run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_one))]),
+        )
+        .expect("invocation 1 must not error");
+        match outcome1 {
+            DeltaRunOutcome::Applied { enqueued } => assert_eq!(
+                enqueued, 1,
+                "invocation 1 enqueues exactly one local_delete for the hydrated child"
+            ),
+            DeltaRunOutcome::Reset { .. } => panic!("expected Applied"),
+        }
+
+        let job = local_delete_job(&state, "shared/child.txt")
+            .expect("the deferred job must exist after invocation 1");
+        assert_eq!(
+            job.status, "retry_wait",
+            "invocation 1 must defer the delete, not leave it immediately runnable"
+        );
+        assert!(job.delta_deferred, "the deferred marker must be set");
+        assert!(
+            state.db.pick_next_due_job().unwrap().is_none(),
+            "the deferred job must not be due — no local_delete may ever become due \
+             for a share conversion"
+        );
+        assert!(
+            state
+                .db
+                .get_local_file("shared/child.txt")
+                .unwrap()
+                .is_some(),
+            "the hydrated child's local row must survive — the job never ran"
+        );
+
+        // Invocation 2, a SEPARATE run_remote_delta call: folder + child re-added,
+        // same Dropbox id.
+        let mut readded_folder = file_entry(Some("/shared"), None, None, None);
+        readded_folder.tag = "folder".to_string();
+        readded_folder.id = Some("id:FOLDER_NEW".to_string());
+        let mut readded_child =
+            file_entry(Some("/shared/child.txt"), Some("H"), Some("rev2"), None);
+        readded_child.id = Some("id:CHILD".to_string());
+        let page_two = DropboxListFolderResponse {
+            entries: vec![readded_folder, readded_child],
+            cursor: "cursor_after_readd".to_string(),
+            has_more: false,
+        };
+
+        let log = captured_tracing_output(|| {
+            let outcome2 = run_remote_delta(
+                &state,
+                "cursor_after_delete",
+                scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_two))]),
+            )
+            .expect("invocation 2 must not error");
+            match outcome2 {
+                DeltaRunOutcome::Applied { enqueued } => assert_eq!(
+                    enqueued, 0,
+                    "the re-add cancels the deferred delete and is itself recorded \
+                     with no new job — no download is owed for an unchanged hash"
+                ),
+                DeltaRunOutcome::Reset { .. } => panic!("expected Applied"),
+            }
+        });
+
+        // DBSYNC-102 (review F7): `run_remote_delta` also debug-logs every raw entry
+        // (commit 059e095), which ALSO carries this path and id — so checking
+        // `log.contains(...)` against the whole captured output is vacuous, it would
+        // stay green even if the cancellation line itself dropped both fields. Isolate
+        // the specific cancellation line and assert on THAT line alone.
+        let cancel_line = log
+            .lines()
+            .find(|line| line.contains("cancelling deferred local_delete"))
+            .unwrap_or_else(|| panic!("no cancellation line found in captured log: {log}"));
+        assert!(
+            cancel_line.contains("INFO"),
+            "the cancellation must be logged at info level; got: {cancel_line}"
+        );
+        assert!(
+            cancel_line.contains("shared/child.txt"),
+            "the cancellation line itself must name the path; got: {cancel_line}"
+        );
+        assert!(
+            cancel_line.contains("id:CHILD"),
+            "the cancellation line itself must name the id; got: {cancel_line}"
+        );
+
+        assert!(
+            local_delete_job(&state, "shared/child.txt").is_none(),
+            "the cancelled job must be gone entirely — never `done`, which the activity \
+             flyout would render as a completed deletion of a file that is still there"
+        );
+        assert!(
+            state.db.pick_next_due_job().unwrap().is_none(),
+            "zero jobs must ever reach running for a share conversion"
+        );
+        assert!(
+            state
+                .db
+                .get_local_file("shared/child.txt")
+                .unwrap()
+                .is_some(),
+            "the hydrated child's local row must survive the whole conversion"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_remote_file("shared/child.txt")
+                .unwrap()
+                .expect("remote row must still exist")
+                .rev,
+            "rev2",
+            "the re-add must be recorded THIS invocation (proves the stale-set fix: \
+             without removing `rel` from the cloned pending_targets, \
+             covered_by_active_job would still drop this re-add)"
+        );
+    }
+
+    /// **The un-share shape — unchanged no-op, explicit regression test.** A folder-only
+    /// `deleted` (twice, two casings, matching the real un-share capture) followed by a
+    /// re-add in a SECOND invocation. Folders carry no index rows, so there is nothing
+    /// to defer and nothing to cancel; this must behave exactly as it did before #179.
+    #[test]
+    fn unshare_conversion_across_two_invocations_is_unchanged_and_defers_nothing() {
+        let state = build_state();
+        // No remote/local rows for the folder itself — folders are never indexed.
+
+        let mut deleted_lower = file_entry(Some("/qa-102"), None, None, None);
+        deleted_lower.tag = "deleted".to_string();
+        deleted_lower.path_lower = Some("/qa-102".to_string());
+        let mut deleted_upper = file_entry(Some("/QA-102"), None, None, None);
+        deleted_upper.tag = "deleted".to_string();
+        deleted_upper.path_lower = Some("/qa-102".to_string());
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted_lower, deleted_upper],
+            cursor: "cursor_after_delete".to_string(),
+            has_more: false,
+        };
+        let outcome1 = run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_one))]),
+        )
+        .expect("invocation 1 must not error");
+        match outcome1 {
+            DeltaRunOutcome::Applied { enqueued } => {
+                assert_eq!(enqueued, 0, "a folder-only delete enqueues nothing")
+            }
+            DeltaRunOutcome::Reset { .. } => panic!("expected Applied"),
+        }
+        assert!(
+            state.db.list_recent_jobs(200).unwrap().is_empty(),
+            "nothing must ever be deferred for a folder-only delete"
+        );
+
+        let mut readded_folder = file_entry(Some("/QA-102"), None, None, None);
+        readded_folder.tag = "folder".to_string();
+        readded_folder.id = Some("id:FOLDER_NEW".to_string());
+        let page_two = DropboxListFolderResponse {
+            entries: vec![readded_folder],
+            cursor: "cursor_after_readd".to_string(),
+            has_more: false,
+        };
+        let outcome2 = run_remote_delta(
+            &state,
+            "cursor_after_delete",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_two))]),
+        )
+        .expect("invocation 2 must not error");
+        match outcome2 {
+            DeltaRunOutcome::Applied { enqueued } => {
+                assert_eq!(enqueued, 0, "a folder re-add enqueues nothing either")
+            }
+            DeltaRunOutcome::Reset { .. } => panic!("expected Applied"),
+        }
+        assert!(
+            state.db.list_recent_jobs(200).unwrap().is_empty(),
+            "still nothing deferred or enqueued after the un-share completes"
+        );
+    }
+
+    /// **A genuine remote delete, no re-add ever arrives.** The job must be deferred
+    /// (`retry_wait`, future `next_retry_at`, `delta_deferred=1`), must be skipped by
+    /// `pick_next_due_job` while that time is in the future, and must become due once
+    /// `next_retry_at` is moved into the past — set directly, as
+    /// `retry_wait_job_with_future_retry_time_is_not_processed_this_tick`
+    /// (`sync_pipeline.rs`) does; no `std::thread::sleep`, no injectable clock.
+    #[test]
+    fn genuine_remote_delete_with_no_readd_stays_deferred_until_next_retry_at_is_due() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("gone_for_real.txt", "H", "rev1", 0, Some("id:GONE"))
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("gone_for_real.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/gone_for_real.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_1".to_string(),
+            has_more: false,
+        };
+        let outcome = run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page))]),
+        )
+        .expect("delta must not error");
+        assert!(matches!(outcome, DeltaRunOutcome::Applied { enqueued: 1 }));
+
+        let job = local_delete_job(&state, "gone_for_real.txt").expect("job must exist");
+        assert_eq!(job.status, "retry_wait");
+        assert!(job.delta_deferred);
+        assert!(
+            job.next_retry_at.is_some(),
+            "a deferred job must carry a future retry time"
+        );
+        assert!(
+            state.db.pick_next_due_job().unwrap().is_none(),
+            "must not be due while next_retry_at is in the future"
+        );
+
+        // No re-add ever arrives. Move the clock forward by setting next_retry_at into
+        // the past directly through the DB connection — exactly the established pattern,
+        // never a sleep.
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        state
+            .db
+            .mark_job_retry_wait(job.id, job.attempt_count, &past, None)
+            .expect("set next_retry_at into the past");
+
+        let due = state
+            .db
+            .pick_next_due_job()
+            .unwrap()
+            .expect("the job must now be due");
+        assert_eq!(due.id, job.id);
+        assert!(
+            due.delta_deferred,
+            "the deferred marker must survive the retry-wait update that moved the \
+             clock — this is also the retry-durability property: mark_job_retry_wait \
+             must never clear delta_deferred"
+        );
+    }
+
+    /// **A re-add with a DIFFERENT id must not cancel.** This is the genuine-new-file
+    /// case wearing the same path as a deleted one — a coincidence the discriminator
+    /// must reject. The deferred delete stays deferred (and will eventually run once its
+    /// grace elapses, which is correct: the old content really is superseded by a
+    /// different item at this path, not merely converted).
+    #[test]
+    fn readd_with_a_different_id_does_not_cancel_the_deferred_delete() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/mismatch.txt", "H", "rev1", 0, Some("id:OLD"))
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/mismatch.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/shared/mismatch.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_1".to_string(),
+            has_more: false,
+        };
+        run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_one))]),
+        )
+        .expect("invocation 1");
+        let job_before = local_delete_job(&state, "shared/mismatch.txt").expect("job exists");
+        assert_eq!(job_before.status, "retry_wait");
+
+        let mut readded_different_id =
+            file_entry(Some("/shared/mismatch.txt"), Some("H"), Some("rev2"), None);
+        readded_different_id.id = Some("id:NEW".to_string());
+        let page_two = DropboxListFolderResponse {
+            entries: vec![readded_different_id],
+            cursor: "cursor_2".to_string(),
+            has_more: false,
+        };
+        run_remote_delta(
+            &state,
+            "cursor_1",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_two))]),
+        )
+        .expect("invocation 2");
+
+        let job_after = local_delete_job(&state, "shared/mismatch.txt")
+            .expect("the job must still exist, uncancelled");
+        assert_eq!(
+            job_after.status, "retry_wait",
+            "a re-add carrying a DIFFERENT id must never cancel the deferred delete"
+        );
+        assert!(job_after.delta_deferred);
+    }
+
+    /// **NULL stored id, D3's content-hash fallback.** When `remote_file_index` has no
+    /// `dropbox_id` on file (a row written before DBSYNC-99 back-filled ids), a re-add
+    /// is identified by `content_hash` equality instead. A matching hash cancels; a
+    /// differing hash does not.
+    #[test]
+    fn null_stored_id_falls_back_to_content_hash_for_cancellation() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/no_id.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/no_id.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/shared/no_id.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_1".to_string(),
+            has_more: false,
+        };
+        run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_one))]),
+        )
+        .expect("invocation 1");
+        assert_eq!(
+            local_delete_job(&state, "shared/no_id.txt").unwrap().status,
+            "retry_wait"
+        );
+
+        // Same content_hash, no id at all: must cancel.
+        let readded_same_hash =
+            file_entry(Some("/shared/no_id.txt"), Some("H"), Some("rev2"), None);
+        let page_two = DropboxListFolderResponse {
+            entries: vec![readded_same_hash],
+            cursor: "cursor_2".to_string(),
+            has_more: false,
+        };
+        run_remote_delta(
+            &state,
+            "cursor_1",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_two))]),
+        )
+        .expect("invocation 2");
+        assert!(
+            local_delete_job(&state, "shared/no_id.txt").is_none(),
+            "a matching content_hash must cancel the deferred delete when no id is stored"
+        );
+    }
+
+    /// NULL stored id, differing content_hash: must NOT cancel.
+    #[test]
+    fn null_stored_id_with_a_differing_content_hash_does_not_cancel() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/no_id_diff.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/no_id_diff.txt", "H", 3, 0)
+            .unwrap();
+
+        let mut deleted = file_entry(Some("/shared/no_id_diff.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page_one = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_1".to_string(),
+            has_more: false,
+        };
+        run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_one))]),
+        )
+        .expect("invocation 1");
+
+        let readded_different_hash = file_entry(
+            Some("/shared/no_id_diff.txt"),
+            Some("H2"),
+            Some("rev2"),
+            None,
+        );
+        let page_two = DropboxListFolderResponse {
+            entries: vec![readded_different_hash],
+            cursor: "cursor_2".to_string(),
+            has_more: false,
+        };
+        run_remote_delta(
+            &state,
+            "cursor_1",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page_two))]),
+        )
+        .expect("invocation 2");
+
+        assert_eq!(
+            local_delete_job(&state, "shared/no_id_diff.txt")
+                .unwrap()
+                .status,
+            "retry_wait",
+            "a differing content_hash, with no stored id to arbitrate, must not cancel"
+        );
+    }
+
+    /// **The snapshot path never defers.** `reconcile_remote_snapshot_with_breaker`
+    /// (the full-sweep / cursor-reset caller) calls the SAME `reconcile_remote_absent`
+    /// the delta path does, but must never call `defer_delta_local_delete` — that call
+    /// exists only at the delta call site in `apply_delta_entries`'s Remove arm.
+    #[test]
+    fn snapshot_path_never_defers_its_local_delete() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("snapshot/gone.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("snapshot/gone.txt", "H", 3, 0)
+            .unwrap();
+
+        let local_files = state.db.list_local_files().unwrap();
+        let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        let pending_targets: HashSet<String> = HashSet::new();
+
+        let enqueued = reconcile_remote_snapshot_with_breaker(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+        )
+        .expect("snapshot reconciliation must not touch the network");
+        assert_eq!(enqueued, 1, "the snapshot path still enqueues the delete");
+
+        let job = local_delete_job(&state, "snapshot/gone.txt").expect("job must exist");
+        assert_eq!(
+            job.status, "queued",
+            "the snapshot path's local_delete must be immediately runnable, never deferred"
+        );
+        assert!(
+            !job.delta_deferred,
+            "the snapshot path must never set delta_deferred"
+        );
+    }
+
+    /// **DBSYNC-102 review F2/P4** (ported from the reviewer's scratchpad throwaway
+    /// `review_c_f2_sweep_rederives_dropped_deferred_delete`): pins the claim F2's
+    /// own doc makes — that dropping an exhausted deferred `local_delete`
+    /// (`Db::drop_exhausted_deferred_local_delete`) loses nothing, because the
+    /// periodic snapshot sweep (`reconcile_remote_snapshot_with_breaker`) re-derives
+    /// the SAME genuine delete from an empty remote snapshot, through the ordinary
+    /// DBSYNC-64 mass-deletion breaker, as a fresh, undeferred `local_delete`.
+    #[test]
+    fn snapshot_sweep_rederives_a_dropped_exhausted_deferred_delete() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/c.txt", "H", "rev1", 0, Some("id:C"))
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("shared/c.txt", "H", 3, 0)
+            .unwrap();
+
+        // A genuine remote delete arrives on the delta path and is deferred.
+        let mut deleted = file_entry(Some("/shared/c.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        assert_eq!(
+            apply_delta_entries(&state, &[deleted], &HashSet::new(), &[]).unwrap(),
+            1
+        );
+        let job = local_delete_job(&state, "shared/c.txt").expect("deferred job must exist");
+        assert!(job.delta_deferred, "precondition: must be deferred");
+
+        // It exhausts its retries (offline) and F2 drops it outright.
+        assert!(
+            state
+                .db
+                .drop_exhausted_deferred_local_delete(job.id)
+                .unwrap(),
+            "precondition: the exhausted deferred delete must be dropped"
+        );
+        assert!(
+            local_delete_job(&state, "shared/c.txt").is_none(),
+            "precondition: nothing local_delete-shaped survives the drop"
+        );
+
+        // The periodic snapshot sweep runs against an empty remote snapshot (the
+        // file is genuinely gone on Dropbox) with the full local index still intact.
+        let local_files = state.db.list_local_files().unwrap();
+        let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
+        let pending_targets = state.db.active_job_paths().unwrap();
+        let enqueued = reconcile_remote_snapshot_with_breaker(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enqueued, 1,
+            "F2/P4 DEMONSTRATED-BY-REGRESSION: the sweep must re-derive the genuine \
+             delete the dropped deferred job was only ever a 60s-early guess at, or \
+             the file is never deleted locally at all"
+        );
+        let rederived = local_delete_job(&state, "shared/c.txt").expect("rederived job");
+        assert!(
+            !rederived.delta_deferred,
+            "the snapshot path's own guarantee still holds: the rederived delete is \
+             undeferred, going through the DBSYNC-64 breaker like any other \
+             snapshot-inferred delete (review P4: an accepted trade-off, not fixed \
+             here — see Db::drop_exhausted_deferred_local_delete's doc)"
+        );
+    }
+
+    /// **A dehydrated child is never deferred, because nothing is enqueued for it.**
+    /// `reconcile_remote_absent` returns `Ok(0)` (not `Ok(1)`) when there is no local
+    /// row to delete — see its "no local file" arm — so `apply_delta_entries` never
+    /// calls `defer_delta_local_delete` at all. This is the existing no-local-row arm,
+    /// pinned here for the share/un-share shape specifically.
+    #[test]
+    fn dehydrated_placeholder_child_is_not_deferred_because_nothing_is_enqueued() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("shared/placeholder.txt", "H", "rev1", 0, Some("id:PLACE"))
+            .unwrap();
+        // Deliberately no `upsert_local_file` — a dehydrated child has a remote row
+        // and no local index row.
+
+        let mut deleted = file_entry(Some("/shared/placeholder.txt"), None, None, None);
+        deleted.tag = "deleted".to_string();
+        let page = DropboxListFolderResponse {
+            entries: vec![deleted],
+            cursor: "cursor_1".to_string(),
+            has_more: false,
+        };
+        let outcome = run_remote_delta(
+            &state,
+            "start",
+            scripted_page_source(vec![Ok(DeltaFetchOutcome::Page(page))]),
+        )
+        .expect("delta must not error");
+        assert!(matches!(outcome, DeltaRunOutcome::Applied { enqueued: 0 }));
+        assert!(
+            state.db.list_recent_jobs(200).unwrap().is_empty(),
+            "a dehydrated child with no local row must enqueue, and therefore defer, nothing"
+        );
+        assert!(
+            state
+                .db
+                .get_remote_file("shared/placeholder.txt")
+                .unwrap()
+                .is_none(),
+            "reconcile_remote_absent's no-local-file arm drops the stale remote row"
         );
     }
 
