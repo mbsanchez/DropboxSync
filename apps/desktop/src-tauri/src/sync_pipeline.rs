@@ -7059,6 +7059,61 @@ mod tests {
         );
     }
 
+    /// **DBSYNC-102, CTO review F1, through the real runner.** The direct-core test
+    /// above proves a read failure returns `Err`; this one proves what the runner then
+    /// does with it: the job goes back to `retry_wait` with `delta_deferred` intact, so
+    /// the retry is verified again — and nothing is deleted, uploaded or flagged. It
+    /// also pins the `outcome="rescheduled"` log line a tester greps for.
+    ///
+    /// Proof this test can fail: restoring `Err(_) => Ok(false)` in
+    /// `file_unchanged_since_delta_check` sends the job down the diverged arm, which
+    /// removes the row — failing the `expect` below.
+    #[cfg(unix)]
+    #[test]
+    fn process_sync_queue_core_reschedules_a_deferred_local_delete_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/locked.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:LOCK");
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let log = captured_tracing_output(|| {
+            let ran = super::process_sync_queue_core(&state, |_| Ok(None)).unwrap();
+            assert!(ran);
+        });
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(path.exists(), "nothing may be deleted on a failed re-check");
+        let jobs = state.db.list_recent_jobs(10).unwrap();
+        let job = jobs
+            .iter()
+            .find(|j| j.job_type == "local_delete" && j.target_path.as_deref() == Some(rel))
+            .expect("the deferred job must survive, to be retried");
+        assert_eq!(job.status, "retry_wait");
+        assert!(
+            job.delta_deferred,
+            "the retry must be verified again: delta_deferred must survive apply_job_failure"
+        );
+        assert_eq!(
+            jobs.iter().filter(|j| j.job_type == "upload").count(),
+            0,
+            "an unreadable file must never be queued for upload"
+        );
+        assert!(state.db.list_recent_conflicts(10).unwrap().is_empty());
+        assert!(
+            log.lines()
+                .any(|l| l.contains("outcome=\"rescheduled\"") && l.contains(rel)),
+            "the re-hash failure must be logged as rescheduled, naming the path; got: {log}"
+        );
+    }
+
     /// **DBSYNC-102 review F7**: `recover_running_jobs` must not clear
     /// `delta_deferred` — an app killed mid-verification must come back still
     /// deferred, not as an unverified delete.
@@ -7173,6 +7228,82 @@ mod tests {
         assert!(
             !log.contains("sync job completed"),
             "must NOT log a kept delete as completed; got: {log}"
+        );
+    }
+
+    /// **DBSYNC-102, CTO review F1 — an unchanged file that cannot be read must not be
+    /// re-uploaded over a genuine remote delete.** The re-check before a deferred delete
+    /// used to treat a read failure as "the file diverged", and the diverged arm always
+    /// enqueues an upload — so a file a collaborator deleted on Dropbox, merely locked
+    /// at that moment (a Windows sharing violation from an open document, an antivirus
+    /// scan, a permission change), was flagged as a conflict and later recreated on
+    /// Dropbox with its unchanged bytes. A read failure is now a retry, not a verdict:
+    /// the core returns `Err` before any side effect, exactly like a failed lookup.
+    ///
+    /// Proof this test can fail: restoring `Err(_) => Ok(false)` in
+    /// `file_unchanged_since_delta_check` makes the core return `Ok(Cancelled)` with
+    /// one upload and one conflict, failing the first assertion.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_unchanged_file_is_retried_not_reuploaded_over_a_genuine_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/locked.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:LOCK");
+        assert_eq!(
+            apply_delta_batch(
+                &state,
+                vec![delta_entry(
+                    "deleted",
+                    "/shared/locked.txt",
+                    None,
+                    None,
+                    None
+                )]
+            ),
+            1
+        );
+        let deferred = state
+            .db
+            .list_recent_jobs(20)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete")
+            .expect("the genuine delete must have been deferred");
+
+        // Content unchanged; the file is merely unreadable for the moment.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = crate::dropbox_transfer::verify_and_delete_local_file_core(
+            &state,
+            deferred.id,
+            rel,
+            |_| Ok(None),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a read failure must be a retry (Err), not a verdict; got {result:?}"
+        );
+        let jobs = state.db.list_recent_jobs(20).unwrap();
+        assert_eq!(
+            jobs.iter().filter(|j| j.job_type == "upload").count(),
+            0,
+            "an unchanged-but-unreadable file must never be queued for re-upload"
+        );
+        assert!(
+            state.db.list_recent_conflicts(20).unwrap().is_empty(),
+            "nothing diverged, so no conflict may be recorded"
+        );
+        assert!(path.exists(), "nothing may be deleted on a failed re-check");
+        let still = jobs
+            .iter()
+            .find(|j| j.id == deferred.id)
+            .expect("the deferred job must survive, to be retried by apply_job_failure");
+        assert!(
+            still.delta_deferred,
+            "the retry must still be verified: delta_deferred must survive"
         );
     }
 }

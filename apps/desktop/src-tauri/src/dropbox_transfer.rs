@@ -1868,8 +1868,9 @@ pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Ap
 
 /// What `verify_and_delete_local_file_core` decided for one deferred `local_delete`.
 /// Both arms are terminal — there is no third "retry" outcome here, because a lookup
-/// failure is never turned into one of these; it is propagated as `Err` instead (see
-/// the core's own doc) and handled by the caller's ordinary retry/backoff path.
+/// or re-hash failure is never turned into one of these; it is propagated as `Err`
+/// instead (see the core's own doc) and handled by the caller's ordinary retry/backoff
+/// path.
 ///
 /// `Cancelled` covers two distinct DB-effect shapes — the path still exists (kept
 /// as-is, possibly with an upload enqueued for a diverged edit — review F3/P2), or
@@ -1921,9 +1922,9 @@ pub(crate) enum DeferredDeleteOutcome {
 ///   the activity flyout, which renders every `local_delete` row that ends `done` as
 ///   "Supprimé (retiré du remote)". A `done` row for a file that is still on disk
 ///   would tell the user it was deleted when it was not; deleting the row instead
-///   means nothing is reported for it at all, which is the truth. The caller's
-///   generic `mark_job_completed` on the `Ok(())` this core returns then no-ops
-///   harmlessly against the now-missing row.
+///   means nothing is reported for it at all, which is the truth. The caller
+///   (`process_sync_queue_core`) handles `Cancelled` in its own arm: it logs the job
+///   as kept and calls neither `mark_job_completed` nor `record_job_processed`.
 ///
 ///   (review F3): the re-add that justifies keeping the file may not carry the
 ///   content the on-disk file now holds — the user could have edited it during the
@@ -1960,9 +1961,12 @@ pub(crate) enum DeferredDeleteOutcome {
 ///     and the freshly-computed on-disk hash matches BOTH the local-index hash AND
 ///     the stored `remote_file_index.content_hash` → unchanged since
 ///     `reconcile_remote_absent` made its decision; delete.
+///   - the file exists but cannot be read — returns `Err` before any side effect and
+///     is retried exactly like a failed lookup. A read failure says nothing about
+///     whether the bytes changed, so it must not take the arm below (CTO review F1).
 ///   - anything else — the hash differs, the row is marked for rescan (its hash
 ///     cannot be trusted, same reasoning `reconcile_remote_absent` itself uses), or
-///     the file cannot even be read — do NOT delete. This takes the FOUR
+///     the local or remote index row is missing — do NOT delete. This takes the FOUR
 ///     `add_conflict`/`remove_remote_file`/`record_conflict`/`notify_conflict`
 ///     calls `reconcile_remote_absent` takes for a diverged local file as a
 ///     VERBATIM COPY, not a call into that function: `reconcile_remote_absent`
@@ -1986,11 +1990,25 @@ pub(crate) enum DeferredDeleteOutcome {
 ///     nothing will ever revisit `rel` again — an edit that was scanned during the
 ///     grace window would stay local-only forever, while the SAME edit, had it
 ///     never been scanned, gets uploaded by the very next scan. So this enqueues an
-///     upload for `rel` right after the four calls, unconditionally: the remote row
-///     for `rel` was just dropped by `remove_remote_file` above, so there is no
-///     longer anything on Dropbox this upload could overwrite — unlike the
-///     `Ok(Some(_))` arm's P2 guard, no gate is needed. This makes the scanned and
-///     unscanned cases converge on the same end state.
+///     upload for `rel` right after the four calls, without the `Ok(Some(_))` arm's
+///     P2 gate: there is no stored remote content left to compare against. That does
+///     NOT mean the upload cannot overwrite anything — it runs later, from the queue,
+///     and something may have appeared at `rel` on Dropbox by then, or the lookup's
+///     "gone" may have been one of the 409s `fetch_remote_file_metadata` over-maps to
+///     `None`. Its exposure is exactly that of an ordinary scan-detected edit upload on
+///     `main`, under the upload path's own guards — no wider. This makes the scanned
+///     and unscanned cases converge on the same end state. It never runs because of a
+///     read failure: a file that cannot be read returns `Err` from the re-check and
+///     never reaches this arm (CTO review F1). It does still run, without any hash
+///     having been compared, when the local row is missing, marked for rescan, or the
+///     remote row is missing — the same cases `reconcile_remote_absent` refuses to
+///     delete on.
+///
+///     A crash between the conflict calls and the final row removal leaves the job to
+///     be recovered and re-run; the re-run finds the remote row already gone, takes
+///     this arm again, and records a second conflict row and notification. The upload
+///     collapses into the first through `enqueue_job`'s `ON CONFLICT` while it is still
+///     active. Accepted: duplicated noise, never a deletion.
 ///
 ///     The job row is dropped via `cancel_verified_local_delete` LAST, after the
 ///     conflict and the upload above (review P5): removing it earlier would mean a
@@ -2064,7 +2082,15 @@ pub(crate) fn verify_and_delete_local_file_core(
             Ok(DeferredDeleteOutcome::Cancelled)
         }
         Ok(None) => {
-            let unchanged = file_unchanged_since_delta_check(state, rel)?;
+            let unchanged = file_unchanged_since_delta_check(state, rel).inspect_err(|err| {
+                tracing::info!(
+                    path = %rel,
+                    outcome = "rescheduled",
+                    error = %err,
+                    "DBSYNC-102 (CTO review F1): deferred local_delete re-hash failed — \
+                     rescheduling through the existing retry/backoff, not deleting"
+                );
+            })?;
             if unchanged {
                 delete_local_file_internal(state, rel)?;
                 tracing::info!(
@@ -2078,7 +2104,7 @@ pub(crate) fn verify_and_delete_local_file_core(
             } else {
                 // (review F1): the on-disk file no longer matches what
                 // `reconcile_remote_absent` saw at delta time (or its hash cannot be
-                // trusted/read) — unlinking now would destroy content Dropbox never
+                // trusted) — unlinking now would destroy content Dropbox never
                 // got to see. These four calls are a VERBATIM COPY of the four
                 // `reconcile_remote_absent` takes for a diverged local file, not a
                 // call into that function — see this function's doc for why it
@@ -2100,16 +2126,16 @@ pub(crate) fn verify_and_delete_local_file_core(
                 // unscanned edit would reach — `main`'s conflict arm never enqueues
                 // an upload here because it assumes one is already pending (see
                 // this function's doc for why that assumption does not hold once a
-                // `local_delete` was pending for `rel`). Unconditional and unguarded,
-                // unlike the `Ok(Some(_))` arm's P2 gate above: `remove_remote_file`
-                // just dropped the only remote content this upload could overwrite.
+                // `local_delete` was pending for `rel`). No P2 gate here: there is no
+                // stored remote content left to compare against. Its exposure is that
+                // of an ordinary edit upload, not none — see this function's doc.
                 state.db.enqueue_job("upload", Some(rel), Some(rel))?;
                 tracing::warn!(
                     path = %rel,
                     outcome = "diverged",
                     "DBSYNC-102 (review F1/P3): deferred local_delete verification found \
-                     the path gone on Dropbox, but the on-disk file changed (or could not \
-                     be trusted/read) during the grace window — refusing to delete, \
+                     the path gone on Dropbox, but the on-disk file changed (or its hash \
+                     could not be trusted) during the grace window — refusing to delete, \
                      flagging as a remote-deleted conflict, and enqueuing an upload so \
                      this path converges on the same end state as an edit that was never \
                      scanned during the grace window"
@@ -2146,7 +2172,9 @@ pub(crate) fn verify_and_delete_local_file_core(
 /// stored remote `content_hash`. Returns `false` — meaning "do not delete" — when
 /// the hashes disagree, the local row is marked [`crate::storage::db::Db::HASH_NEEDS_RESCAN`]
 /// (its hash cannot be trusted, same reasoning `reconcile_remote_absent` itself
-/// applies), the local row is missing entirely, or the file cannot be read.
+/// applies), or the local row is missing entirely. Returns `Err` when the file exists
+/// but cannot be read: that is not evidence of an edit, and must retry rather than
+/// take the diverged arm (see the match below).
 fn file_unchanged_since_delta_check(state: &AppState, rel: &str) -> AppResult<bool> {
     let folder = state
         .db
@@ -2185,7 +2213,18 @@ fn file_unchanged_since_delta_check(state: &AppState, rel: &str) -> AppResult<bo
         Ok((on_disk_hash, _size, _mtime)) => {
             Ok(on_disk_hash == remote_row.content_hash && on_disk_hash == local_row.hash)
         }
-        Err(_) => Ok(false),
+        // A read failure says nothing about whether the bytes changed — a locked file
+        // (a Windows sharing violation from an open document, an antivirus scan) or a
+        // momentary permission change reads the same as an edit would if mapped to
+        // `false`. And `false` is not neutral here: the caller's diverged arm records a
+        // conflict and enqueues an upload, so an UNCHANGED file a collaborator deleted
+        // would be recreated on Dropbox once it became readable again (CTO review F1).
+        // Treat it like a failed lookup instead: an error, before any side effect, so
+        // the job retries with `delta_deferred` intact and an exhausted job is dropped
+        // and re-derived by the snapshot sweep.
+        Err(e) => Err(AppError::Io(format!(
+            "cannot re-hash {rel} before a deferred local_delete ({e})"
+        ))),
     }
 }
 

@@ -39,7 +39,7 @@ function queueActionLabel(job: SyncJob): string {
     case "local_delete":
       // (review P6): only a job that actually finished (`status === "done"`) may
       // read as completed — `failed` must not share that label. Before this fix,
-      // a failed local_delete (the job never ran) fell into the same "Supprimé"
+      // a failed local_delete (the job ran and failed) fell into the same "Supprimé"
       // branch as a genuinely completed one, telling the user their file was
       // deleted when it was not.
       if (isPendingJobStatus(job.status)) {

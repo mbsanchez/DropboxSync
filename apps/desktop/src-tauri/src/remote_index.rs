@@ -79,7 +79,7 @@ pub(crate) struct RemoteFileMeta {
 /// change) and on (re)login so the loop reseeds against the new state.
 pub(crate) const REMOTE_DELTA_CURSOR_KEY: &str = "remote_delta_cursor";
 
-/// DBSYNC-102 (#179): how long a delta-driven `local_delete` of hydrated content waits
+/// DBSYNC-102 (#179): how long a delta-driven `local_delete` of indexed content waits
 /// before it is allowed to run, so a share/un-share conversion's re-add (same Dropbox
 /// id, same path) has a chance to cancel it first.
 ///
@@ -1136,7 +1136,7 @@ pub(crate) fn apply_delta_entries(
                     let removed = reconcile_remote_absent(state, &rel)?;
                     if removed == 1 {
                         // DBSYNC-102 (#179, D1): `reconcile_remote_absent` just enqueued a
-                        // `local_delete` for hydrated content from a delta `deleted` entry
+                        // `local_delete` for indexed content from a delta `deleted` entry
                         // — defer it for the grace window rather than letting it drain
                         // immediately, so a conversion's re-add (observed on the Upsert arm
                         // above, possibly in a LATER invocation) can still cancel it. This is
@@ -2795,7 +2795,7 @@ mod tests {
             .expect("the deferred job must still exist");
         assert_eq!(
             job.status, "retry_wait",
-            "a delta-driven local_delete of hydrated content must be deferred, not left queued"
+            "a delta-driven local_delete of indexed content must be deferred, not left queued"
         );
         assert!(job.delta_deferred, "the deferred marker must be set");
         assert!(
@@ -3929,7 +3929,11 @@ mod tests {
         );
     }
 
-    /// **A dehydrated child is never deferred, because nothing is enqueued for it.**
+    /// **A dehydrated macOS child (`.cloudsc`, no local index row) is never deferred,
+    /// because nothing is enqueued for it.** On Windows a CfAPI placeholder DOES keep a
+    /// local row, with its hash equal to the remote one, so its genuine delete is
+    /// deferred like any other — which is why `file_unchanged_since_delta_check`
+    /// returns early for a dehydrated placeholder instead of hashing it.
     /// `reconcile_remote_absent` returns `Ok(0)` (not `Ok(1)`) when there is no local
     /// row to delete — see its "no local file" arm — so `apply_delta_entries` never
     /// calls `defer_delta_local_delete` at all. This is the existing no-local-row arm,
