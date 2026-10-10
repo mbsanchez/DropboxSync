@@ -1866,6 +1866,368 @@ pub(crate) fn delete_local_file_internal(state: &AppState, relative: &str) -> Ap
     Ok(())
 }
 
+/// What `verify_and_delete_local_file_core` decided for one deferred `local_delete`.
+/// Both arms are terminal — there is no third "retry" outcome here, because a lookup
+/// or re-hash failure is never turned into one of these; it is propagated as `Err`
+/// instead (see the core's own doc) and handled by the caller's ordinary retry/backoff
+/// path.
+///
+/// `Cancelled` covers two distinct DB-effect shapes — the path still exists (kept
+/// as-is, possibly with an upload enqueued for a diverged edit — review F3/P2), or
+/// the path is gone but the on-disk file diverged (a conflict is recorded, the
+/// remote row dropped, and an upload enqueued — review F1/P3). It is deliberately
+/// NOT split into a third variant for the diverged shape: the one caller that reads
+/// this value (`process_sync_queue_core`) treats both the same way — neither is a
+/// completed delete, so both must log "kept", never "completed" — and splitting the
+/// variant would add a branch with no corresponding difference in that caller's
+/// behaviour. See the core's own doc for exactly what each `Cancelled`-producing
+/// arm does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredDeleteOutcome {
+    /// The path was genuinely gone on Dropbox — deleted exactly as an ordinary,
+    /// undeferred `local_delete` would.
+    Deleted,
+    /// The delete did not run — the path still exists on Dropbox, or the on-disk
+    /// file diverged during the grace window. Either arm can still write to disk
+    /// and the index: see the core function's doc for what each one does (a
+    /// diverged edit can enqueue an upload in both shapes; the diverged-on-disk
+    /// shape also records a conflict and drops the remote index row).
+    Cancelled,
+}
+
+/// DBSYNC-102 (#180): the network-free core of the execution-time verification a
+/// delta-deferred `local_delete` goes through before it is allowed to destroy
+/// anything. `lookup` is injected — mirrors how `run_remote_delta` takes an injected
+/// page source (`remote_index.rs`) — specifically so a test can drive every branch
+/// below with a fake closure instead of the real, live `fetch_remote_file_metadata`.
+///
+/// `job_id` identifies the `sync_jobs` row currently `running` for `rel` (the one
+/// `pick_next_due_job` just flipped before calling in here); it is needed for both
+/// the `Cancelled` arm below and the `Ok(None)` arm's own diverged-file branch, to
+/// remove that row directly — see below for why.
+///
+/// Outcomes, matching #180's acceptance criteria plus the review-F1/F3 fixes:
+///
+/// - `lookup` returns `Ok(Some(meta))` — the path still exists on Dropbox. This slice
+///   treats EVERY `Some`, not only one whose `id` matches the stored
+///   `remote_file_index.dropbox_id`, as "do not delete": destroying local content for
+///   a path Dropbox still reports as present is the exact failure mode DBSYNC-102
+///   exists to close, and a narrower reading that only cancelled on an exact id match
+///   would reopen it for a replaced-at-the-same-path item with a different id. A
+///   differing identity is not nothing — a later sweep still has the stored `rev`
+///   to compare against and can raise a conflict or enqueue a download — but it can
+///   never, by taking this branch, lose data. The `sync_jobs` row for this deferred
+///   delete is DELETED outright here, not marked `done` — the same choice #179 made
+///   for `cancel_deferred_local_delete`, for the same reason: `list_recent_jobs` feeds
+///   the activity flyout, which renders every `local_delete` row that ends `done` as
+///   "Supprimé (retiré du remote)". A `done` row for a file that is still on disk
+///   would tell the user it was deleted when it was not; deleting the row instead
+///   means nothing is reported for it at all, which is the truth. The caller
+///   (`process_sync_queue_core`) handles `Cancelled` in its own arm: it logs the job
+///   as kept and calls neither `mark_job_completed` nor `record_job_processed`.
+///
+///   (review F3): the re-add that justifies keeping the file may not carry the
+///   content the on-disk file now holds — the user could have edited it during the
+///   grace window, got a conflicted copy from the scan, and the index now (wrongly)
+///   claims the original path is in sync. If `local_file_index[rel].hash` disagrees
+///   with `remote_file_index[rel].content_hash` at this point, nothing else will
+///   ever upload that edit to this path, so an `upload` job is enqueued here for it
+///   — the exact call the scanner itself uses for a changed file.
+///
+///   (review P2): that upload must not run against a REMOTE this client never saw.
+///   `meta` can describe a different file entirely (another person's upload landing
+///   at this path with a different id) or a collaborator's edit of the SAME id with
+///   a different `content_hash` — in both cases the stored `remote_file_index`
+///   content_hash is already stale, so comparing the local hash only against it
+///   would enqueue an `upload` that overwrites content this client has never seen,
+///   using the upload path's overwrite mode. The upload is therefore enqueued only
+///   when `meta` still describes the content last synced to this path: the same
+///   `dropbox_id` as stored (when one is on file) AND the same `content_hash`.
+///   Otherwise this leaves it alone — the sweep's download path has its own
+///   conflict guard for a changed remote, which is the right place to resolve it.
+/// - `lookup` returns `Ok(None)` — the path reports genuinely gone on Dropbox AS OF
+///   THIS CALL. That used to be enough to delete unconditionally, but the check and
+///   the unlink are no longer milliseconds apart the way they are inside
+///   `reconcile_remote_absent` — the grace window puts up to
+///   `DELTA_DELETE_GRACE_SECS` between the delta-time hash comparison and this
+///   execution-time one (review F1), during which the file can be edited and that
+///   edit can be missed entirely (a watcher batch dropped while `sync_running` is
+///   held, or still inside debounce) — so this re-reads the on-disk bytes right
+///   here, immediately before deciding to unlink, and only deletes if they are
+///   provably unchanged:
+///   - the path is already gone from disk → nothing to protect, delete (clears the
+///     index rows exactly as `delete_local_file_internal` always has).
+///   - the path exists, its local-index hash is not [`crate::storage::db::Db::HASH_NEEDS_RESCAN`],
+///     and the freshly-computed on-disk hash matches BOTH the local-index hash AND
+///     the stored `remote_file_index.content_hash` → unchanged since
+///     `reconcile_remote_absent` made its decision; delete.
+///   - the file exists but cannot be read — returns `Err` before any side effect and
+///     is retried exactly like a failed lookup. A read failure says nothing about
+///     whether the bytes changed, so it must not take the arm below (CTO review F1).
+///   - anything else — the hash differs, the row is marked for rescan (its hash
+///     cannot be trusted, same reasoning `reconcile_remote_absent` itself uses), or
+///     the local or remote index row is missing — do NOT delete. This takes the FOUR
+///     `add_conflict`/`remove_remote_file`/`record_conflict`/`notify_conflict`
+///     calls `reconcile_remote_absent` takes for a diverged local file as a
+///     VERBATIM COPY, not a call into that function: `reconcile_remote_absent`
+///     has no way to take this branch without also enqueueing a `local_delete`
+///     (see its own doc — the two outcomes are the same `if`/`else`), which here
+///     would resurrect the exact unconditional delete this whole function exists
+///     to replace. The copy is held byte-identical to `reconcile_remote_absent`'s
+///     own arm on purpose, so the two can never silently drift apart; that
+///     function itself is untouched by this slice.
+///
+///     (review P3): `reconcile_remote_absent`'s own version of this arm never
+///     enqueues an upload for `rel`, because on `main` it can only be reached with
+///     `local.hash != prev.content_hash` already true BEFORE any delete was ever
+///     considered — which only happens because an earlier scan already found the
+///     edit and enqueued its upload in the same call (`process_local_file_change`'s
+///     uncovered arm). That assumption does not hold here: a pending `local_delete`
+///     on `rel` makes `covered_by_active_job` true for the whole grace window, so a
+///     scan that ran during it routed the edit to a CONFLICTED COPY instead
+///     (`process_local_file_change`'s covered arm) and enqueued the upload for THAT
+///     copy, never for `rel` itself. Once the four calls above drop the remote row,
+///     nothing will ever revisit `rel` again — an edit that was scanned during the
+///     grace window would stay local-only forever, while the SAME edit, had it
+///     never been scanned, gets uploaded by the very next scan. So this enqueues an
+///     upload for `rel` right after the four calls, without the `Ok(Some(_))` arm's
+///     P2 gate: there is no stored remote content left to compare against. That does
+///     NOT mean the upload cannot overwrite anything — it runs later, from the queue,
+///     and something may have appeared at `rel` on Dropbox by then, or the lookup's
+///     "gone" may have been one of the 409s `fetch_remote_file_metadata` over-maps to
+///     `None`. Its exposure is exactly that of an ordinary scan-detected edit upload on
+///     `main`, under the upload path's own guards — no wider. This makes the scanned
+///     and unscanned cases converge on the same end state. It never runs because of a
+///     read failure: a file that cannot be read returns `Err` from the re-check and
+///     never reaches this arm (CTO review F1). It does still run, without any hash
+///     having been compared, when the local row is missing, marked for rescan, or the
+///     remote row is missing — the same cases `reconcile_remote_absent` refuses to
+///     delete on.
+///
+///     A crash between the conflict calls and the final row removal leaves the job to
+///     be recovered and re-run; the re-run finds the remote row already gone, takes
+///     this arm again, and records a second conflict row and notification. The upload
+///     collapses into the first through `enqueue_job`'s `ON CONFLICT` while it is still
+///     active. Accepted: duplicated noise, never a deletion.
+///
+///     The job row is dropped via `cancel_verified_local_delete` LAST, after the
+///     conflict and the upload above (review P5): removing it earlier would mean a
+///     DB error partway through those effects loses the upload and leaves the
+///     caller's `apply_job_failure` to update a row that is already gone. A delete
+///     that would have destroyed an unsynced edit is not the same as the "kept,
+///     exists" case above, but it is not a completed delete either.
+///
+///   This is deliberately NOT a fix for `fetch_remote_file_metadata`'s own
+///   `Ok(None)` mapping (a 409 whose body merely contains `"path"`, which also
+///   matches `path/restricted_content` — pre-existing, shared, left unchanged): if
+///   that signal is wrong and the file is genuinely unchanged, this still deletes
+///   it, exactly as before this fix. What F1 closes is the NEWLY-introduced gap —
+///   a correct "genuinely gone" answer arriving late enough to race an edit it was
+///   never asked about.
+/// - `lookup` returns `Err(_)` — the verification itself failed (almost always a
+///   network error). Propagated UNCHANGED, with nothing deleted and no DB write at
+///   all from this function. The caller's ordinary `apply_job_failure` path then
+///   reschedules through the existing retry/backoff exactly as any other job
+///   failure would, and `delta_deferred` is untouched by that reschedule (see
+///   `SyncJobRow::delta_deferred`'s doc) — so the next attempt re-enters this same
+///   verification rather than silently falling through to an unconditional delete.
+///
+/// Every outcome, including the error, is logged with the path and the outcome;
+/// the `Ok(Some(_))` and genuinely-deleted arms additionally log the id Dropbox
+/// reported (when there is one), and the diverged arm logs at `warn` rather than
+/// `info` since it means an edit almost escaped deletion.
+pub(crate) fn verify_and_delete_local_file_core(
+    state: &AppState,
+    job_id: i64,
+    rel: &str,
+    lookup: impl FnOnce(&str) -> AppResult<Option<crate::remote_index::RemoteFileMeta>>,
+) -> AppResult<DeferredDeleteOutcome> {
+    match lookup(rel) {
+        Ok(Some(meta)) => {
+            tracing::info!(
+                path = %rel,
+                outcome = "kept",
+                id = meta.id.as_deref().unwrap_or("<none>"),
+                "DBSYNC-102 (#180): deferred local_delete verified at execution time — \
+                 path still exists on Dropbox, cancelling the delete"
+            );
+            // (review F3): a re-add that cancels the delete is not a guarantee the
+            // on-disk bytes match what Dropbox now holds — see this function's doc.
+            // (review P2): nor is a cancel a guarantee the REMOTE itself still holds
+            // the content this client last synced — only enqueue the upload when
+            // `meta` still describes exactly that content (see this function's doc).
+            if let (Some(local), Some(remote)) = (
+                state.db.get_local_file(rel)?,
+                state.db.get_remote_file(rel)?,
+            ) {
+                let remote_unchanged = match remote.dropbox_id.as_deref() {
+                    Some(stored_id) => meta.id.as_deref() == Some(stored_id),
+                    None => true,
+                } && meta.content_hash == remote.content_hash;
+                if remote_unchanged && local.hash != remote.content_hash {
+                    state.db.enqueue_job("upload", Some(rel), Some(rel))?;
+                    tracing::info!(
+                        path = %rel,
+                        "DBSYNC-102 (review F3): deferred local_delete cancelled, but the \
+                         local copy diverged from the stored remote hash during the grace \
+                         window — enqueuing an upload to reconcile it"
+                    );
+                }
+            }
+            // (review P5): remove the job row LAST, after every other effect above
+            // has succeeded — removing it first would mean a DB error partway
+            // through the reads/enqueue above loses the upload and leaves the
+            // caller's `apply_job_failure` to update a row that is already gone.
+            state.db.cancel_verified_local_delete(job_id)?;
+            Ok(DeferredDeleteOutcome::Cancelled)
+        }
+        Ok(None) => {
+            let unchanged = file_unchanged_since_delta_check(state, rel).inspect_err(|err| {
+                tracing::info!(
+                    path = %rel,
+                    outcome = "rescheduled",
+                    error = %err,
+                    "DBSYNC-102 (CTO review F1): deferred local_delete re-hash failed — \
+                     rescheduling through the existing retry/backoff, not deleting"
+                );
+            })?;
+            if unchanged {
+                delete_local_file_internal(state, rel)?;
+                tracing::info!(
+                    path = %rel,
+                    outcome = "deleted",
+                    id = "<none>",
+                    "DBSYNC-102 (#180): deferred local_delete verified at execution time — \
+                     path is genuinely gone on Dropbox, deleting"
+                );
+                Ok(DeferredDeleteOutcome::Deleted)
+            } else {
+                // (review F1): the on-disk file no longer matches what
+                // `reconcile_remote_absent` saw at delta time (or its hash cannot be
+                // trusted) — unlinking now would destroy content Dropbox never
+                // got to see. These four calls are a VERBATIM COPY of the four
+                // `reconcile_remote_absent` takes for a diverged local file, not a
+                // call into that function — see this function's doc for why it
+                // cannot be called here without also enqueueing a `local_delete`,
+                // and why the copy is held byte-identical to it on purpose.
+                state.db.add_conflict(
+                    rel,
+                    rel,
+                    "remote deleted while local had unsynced changes",
+                    None,
+                    true,
+                )?;
+                state.db.remove_remote_file(rel)?;
+                if let Ok(mut engine) = state.sync_engine.lock() {
+                    engine.record_conflict();
+                }
+                crate::sharing::notify_conflict(rel);
+                // (review P3): converge this arm on the same end state an
+                // unscanned edit would reach — `main`'s conflict arm never enqueues
+                // an upload here because it assumes one is already pending (see
+                // this function's doc for why that assumption does not hold once a
+                // `local_delete` was pending for `rel`). No P2 gate here: there is no
+                // stored remote content left to compare against. Its exposure is that
+                // of an ordinary edit upload, not none — see this function's doc.
+                state.db.enqueue_job("upload", Some(rel), Some(rel))?;
+                tracing::warn!(
+                    path = %rel,
+                    outcome = "diverged",
+                    "DBSYNC-102 (review F1/P3): deferred local_delete verification found \
+                     the path gone on Dropbox, but the on-disk file changed (or its hash \
+                     could not be trusted) during the grace window — refusing to delete, \
+                     flagging as a remote-deleted conflict, and enqueuing an upload so \
+                     this path converges on the same end state as an edit that was never \
+                     scanned during the grace window"
+                );
+                // (review P5): remove the job row LAST, after every other effect
+                // above has succeeded — see the `Ok(Some(_))` arm's comment for why.
+                state.db.cancel_verified_local_delete(job_id)?;
+                Ok(DeferredDeleteOutcome::Cancelled)
+            }
+        }
+        Err(err) => {
+            tracing::info!(
+                path = %rel,
+                outcome = "rescheduled",
+                error = %err,
+                "DBSYNC-102 (#180): deferred local_delete verification failed — \
+                 rescheduling through the existing retry/backoff, not deleting"
+            );
+            Err(err)
+        }
+    }
+}
+
+/// DBSYNC-102 (review F1): re-checks, right before a deferred `local_delete`
+/// unlinks anything, that the on-disk file is still the exact bytes
+/// `reconcile_remote_absent` saw safe to delete back at delta time. Up to
+/// `DELTA_DELETE_GRACE_SECS` can have passed between that check and this one, and
+/// nothing guarantees a scan ran in between (a watcher batch can be dropped while
+/// `sync_running` is held — see `fs_watcher.rs`'s `remember_dropped`).
+///
+/// Reuses the project's existing file-hashing function (`hash_file`) rather than a
+/// new one. Returns `true` only when there is nothing left to protect (the file is
+/// already gone) or when the on-disk hash matches BOTH the local-index hash and the
+/// stored remote `content_hash`. Returns `false` — meaning "do not delete" — when
+/// the hashes disagree, the local row is marked [`crate::storage::db::Db::HASH_NEEDS_RESCAN`]
+/// (its hash cannot be trusted, same reasoning `reconcile_remote_absent` itself
+/// applies), or the local row is missing entirely. Returns `Err` when the file exists
+/// but cannot be read: that is not evidence of an edit, and must retry rather than
+/// take the diverged arm (see the match below).
+fn file_unchanged_since_delta_check(state: &AppState, rel: &str) -> AppResult<bool> {
+    let folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    let local_path = safe_join(Path::new(&folder), rel)?;
+
+    if !local_path.exists() {
+        // Nothing on disk to protect — a delete with no bytes to lose.
+        return Ok(true);
+    }
+
+    // DBSYNC-102 (review P1, Windows-only): a dehydrated CfAPI placeholder has its
+    // local-index hash set equal to the remote content_hash by `cloudsc_ops.rs`, so
+    // a genuine remote delete reaches this point for an online-only file. Hashing
+    // it below would open the placeholder and trigger an on-demand download
+    // (recall) of content Dropbox no longer has — the same trap the scanner itself
+    // guards against (see `is_dehydrated_placeholder`'s call sites in
+    // `sync_pipeline.rs`). There are no local bytes to protect, so this is safe to
+    // treat as unchanged and let the delete proceed.
+    if crate::path_util::is_dehydrated_placeholder(&local_path) {
+        return Ok(true);
+    }
+
+    let Some(local_row) = state.db.get_local_file(rel)? else {
+        // No index row to compare against: cannot prove the file is unchanged.
+        return Ok(false);
+    };
+    if local_row.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
+        return Ok(false);
+    }
+    let Some(remote_row) = state.db.get_remote_file(rel)? else {
+        return Ok(false);
+    };
+    match hash_file(&local_path) {
+        Ok((on_disk_hash, _size, _mtime)) => {
+            Ok(on_disk_hash == remote_row.content_hash && on_disk_hash == local_row.hash)
+        }
+        // A read failure says nothing about whether the bytes changed — a locked file
+        // (a Windows sharing violation from an open document, an antivirus scan) or a
+        // momentary permission change reads the same as an edit would if mapped to
+        // `false`. And `false` is not neutral here: the caller's diverged arm records a
+        // conflict and enqueues an upload, so an UNCHANGED file a collaborator deleted
+        // would be recreated on Dropbox once it became readable again (CTO review F1).
+        // Treat it like a failed lookup instead: an error, before any side effect, so
+        // the job retries with `delta_deferred` intact and an exhausted job is dropped
+        // and re-derived by the snapshot sweep.
+        Err(e) => Err(AppError::Io(format!(
+            "cannot re-hash {rel} before a deferred local_delete ({e})"
+        ))),
+    }
+}
+
 pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> AppResult<()> {
     let token = get_access_token(state)?;
     let folder = state
@@ -2178,11 +2540,13 @@ mod tests {
         atomic_replace, choose_upload_strategy, classify_delete_response, classify_move_response,
         conflict_copy_with_content_exists, download_would_conflict, download_would_destroy_local,
         emit_sync_conflict, emit_upload_progress, is_final_chunk, retry_transient,
-        upload_would_clobber_unknown_content, DeleteOutcome, MoveOutcome, UploadStrategy,
-        UPLOAD_CHUNK_SIZE, UPLOAD_SESSION_THRESHOLD_BYTES,
+        upload_would_clobber_unknown_content, verify_and_delete_local_file_core,
+        DeferredDeleteOutcome, DeleteOutcome, MoveOutcome, UploadStrategy, UPLOAD_CHUNK_SIZE,
+        UPLOAD_SESSION_THRESHOLD_BYTES,
     };
     use crate::error::{AppError, AppResult};
     use crate::path_util::hash_file;
+    use crate::remote_index::RemoteFileMeta;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// An `AppState` on an isolated temp DB with `sync_folder` set. The NotFound branch
@@ -2796,5 +3160,475 @@ mod tests {
                     .to_string()
         }
         .is_session_invalid());
+    }
+
+    // ---------------------------------------------------------------------------
+    // DBSYNC-102 #180 — execution-time verification before a deferred `local_delete`
+    // runs. Every test below drives `verify_and_delete_local_file_core` directly with
+    // a fake `lookup` closure; none may reach `fetch_remote_file_metadata`'s
+    // production call path, `get_access_token`, or any live network/keychain.
+    // ---------------------------------------------------------------------------
+
+    /// Builds a `local_delete` job already `running` for `rel` — the exact state
+    /// `process_sync_queue_internal` hands the job in, since `pick_next_due_job` flips
+    /// a picked row to `running` before dispatch even starts. Goes through the real
+    /// `enqueue_job` / `defer_delta_local_delete` / `pick_next_due_job` pipeline
+    /// instead of a hand-written row, so the job id/status/`delta_deferred` all come
+    /// from production code, not from an assumption about their shape.
+    fn running_deferred_job(state: &crate::state::AppState, rel: &str) -> i64 {
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .expect("enqueue");
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        assert!(
+            state.db.defer_delta_local_delete(rel, &past).unwrap(),
+            "defer must match the just-enqueued row"
+        );
+        let job = state
+            .db
+            .pick_next_due_job()
+            .unwrap()
+            .expect("the deferred job must now be due");
+        assert_eq!(job.target_path.as_deref(), Some(rel));
+        assert!(job.delta_deferred, "precondition: must be a deferred job");
+        // `pick_next_due_job`'s returned row carries the PRE-pick status by design (see
+        // its own doc) — it already flipped the DB row to `running` as a side effect,
+        // which is what matters here. Confirm that against a fresh read instead of the
+        // stale field on `job`.
+        let persisted_status = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .expect("row")
+            .status;
+        assert_eq!(
+            persisted_status, "running",
+            "precondition: pick_next_due_job must already have flipped the row"
+        );
+        job.id
+    }
+
+    fn fake_meta(id: Option<&str>) -> RemoteFileMeta {
+        RemoteFileMeta {
+            content_hash: "H".to_string(),
+            rev: "rev2".to_string(),
+            modified_ts: 0,
+            id: id.map(str::to_string),
+        }
+    }
+
+    /// Seeds both index rows and a real file on disk for `rel`, so a test can assert
+    /// on the filesystem itself, not only on the DB rows.
+    /// DBSYNC-102 (review F1): the local-index/remote-index hash MUST be the real
+    /// on-disk hash of the seeded content, not an opaque placeholder — the
+    /// execution-time verification core now re-hashes the file for real before a
+    /// genuinely-gone delete is allowed to proceed (`file_unchanged_since_delta_check`),
+    /// so a fixture whose recorded hash does not match its own bytes would make
+    /// every "genuinely gone, unchanged" test look diverged instead.
+    fn seed_hydrated_file(
+        state: &crate::state::AppState,
+        rel: &str,
+        stored_id: Option<&str>,
+    ) -> std::path::PathBuf {
+        let folder = state.db.get_sync_folder().unwrap().unwrap();
+        let path = std::path::Path::new(&folder).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"hello").unwrap();
+        let (hash, size, mtime) = hash_file(&path).unwrap();
+        state
+            .db
+            .upsert_remote_file(rel, &hash, "rev1", 0, stored_id)
+            .unwrap();
+        state.db.upsert_local_file(rel, &hash, size, mtime).unwrap();
+        path
+    }
+
+    /// **Exists, same id → kept.** Both index rows and the file on disk survive; the
+    /// job's row is gone entirely rather than left `done` (see the core's doc for why:
+    /// the activity flyout renders every `done` `local_delete` as a completed
+    /// deletion).
+    #[test]
+    fn verify_before_delete_exists_same_id_keeps_everything_and_drops_the_job_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/child.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:CHILD"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let outcome = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            Ok(Some(fake_meta(Some("id:CHILD"))))
+        })
+        .expect("lookup succeeded");
+
+        assert_eq!(outcome, DeferredDeleteOutcome::Cancelled);
+        assert!(
+            path.exists(),
+            "the file must survive — Dropbox still has it"
+        );
+        assert!(
+            state.db.get_local_file(rel).unwrap().is_some(),
+            "the local index row must survive"
+        );
+        assert!(
+            state.db.get_remote_file(rel).unwrap().is_some(),
+            "the remote index row must survive"
+        );
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.id != job_id),
+            "the kept job's row must be gone entirely, never left as a completed delete"
+        );
+    }
+
+    /// **Exists, a DIFFERENT id → kept, same as above.** D2's wording only names
+    /// same-id/hash and genuinely-gone; this slice treats EVERY `Ok(Some(_))` as
+    /// "do not delete" — see the core's doc comment for why a narrower reading would
+    /// reopen the exact failure mode this ticket exists to close.
+    #[test]
+    fn verify_before_delete_exists_different_id_also_keeps_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/mismatch.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:OLD"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let outcome = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            Ok(Some(fake_meta(Some("id:SOMETHING-ELSE"))))
+        })
+        .expect("lookup succeeded");
+
+        assert_eq!(
+            outcome,
+            DeferredDeleteOutcome::Cancelled,
+            "a differing identity must still cancel, not fall through to deleting"
+        );
+        assert!(path.exists(), "the file must survive");
+        assert!(state.db.get_local_file(rel).unwrap().is_some());
+        assert!(state.db.get_remote_file(rel).unwrap().is_some());
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.id != job_id),
+            "the job row must be gone, never left as a completed delete"
+        );
+    }
+
+    /// **DBSYNC-102 (review F3), the execution-time half**: a kept delete (the
+    /// path still exists on Dropbox) does not prove the on-disk copy matches it —
+    /// the local index can already hold an edit's hash (written by a scan that ran
+    /// during the grace window) while the remote index still holds the pre-edit
+    /// one. Before F3, nothing else would ever enqueue the upload that reconciles
+    /// that edit.
+    #[test]
+    fn verify_before_delete_exists_but_diverged_enqueues_an_upload_for_the_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/diverged.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:DOC"));
+        // Simulate a scan that already recorded an edit's hash in the local index
+        // while the remote index still holds the pre-edit hash.
+        state
+            .db
+            .upsert_local_file(rel, "EDITED_HASH", 99, 0)
+            .unwrap();
+        let job_id = running_deferred_job(&state, rel);
+
+        // (review P2): `meta` must describe the SAME remote content already stored
+        // — same id, same content_hash — or the upload gate below would (correctly)
+        // refuse to enqueue; see the separate "remote changed" tests for that case.
+        let stored = state.db.get_remote_file(rel).unwrap().unwrap();
+        let outcome = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            Ok(Some(RemoteFileMeta {
+                content_hash: stored.content_hash.clone(),
+                rev: "rev2".to_string(),
+                modified_ts: 0,
+                id: Some("id:DOC".to_string()),
+            }))
+        })
+        .expect("lookup succeeded");
+
+        assert_eq!(outcome, DeferredDeleteOutcome::Cancelled);
+        assert!(path.exists());
+        let upload = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload" && j.target_path.as_deref() == Some(rel));
+        assert!(
+            upload.is_some(),
+            "F3 DEMONSTRATED-BY-REGRESSION: a cancel must enqueue an upload for a \
+             diverged local copy, or the edit is never reconciled"
+        );
+    }
+
+    /// **DBSYNC-102 (review P2)**: the SAME id re-appears, but a collaborator's
+    /// edit changed its content (a different `content_hash`) while the delete was
+    /// deferred. `F3`'s original guard compared local only against the STORED
+    /// remote hash and would enqueue an overwriting `upload` against content this
+    /// client never saw. The upload must not be enqueued; the collaborator's edit
+    /// is left for the sweep's download path to reconcile instead.
+    #[test]
+    fn verify_before_delete_same_id_but_remote_content_changed_does_not_overwrite_a_collaborators_edit(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/collab.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:DOC"));
+        // A local edit made during the grace window, routed to the local index
+        // directly (mirrors a scan having already run).
+        state
+            .db
+            .upsert_local_file(rel, "EDITED_HASH", 99, 0)
+            .unwrap();
+        let job_id = running_deferred_job(&state, rel);
+
+        // Same id, but a DIFFERENT content_hash: a collaborator edited the file on
+        // Dropbox during the grace window.
+        let outcome = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            Ok(Some(RemoteFileMeta {
+                content_hash: "COLLABORATOR_EDIT_HASH".to_string(),
+                rev: "rev2".to_string(),
+                modified_ts: 0,
+                id: Some("id:DOC".to_string()),
+            }))
+        })
+        .expect("lookup succeeded");
+
+        assert_eq!(outcome, DeferredDeleteOutcome::Cancelled);
+        assert!(path.exists(), "the local edit must survive");
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.job_type != "upload"),
+            "P2 DEMONSTRATED-BY-REGRESSION: a changed remote must not produce an \
+             upload that would overwrite a collaborator's edit this client never saw"
+        );
+    }
+
+    /// **DBSYNC-102 (review P2)**: a DIFFERENT id re-appears at `rel` (another
+    /// person's file replaced it at the same path) while the local copy also
+    /// diverged. The upload must not be enqueued against an entirely different
+    /// remote file.
+    #[test]
+    fn verify_before_delete_different_id_with_diverged_local_does_not_overwrite_a_different_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/replaced.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:OLD"));
+        state
+            .db
+            .upsert_local_file(rel, "EDITED_HASH", 99, 0)
+            .unwrap();
+        let job_id = running_deferred_job(&state, rel);
+
+        let outcome = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            Ok(Some(fake_meta(Some("id:SOMETHING-ELSE"))))
+        })
+        .expect("lookup succeeded");
+
+        assert_eq!(outcome, DeferredDeleteOutcome::Cancelled);
+        assert!(path.exists(), "the local edit must survive");
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.job_type != "upload"),
+            "P2 DEMONSTRATED-BY-REGRESSION: a different remote identity must not \
+             produce an upload that would overwrite a different file"
+        );
+    }
+
+    /// **Genuinely gone → deleted exactly as an ordinary `local_delete` would.**
+    #[test]
+    fn verify_before_delete_genuinely_gone_deletes_exactly_as_today() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/gone.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:GONE"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let outcome = verify_and_delete_local_file_core(&state, job_id, rel, |_| Ok(None))
+            .expect("lookup succeeded");
+
+        assert_eq!(outcome, DeferredDeleteOutcome::Deleted);
+        assert!(!path.exists(), "the file must actually be removed");
+        assert!(
+            state.db.get_local_file(rel).unwrap().is_none(),
+            "the local index row must be cleared"
+        );
+        assert!(
+            state.db.get_remote_file(rel).unwrap().is_none(),
+            "the remote index row must be cleared"
+        );
+    }
+
+    /// **Lookup error → nothing deleted, and the error is propagated unchanged.**
+    /// `process_sync_queue_internal`'s ordinary `apply_job_failure` path (exercised
+    /// directly in `sync_pipeline.rs`'s own test for this slice, since that function
+    /// is private to that module) then reschedules through the existing
+    /// retry/backoff, with `delta_deferred` untouched by the reschedule.
+    #[test]
+    fn verify_before_delete_lookup_error_deletes_nothing_and_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/flaky.txt";
+        let path = seed_hydrated_file(&state, rel, Some("id:FLAKY"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let result = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            Err(AppError::Network(
+                "get_metadata request failed: connection reset".to_string(),
+            ))
+        });
+
+        assert!(
+            result.is_err(),
+            "the lookup error must propagate, not be swallowed"
+        );
+        assert!(
+            path.exists(),
+            "nothing on disk may be touched on a failed verification"
+        );
+        assert!(
+            state.db.get_local_file(rel).unwrap().is_some(),
+            "the local index row must survive a failed verification"
+        );
+        assert!(
+            state.db.get_remote_file(rel).unwrap().is_some(),
+            "the remote index row must survive a failed verification"
+        );
+        // The core itself makes no DB write for the job row on this path — the row
+        // is exactly as `running_deferred_job` left it, for the caller's ordinary
+        // failure handling to act on.
+        let job = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("the job row must still exist");
+        assert_eq!(job.status, "running");
+        assert!(job.delta_deferred);
+    }
+
+    /// **An ordinary, undeferred `local_delete` never calls the lookup at all.** This
+    /// pins the core function's OWN unconditional behaviour (it always calls `lookup`
+    /// — there is no branch inside it that skips the call), so the guarantee that an
+    /// ordinary `local_delete` never reaches verification has to come from the
+    /// DISPATCH, not from this function. See `sync_pipeline::dispatch_local_delete`'s
+    /// own tests for that half of the proof — this module cannot see
+    /// `job.delta_deferred` at all, by design: that decision belongs entirely to the
+    /// caller, which is exactly what makes it testable in isolation there.
+    #[test]
+    fn verify_before_delete_core_always_calls_its_injected_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/always.txt";
+        seed_hydrated_file(&state, rel, Some("id:ALWAYS"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let mut called = false;
+        let _ = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+            called = true;
+            Ok(None)
+        });
+        assert!(
+            called,
+            "the core itself has no conditional path around the lookup — routing \
+             around it is the dispatch's job, tested separately"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DBSYNC-102 (review F7): pin the core's own `outcome = "..."` log field for
+    // each of its three terminal outcomes, not just the behaviour. A `captured_*`
+    // helper, mirroring `remote_index.rs`'s own (private to that module's tests).
+    // ---------------------------------------------------------------------------
+
+    #[derive(Clone)]
+    struct SharedBufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_tracing_output(f: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let buf_for_writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBufWriter(buf_for_writer.clone()))
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("tracing output must be valid utf-8")
+    }
+
+    #[test]
+    fn verify_before_delete_logs_outcome_deleted_for_a_genuinely_gone_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/gone2.txt";
+        seed_hydrated_file(&state, rel, Some("id:GONE2"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let log = captured_tracing_output(|| {
+            verify_and_delete_local_file_core(&state, job_id, rel, |_| Ok(None)).unwrap();
+        });
+        let line = log
+            .lines()
+            .find(|l| l.contains("verified at execution time"))
+            .unwrap_or_else(|| panic!("no verification line in: {log}"));
+        assert!(
+            line.contains("outcome=\"deleted\"") || line.contains("outcome=deleted"),
+            "must log outcome=deleted; got: {line}"
+        );
+    }
+
+    #[test]
+    fn verify_before_delete_logs_outcome_rescheduled_on_a_lookup_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/flaky2.txt";
+        seed_hydrated_file(&state, rel, Some("id:FLAKY2"));
+        let job_id = running_deferred_job(&state, rel);
+
+        let log = captured_tracing_output(|| {
+            let _ = verify_and_delete_local_file_core(&state, job_id, rel, |_| {
+                Err(AppError::Network("offline".into()))
+            });
+        });
+        let line = log
+            .lines()
+            .find(|l| l.contains("verification failed"))
+            .unwrap_or_else(|| panic!("no verification-failed line in: {log}"));
+        assert!(
+            line.contains("outcome=\"rescheduled\"") || line.contains("outcome=rescheduled"),
+            "must log outcome=rescheduled; got: {line}"
+        );
     }
 }

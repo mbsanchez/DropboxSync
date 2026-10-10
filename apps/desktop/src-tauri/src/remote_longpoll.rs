@@ -82,12 +82,35 @@ fn longpoll_loop(state: &AppState) {
         // 3. Longpoll (unauthenticated, long-blocking).
         match do_longpoll(state, &cursor) {
             Ok(resp) => {
-                err_backoff = 0;
-                if resp.changes && !apply_and_drain(state) {
-                    // Another sync owns the gate; the delta wasn't applied and the
-                    // cursor didn't advance. Pause so we don't hot-loop re-longpolling
-                    // the still-pending change until that sync finishes.
-                    std::thread::sleep(Duration::from_secs(GATE_BUSY_SLEEP_SECS));
+                // Reset `err_backoff` only when the cycle succeeds: no changes, or the delta
+                // applied. A busy gate is neither, so it leaves the backoff alone — on
+                // purpose, so a gate taken by another sync between two delta failures
+                // cannot reset the growth.
+                if resp.changes {
+                    match apply_and_drain(state) {
+                        DrainOutcome::GateBusy => {
+                            // Another sync owns the gate; the delta wasn't applied and
+                            // the cursor didn't advance. Pause so we don't hot-loop
+                            // re-longpolling the still-pending change until that sync
+                            // finishes.
+                            std::thread::sleep(Duration::from_secs(GATE_BUSY_SLEEP_SECS));
+                        }
+                        DrainOutcome::DeltaFailed => {
+                            // DBSYNC-102 review finding #4: `apply_remote_delta` failed
+                            // (a page fetch errored, or a local write failed) — the
+                            // cursor did not advance, so re-longpolling immediately
+                            // would spin, re-fetching the same pages under
+                            // `sync_running` with no backoff, which can also starve the
+                            // 300s `full_sync_cycle` sweep. Reuse the SAME backoff this
+                            // loop already uses for a failed longpoll request, rather
+                            // than inventing a second mechanism.
+                            err_backoff = next_backoff(err_backoff);
+                            std::thread::sleep(Duration::from_secs(err_backoff));
+                        }
+                        DrainOutcome::Applied => err_backoff = 0,
+                    }
+                } else {
+                    err_backoff = 0;
                 }
                 if let Some(secs) = resp.backoff {
                     std::thread::sleep(Duration::from_secs(secs));
@@ -154,10 +177,31 @@ fn do_longpoll(state: &AppState, cursor: &str) -> AppResult<DropboxLongpollRespo
         .map_err(|e| AppError::Other(format!("longpoll parse failed: {e}")))
 }
 
+/// What `apply_and_drain` accomplished, reported back to `longpoll_loop` so it can
+/// decide whether to back off (DBSYNC-102 review finding #4).
+enum DrainOutcome {
+    /// Another sync owned the gate; nothing was applied or drained.
+    GateBusy,
+    /// `apply_remote_delta` failed. The queue was still drained and the
+    /// materialization sweep still ran (unchanged from before this fix — a delta
+    /// failure must not also block unrelated queued work from draining), but the
+    /// caller must back off before re-longpolling, since the cursor did not advance
+    /// and an immediate retry would just re-fetch the same pages.
+    DeltaFailed,
+    /// The delta applied without error (whether or not it enqueued anything) and the
+    /// queue was drained.
+    Applied,
+}
+
 /// Apply the remote delta + drain, under the shared single-flight gate. Returns
-/// `false` if another sync owned the gate (nothing applied — caller should pause
-/// before re-longpolling the still-pending change).
-fn apply_and_drain(state: &AppState) -> bool {
+/// `DrainOutcome::GateBusy` if another sync owned the gate (nothing applied — caller
+/// should pause before re-longpolling the still-pending change); `DeltaFailed` if
+/// `apply_remote_delta` itself errored (caller should back off — DBSYNC-102 review
+/// finding #4: before this, a failing delta looked identical to a successful one to
+/// the caller, so the loop hot-looped re-fetching the same pages with no backoff,
+/// which could also starve the 300s `full_sync_cycle` sweep that is otherwise the
+/// only thing healing a stuck cursor); `Applied` otherwise.
+fn apply_and_drain(state: &AppState) -> DrainOutcome {
     if state
         .sync_running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -165,14 +209,20 @@ fn apply_and_drain(state: &AppState) -> bool {
     {
         // A scan/tick/watcher already owns the sync; the next longpoll or the
         // 5-min sweep reconciles. No double-drain.
-        return false;
+        return DrainOutcome::GateBusy;
     }
     crate::auth_session::refresh_tray_tooltip(state);
-    match crate::remote_index::apply_remote_delta(state) {
-        Ok(n) if n > 0 => tracing::info!(enqueued = n, "longpoll applied remote delta"),
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "apply_remote_delta failed"),
-    }
+    let delta_failed = match crate::remote_index::apply_remote_delta(state) {
+        Ok(n) if n > 0 => {
+            tracing::info!(enqueued = n, "longpoll applied remote delta");
+            false
+        }
+        Ok(_) => false,
+        Err(e) => {
+            tracing::error!(error = %e, "apply_remote_delta failed");
+            true
+        }
+    };
     crate::sync_pipeline::drain_sync_queue(state);
     // DBSYNC-69: drive the materialization sweep on the longpoll path too, so a
     // cloud restore materializes within seconds instead of waiting for the 5-min
@@ -189,7 +239,11 @@ fn apply_and_drain(state: &AppState) -> bool {
     }
     state.sync_running.store(false, Ordering::Release);
     crate::auth_session::refresh_tray_tooltip(state);
-    true
+    if delta_failed {
+        DrainOutcome::DeltaFailed
+    } else {
+        DrainOutcome::Applied
+    }
 }
 
 #[cfg(test)]

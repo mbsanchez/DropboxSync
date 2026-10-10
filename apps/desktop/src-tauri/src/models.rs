@@ -94,6 +94,17 @@ pub(crate) struct DropboxEntry {
     #[serde(rename = ".tag")]
     pub tag: String,
     pub path_display: Option<String>,
+    /// Dropbox's case-NORMALIZED path, sent on every entry (`deleted` included).
+    /// `path_display` only promises correct casing on the path's LAST component —
+    /// an ancestor folder's casing can drift between two entries for what is
+    /// otherwise the same item (DBSYNC-102 #2 review finding), so anything that
+    /// must treat two entries as "the same path" keys on this field, not on
+    /// `path_display`. `Option` because the API marks it optional, exactly like
+    /// `path_display`: both are null for an item that is not mounted. Real entries
+    /// carry both or neither, and an entry with no `path_display` is skipped before
+    /// this field is consulted, so the lowercase fallback in the collapse only ever
+    /// runs for a hand-built test fixture.
+    pub path_lower: Option<String>,
     pub content_hash: Option<String>,
     pub rev: Option<String>,
     pub server_modified: Option<String>,

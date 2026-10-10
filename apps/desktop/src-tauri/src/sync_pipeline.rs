@@ -158,6 +158,23 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
     placeholder_exists(root, rel) || crate::path_util::is_dehydrated_placeholder(&root.join(rel))
 }
 
+/// True when `path` is exactly `prefix`, or is a descendant of it (i.e. `prefix`
+/// followed by a `/` is a literal prefix of `path`). Compares the separator byte
+/// rather than building `format!("{prefix}/")`, because this runs once per
+/// candidate per active job on every scan of a large index.
+///
+/// The arithmetic alone — no decision about what "covered" MEANS for a caller.
+/// `covered_by_active_job` and `pending_delete_covering` each reimplemented this
+/// exact-or-separator-prefix check independently; this is the one shared helper
+/// both now call, so a future change to the boundary rule cannot drift between
+/// them by editing one copy and forgetting the other.
+fn path_covered_by(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.as_bytes()[prefix.len()] == b'/'
+            && path.starts_with(prefix))
+}
+
 /// Is `path` at, or underneath, any path an active job names?
 ///
 /// **The hazard this answers is prefix-shaped, and for four review rounds the guards were
@@ -170,16 +187,78 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
 ///
 /// One predicate, every call site. Anything that asks "is this path busy?" asks it here.
 ///
-/// Compares the separator byte rather than building `format!("{p}/")`, because this runs
-/// once per candidate per active job on every scan of a large index.
+/// The exact-or-separator-prefix arithmetic itself lives in `path_covered_by`, shared with
+/// `pending_delete_covering`; this function keeps its own decision — "any active job at all
+/// covers this path" — around that shared check.
 pub(crate) fn covered_by_active_job(path: &str, active: &HashSet<String>) -> bool {
-    if active.contains(path) {
-        return true;
-    }
-    active.iter().any(|prefix| {
-        path.len() > prefix.len()
-            && path.as_bytes()[prefix.len()] == b'/'
-            && path.starts_with(prefix.as_str())
+    active.iter().any(|prefix| path_covered_by(path, prefix))
+}
+
+/// **DBSYNC-102 #175 — diagnostic only, not a fix.** `covered_by_active_job` above
+/// answers one question — "does an active job already own this path, so don't
+/// double-enqueue" — but on the delta's UPSERT arm (`remote_index.rs`'s
+/// `apply_delta_entries`) that same answer is unintentionally also read as "ignore
+/// new remote truth about this path". Usually harmless: the covering job is a
+/// `download` or an `upload` that will itself reconcile the path shortly.
+///
+/// **What this predicate actually catches is narrower than "a re-add dropped
+/// because the earlier `local_delete` is still pending" might suggest.** In the
+/// normal case, `remote_longpoll.rs`'s `apply_and_drain` calls
+/// `sync_pipeline::drain_sync_queue` right after `apply_remote_delta` returns,
+/// inside the SAME `sync_running` gate — so the `local_delete` this invocation just
+/// enqueued for a deleted-and-not-re-added path has usually already RUN by the time
+/// the next `apply_remote_delta` invocation starts. A re-add arriving in that next
+/// invocation then takes the UNCOVERED path: `covered_by_active_job` sees nothing
+/// (the job is done, the row is gone), `reconcile_remote_present` finds no previous
+/// remote row to compare against, and the re-add is recorded with no download
+/// enqueued at all — the local copy stays gone, and this predicate never fires,
+/// because the drop it detects never happened.
+///
+/// This predicate only fires in the LEFTOVER cases, where the `local_delete` is
+/// still active when the re-add's invocation reads `pending_targets`: the delete
+/// backed off into `retry_wait`, the drain stopped after draining only its
+/// `SYNC_BATCH_CAP` jobs this tick and the delete was not among them, a drain call
+/// errored before reaching it, or a previously `failed` delete job was revived.
+/// DBSYNC-102's batch collapse (`collapse_delta_entries`) cannot reach any of these
+/// — it only resolves a delete/re-add contradiction within ONE invocation's batch,
+/// and every case above is split across two.
+///
+/// This predicate is PURE and answers only: given a path `covered_by_active_job`
+/// already dropped, is the covering job a pending `local_delete`? It does not call
+/// `covered_by_active_job`, does not run before it, and does not change what it
+/// decides — the drop has already happened by the time this is consulted. It exists
+/// purely so the caller can log the one case that is this residual and stay silent
+/// for the ordinary double-enqueue guard (a covering `download` or `upload`).
+///
+/// `pending` pairs each active job's covering path with its `job_type` —
+/// `covered_by_active_job`'s own `HashSet<String>` carries no type, so this is the
+/// smallest additional shape the diagnostic needs; see `Db::active_jobs_with_type`'s
+/// doc for why it is a sibling read, not a change to the set that filter consults.
+///
+/// Prefix semantics are intentionally identical to `covered_by_active_job`'s (both
+/// now share `path_covered_by`): a `local_delete` queued for a FOLDER still counts
+/// as covering a descendant file's path, for the same reason a pending folder move
+/// does there (DBSYNC-99 round 5).
+///
+/// The fix for the conflation itself — tracked as **DBSYNC-109** — is deliberately
+/// not here: that same filter also protects a descendant of a pending folder move, so
+/// changing its meaning on the upsert arm carries its own blast radius and belongs in
+/// its own ticket, and DBSYNC-109 also owns fixing the wider no-warning case described
+/// above, which this predicate structurally cannot detect. This predicate is one
+/// detector for one slice of the problem, not the fix.
+///
+/// Returns the covering `local_delete` job's target path when a warning is owed,
+/// `None` when the path is not covered by one at all (including: not covered by any
+/// pending job, or covered only by a `download`/`upload`).
+pub(crate) fn pending_delete_covering<'a>(
+    dropped_path: &str,
+    pending: &'a [(String, String)],
+) -> Option<&'a str> {
+    pending.iter().find_map(|(target, job_type)| {
+        if job_type != "local_delete" {
+            return None;
+        }
+        path_covered_by(dropped_path, target).then_some(target.as_str())
     })
 }
 
@@ -1490,7 +1569,58 @@ pub(crate) fn drain_sync_queue(state: &AppState) {
     }
 }
 
+/// DBSYNC-102 (#180): the routing decision for `process_sync_queue_internal`'s
+/// `"local_delete"` arm, pulled out as a pure function so the choice itself — and
+/// ONLY the choice — is directly testable with two fakes, with no `AppState`, no
+/// filesystem and no network. `verify` and `direct` are both `FnOnce() -> AppResult<()>`
+/// in production, but this is generic over the return type so a test can inject a
+/// simple marker instead.
+///
+/// `delta_deferred == true` runs `verify` (execution-time verification against
+/// Dropbox before deleting anything); `delta_deferred == false` — every ordinary
+/// `local_delete`, exactly as before this slice — runs `direct` and never touches
+/// `verify` at all. A test proves that "never" with a `verify` fake that panics if
+/// it is ever called for a `false` job, and symmetrically for `direct` on a `true`
+/// job.
+pub(crate) fn dispatch_local_delete<T>(
+    delta_deferred: bool,
+    verify: impl FnOnce() -> T,
+    direct: impl FnOnce() -> T,
+) -> T {
+    if delta_deferred {
+        verify()
+    } else {
+        direct()
+    }
+}
+
+/// Production entry point: picks and runs exactly one due job, wiring the real,
+/// live `fetch_remote_file_metadata` in as the `"local_delete"` arm's
+/// execution-time verification lookup. **Never call this from a test** — the
+/// lookup it wires in reads the real OS keychain and makes a live request against
+/// the maintainer's real Dropbox account; drive `process_sync_queue_core` directly
+/// instead, with a fake lookup.
 pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
+    process_sync_queue_core(state, |rel| {
+        crate::remote_index::fetch_remote_file_metadata(state, rel)
+    })
+}
+
+/// DBSYNC-102 (review F4): the real body of `process_sync_queue_internal` — pick,
+/// dispatch, and settle exactly one due job — with the `"local_delete"` arm's
+/// execution-time verification lookup taken as a parameter instead of hard-wired
+/// to the live `fetch_remote_file_metadata`. This is the ONLY thing #180's own
+/// seam (`dispatch_local_delete`, tested in isolation above) could not prove: that
+/// the real call site actually passes `job.delta_deferred` through to the real
+/// runner, rather than e.g. a hardcoded `false` that would silently revert every
+/// deferred delete to an unverified one. A test drives this function directly,
+/// with a fake `lookup`, through the exact call site production uses — pick,
+/// dispatch, `verify_and_delete_local_file_core`, and completion — and fails if
+/// that call site stops passing `job.delta_deferred` through.
+fn process_sync_queue_core(
+    state: &AppState,
+    local_delete_lookup: impl FnOnce(&str) -> AppResult<Option<crate::remote_index::RemoteFileMeta>>,
+) -> AppResult<bool> {
     let next = state.db.pick_next_due_job()?;
     let Some(job) = next else {
         refresh_queue_depth_internal(state)?;
@@ -1515,6 +1645,13 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
         attempt,
         "sync job started"
     );
+
+    // DBSYNC-102 (review F5): captured only by the `"local_delete"` deferred
+    // branch below, so the completion handler can tell a genuine delete from a
+    // verification that found the path still there (or diverged) and kept it —
+    // the latter must be logged and counted differently, not as "sync job
+    // completed" / `record_job_processed()`.
+    let mut local_delete_outcome: Option<crate::dropbox_transfer::DeferredDeleteOutcome> = None;
 
     let op_result: AppResult<()> = match job.job_type.as_str() {
         "upload" => job
@@ -1552,7 +1689,22 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
             .ok_or_else(|| {
                 AppError::Sync("local_delete job missing target_path/source_path".to_string())
             })
-            .and_then(|rel| delete_local_file_internal(state, rel)),
+            .and_then(|rel| {
+                dispatch_local_delete(
+                    job.delta_deferred,
+                    || {
+                        let outcome = crate::dropbox_transfer::verify_and_delete_local_file_core(
+                            state,
+                            job.id,
+                            rel,
+                            local_delete_lookup,
+                        )?;
+                        local_delete_outcome = Some(outcome);
+                        Ok(())
+                    },
+                    || delete_local_file_internal(state, rel),
+                )
+            }),
         "download" => job
             .target_path
             .as_deref()
@@ -1588,6 +1740,29 @@ pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
     };
 
     match op_result {
+        // DBSYNC-102 (review F5): a deferred `local_delete` whose verification
+        // KEPT the path (still exists on Dropbox, or diverged locally during the
+        // grace window — see `verify_and_delete_local_file_core`'s F1 doc) is not
+        // a completed delete. Its job row was already dropped by the core itself
+        // (`cancel_verified_local_delete`), so `mark_job_completed` would be a
+        // harmless no-op here anyway — but logging it as "sync job completed" and
+        // counting it via `record_job_processed()` would tell an operator reading
+        // the log (or the HITL tester grepping for exactly that line) that a
+        // deletion happened when nothing was deleted.
+        Ok(())
+            if job.job_type == "local_delete"
+                && local_delete_outcome
+                    == Some(crate::dropbox_transfer::DeferredDeleteOutcome::Cancelled) =>
+        {
+            tracing::info!(
+                job_id = job.id,
+                job_type = %job.job_type,
+                path = %job_path,
+                "sync job kept (local_delete verification found the path still exists \
+                 on Dropbox, or the on-disk file diverged during the grace window; \
+                 nothing was deleted)"
+            );
+        }
         Ok(()) => {
             // DBSYNC-99: the source deletion a refused move owes is enqueued HERE and nowhere
             // else. It exists because this upload put the bytes at the destination — not
@@ -1664,6 +1839,31 @@ fn apply_job_failure(
         .unwrap_or(job_path);
 
     match classify_job_failure(err, attempt, max_attempts) {
+        // DBSYNC-102 (review F2): a delta-deferred `local_delete` that exhausts its
+        // retries (almost always a lookup failure while offline) is DROPPED, not
+        // marked `failed`. A `failed` row here would pin the tray to a permanent
+        // Error, render a false "deletion failed" row in the activity flyout for a
+        // file that was never actually deleted, and — being the LOWEST-id
+        // `local_delete` for its path — drain ahead of any job the user created
+        // since (e.g. an edit's `upload`) the next time "Retry failed jobs" is
+        // pressed, unlinking that edit before the upload ever ran. Dropping it loses
+        // nothing: a genuine remote deletion is re-derived by the periodic 300s
+        // snapshot sweep, which enqueues a fresh, undeferred `local_delete` through
+        // the DBSYNC-64 breaker.
+        JobFailure::Permanent(PermanentReason::AttemptsExhausted)
+            if job.job_type == "local_delete" && job.delta_deferred =>
+        {
+            tracing::warn!(
+                job_id = job.id,
+                path = %job_path,
+                attempt,
+                error = %err,
+                "DBSYNC-102: deferred local_delete exhausted its retries — dropping the \
+                 job instead of leaving it `failed`; a genuine delete is re-derived by \
+                 the periodic snapshot sweep"
+            );
+            state.db.drop_exhausted_deferred_local_delete(job.id)?;
+        }
         JobFailure::Permanent(reason) => {
             let msg = match reason {
                 PermanentReason::UnrepresentablePath => {
@@ -2058,6 +2258,7 @@ pub(crate) fn full_sync_cycle(state: &AppState) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
@@ -2066,10 +2267,11 @@ mod tests {
 
     use super::{
         block_mass_deletion, cleanup_stale_upload_state, clear_mass_delete_blocked,
-        is_mass_deletion, mass_delete_pause_active, process_changed_paths,
-        resolve_conflict_internal, run_sync_tick_internal, scan_local_changes_only, ConflictAction,
-        MassDeleteSource, SYNC_BATCH_CAP,
+        covered_by_active_job, is_mass_deletion, mass_delete_pause_active, pending_delete_covering,
+        process_changed_paths, resolve_conflict_internal, run_sync_tick_internal,
+        scan_local_changes_only, ConflictAction, MassDeleteSource, SYNC_BATCH_CAP,
     };
+    use crate::error::AppResult;
     use crate::state::AppState;
     use crate::storage::db::Db;
     use crate::storage::secure_store::SecureStore;
@@ -2103,6 +2305,142 @@ mod tests {
             sync_running: Arc::new(AtomicBool::new(false)),
             token_refresh_lock: Arc::new(Mutex::new(())),
             http_client: crate::state::build_http_client(),
+        }
+    }
+
+    // -------------------------------------------------------------------------------
+    // `pending_delete_covering` (DBSYNC-102 #175): pure predicate, no `AppState`, no
+    // database, no `AppState`-backed job at all. Exercises the four cases named in
+    // #175's acceptance criteria directly.
+    // -------------------------------------------------------------------------------
+
+    /// Covering job is exactly `local_delete` on the dropped path itself → warn, and
+    /// the returned covering target is that same path.
+    #[test]
+    fn pending_delete_covering_warns_when_the_covering_job_is_a_local_delete() {
+        let pending = vec![("shared/stale.txt".to_string(), "local_delete".to_string())];
+
+        assert_eq!(
+            pending_delete_covering("shared/stale.txt", &pending),
+            Some("shared/stale.txt"),
+            "a pending local_delete covering the exact dropped path must be reported"
+        );
+    }
+
+    /// Covering job is a `download` or an `upload` on the exact same path → no warn.
+    /// This is the ordinary double-enqueue guard `covered_by_active_job` exists for,
+    /// and it must stay silent — the whole point of this predicate is to NOT add noise
+    /// to that normal path.
+    #[test]
+    fn pending_delete_covering_does_not_warn_for_a_download_or_an_upload() {
+        let downloading = vec![("shared/busy.txt".to_string(), "download".to_string())];
+        assert_eq!(
+            pending_delete_covering("shared/busy.txt", &downloading),
+            None,
+            "a covering download must never be reported as this residual"
+        );
+
+        let uploading = vec![("shared/busy.txt".to_string(), "upload".to_string())];
+        assert_eq!(
+            pending_delete_covering("shared/busy.txt", &uploading),
+            None,
+            "a covering upload must never be reported as this residual"
+        );
+    }
+
+    /// The cover is prefix-shaped: the pending `local_delete` names an ANCESTOR
+    /// folder, not the dropped file's exact path — mirroring
+    /// `covered_by_active_job`'s own prefix semantics (DBSYNC-99 round 5) so a
+    /// `local_delete` queued for a folder still counts as covering a descendant.
+    #[test]
+    fn pending_delete_covering_warns_when_the_cover_is_an_ancestor_folder_delete() {
+        let pending = vec![("shared/folder".to_string(), "local_delete".to_string())];
+
+        assert_eq!(
+            pending_delete_covering("shared/folder/child.txt", &pending),
+            Some("shared/folder"),
+            "a local_delete queued for an ancestor folder must cover a descendant file, \
+             exactly like covered_by_active_job's own prefix rule"
+        );
+    }
+
+    /// Not covered by anything at all → no warn. Also guards the prefix test against
+    /// a false positive on a mere string-prefix (not a true path-separator boundary):
+    /// `shared/folder2.txt` shares the literal prefix `shared/folder` with the pending
+    /// delete's target but is NOT a descendant of it (no `/` at the boundary), so it
+    /// must not be reported.
+    #[test]
+    fn pending_delete_covering_does_not_warn_when_not_covered_at_all() {
+        let pending = vec![("shared/folder".to_string(), "local_delete".to_string())];
+
+        assert_eq!(
+            pending_delete_covering("unrelated/path.txt", &pending),
+            None,
+            "a path with no covering pending job at all must not be reported"
+        );
+        assert_eq!(
+            pending_delete_covering("shared/folder2.txt", &pending),
+            None,
+            "a literal string-prefix match that is not a true path-separator boundary \
+             must not be mistaken for a descendant"
+        );
+        assert_eq!(
+            pending_delete_covering("shared/anything.txt", &[]),
+            None,
+            "an empty pending list covers nothing"
+        );
+    }
+
+    /// DBSYNC-102 — `covered_by_active_job` and `pending_delete_covering` both answer
+    /// "is this path the prefix itself, or a path-separated descendant of it?". They
+    /// once carried two independent copies of that arithmetic, which could silently
+    /// disagree; both now call `path_covered_by`, so the boundary rule lives in one
+    /// place.
+    ///
+    /// What this test still pins is the rule itself, through both callers: every row
+    /// of the shared table is checked against a fixed `expected` value on each side.
+    /// Because the two sides now share the helper, an edit to `path_covered_by` moves
+    /// them together, so it is the per-row `expected` assertions that fire, not the
+    /// "they agree" one. That one would only fire if a caller stopped delegating to
+    /// the helper and grew its own rule again.
+    ///
+    /// Proof this test can fail: dropping the separator check in `path_covered_by`
+    /// (treating ANY shared string prefix as coverage) fails the
+    /// `"shared/folder2.txt"` vs `"shared/folder"` row on both sides.
+    #[test]
+    fn covered_by_active_job_and_pending_delete_covering_agree_on_the_prefix_rule() {
+        // (path, the single active/pending target, expect both to report "covered")
+        let cases: &[(&str, &str, bool)] = &[
+            ("shared/stale.txt", "shared/stale.txt", true), // exact match
+            ("shared/folder/child.txt", "shared/folder", true), // true descendant
+            ("shared/folder2.txt", "shared/folder", false), // literal prefix, no separator
+            ("unrelated/path.txt", "shared/folder", false), // unrelated entirely
+            ("shared/folder", "shared/folder/deeper", false), // path shorter than the target
+            ("shared", "shared/folder", false),             // ditto, boundary case
+            ("", "a", false),                               // empty path
+        ];
+
+        for (path, target, expected) in cases {
+            let mut active = HashSet::new();
+            active.insert(target.to_string());
+            let active_says = covered_by_active_job(path, &active);
+
+            let pending = vec![(target.to_string(), "local_delete".to_string())];
+            let pending_says = pending_delete_covering(path, &pending).is_some();
+
+            assert_eq!(
+                active_says, *expected,
+                "covered_by_active_job({path:?}, {{{target:?}}}) expected {expected}"
+            );
+            assert_eq!(
+                pending_says, *expected,
+                "pending_delete_covering({path:?}, [({target:?}, local_delete)]) expected {expected}"
+            );
+            assert_eq!(
+                active_says, pending_says,
+                "covered_by_active_job and pending_delete_covering disagree for \
+                 path={path:?} target={target:?} — their prefix rules have drifted apart"
+            );
         }
     }
 
@@ -2371,6 +2709,40 @@ mod tests {
 
     fn sync_root(state: &AppState) -> std::path::PathBuf {
         std::path::PathBuf::from(state.db.get_sync_folder().unwrap().unwrap())
+    }
+
+    /// A `Write` implementation over a shared, clonable buffer, so a `tracing`
+    /// subscriber installed for the duration of one test's closure can be read back
+    /// afterwards. Mirrors `remote_index.rs`'s own test-only copy exactly (not
+    /// extracted into shared `#[cfg(test)]` support — each module's test harness
+    /// stays self-contained here, same as the rest of this file's test helpers).
+    #[derive(Clone)]
+    struct SharedBufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` with a `tracing` subscriber installed for the CURRENT THREAD only
+    /// and returns everything it formatted, as plain text.
+    fn captured_tracing_output(f: impl FnOnce()) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let buf_for_writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedBufWriter(buf_for_writer.clone()))
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("tracing output must be valid utf-8")
     }
 
     /// Both paths of every move job, as `(source, target)`.
@@ -4868,7 +5240,13 @@ mod tests {
             .mark_job_retry_wait(upload_id, 4, &Utc::now().to_rfc3339(), Some("previous"))
             .unwrap();
 
-        assert!(super::process_sync_queue_internal(&state).expect("drain"));
+        // Through the core with a lookup that panics if called: this job is an upload,
+        // so the `local_delete` verification lookup must never run — and if it ever
+        // did, it must not reach the real keychain the production shell wires in.
+        assert!(super::process_sync_queue_core(&state, |rel| {
+            panic!("verification lookup must not run for this job (rel={rel})")
+        })
+        .expect("drain"));
 
         assert_eq!(
             state
@@ -4977,7 +5355,13 @@ mod tests {
             "precondition: no manufactured local row — the gate must reach the disk"
         );
 
-        assert!(super::process_sync_queue_internal(&state).expect("drain"));
+        // Through the core with a lookup that panics if called: this job is an upload,
+        // so the `local_delete` verification lookup must never run — and if it ever
+        // did, it must not reach the real keychain the production shell wires in.
+        assert!(super::process_sync_queue_core(&state, |rel| {
+            panic!("verification lookup must not run for this job (rel={rel})")
+        })
+        .expect("drain"));
 
         // What this pins is that the success arm calls settle at all. It does NOT pin which
         // field the destination is read from: `enqueue_upload_then_delete` inserts
@@ -6001,6 +6385,925 @@ mod tests {
         assert!(
             mass_delete_pause_active(&state).unwrap(),
             "remote key set (non-empty) → paused"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DBSYNC-102 #180 — `dispatch_local_delete`'s routing, the reschedule half of a
+    // failed execution-time verification, and (review F4) `process_sync_queue_core`
+    // driven end-to-end with a fake lookup through the EXACT call site production
+    // uses. The verify-then-delete core itself
+    // (`dropbox_transfer::verify_and_delete_local_file_core`) is also tested
+    // directly in `dropbox_transfer.rs` with a fake lookup; nothing here reaches
+    // `fetch_remote_file_metadata` or `get_access_token` — both require a live
+    // Dropbox account; `process_sync_queue_internal` (the thin production shell
+    // that wires the real one in) is never called from a test either.
+    // ---------------------------------------------------------------------------
+
+    /// `delta_deferred == false` (every ordinary `local_delete`, unchanged by this
+    /// slice) must run `direct` and must NEVER call `verify` — proved with a `verify`
+    /// fake that panics if it is ever invoked, not merely by inspecting the result.
+    #[test]
+    fn dispatch_local_delete_routes_an_ordinary_job_directly_never_touching_verify() {
+        let result: AppResult<()> = super::dispatch_local_delete(
+            false,
+            || -> AppResult<()> { panic!("verify must never run for delta_deferred == false") },
+            || Ok(()),
+        );
+        assert!(result.is_ok());
+    }
+
+    /// `delta_deferred == true` must run `verify` and must NEVER call `direct` —
+    /// the symmetric proof, with the panic on the other side.
+    #[test]
+    fn dispatch_local_delete_routes_a_deferred_job_through_verify_never_touching_direct() {
+        let result: AppResult<()> = super::dispatch_local_delete(
+            true,
+            || Ok(()),
+            || -> AppResult<()> { panic!("direct must never run for delta_deferred == true") },
+        );
+        assert!(result.is_ok());
+    }
+
+    /// The routing is also value-faithful, not just panic-free: each branch's own
+    /// return value is the one that comes back out, so a future refactor that silently
+    /// swapped which closure's result is returned (while still "calling the right
+    /// one") would still be caught.
+    #[test]
+    fn dispatch_local_delete_returns_the_chosen_branchs_own_value() {
+        assert_eq!(
+            super::dispatch_local_delete(false, || "verify", || "direct"),
+            "direct"
+        );
+        assert_eq!(
+            super::dispatch_local_delete(true, || "verify", || "direct"),
+            "verify"
+        );
+    }
+
+    /// **A failed execution-time verification reschedules exactly like any other job
+    /// failure, and `delta_deferred` survives it.** Drives the real `apply_job_failure`
+    /// (the function `process_sync_queue_internal` actually calls on `Err`) with a job
+    /// built through the real `enqueue_job` / `defer_delta_local_delete` /
+    /// `pick_next_due_job` pipeline, so the deferred marker on the row comes from
+    /// production code, not from a hand-written assumption about its shape.
+    #[test]
+    fn a_failed_deferred_verification_reschedules_with_delta_deferred_intact() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+
+        state
+            .db
+            .enqueue_job(
+                "local_delete",
+                Some("shared/flaky.txt"),
+                Some("shared/flaky.txt"),
+            )
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state
+            .db
+            .defer_delta_local_delete("shared/flaky.txt", &past)
+            .unwrap());
+        let job = state
+            .db
+            .pick_next_due_job()
+            .unwrap()
+            .expect("the deferred job must be due and now running");
+        assert!(job.delta_deferred, "precondition");
+        assert_eq!(job.attempt_count, 0, "precondition: first attempt");
+
+        let network_err = crate::error::AppError::Network(
+            "get_metadata request failed: connection reset".to_string(),
+        );
+        super::apply_job_failure(&state, &job, 1, 5, &network_err).expect("apply");
+
+        let row = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .expect("the job row must still exist");
+        assert_eq!(
+            row.status, "retry_wait",
+            "a failed verification must reschedule, not delete and not fail permanently"
+        );
+        assert_eq!(row.attempt_count, 1, "the attempt must be counted");
+        assert!(
+            row.next_retry_at.is_some()
+                && row.next_retry_at.as_deref().unwrap() > Utc::now().to_rfc3339().as_str(),
+            "the next attempt must be scheduled in the future, not immediately due"
+        );
+        assert!(
+            row.delta_deferred,
+            "delta_deferred must survive the reschedule — the next pick must re-enter \
+             this same verification, never fall through to an unconditional delete"
+        );
+    }
+
+    // ======================================================================
+    // DBSYNC-102 — adversarial review round. Each test below is ported from a
+    // throwaway `review_a_*` reproduction left in the reviewer's scratchpad clone,
+    // renamed to describe the regression it now pins. Each failed against the
+    // branch before its corresponding fix and passes after it (confirmed by
+    // mutation below).
+    // ======================================================================
+
+    fn delta_entry(
+        tag: &str,
+        path: &str,
+        hash: Option<&str>,
+        rev: Option<&str>,
+        id: Option<&str>,
+    ) -> crate::models::DropboxEntry {
+        crate::models::DropboxEntry {
+            tag: tag.to_string(),
+            path_display: Some(path.to_string()),
+            path_lower: Some(path.to_lowercase()),
+            content_hash: hash.map(str::to_string),
+            rev: rev.map(str::to_string),
+            server_modified: None,
+            size: None,
+            id: id.map(str::to_string),
+        }
+    }
+
+    fn apply_delta_batch(state: &AppState, entries: Vec<crate::models::DropboxEntry>) -> usize {
+        let targets = state.db.active_job_paths().unwrap();
+        let types = state.db.active_jobs_with_type().unwrap();
+        crate::remote_index::apply_delta_entries(state, &entries, &targets, &types).unwrap()
+    }
+
+    /// Seeds a hydrated, in-sync file at `rel` whose index hashes are the REAL
+    /// on-disk hash — the shape `reconcile_remote_absent` needs to take its
+    /// remote-wins delete branch.
+    fn seed_synced_hydrated_file(
+        state: &AppState,
+        rel: &str,
+        id: &str,
+    ) -> (std::path::PathBuf, String) {
+        let path = sync_root(state).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"original").unwrap();
+        let (hash, size, mtime) = crate::path_util::hash_file(&path).unwrap();
+        state.db.upsert_local_file(rel, &hash, size, mtime).unwrap();
+        state
+            .db
+            .upsert_remote_file(rel, &hash, "rev1", 0, Some(id))
+            .unwrap();
+        (path, hash)
+    }
+
+    /// **DBSYNC-102 review F1** (ex
+    /// `review_a_unscanned_edit_during_grace_is_destroyed_by_the_deferred_delete`):
+    /// a genuine remote delete is deferred; the user saves new work into the file
+    /// during the grace window and no scan ever runs before the job comes due (a
+    /// watcher batch dropped while `sync_running` is held, or still inside
+    /// debounce). Before F1, the verify core's `Ok(None)` arm unlinked the edited
+    /// file unconditionally, with no re-check of the on-disk content at all.
+    #[test]
+    fn verify_before_delete_refuses_to_unlink_an_edit_made_during_the_grace_window() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, _h) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+
+        let n = apply_delta_batch(
+            &state,
+            vec![delta_entry("deleted", "/shared/doc.txt", None, None, None)],
+        );
+        assert_eq!(n, 1);
+        let job = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete")
+            .unwrap();
+        assert!(job.delta_deferred && job.status == "retry_wait");
+
+        // t = +10s: the user saves new work into the file. No scan runs before the
+        // job comes due (lost watcher batch / still-debounced edit).
+        std::fs::write(&path, b"USER WORK THAT NEVER REACHED DROPBOX").unwrap();
+
+        // t = +60s: the grace elapses (forced due through a public Db method, same
+        // pattern as every other deferred-job test in this file).
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        state
+            .db
+            .mark_job_retry_wait(job.id, 0, &past, None)
+            .unwrap();
+        let picked = state.db.pick_next_due_job().unwrap().expect("due");
+        assert!(picked.delta_deferred);
+
+        // What `process_sync_queue_core` does, with the live lookup faked.
+        let outcome = crate::dropbox_transfer::verify_and_delete_local_file_core(
+            &state,
+            picked.id,
+            rel,
+            |_| Ok(None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::dropbox_transfer::DeferredDeleteOutcome::Cancelled,
+            "F1: the disk re-check must refuse to delete a file that changed since \
+             the delta-time check"
+        );
+        assert!(
+            path.exists(),
+            "F1 DEMONSTRATED-BY-REGRESSION: the user's unsynced edit must survive, \
+             not be unlinked"
+        );
+        assert_eq!(
+            state.db.list_recent_conflicts(10).unwrap().len(),
+            1,
+            "the divergence must be flagged as a conflict instead of silently destroyed"
+        );
+        assert!(
+            state.db.get_local_file(rel).unwrap().is_some(),
+            "the local index row (and the edit it points at) must survive"
+        );
+        assert!(
+            state.db.get_remote_file(rel).unwrap().is_none(),
+            "the stale remote row is dropped — same as reconcile_remote_absent's own \
+             conflict arm — so the next sweep does not re-ask about a path Dropbox \
+             already reports gone"
+        );
+    }
+
+    /// **DBSYNC-102 review P3** (ported from the reviewer's scratchpad throwaway
+    /// `review_c_f1_scanned_edit_then_genuine_delete_orphans_rel`): same divergence
+    /// as the test above, but the edit is ALREADY SCANNED before the deferred
+    /// delete comes due — because `rel` is covered by the pending `local_delete`,
+    /// `process_local_file_change`'s covered arm routes the edit to a CONFLICTED
+    /// COPY and enqueues the upload for THAT copy, never for `rel` itself (see its
+    /// own doc). Before P3, the diverged arm recorded the conflict, dropped the
+    /// remote row, and enqueued nothing for `rel` — leaving it local-only forever,
+    /// unlike the unscanned case (the test above), where the next scan uploads
+    /// `rel` and recreates it on Dropbox. Same user action, two different end
+    /// states, depending only on watcher/scan timing.
+    #[test]
+    fn verify_before_delete_diverged_arm_uploads_rel_when_the_edit_was_already_scanned() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, _h) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+
+        // Invocation 1: a genuine remote delete arrives; local matches the
+        // last-synced remote content, so `reconcile_remote_absent` takes the
+        // delete arm and the delete is deferred for the grace window.
+        assert_eq!(
+            apply_delta_batch(
+                &state,
+                vec![delta_entry("deleted", "/shared/doc.txt", None, None, None)]
+            ),
+            1
+        );
+
+        // Inside the grace window: the user edits the file, and — unlike the test
+        // above — a scan runs BEFORE the deferred delete comes due. `rel` is
+        // covered by the pending `local_delete`, so the scan creates a conflicted
+        // copy instead of enqueuing an upload for `rel`.
+        std::fs::write(&path, b"edited during grace, SCANNED").unwrap();
+        assert_eq!(
+            process_changed_paths(&state, &[rel.to_string()]).unwrap(),
+            1,
+            "the scan must route the edit to a conflicted copy, not an upload for rel"
+        );
+        let del = state
+            .db
+            .list_recent_jobs(20)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete")
+            .unwrap();
+
+        // Execution time: the grace elapses; the lookup confirms the path is
+        // genuinely gone on Dropbox, but the on-disk file diverged since the
+        // delta-time check (the scan's edit), so the diverged arm runs.
+        let outcome =
+            crate::dropbox_transfer::verify_and_delete_local_file_core(&state, del.id, rel, |_| {
+                Ok(None)
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::dropbox_transfer::DeferredDeleteOutcome::Cancelled
+        );
+        assert!(path.exists(), "the edit must survive, never unlinked");
+        // Two conflicts, not one: the scan's covered arm already recorded one for
+        // the conflicted copy it created, and the diverged arm above records its
+        // own remote-deleted conflict for `rel` on top of it.
+        assert_eq!(
+            state.db.list_recent_conflicts(10).unwrap().len(),
+            2,
+            "both the scan's conflicted-copy conflict and the diverged arm's \
+             remote-deleted conflict must be recorded"
+        );
+
+        let upload_for_rel = state
+            .db
+            .list_recent_jobs(20)
+            .unwrap()
+            .into_iter()
+            .any(|j| j.job_type == "upload" && j.target_path.as_deref() == Some(rel));
+        assert!(
+            upload_for_rel,
+            "P3 DEMONSTRATED-BY-REGRESSION: the diverged arm must enqueue an upload \
+             for {rel} when the edit was already scanned during the grace window, \
+             or {rel} is orphaned local-only forever — unlike the unscanned case, \
+             where the very next scan uploads it unprompted"
+        );
+
+        // Nothing further is left for a rescan or the sweep to find: the upload
+        // above is now the only thing standing between `rel` and Dropbox.
+        let rescan = process_changed_paths(&state, &[rel.to_string()]).unwrap();
+        assert_eq!(
+            rescan, 0,
+            "a rescan must find nothing further once the upload above is enqueued"
+        );
+        let sweep = crate::remote_index::reconcile_remote_absent(&state, rel).unwrap();
+        assert_eq!(
+            sweep, 0,
+            "the remote row is already gone; there is nothing left for the sweep to \
+             re-derive"
+        );
+    }
+
+    /// **DBSYNC-102 review F3** (ex
+    /// `review_a_scanned_edit_then_cancel_leaves_a_silent_divergence`): a scanned
+    /// edit during the grace window produces a conflicted copy and writes the
+    /// EDIT's hash into `local_file_index[rel]`; a re-add with the ORIGINAL hash
+    /// then cancels the deferred delete. Before F3, nothing re-derived the owed
+    /// upload for `rel` itself: the cancel only proved the path still exists, not
+    /// that its bytes matched, and the divergence was permanent and silent — a
+    /// rescan found nothing to do because the index already claimed `rel` was
+    /// synced.
+    #[test]
+    fn apply_delta_entries_cancel_on_readd_enqueues_an_upload_for_the_diverged_edit() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, orig_hash) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+
+        assert_eq!(
+            apply_delta_batch(
+                &state,
+                vec![delta_entry("deleted", "/shared/doc.txt", None, None, None)]
+            ),
+            1
+        );
+
+        std::fs::write(&path, b"edited during grace").unwrap();
+        let n = process_changed_paths(&state, &[rel.to_string()]).unwrap();
+        assert_eq!(
+            n, 1,
+            "scan routes the edit to a conflicted copy (path is covered)"
+        );
+
+        // Invocation N+1: re-add with the same id and the ORIGINAL (pre-edit) hash.
+        apply_delta_batch(
+            &state,
+            vec![delta_entry(
+                "file",
+                "/shared/doc.txt",
+                Some(&orig_hash),
+                Some("rev2"),
+                Some("id:DOC"),
+            )],
+        );
+
+        let (disk_hash, _, _) = crate::path_util::hash_file(&path).unwrap();
+        let local = state.db.get_local_file(rel).unwrap().unwrap();
+        let remote = state.db.get_remote_file(rel).unwrap().unwrap();
+        assert_eq!(
+            local.hash, disk_hash,
+            "the local index claims the edit is synced (unchanged pre-existing behaviour)"
+        );
+        assert_ne!(
+            remote.content_hash, disk_hash,
+            "but Dropbox still holds the pre-edit bytes"
+        );
+
+        let upload = state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "upload" && j.target_path.as_deref() == Some(rel));
+        assert!(
+            upload.is_some(),
+            "F3 DEMONSTRATED-BY-REGRESSION: an upload for the diverged edit must be \
+             enqueued on the cancel, or nothing will ever reconcile {rel}"
+        );
+    }
+
+    /// **DBSYNC-102 review P2**: the re-add carries the SAME id but a DIFFERENT
+    /// `content_hash` — a collaborator edited the file on Dropbox during the grace
+    /// window, not merely a re-add of the original content. F3's original guard
+    /// compared local only against the STORED remote hash and would enqueue an
+    /// overwriting `upload` against content this client never saw. The upload must
+    /// not be enqueued; the collaborator's edit is left for the sweep's download
+    /// path to reconcile instead.
+    #[test]
+    fn apply_delta_entries_cancel_on_readd_does_not_overwrite_a_collaborators_edit() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, orig_hash) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+
+        assert_eq!(
+            apply_delta_batch(
+                &state,
+                vec![delta_entry("deleted", "/shared/doc.txt", None, None, None)]
+            ),
+            1
+        );
+
+        // A local edit during the grace window, scanned and routed to a
+        // conflicted copy exactly as in the F3 test above.
+        std::fs::write(&path, b"edited during grace").unwrap();
+        assert_eq!(
+            process_changed_paths(&state, &[rel.to_string()]).unwrap(),
+            1
+        );
+
+        // Invocation N+1: re-add with the SAME id, but a DIFFERENT content_hash —
+        // a collaborator's edit, not a re-add of the pre-delete content.
+        assert_ne!(
+            "COLLABORATOR_EDIT_HASH", orig_hash,
+            "sanity: the fixture hash must actually differ from the collaborator hash"
+        );
+        apply_delta_batch(
+            &state,
+            vec![delta_entry(
+                "file",
+                "/shared/doc.txt",
+                Some("COLLABORATOR_EDIT_HASH"),
+                Some("rev2"),
+                Some("id:DOC"),
+            )],
+        );
+
+        // The deferred local_delete must still be cancelled (the path exists).
+        assert!(
+            state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.job_type != "local_delete"),
+            "the deferred delete must still be cancelled by the re-add"
+        );
+        assert!(
+            state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.job_type != "upload" || j.target_path.as_deref() != Some(rel)),
+            "P2 DEMONSTRATED-BY-REGRESSION: a re-add whose content_hash diverged from \
+             the stored one must not enqueue an upload for {rel} — that would \
+             overwrite a collaborator's edit this client never downloaded"
+        );
+    }
+
+    /// **DBSYNC-102 review F2** (ex
+    /// `review_a_retry_failed_jobs_runs_a_stale_deferred_delete_over_a_later_edit`):
+    /// a deferred `local_delete` that exhausts its retries on lookup errors
+    /// (offline) used to become a `failed` row with `delta_deferred=1` — pinning
+    /// the tray to Error — while the user kept editing the still-present file
+    /// offline. Back online, pressing "Retry failed jobs" requeued BOTH jobs, and
+    /// the stale delete (lower id) drained first and unlinked the edited file
+    /// before its own upload ever ran. F2 drops the exhausted deferred delete
+    /// instead of failing it, so there is nothing left for Retry to race.
+    #[test]
+    fn deferred_local_delete_exhausting_retries_is_dropped_so_retry_cannot_race_a_later_edit() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, _h) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+        assert_eq!(
+            apply_delta_batch(
+                &state,
+                vec![delta_entry("deleted", "/shared/doc.txt", None, None, None)]
+            ),
+            1
+        );
+        let del = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete")
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        state
+            .db
+            .mark_job_retry_wait(del.id, 4, &past, None)
+            .unwrap();
+        let picked = state.db.pick_next_due_job().unwrap().unwrap();
+        let err = crate::error::AppError::Network("offline".into());
+        super::apply_job_failure(&state, &picked, 5, 5, &err).unwrap();
+
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .into_iter()
+                .all(|j| j.id != picked.id),
+            "F2 DEMONSTRATED-BY-REGRESSION: the exhausted deferred local_delete must \
+             be dropped outright, not left as a `failed` row"
+        );
+
+        // Offline edit of the still-present file: not covered (the row is gone, not
+        // merely `failed`, so nothing blocks the scan from enqueuing the upload).
+        std::fs::write(&path, b"offline work").unwrap();
+        assert_eq!(
+            process_changed_paths(&state, &[rel.to_string()]).unwrap(),
+            1
+        );
+        let up = state.db.pick_next_due_job().unwrap().unwrap();
+        assert_eq!(up.job_type, "upload");
+        super::apply_job_failure(&state, &up, 5, 5, &err).unwrap();
+
+        // Back online, user presses Retry: only the upload is left to requeue.
+        assert_eq!(
+            state.db.requeue_failed_jobs().unwrap(),
+            1,
+            "only the upload should still be `failed` — the stale delete is gone"
+        );
+        let first = state.db.pick_next_due_job().unwrap().unwrap();
+        assert_eq!(
+            first.job_type, "upload",
+            "no stale local_delete remains to drain ahead of the edit's upload"
+        );
+        assert!(
+            path.exists(),
+            "the offline edit must never have been unlinked"
+        );
+    }
+
+    /// **DBSYNC-102 review F4**: drives `process_sync_queue_core` — the exact body
+    /// `process_sync_queue_internal` calls in production — end to end for a
+    /// DEFERRED `local_delete`, with a fake lookup. This is the one thing
+    /// `dispatch_local_delete`'s own tests above cannot prove on their own: that
+    /// the real call site inside this function still passes `job.delta_deferred`
+    /// through to the real runner, rather than e.g. a hardcoded `false` that would
+    /// silently revert every deferred delete to an unverified one. Replacing
+    /// `job.delta_deferred` with `false` at that call site makes the first
+    /// assertion below fail (the file is unlinked despite the lookup saying the
+    /// path still exists).
+    #[test]
+    fn process_sync_queue_core_runs_a_deferred_local_delete_through_the_real_dispatch_seam() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+
+        // Kept: the fake lookup says the path still exists on Dropbox.
+        let ran = super::process_sync_queue_core(&state, |_| {
+            Ok(Some(crate::remote_index::RemoteFileMeta {
+                content_hash: "original".to_string(),
+                rev: "rev2".to_string(),
+                modified_ts: 0,
+                id: Some("id:DOC".to_string()),
+            }))
+        })
+        .unwrap();
+        assert!(ran, "a due job must have been processed");
+        assert!(
+            path.exists(),
+            "F4 DEMONSTRATED-BY-REGRESSION: a deferred delete whose verification \
+             KEEPS the path must not unlink it — if this fails, the call site \
+             stopped passing job.delta_deferred through to the real dispatch"
+        );
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .iter()
+                .all(|j| j.job_type != "local_delete"),
+            "the kept job's row must be gone, never left as a completed delete"
+        );
+    }
+
+    /// **DBSYNC-102 review F4 (continued)**: the same real seam, but for a
+    /// genuinely-gone deferred delete — it must still delete exactly as before.
+    #[test]
+    fn process_sync_queue_core_still_deletes_a_deferred_local_delete_that_is_genuinely_gone() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/gone.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:GONE");
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+
+        let ran = super::process_sync_queue_core(&state, |_| Ok(None)).unwrap();
+        assert!(ran);
+        assert!(!path.exists(), "genuinely-gone must still delete");
+        assert!(state.db.get_local_file(rel).unwrap().is_none());
+    }
+
+    /// **DBSYNC-102 review F4 (continued)**: a lookup failure reschedules through
+    /// the ordinary retry/backoff path, with `delta_deferred` surviving so the next
+    /// pick re-enters the same verification.
+    #[test]
+    fn process_sync_queue_core_reschedules_a_deferred_local_delete_on_lookup_error() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/flaky.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:FLAKY");
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+
+        let ran = super::process_sync_queue_core(&state, |_| {
+            Err(crate::error::AppError::Network("offline".into()))
+        })
+        .unwrap();
+        assert!(ran);
+        assert!(
+            path.exists(),
+            "nothing may be deleted on a failed verification"
+        );
+        let job = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.target_path.as_deref() == Some(rel))
+            .expect("the job row must survive a failed verification");
+        assert_eq!(job.status, "retry_wait");
+        assert!(
+            job.delta_deferred,
+            "must re-enter the same verification next pick"
+        );
+    }
+
+    /// **DBSYNC-102, CTO review F1, through the real runner.** The direct-core test
+    /// above proves a read failure returns `Err`; this one proves what the runner then
+    /// does with it: the job goes back to `retry_wait` with `delta_deferred` intact, so
+    /// the retry is verified again — and nothing is deleted, uploaded or flagged. It
+    /// also pins the `outcome="rescheduled"` log line a tester greps for.
+    ///
+    /// Proof this test can fail: restoring `Err(_) => Ok(false)` in
+    /// `file_unchanged_since_delta_check` sends the job down the diverged arm, which
+    /// removes the row — failing the `expect` below.
+    #[cfg(unix)]
+    #[test]
+    fn process_sync_queue_core_reschedules_a_deferred_local_delete_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/locked.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:LOCK");
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let log = captured_tracing_output(|| {
+            let ran = super::process_sync_queue_core(&state, |_| Ok(None)).unwrap();
+            assert!(ran);
+        });
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(path.exists(), "nothing may be deleted on a failed re-check");
+        let jobs = state.db.list_recent_jobs(10).unwrap();
+        let job = jobs
+            .iter()
+            .find(|j| j.job_type == "local_delete" && j.target_path.as_deref() == Some(rel))
+            .expect("the deferred job must survive, to be retried");
+        assert_eq!(job.status, "retry_wait");
+        assert!(
+            job.delta_deferred,
+            "the retry must be verified again: delta_deferred must survive apply_job_failure"
+        );
+        assert_eq!(
+            jobs.iter().filter(|j| j.job_type == "upload").count(),
+            0,
+            "an unreadable file must never be queued for upload"
+        );
+        assert!(state.db.list_recent_conflicts(10).unwrap().is_empty());
+        assert!(
+            log.lines()
+                .any(|l| l.contains("outcome=\"rescheduled\"") && l.contains(rel)),
+            "the re-hash failure must be logged as rescheduled, naming the path; got: {log}"
+        );
+    }
+
+    /// **DBSYNC-102 review F7**: `recover_running_jobs` must not clear
+    /// `delta_deferred` — an app killed mid-verification must come back still
+    /// deferred, not as an unverified delete.
+    #[test]
+    fn recover_running_jobs_preserves_delta_deferred() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+        let job = state.db.pick_next_due_job().unwrap().unwrap();
+        assert!(job.delta_deferred, "precondition");
+
+        let recovered = state.db.recover_running_jobs().unwrap();
+        assert_eq!(recovered, 1);
+
+        let row = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .unwrap();
+        assert_eq!(row.status, "queued");
+        assert!(
+            row.delta_deferred,
+            "an interrupted verification must come back still deferred"
+        );
+    }
+
+    /// **DBSYNC-102 review F7**: pin the grace actually applied, not merely that
+    /// `next_retry_at` is set to *some* future time (a 1s grace would also pass
+    /// that weaker check).
+    #[test]
+    fn deferred_local_delete_grace_is_at_least_fifty_five_seconds() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        seed_synced_hydrated_file(&state, rel, "id:DOC");
+
+        apply_delta_batch(
+            &state,
+            vec![delta_entry("deleted", "/shared/doc.txt", None, None, None)],
+        );
+        let job = state
+            .db
+            .list_recent_jobs(10)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete")
+            .unwrap();
+        let next_retry_at = chrono::DateTime::parse_from_rfc3339(
+            job.next_retry_at
+                .as_deref()
+                .expect("deferred job must carry next_retry_at"),
+        )
+        .unwrap()
+        .with_timezone(&Utc);
+        // (review C3): pin BOTH ends — a lower bound alone also passes for a grace
+        // that regressed to, say, 10 minutes, which would be its own (different)
+        // bug: a share conversion's re-add would then sit "pending" for far longer
+        // than the ~3.45s gap this grace was sized to cover.
+        let min_grace = Utc::now() + Duration::seconds(55);
+        let max_grace = Utc::now() + Duration::seconds(65);
+        assert!(
+            next_retry_at >= min_grace,
+            "the grace must be at least 55s, not merely \"some future time\"; got {next_retry_at}"
+        );
+        assert!(
+            next_retry_at <= max_grace,
+            "C3 DEMONSTRATED-BY-REGRESSION: the grace must also be at most 65s — a \
+             much longer grace is its own bug, not a safer one; got {next_retry_at}"
+        );
+    }
+
+    /// **DBSYNC-102 review F5**: a kept (cancelled-at-execution-time) deferred
+    /// `local_delete` must be logged as "kept", never as "sync job completed" —
+    /// the latter is exactly the line an operator (or the HITL tester) greps for
+    /// to confirm a deletion happened.
+    #[test]
+    fn process_sync_queue_core_logs_a_kept_deferred_delete_as_kept_not_completed() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        seed_synced_hydrated_file(&state, rel, "id:DOC");
+        state
+            .db
+            .enqueue_job("local_delete", Some(rel), Some(rel))
+            .unwrap();
+        let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+        assert!(state.db.defer_delta_local_delete(rel, &past).unwrap());
+
+        let log = captured_tracing_output(|| {
+            super::process_sync_queue_core(&state, |_| {
+                Ok(Some(crate::remote_index::RemoteFileMeta {
+                    content_hash: "H".to_string(),
+                    rev: "rev2".to_string(),
+                    modified_ts: 0,
+                    id: Some("id:DOC".to_string()),
+                }))
+            })
+            .unwrap();
+        });
+        assert!(
+            log.contains("sync job kept"),
+            "must log the kept outcome; got: {log}"
+        );
+        assert!(
+            !log.contains("sync job completed"),
+            "must NOT log a kept delete as completed; got: {log}"
+        );
+    }
+
+    /// **DBSYNC-102, CTO review F1 — an unchanged file that cannot be read must not be
+    /// re-uploaded over a genuine remote delete.** The re-check before a deferred delete
+    /// used to treat a read failure as "the file diverged", and the diverged arm always
+    /// enqueues an upload — so a file a collaborator deleted on Dropbox, merely locked
+    /// at that moment (a Windows sharing violation from an open document, an antivirus
+    /// scan, a permission change), was flagged as a conflict and later recreated on
+    /// Dropbox with its unchanged bytes. A read failure is now a retry, not a verdict:
+    /// the core returns `Err` before any side effect, exactly like a failed lookup.
+    ///
+    /// Proof this test can fail: restoring `Err(_) => Ok(false)` in
+    /// `file_unchanged_since_delta_check` makes the core return `Ok(Cancelled)` with
+    /// one upload and one conflict, failing the first assertion.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_unchanged_file_is_retried_not_reuploaded_over_a_genuine_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/locked.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:LOCK");
+        assert_eq!(
+            apply_delta_batch(
+                &state,
+                vec![delta_entry(
+                    "deleted",
+                    "/shared/locked.txt",
+                    None,
+                    None,
+                    None
+                )]
+            ),
+            1
+        );
+        let deferred = state
+            .db
+            .list_recent_jobs(20)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "local_delete")
+            .expect("the genuine delete must have been deferred");
+
+        // Content unchanged; the file is merely unreadable for the moment.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = crate::dropbox_transfer::verify_and_delete_local_file_core(
+            &state,
+            deferred.id,
+            rel,
+            |_| Ok(None),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a read failure must be a retry (Err), not a verdict; got {result:?}"
+        );
+        let jobs = state.db.list_recent_jobs(20).unwrap();
+        assert_eq!(
+            jobs.iter().filter(|j| j.job_type == "upload").count(),
+            0,
+            "an unchanged-but-unreadable file must never be queued for re-upload"
+        );
+        assert!(
+            state.db.list_recent_conflicts(20).unwrap().is_empty(),
+            "nothing diverged, so no conflict may be recorded"
+        );
+        assert!(path.exists(), "nothing may be deleted on a failed re-check");
+        let still = jobs
+            .iter()
+            .find(|j| j.id == deferred.id)
+            .expect("the deferred job must survive, to be retried by apply_job_failure");
+        assert!(
+            still.delta_deferred,
+            "the retry must still be verified: delta_deferred must survive"
         );
     }
 }
