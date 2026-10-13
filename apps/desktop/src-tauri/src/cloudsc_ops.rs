@@ -11,10 +11,10 @@ use crate::cloudsc::{
 };
 use crate::dropbox_transfer::{delete_remote_file_internal, download_remote_file_internal};
 use crate::error::{AppError, AppResult};
-use crate::models::{CloudscMeta, CloudscPlaceholderInfo, DropboxListFolderResponse};
+use crate::models::{CloudscMeta, CloudscPlaceholderInfo, DropboxEntry, DropboxListFolderResponse};
 use crate::path_util::{
-    hash_file, is_ignored_local_path, is_path_allowed, normalize_dropbox_path, parse_prefix_csv,
-    relpath_under, safe_join,
+    fold, hash_file, is_ignored_local_path, is_path_allowed, key_from_disk, key_from_dropbox,
+    normalize_dropbox_path, parse_prefix_csv, safe_join,
 };
 use crate::state::AppState;
 
@@ -43,8 +43,6 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     // DBSYNC-45: collect placeholder create/prune names to emit ONE
     // `placeholder-changed` event per index call (no per-file event flood on a
     // large initial sweep); the frontend logs them into the Activité feed.
-    let mut created_names: Vec<String> = Vec::new();
-    let mut removed_names: Vec<String> = Vec::new();
 
     // DBSYNC-59 Slice 2: when native CfAPI placeholders are active, a remote-only
     // FILE is materialized as a real dehydrated placeholder (cloud icon) instead of a
@@ -107,167 +105,22 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
     // Names of every remote child in this folder (regardless of selective-sync
     // filtering), used below to prune placeholders whose remote target is gone.
-    let mut remote_child_names: HashSet<String> = HashSet::new();
+    let mut names = SweepNames {
+        remote_child_names: HashSet::new(),
+        created_names: Vec::new(),
+    };
 
     loop {
-        for entry in entries_resp.entries {
-            let tag = entry.tag;
+        created += materialize_listing_entries(
+            state,
+            entries_resp.entries,
+            local_dir,
+            &include_prefixes,
+            &exclude_prefixes,
+            &mut names,
             #[cfg(windows)]
-            let content_hash = entry.content_hash;
-            #[cfg(windows)]
-            let rev = entry.rev;
-            #[cfg(windows)]
-            let size = entry.size;
-            #[cfg(windows)]
-            let server_modified = entry.server_modified;
-            let path_display = match entry.path_display {
-                Some(p) => p,
-                None => continue,
-            };
-
-            let child_name = path_display
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(&path_display)
-                .to_string();
-            remote_child_names.insert(child_name.clone());
-
-            let relative = path_display.trim_start_matches('/').to_string();
-            if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
-                continue;
-            }
-
-            // `child_name` is the last segment of a remote path_display: refuse a
-            // name that carries embedded separators / traversal before writing it
-            // to local disk (skip the poisoned entry, don't abort the sweep).
-            let placeholder_path = match safe_join(local_dir, &format!("{child_name}.cloudsc")) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(name = %child_name, error = %e, "skipping unsafe placeholder name");
-                    continue;
-                }
-            };
-            let target_path = cloudsc_target_path(&placeholder_path);
-            // Skip if already represented locally: as a placeholder, or as a real
-            // file/dir (a hydrated folder is a real dir, so we never shadow it with
-            // a `<name>.cloudsc`).
-            if placeholder_path.exists() {
-                // DBSYNC-66: on Windows a `.cloudsc` sidecar is always wrong (a
-                // leftover from an older build or from a moment CfAPI was inactive)
-                // and it shadows the native placeholder — remove it and materialize
-                // natively below. On non-Windows the `.cloudsc` IS the placeholder,
-                // so keep it.
-                #[cfg(windows)]
-                {
-                    if let Err(e) = fs::remove_file(&placeholder_path) {
-                        tracing::warn!(name = %child_name, error = %e, "failed to remove stale .cloudsc sidecar; skipping");
-                        continue;
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    continue;
-                }
-            }
-            if target_path.exists() {
-                continue;
-            }
-
-            // DBSYNC-59 Slice 2: with native CfAPI placeholders active, represent
-            // cloud-only content the native way (like Dropbox/OneDrive) instead of a
-            // `.cloudsc` sidecar: a FILE becomes a real dehydrated placeholder (cloud
-            // icon), a FOLDER becomes a real directory whose children are indexed as
-            // placeholders on the next sweep. The non-Windows / inactive / missing-
-            // metadata paths keep `.cloudsc`.
-            #[cfg(windows)]
-            if cfapi_active {
-                if tag == "file" {
-                    if let (Some(ch), Some(rv), Some(sz)) =
-                        (content_hash.as_deref(), rev.as_deref(), size)
-                    {
-                        if !ch.is_empty() && !rv.is_empty() {
-                            let mts = server_modified
-                                .as_deref()
-                                .map(crate::remote_index::parse_rfc3339_ts_to_unix)
-                                .unwrap_or(0);
-                            if create_remote_only_placeholder(
-                                state,
-                                local_dir,
-                                &child_name,
-                                &relative,
-                                &path_display,
-                                ch,
-                                rv,
-                                sz,
-                                mts,
-                            ) {
-                                created += 1;
-                                created_names.push(child_name.clone());
-                            }
-                            continue; // represented natively — no `.cloudsc`
-                        }
-                    }
-                    // Missing content_hash/rev/size → fall through to `.cloudsc`.
-                } else if tag == "folder" {
-                    // A cloud-only folder is a real directory (its children surface as
-                    // placeholders next sweep), never a `<name>.cloudsc`.
-                    // DBSYNC-66 Slice 1: arm this folder's own rel BEFORE creating it —
-                    // the shell may churn (delete-then-recreate) placeholders while
-                    // materializing a restored subtree, and that churn must not be
-                    // read as a user delete.
-                    #[cfg(windows)]
-                    crate::cloud_filter::mark_materialization(&relative);
-                    match fs::create_dir_all(&target_path) {
-                        Ok(()) => {
-                            let _ = state.db.upsert_known_folder(&relative);
-                            created += 1;
-                            created_names.push(child_name.clone());
-                            // DBSYNC-67: convert this folder to an in-sync placeholder
-                            // NOW, while it is still empty — CfConvertToPlaceholder
-                            // only works on an empty directory (it returns 0x8007017C
-                            // once the folder holds placeholder children). Doing it
-                            // here, BEFORE the recursion below materializes children,
-                            // is what makes Explorer render the cloud/aggregate icon
-                            // instead of a stuck "syncing" glyph.
-                            #[cfg(windows)]
-                            crate::cloud_filter::apply_folder_state(&target_path);
-                            // DBSYNC-66: recurse into the just-created folder now so a
-                            // restored/new subtree materializes fully in ONE sweep
-                            // (depth-first, each folder listed once) instead of one
-                            // level per scan tick — the cause of the minutes-long
-                            // trickle after a cloud folder restore.
-                            match normalize_dropbox_path(&relative) {
-                                Ok(child_remote) => {
-                                    match index_remote_folder_children_as_cloudsc_placeholders_internal(
-                                        state,
-                                        &child_remote,
-                                        &target_path,
-                                    ) {
-                                        Ok(n) => created += n,
-                                        Err(e) => tracing::warn!(rel = %relative, error = %e, "recursive materialization of subfolder failed"),
-                                    }
-                                }
-                                Err(e) => tracing::warn!(rel = %relative, error = %e, "recursive materialization: unsafe child path"),
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(name = %child_name, error = %e, "remote-only folder: create dir failed");
-                        }
-                    }
-                    continue; // represented natively — no `.cloudsc`
-                }
-            }
-
-            let meta = CloudscMeta {
-                version: 1,
-                tag,
-                remote_path_display: path_display,
-            };
-            write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
-            created += 1;
-            created_names.push(child_name.clone());
-        }
+            cfapi_active,
+        )?;
 
         if !entries_resp.has_more {
             break;
@@ -299,23 +152,234 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     // (any list error returns earlier), so a failed/partial listing never deletes
     // placeholders. Hydrated content (real files/dirs) is untouched — only
     // `.cloudsc` files are considered.
+    let removed_names = prune_stale_cloudsc_placeholders(local_dir, &names.remote_child_names)?;
+
+    emit_placeholder_changed(&names.created_names, &removed_names);
+    Ok(created)
+}
+
+/// Names tracked across the pages of one sweep (DBSYNC-103).
+struct SweepNames {
+    /// [`fold`] of every remote child of the folder, selective-sync filtering aside: the
+    /// prune keeps a `.cloudsc` whose folded target is in here.
+    remote_child_names: HashSet<String>,
+    /// Display names of the placeholders created, for the one summary event.
+    created_names: Vec<String>,
+}
+
+/// Creates a placeholder for every entry of one `list_folder` page that has no local
+/// representation, and records the remote child names for the prune. Split out of the
+/// network loop so a listing can be injected (DBSYNC-103).
+///
+/// Returns the number of placeholders/folders created.
+#[cfg_attr(
+    not(windows),
+    allow(
+        unused_variables,
+        reason = "state is only used by the Windows CfAPI branch"
+    )
+)]
+fn materialize_listing_entries(
+    state: &AppState,
+    entries: Vec<DropboxEntry>,
+    local_dir: &Path,
+    include_prefixes: &[String],
+    exclude_prefixes: &[String],
+    names: &mut SweepNames,
+    #[cfg(windows)] cfapi_active: bool,
+) -> AppResult<usize> {
+    let mut created = 0usize;
+    for entry in entries {
+        let tag = entry.tag;
+        #[cfg(windows)]
+        let content_hash = entry.content_hash;
+        #[cfg(windows)]
+        let rev = entry.rev;
+        #[cfg(windows)]
+        let size = entry.size;
+        #[cfg(windows)]
+        let server_modified = entry.server_modified;
+        let path_display = match entry.path_display {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let child_name = path_display
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&path_display)
+            .to_string();
+        names.remote_child_names.insert(fold(&child_name));
+
+        let relative = key_from_dropbox(&path_display);
+        if !is_path_allowed(&relative, include_prefixes, exclude_prefixes) {
+            continue;
+        }
+
+        // `child_name` is the last segment of a remote path_display: refuse a
+        // name that carries embedded separators / traversal before writing it
+        // to local disk (skip the poisoned entry, don't abort the sweep).
+        let placeholder_path = match safe_join(local_dir, &format!("{child_name}.cloudsc")) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(name = %child_name, error = %e, "skipping unsafe placeholder name");
+                continue;
+            }
+        };
+        let target_path = cloudsc_target_path(&placeholder_path);
+        // Skip if already represented locally: as a placeholder, or as a real
+        // file/dir (a hydrated folder is a real dir, so we never shadow it with
+        // a `<name>.cloudsc`).
+        if placeholder_path.exists() {
+            // DBSYNC-66: on Windows a `.cloudsc` sidecar is always wrong (a
+            // leftover from an older build or from a moment CfAPI was inactive)
+            // and it shadows the native placeholder — remove it and materialize
+            // natively below. On non-Windows the `.cloudsc` IS the placeholder,
+            // so keep it.
+            #[cfg(windows)]
+            {
+                if let Err(e) = fs::remove_file(&placeholder_path) {
+                    tracing::warn!(name = %child_name, error = %e, "failed to remove stale .cloudsc sidecar; skipping");
+                    continue;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                continue;
+            }
+        }
+        if target_path.exists() {
+            continue;
+        }
+
+        // DBSYNC-59 Slice 2: with native CfAPI placeholders active, represent
+        // cloud-only content the native way (like Dropbox/OneDrive) instead of a
+        // `.cloudsc` sidecar: a FILE becomes a real dehydrated placeholder (cloud
+        // icon), a FOLDER becomes a real directory whose children are indexed as
+        // placeholders on the next sweep. The non-Windows / inactive / missing-
+        // metadata paths keep `.cloudsc`.
+        #[cfg(windows)]
+        if cfapi_active {
+            if tag == "file" {
+                if let (Some(ch), Some(rv), Some(sz)) =
+                    (content_hash.as_deref(), rev.as_deref(), size)
+                {
+                    if !ch.is_empty() && !rv.is_empty() {
+                        let mts = server_modified
+                            .as_deref()
+                            .map(crate::remote_index::parse_rfc3339_ts_to_unix)
+                            .unwrap_or(0);
+                        if create_remote_only_placeholder(
+                            state,
+                            local_dir,
+                            &child_name,
+                            &relative,
+                            &path_display,
+                            ch,
+                            rv,
+                            sz,
+                            mts,
+                        ) {
+                            created += 1;
+                            names.created_names.push(child_name.clone());
+                        }
+                        continue; // represented natively — no `.cloudsc`
+                    }
+                }
+                // Missing content_hash/rev/size → fall through to `.cloudsc`.
+            } else if tag == "folder" {
+                // A cloud-only folder is a real directory (its children surface as
+                // placeholders next sweep), never a `<name>.cloudsc`.
+                // DBSYNC-66 Slice 1: arm this folder's own rel BEFORE creating it —
+                // the shell may churn (delete-then-recreate) placeholders while
+                // materializing a restored subtree, and that churn must not be
+                // read as a user delete.
+                #[cfg(windows)]
+                crate::cloud_filter::mark_materialization(&relative);
+                match fs::create_dir_all(&target_path) {
+                    Ok(()) => {
+                        let _ = state.db.upsert_known_folder(&relative);
+                        created += 1;
+                        names.created_names.push(child_name.clone());
+                        // DBSYNC-67: convert this folder to an in-sync placeholder
+                        // NOW, while it is still empty — CfConvertToPlaceholder
+                        // only works on an empty directory (it returns 0x8007017C
+                        // once the folder holds placeholder children). Doing it
+                        // here, BEFORE the recursion below materializes children,
+                        // is what makes Explorer render the cloud/aggregate icon
+                        // instead of a stuck "syncing" glyph.
+                        #[cfg(windows)]
+                        crate::cloud_filter::apply_folder_state(&target_path);
+                        // DBSYNC-66: recurse into the just-created folder now so a
+                        // restored/new subtree materializes fully in ONE sweep
+                        // (depth-first, each folder listed once) instead of one
+                        // level per scan tick — the cause of the minutes-long
+                        // trickle after a cloud folder restore.
+                        match normalize_dropbox_path(&relative) {
+                            Ok(child_remote) => {
+                                match index_remote_folder_children_as_cloudsc_placeholders_internal(
+                                    state,
+                                    &child_remote,
+                                    &target_path,
+                                ) {
+                                    Ok(n) => created += n,
+                                    Err(e) => {
+                                        tracing::warn!(rel = %relative, error = %e, "recursive materialization of subfolder failed")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(rel = %relative, error = %e, "recursive materialization: unsafe child path")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %child_name, error = %e, "remote-only folder: create dir failed");
+                    }
+                }
+                continue; // represented natively — no `.cloudsc`
+            }
+        }
+
+        let meta = CloudscMeta {
+            version: 1,
+            tag,
+            remote_path_display: path_display,
+        };
+        write_cloudsc_placeholder_file(&placeholder_path, &meta)?;
+        created += 1;
+        names.created_names.push(child_name.clone());
+    }
+    Ok(created)
+}
+
+/// Removes every `<X>.cloudsc` in `local_dir` whose target `X` is not among
+/// `remote_child_names` (already [`fold`]ed) and returns the removed target names.
+///
+/// Both sides are folded: the placeholder keeps the name the file system gave it (NFD on a
+/// volume that preserves it) while Dropbox returns NFC, and a placeholder that differs from
+/// its remote child only by Unicode form or case is the same item, not a stale one
+/// (DBSYNC-103).
+fn prune_stale_cloudsc_placeholders(
+    local_dir: &Path,
+    remote_child_names: &HashSet<String>,
+) -> AppResult<Vec<String>> {
+    let mut removed = Vec::new();
     for dir_entry in fs::read_dir(local_dir)
         .map_err(|e| AppError::Io(format!("failed reading local dir: {e}")))?
     {
-        let dir_entry = match dir_entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(dir_entry) = dir_entry else { continue };
         let name = dir_entry.file_name().to_string_lossy().to_string();
         if let Some(target) = name.strip_suffix(".cloudsc") {
-            if !remote_child_names.contains(target) && fs::remove_file(dir_entry.path()).is_ok() {
-                removed_names.push(target.to_string());
+            if !remote_child_names.contains(&fold(target))
+                && fs::remove_file(dir_entry.path()).is_ok()
+            {
+                removed.push(target.to_string());
             }
         }
     }
-
-    emit_placeholder_changed(&created_names, &removed_names);
-    Ok(created)
+    Ok(removed)
 }
 
 /// Materialize a remote-only FILE as a native CfAPI dehydrated placeholder (Windows,
@@ -526,7 +590,7 @@ pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
             continue;
         }
         let dir = entry.path();
-        let rel = relpath_under(&sync_folder, dir)?; // "" for the sync root itself
+        let rel = key_from_disk(&sync_folder, dir)?; // "" for the sync root itself
                                                      // "" for root, "/Cocina", ...; a malformed path skips this folder only.
         let remote_path = match normalize_dropbox_path(&rel) {
             Ok(p) => p,
@@ -590,7 +654,7 @@ pub(crate) fn list_cloudsc_placeholders(
         }
         let placeholder_path = entry.path();
         let meta = read_cloudsc_placeholder_file(placeholder_path)?;
-        let local_rel = relpath_under(&sync_folder, placeholder_path)?;
+        let local_rel = key_from_disk(&sync_folder, placeholder_path)?;
         out.push(CloudscPlaceholderInfo {
             local_path_display: local_rel,
             tag: meta.tag,
@@ -635,7 +699,7 @@ pub(crate) fn list_cloudsc_placeholder_rels(state: &AppState) -> AppResult<Vec<S
         if !entry.file_name().to_string_lossy().ends_with(".cloudsc") {
             continue;
         }
-        out.push(relpath_under(&sync_folder, entry.path())?);
+        out.push(key_from_disk(&sync_folder, entry.path())?);
     }
     Ok(out)
 }
@@ -1058,7 +1122,7 @@ fn dehydrate_folder_cfapi(
             continue;
         }
         // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
-        let file_rel = match relpath_under(root, entry.path()) {
+        let file_rel = match key_from_disk(root, entry.path()) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -1136,7 +1200,7 @@ fn dehydrate_folder_collapse(
             continue; // symlink/other — left in place; it blocks the collapse (→ degrade)
         }
         // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
-        let file_rel = match relpath_under(root, entry.path()) {
+        let file_rel = match key_from_disk(root, entry.path()) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -1455,6 +1519,7 @@ pub(crate) fn prune_empty_deleted_ancestors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_util::relpath_under;
 
     // The materialized-folder sweep maps each real local directory to its Dropbox
     // list_folder path via `normalize_dropbox_path(relpath_under(root, dir))`. The
@@ -2039,5 +2104,196 @@ mod tests {
             vec!["dir2".to_string(), "dirtest/sub".to_string()],
             "only 'dir' and its descendants may be untracked"
         );
+    }
+    // ---------------------------------------------------------------------------
+    // DBSYNC-103: Unicode-form-insensitive sweep / prune
+    // ---------------------------------------------------------------------------
+
+    /// Same name, two Unicode forms: Dropbox returns NFC, APFS keeps what it was given.
+    const NAME_NFC: &str = "caf\u{e9}.txt";
+    const NAME_NFD: &str = "cafe\u{301}.txt";
+
+    fn listing_entry(tag: &str, path_display: &str) -> DropboxEntry {
+        DropboxEntry {
+            tag: tag.to_string(),
+            path_display: Some(path_display.to_string()),
+            path_lower: Some(path_display.to_lowercase()),
+            content_hash: None,
+            rev: None,
+            server_modified: None,
+            size: None,
+            id: None,
+        }
+    }
+
+    /// Runs the page-materialization and the prune over an injected listing, exactly as
+    /// the network-driven sweep does, and returns `(created, removed)`.
+    fn sweep_injected(
+        state: &AppState,
+        dir: &Path,
+        entries: Vec<DropboxEntry>,
+    ) -> (usize, Vec<String>) {
+        let mut names = SweepNames {
+            remote_child_names: HashSet::new(),
+            created_names: Vec::new(),
+        };
+        #[cfg(windows)]
+        let created = materialize_listing_entries(state, entries, dir, &[], &[], &mut names, false)
+            .expect("materialize");
+        #[cfg(not(windows))]
+        let created = materialize_listing_entries(state, entries, dir, &[], &[], &mut names)
+            .expect("materialize");
+        let removed =
+            prune_stale_cloudsc_placeholders(dir, &names.remote_child_names).expect("prune");
+        (created, removed)
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// An NFD placeholder on disk and an NFC remote child are one item: not pruned, and
+    /// no NFC twin is created next to it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nfd_placeholder_is_neither_pruned_nor_duplicated_by_an_nfc_remote_child() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+        let placeholder = sync.join(format!("{NAME_NFD}.cloudsc"));
+        std::fs::write(&placeholder, b"original-bytes").expect("seed placeholder");
+
+        let (created, removed) = sweep_injected(
+            &state,
+            &sync,
+            vec![listing_entry("file", &format!("/{NAME_NFC}"))],
+        );
+
+        assert_eq!(created, 0, "no duplicate placeholder");
+        assert!(
+            removed.is_empty(),
+            "form-only difference is not stale: {removed:?}"
+        );
+        let names = dir_names(&sync);
+        assert_eq!(names.len(), 1, "exactly one entry on disk: {names:?}");
+        assert_eq!(
+            names[0],
+            format!("{NAME_NFD}.cloudsc"),
+            "the on-disk name stays the real (NFD) one"
+        );
+        assert_eq!(
+            std::fs::read(&placeholder).expect("read"),
+            b"original-bytes"
+        );
+    }
+
+    /// The same, for a hydrated real file and a real folder under an NFD name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nfd_real_file_or_dir_is_not_shadowed_by_a_placeholder_for_the_nfc_remote_name() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+        std::fs::write(sync.join(NAME_NFD), b"x").expect("seed file");
+        std::fs::create_dir(sync.join("do\u{301}s")).expect("seed dir");
+
+        let (created, removed) = sweep_injected(
+            &state,
+            &sync,
+            vec![
+                listing_entry("file", &format!("/{NAME_NFC}")),
+                listing_entry("folder", "/d\u{f3}s"),
+            ],
+        );
+
+        assert_eq!(created, 0);
+        assert!(removed.is_empty());
+        assert_eq!(dir_names(&sync).len(), 2, "no .cloudsc appeared");
+    }
+
+    /// Control: a placeholder whose name really differs is still pruned, and a genuinely
+    /// new remote child still gets its placeholder (the fold does not over-match).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn genuinely_different_names_are_still_pruned_and_created() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+        // `cafe.txt` (plain e) is a different name from `café.txt`.
+        std::fs::write(sync.join("cafe.txt.cloudsc"), b"stale").expect("seed");
+
+        let (created, removed) = sweep_injected(
+            &state,
+            &sync,
+            vec![listing_entry("file", &format!("/{NAME_NFC}"))],
+        );
+
+        assert_eq!(created, 1);
+        assert_eq!(removed, vec!["cafe.txt".to_string()]);
+        assert!(!sync.join("cafe.txt.cloudsc").exists());
+        assert!(sync.join(format!("{NAME_NFC}.cloudsc")).exists());
+    }
+
+    /// The remote side is folded too: if a listing ever carries the NFD spelling, an NFC
+    /// placeholder on disk is still the same item.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nfc_placeholder_survives_a_listing_that_spells_the_name_nfd() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+        std::fs::write(sync.join(format!("{NAME_NFC}.cloudsc")), b"p").expect("seed");
+
+        let (created, removed) = sweep_injected(
+            &state,
+            &sync,
+            vec![listing_entry("file", &format!("/{NAME_NFD}"))],
+        );
+
+        assert_eq!(created, 0);
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(dir_names(&sync).len(), 1);
+    }
+
+    /// Prune alone, also when the remote name is the NFD one and the placeholder the NFC
+    /// one (the fold is symmetric).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prune_keeps_an_nfc_placeholder_for_an_nfd_remote_child() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path();
+        std::fs::write(dir.join(format!("{NAME_NFC}.cloudsc")), b"p").expect("seed");
+        let remote: HashSet<String> = [fold(NAME_NFD)].into_iter().collect();
+
+        let removed = prune_stale_cloudsc_placeholders(dir, &remote).expect("prune");
+
+        assert!(removed.is_empty(), "{removed:?}");
+        assert_eq!(dir_names(dir).len(), 1);
+    }
+
+    /// Off macOS nothing is normalized: an NFD placeholder and an NFC remote child are
+    /// still two names, so behaviour is what it was before DBSYNC-103 (the NFD one is
+    /// pruned; the NFC one is created). NTFS and ext4 keep both forms distinct.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_form_only_difference_is_still_a_different_name() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+        std::fs::write(sync.join(format!("{NAME_NFD}.cloudsc")), b"p").expect("seed");
+
+        let (created, removed) = sweep_injected(
+            &state,
+            &sync,
+            vec![listing_entry("file", &format!("/{NAME_NFC}"))],
+        );
+
+        assert_eq!(created, 1);
+        assert_eq!(removed, vec![NAME_NFD.to_string()]);
     }
 }

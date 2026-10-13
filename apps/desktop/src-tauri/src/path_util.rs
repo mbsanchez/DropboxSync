@@ -59,6 +59,10 @@ pub(crate) fn is_editor_temp_path(relative: &str) -> bool {
 /// - Exact relative path (contains `/`), e.g. `Notes/scratch.txt` — matches only
 ///   that exact path, not any other file with the same basename.
 pub(crate) fn matches_ignore_globs(relative: &str, globs: &[String]) -> bool {
+    // DBSYNC-103 #188: the key is compared in canonical form (NFC on macOS), the same form
+    // `parse_ignore_globs_csv` gives the patterns, so the spelling either side was typed in
+    // cannot decide the outcome. Borrowed (no allocation) when it is already canonical.
+    let relative = canonical_cow(relative);
     // Separator fold is Windows-only (DBSYNC-104) — see `should_ignore_local_path`.
     #[cfg(windows)]
     let rel_lower = relative.replace('\\', "/").to_ascii_lowercase();
@@ -115,6 +119,11 @@ fn user_ignore_globs_match(relative: &str) -> bool {
 /// trimmed, non-empty patterns. Mirrors [`parse_prefix_csv`] but does not strip a
 /// leading `/` — ignore patterns are basenames/suffixes/relative paths, not
 /// selective-sync prefixes.
+///
+/// Each pattern is put in the canonical key form (NFC on macOS, identity elsewhere;
+/// DBSYNC-103 #188). A name typed or pasted in NFD would otherwise never match the NFC
+/// keys the index now holds, and the ignored file would start syncing. The stored CSV is
+/// not rewritten: only the parsed view is canonical.
 pub(crate) fn parse_ignore_globs_csv(csv: Option<String>) -> Vec<String> {
     match csv {
         None => Vec::new(),
@@ -122,7 +131,7 @@ pub(crate) fn parse_ignore_globs_csv(csv: Option<String>) -> Vec<String> {
             .split(',')
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
-            .map(|p| p.to_string())
+            .map(to_canonical_form)
             .collect(),
     }
 }
@@ -172,13 +181,27 @@ pub(crate) fn is_dehydrated_placeholder(abs: &Path) -> bool {
     }
 }
 
+/// [`to_canonical_form`] without the allocation when `s` is already canonical (always, off
+/// macOS). For predicates that run once per scanned file.
+fn canonical_cow(s: &str) -> std::borrow::Cow<'_, str> {
+    if is_canonical_form(s) {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(to_canonical_form(s))
+    }
+}
+
 /// The single place an **absolute local path** becomes a relative index key.
 ///
 /// Every local producer goes through here (DBSYNC-104). The storage layer relies on that:
 /// it no longer normalizes separators itself, it asserts that callers have.
 ///
+/// Callers that produce an index key use [`key_from_disk`], which adds NFC on macOS
+/// (DBSYNC-103); this function alone is for paths that are only joined back onto the root.
+///
 /// Remote keys have a second, independent source: `path_display` from the Dropbox API,
-/// stripped of its leading `/` in `remote_index`, `cloudsc_ops` and `dropbox_transfer`.
+/// turned into a key by [`key_from_dropbox`] in `remote_index`, `cloudsc_ops` and
+/// `dropbox_transfer`.
 /// Those never reach this function and do not need to — a Dropbox path is `/`-canonical by
 /// construction. Review L1 flagged an earlier version of this comment for claiming
 /// otherwise, which mattered because this claim is the justification for deleting the
@@ -205,6 +228,67 @@ pub(crate) fn relpath_under(sync_folder: &Path, absolute: &Path) -> AppResult<St
     let rel = rel.replace('\\', "/");
 
     Ok(rel)
+}
+
+/// NFC-normalize `s` on macOS; identity elsewhere (DBSYNC-103).
+///
+/// APFS looks names up form-insensitively, so one file can be reached as NFC or NFD, but
+/// the index is byte-exact. Probe (2026-10-13): Dropbox stores and returns NFC and treats
+/// NFC/NFD as one name. Every index key is therefore NFC on macOS. Windows and Linux keep
+/// bytes untouched: NTFS preserves whatever form it was given and nothing here changes it.
+#[cfg(target_os = "macos")]
+pub(crate) fn to_canonical_form(s: &str) -> String {
+    use unicode_normalization::{is_nfc, UnicodeNormalization};
+    if is_nfc(s) {
+        s.to_owned()
+    } else {
+        s.nfc().collect()
+    }
+}
+
+/// Identity off macOS, see the macOS variant.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn to_canonical_form(s: &str) -> String {
+    s.to_owned()
+}
+
+/// True if `s` is already in the canonical Unicode form for index keys: NFC on macOS,
+/// always true elsewhere. Used by the storage layer's debug assertion (DBSYNC-103).
+#[cfg(target_os = "macos")]
+pub(crate) fn is_canonical_form(s: &str) -> bool {
+    unicode_normalization::is_nfc(s)
+}
+
+/// Always true off macOS, see the macOS variant.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn is_canonical_form(_s: &str) -> bool {
+    true
+}
+
+/// The single place an **absolute local path** becomes an index key: [`relpath_under`]
+/// plus NFC on macOS (DBSYNC-103). Unchanged on every other platform.
+///
+/// Use this, not `relpath_under`, whenever the result is stored, compared with a stored
+/// key, or enqueued. `relpath_under` alone is right only where the result is just joined
+/// back onto the sync root to reach the file (APFS resolves any form).
+pub(crate) fn key_from_disk(sync_folder: &Path, absolute: &Path) -> AppResult<String> {
+    relpath_under(sync_folder, absolute).map(|rel| to_canonical_form(&rel))
+}
+
+/// The single place a Dropbox `path_display` becomes an index key: the leading `/`
+/// trimmed plus NFC on macOS (DBSYNC-103). The input is NOT altered as an API address:
+/// callers that send the path back to Dropbox keep their own `path_display`.
+pub(crate) fn key_from_dropbox(path_display: &str) -> String {
+    to_canonical_form(path_display.trim_start_matches('/'))
+}
+
+/// Comparison form of an index key or path: NFC then lowercase on macOS, plain lowercase
+/// elsewhere (the pre-existing behaviour). Never stored (DBSYNC-103).
+///
+/// Both sides of every local-vs-remote or remote-vs-remote match must go through this one
+/// function. Dropbox is case-insensitive and form-insensitive, so the match must be too.
+pub(crate) fn fold(s: &str) -> String {
+    to_canonical_form(s).to_lowercase()
 }
 
 /// True if `input` contains a path-traversal component (`..`) or an embedded NUL byte.
@@ -342,6 +426,10 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> AppResult<PathBuf> {
     Ok(joined)
 }
 
+/// Parses a comma-separated selective-sync prefix list. Each prefix loses its leading `/`
+/// and is put in the canonical key form (NFC on macOS, identity elsewhere; DBSYNC-103
+/// #188), so an NFD-typed exclude prefix still matches the NFC keys. The stored CSV is not
+/// rewritten.
 pub(crate) fn parse_prefix_csv(csv: Option<String>) -> Vec<String> {
     match csv {
         None => Vec::new(),
@@ -349,7 +437,7 @@ pub(crate) fn parse_prefix_csv(csv: Option<String>) -> Vec<String> {
             .split(',')
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
-            .map(|p| p.trim_start_matches('/').to_string())
+            .map(|p| to_canonical_form(p.trim_start_matches('/')))
             .collect(),
     }
 }
@@ -359,6 +447,8 @@ pub(crate) fn is_path_allowed(
     include_prefixes: &[String],
     exclude_prefixes: &[String],
 ) -> bool {
+    // DBSYNC-103 #188: compare in canonical form; the prefixes were canonicalised at parse.
+    let relative = &*canonical_cow(relative);
     let included = if include_prefixes.is_empty() {
         true
     } else {
@@ -487,12 +577,16 @@ mod tests {
 
     use std::path::Path;
 
+    #[cfg(not(target_os = "macos"))]
+    use super::to_canonical_form;
     use super::{
         backoff_seconds, hash_file, is_builtin_ignored_local_path, is_dehydrated_placeholder,
         is_ignored_local_path, matches_ignore_globs, normalize_dropbox_path, relpath_under,
         safe_join, set_user_ignore_globs, should_ignore_local_path, validate_relative,
         DROPBOX_BLOCK_SIZE,
     };
+    use super::{fold, is_canonical_form, key_from_disk, key_from_dropbox};
+    use super::{is_path_allowed, parse_ignore_globs_csv, parse_prefix_csv};
 
     #[test]
     fn dehydrated_placeholder_is_false_for_plain_and_missing_files() {
@@ -991,5 +1085,167 @@ mod tests {
         let by_name = vec!["b.log".to_string()];
         assert!(!matches_ignore_globs("a\\b.log", &by_name));
         assert!(matches_ignore_globs("a/b.log", &by_name));
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103: key constructors and the one comparison fold.
+    // -------------------------------------------------------------------------------
+    const NFD: &str = "cafe\u{301}.txt";
+    const NFC: &str = "caf\u{e9}.txt";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn key_from_disk_yields_nfc_for_an_nfd_name() {
+        let root = Path::new("/sync/root");
+        let abs = root.join("Dir").join(NFD);
+        assert_eq!(
+            key_from_disk(root, &abs).expect("key"),
+            format!("Dir/{NFC}")
+        );
+        // Already-NFC input and the root itself are untouched.
+        assert_eq!(key_from_disk(root, &root.join(NFC)).expect("key"), NFC);
+        assert_eq!(key_from_disk(root, root).expect("key"), "");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn key_from_dropbox_trims_the_slash_and_yields_nfc() {
+        assert_eq!(
+            key_from_dropbox(&format!("/Dir/{NFD}")),
+            format!("Dir/{NFC}")
+        );
+        assert_eq!(
+            key_from_dropbox(&format!("/Dir/{NFC}")),
+            format!("Dir/{NFC}")
+        );
+        assert_eq!(key_from_dropbox("/plain.txt"), "plain.txt");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fold_equates_nfd_nfc_and_case_but_not_different_names() {
+        assert_eq!(fold(NFD), fold(NFC));
+        assert_eq!(fold(&NFC.to_uppercase()), fold(NFD));
+        assert_ne!(fold("cafe.txt"), fold(NFC), "e and é are different names");
+        assert!(is_canonical_form(NFC));
+        assert!(!is_canonical_form(NFD));
+    }
+
+    /// The Windows leg: nothing is normalized, so NFC and NFD stay distinct keys and
+    /// behaviour is byte-for-byte what it was before DBSYNC-103 (NTFS preserves the form it
+    /// was given). Gated to the platforms where it is the contract.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_no_helper_merges_distinct_unicode_forms() {
+        assert_ne!(to_canonical_form(NFD), to_canonical_form(NFC));
+        assert_eq!(to_canonical_form(NFD), NFD);
+        assert_ne!(
+            key_from_dropbox(&format!("/{NFD}")),
+            key_from_dropbox(&format!("/{NFC}"))
+        );
+        assert_eq!(key_from_dropbox(&format!("/{NFD}")), NFD);
+        assert_ne!(fold(NFD), fold(NFC));
+        // `fold` is exactly the old plain lowercase.
+        assert_eq!(fold("ÉA.TXT"), "ÉA.TXT".to_lowercase());
+        assert!(is_canonical_form(NFD));
+        let root = Path::new("/sync/root");
+        assert_ne!(
+            key_from_disk(root, &root.join(NFD)).unwrap(),
+            key_from_disk(root, &root.join(NFC)).unwrap()
+        );
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103 #188: the user's typed prefixes and globs are canonicalised when parsed.
+    // The parse tests assert the parsed output only and the match tests feed the predicate
+    // already-canonical patterns, so each guard is the only thing its own test depends on.
+    // -------------------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_prefix_csv_canonicalises_each_prefix_and_still_strips_the_slash() {
+        let csv = format!("/{NFD}dir, plain ,,/{NFC}b");
+        assert_eq!(
+            parse_prefix_csv(Some(csv)),
+            vec![format!("{NFC}dir"), "plain".to_string(), format!("{NFC}b")]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_ignore_globs_csv_canonicalises_each_pattern_and_keeps_a_leading_slash() {
+        let csv = format!("{NFD}, *{NFD}, /abs/{NFD} ,other");
+        assert_eq!(
+            parse_ignore_globs_csv(Some(csv)),
+            vec![
+                NFC.to_string(),
+                format!("*{NFC}"),
+                format!("/abs/{NFC}"),
+                "other".to_string()
+            ]
+        );
+    }
+
+    /// An NFC key against a prefix list the user typed in NFD, end to end through the parser.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_nfd_typed_exclude_prefix_excludes_the_nfc_key() {
+        let exclude = parse_prefix_csv(Some(format!("{NFD}dir")));
+        assert!(!is_path_allowed(&format!("{NFC}dir/a.txt"), &[], &exclude));
+        assert!(is_path_allowed("other/a.txt", &[], &exclude));
+        let include = parse_prefix_csv(Some(format!("{NFD}dir")));
+        assert!(is_path_allowed(&format!("{NFC}dir/a.txt"), &include, &[]));
+    }
+
+    /// Vice versa: an NFC prefix still matches a key that arrives in NFD.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn is_path_allowed_compares_an_nfd_key_against_canonical_prefixes() {
+        let prefixes = vec![format!("{NFC}dir")];
+        assert!(!is_path_allowed(&format!("{NFD}dir/a.txt"), &[], &prefixes));
+        assert!(is_path_allowed(&format!("{NFD}dir/a.txt"), &prefixes, &[]));
+        assert!(is_path_allowed("other/a.txt", &[], &prefixes));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_nfd_typed_glob_ignores_the_nfc_key() {
+        let globs = parse_ignore_globs_csv(Some(format!("{NFD}, *{NFD}x, dir/{NFD}")));
+        assert!(matches_ignore_globs(NFC, &globs), "basename form");
+        assert!(matches_ignore_globs(&format!("sub/{NFC}"), &globs));
+        assert!(matches_ignore_globs(&format!("a{NFC}x"), &globs), "suffix");
+        assert!(matches_ignore_globs(&format!("dir/{NFC}"), &globs), "path");
+        assert!(!matches_ignore_globs("cafe.txt", &globs));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matches_ignore_globs_compares_an_nfd_key_against_canonical_patterns() {
+        let globs = vec![NFC.to_string(), format!("*{NFC}x"), format!("dir/{NFC}")];
+        assert!(matches_ignore_globs(NFD, &globs), "basename form");
+        assert!(matches_ignore_globs(&format!("a{NFD}x"), &globs), "suffix");
+        assert!(matches_ignore_globs(&format!("dir/{NFD}"), &globs), "path");
+        assert!(!matches_ignore_globs("cafe.txt", &globs));
+    }
+
+    /// Off macOS nothing changes: the parsers return the bytes typed and the predicates
+    /// keep NFC and NFD apart, exactly as before DBSYNC-103.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_prefix_and_glob_parsing_is_unchanged() {
+        assert_eq!(
+            parse_prefix_csv(Some(format!("/{NFD}dir, b"))),
+            vec![format!("{NFD}dir"), "b".to_string()]
+        );
+        assert_eq!(
+            parse_ignore_globs_csv(Some(format!("{NFD}, *.log"))),
+            vec![NFD.to_string(), "*.log".to_string()]
+        );
+        assert!(is_path_allowed(
+            &format!("{NFC}dir/a"),
+            &[],
+            &[format!("{NFD}dir")]
+        ));
+        assert!(!matches_ignore_globs(NFC, &[NFD.to_string()]));
     }
 }

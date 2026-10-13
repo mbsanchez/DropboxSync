@@ -15,7 +15,7 @@ use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
 use crate::error::{AppError, AppResult};
-use crate::path_util::{is_ignored_local_path, relpath_under, validate_relative};
+use crate::path_util::{is_ignored_local_path, key_from_disk, validate_relative};
 use crate::state::AppState;
 
 /// Keeps the debouncer (its OS watch + worker thread) alive for the app's
@@ -297,10 +297,11 @@ pub(crate) fn map_event_path(
     let canon_n = normalize_verbatim(canon_root);
     let conf_n = normalize_verbatim(configured_root);
 
-    let rel = relpath_under(&canon_n, &abs_n)
-        .or_else(|_| relpath_under(&conf_n, &abs_n))
+    let rel = key_from_disk(&canon_n, &abs_n)
+        .or_else(|_| key_from_disk(&conf_n, &abs_n))
         .ok()?;
 
+    // `key_from_disk` yields NFC on macOS (DBSYNC-103); trimming a `/` cannot change that.
     let rel = rel.trim_start_matches('/').to_string();
     if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
         return None;
@@ -480,6 +481,32 @@ mod tests {
     use std::path::Path;
 
     use super::map_event_path;
+
+    /// DBSYNC-103. FSEvents can report a name in the form the creator used (unverified
+    /// which), so the watcher's key must be NFC whatever arrives.
+    ///
+    /// Proof this test can fail: reverting `map_event_path` to `relpath_under` plus a bare
+    /// trim yields the NFD key.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_nfd_event_path_maps_to_an_nfc_key() {
+        let root = Path::new("/sync/root");
+        assert_eq!(
+            map_event_path(root, root, Path::new("/sync/root/Dir/cafe\u{301}.txt")),
+            Some("Dir/caf\u{e9}.txt".to_string())
+        );
+    }
+
+    /// Off macOS the form is preserved, so the two spellings stay two keys.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_nfd_event_path_keeps_its_form_off_macos() {
+        let root = Path::new("/sync/root");
+        assert_eq!(
+            map_event_path(root, root, Path::new("/sync/root/cafe\u{301}.txt")),
+            Some("cafe\u{301}.txt".to_string())
+        );
+    }
 
     #[test]
     fn maps_a_file_under_the_root_to_a_forward_slash_relative() {

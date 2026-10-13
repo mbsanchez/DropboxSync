@@ -16,7 +16,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::error::{AppError, AppResult};
 use crate::open_handlers::{resolve_cloudsc_rel_path, spawn_drain_sync_queue_if_idle};
-use crate::path_util::relpath_under;
+use crate::path_util::key_from_disk;
 use crate::state::AppState;
 use crate::sync_pipeline::refresh_queue_depth_internal;
 
@@ -143,7 +143,7 @@ fn validate_under_root(state: &AppState, abs: &Path) -> AppResult<String> {
     let abs_canon = abs
         .canonicalize()
         .map_err(|e| AppError::Io(format!("invalid path: {e}")))?;
-    relpath_under(&sync_canon, &abs_canon)
+    key_from_disk(&sync_canon, &abs_canon)
 }
 
 /// Handle a parsed action delivered by the OS (single-instance / cold start).
@@ -275,5 +275,20 @@ mod tests {
             validate_under_root(&state, &out_file).is_err(),
             "a path outside the sync root must be rejected"
         );
+    }
+
+    /// DBSYNC-103. The key a shell action derives for an item must be NFC even when the
+    /// file's name is NFD on disk.
+    ///
+    /// Proof this test can fail: reverting `validate_under_root` to `relpath_under`
+    /// returns the NFD name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validate_under_root_returns_an_nfc_key_for_an_nfd_name() {
+        let root = tempfile::tempdir().expect("root");
+        let file = root.path().join("cafe\u{301}.txt");
+        std::fs::write(&file, b"y").unwrap();
+        let state = build_state_with_sync_folder(root.path());
+        assert_eq!(validate_under_root(&state, &file).unwrap(), "caf\u{e9}.txt");
     }
 }
