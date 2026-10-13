@@ -445,7 +445,7 @@ pub(crate) fn fetch_remote_file_metadata(
 }
 
 /// Maps a single `list_folder`/`list_folder/continue` entry to the
-/// `(lowercased path_display, RemoteFileMeta)` pair used to key the batched
+/// `(fold(path_display), RemoteFileMeta)` pair used to key the batched
 /// remote index, or `None` when the entry isn't an indexable file (folders,
 /// deleted entries, or files missing `content_hash`/`rev`/`path_display`).
 pub(crate) fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMeta)> {
@@ -878,9 +878,10 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
         //
         // DBSYNC-103 (#189): enqueued as a VERIFIED delete (`delta_deferred = 1`), never
         // an immediate one. This function is reached from a snapshot's inferred
-        // absence, and a key mismatch between the two sides once unlinked files that
-        // were present on Dropbox. At execution time the job asks Dropbox: present ->
-        // kept, gone -> re-hash and delete, read failure -> retry.
+        // absence, where a key mismatch between the two sides once unlinked files that
+        // were present on Dropbox, and from the delta `Remove` arm, which then also
+        // parks the job in the DBSYNC-102 grace window. At execution time the job asks
+        // Dropbox: present -> kept, gone -> re-hash and delete, read failure -> retry.
         state.db.enqueue_verified_local_delete(rel)?;
         Ok(1)
     } else {

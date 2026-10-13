@@ -95,7 +95,7 @@ use crate::path_util::{is_canonical_form, to_canonical_form};
 /// user's typed text. Those are left byte-for-byte as stored: DBSYNC-103 #188
 /// canonicalises them when they are *parsed* (`path_util::parse_prefix_csv` and
 /// `parse_ignore_globs_csv`), so there is nothing to re-key here.
-pub(crate) const PATH_COLUMNS: &[(&str, &[&str])] = &[
+const PATH_COLUMNS: &[(&str, &[&str])] = &[
     ("local_file_index", &["relative_path"]),
     ("remote_file_index", &["relative_path"]),
     ("known_folders", &["relative_path"]),
@@ -142,7 +142,7 @@ pub(crate) fn rekey_to_canonical_form(
 /// [`rekey_to_canonical_form`] with a hook called after each table's step, inside the
 /// transaction. Production passes a no-op; the fail-closed tests inject an error (to prove
 /// earlier tables roll back) or a stray NFD value (to prove the final verification fires).
-pub(crate) fn rekey_with(
+fn rekey_with(
     conn: &mut Connection,
     db_path: &Path,
     after_step: &mut dyn FnMut(&str, &Transaction<'_>) -> AppResult<()>,

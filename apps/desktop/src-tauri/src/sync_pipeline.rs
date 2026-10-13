@@ -2845,15 +2845,18 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
 
+        // A key valid on every platform. The classification is driven by Dropbox's
+        // `malformed_path` body below, not by the name, and a `\` key cannot exist on
+        // Windows, where the storage assert rightly refuses it (DBSYNC-103).
         state
             .db
-            .enqueue_job("upload", None, Some("a\\b.txt"))
+            .enqueue_job("upload", None, Some("Informes/rejected.txt"))
             .unwrap();
         let job = state.db.pick_next_due_job().unwrap().expect("queued job");
 
         let rejected = crate::error::AppError::Dropbox {
             status: 409,
-            message: "upload for /a\\b.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
+            message: "upload for /Informes/rejected.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
                       {\".tag\":\"malformed_path\",\"malformed_path\":null}},\
                       \"error_summary\":\"path/malformed_path/\"}"
                 .to_string(),
@@ -2876,7 +2879,10 @@ mod tests {
         );
 
         let err = row.last_error.expect("a message the user can act on");
-        assert!(err.contains("a\\b.txt"), "must name the file: {err}");
+        assert!(
+            err.contains("Informes/rejected.txt"),
+            "must name the file: {err}"
+        );
         assert!(err.contains("Rename it"), "must say what to do: {err}");
 
         assert!(

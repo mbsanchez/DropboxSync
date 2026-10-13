@@ -4137,12 +4137,6 @@ mod tests {
         );
     }
 
-    /// DBSYNC-102 (#179): a database that already carries the modern `job_type`/`status`
-    /// CHECKs (so the rebuild above is skipped entirely) must still pick up
-    /// `delta_deferred` through the plain `add_column_if_missing` path, additively, with
-    /// existing rows defaulting to `0` (never-deferred) rather than `NULL`. Mirrors
-    /// `migrate_widens_a_narrower_job_type_check`'s shape, but for an additive column
-    /// rather than a CHECK.
     /// DBSYNC-103 (L5). Two launches can race on the first start after an upgrade, because
     /// `Db::new` (schema migrate plus NFC re-key) runs before the single-instance hand-off.
     /// Both connections must wait for the lock rather than fail at once. The configured value
@@ -4212,6 +4206,12 @@ mod tests {
         assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
     }
 
+    /// DBSYNC-102 (#179): a database that already carries the modern `job_type`/`status`
+    /// CHECKs (so the rebuild above is skipped entirely) must still pick up
+    /// `delta_deferred` through the plain `add_column_if_missing` path, additively, with
+    /// existing rows defaulting to `0` (never-deferred) rather than `NULL`. Mirrors
+    /// `migrate_widens_a_narrower_job_type_check`'s shape, but for an additive column
+    /// rather than a CHECK.
     #[test]
     fn migrate_adds_delta_deferred_to_a_pre_existing_sync_jobs_table() {
         let path = unique_db_path();
