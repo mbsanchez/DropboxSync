@@ -9,3 +9,6 @@ artifacts/
 
 # Local Claude Code state (project .claude/settings.json IS committed)
 .claude/settings.local.json
+
+# Local cowork-workflow plans and ticket state (working documents, never committed)
+.cowork/
