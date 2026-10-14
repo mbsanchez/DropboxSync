@@ -45,6 +45,8 @@ tempfile = "3"
 # Already in Cargo.lock transitively via Tauri, but a transitive crate cannot be imported —
 # it has to be declared. Used only by `finder_extension.rs` (DBSYNC-86).
 objc2 = "0.6"
+# NFC/NFD index-key identity (DBSYNC-103). APFS is form-insensitive, the index is not.
+unicode-normalization = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

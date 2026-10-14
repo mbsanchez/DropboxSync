@@ -109,12 +109,17 @@ pub struct Db {
 }
 
 /// Debug-only contract check: every index key reaching the storage layer is already
-/// `/`-canonical.
+/// canonical for its platform.
 ///
-/// Local keys get that from [`crate::path_util::relpath_under`], the single local
-/// producer. Remote keys come from Dropbox `path_display` stripped of its leading `/`,
-/// which is `/`-canonical by construction and never passes through `relpath_under`
-/// (review L1 corrected an earlier comment that claimed one source for both).
+/// - **`/`-canonical (Windows):** local keys get that from [`crate::path_util::key_from_disk`]
+///   (which wraps `relpath_under`), the single local producer. Remote keys come from Dropbox
+///   `path_display` through [`crate::path_util::key_from_dropbox`], which is `/`-canonical by
+///   construction and never passes through `relpath_under` (review L1 corrected an earlier
+///   comment that claimed one source for both).
+/// - **NFC (macOS, DBSYNC-103):** APFS resolves a name in any Unicode form but the index is
+///   byte-exact, so one file could be two rows (an NFD scan key and the NFC key Dropbox
+///   returns), and the snapshot sweep then read the unmatched row as "deleted remotely" and
+///   unlinked a file the user had just created. Both producers now emit NFC; this asserts it.
 ///
 /// This layer used to rewrite `\` to `/` itself, in twelve accessors (DBSYNC-45) — a
 /// second, independent normalization boundary. On macOS, where `\` is a legal byte in
@@ -125,27 +130,55 @@ pub struct Db {
 /// missed one re-aliasing in silence, so the rewrites are gone and the invariant moved
 /// to the producer (DBSYNC-104).
 ///
-/// Windows-only: there `\` cannot occur in a name, so its presence means a caller
-/// bypassed `relpath_under`. On Unix a backslash is legitimate data and passes through.
+/// The separator check is Windows-only: there `\` cannot occur in a name, so its presence
+/// means a caller bypassed the producer. On Unix a backslash is legitimate data. The NFC
+/// check is macOS-only and a no-op elsewhere, where the form is preserved untouched.
 ///
 /// `debug_assert!` compiles out in release. This is a development guard that makes a
 /// bypassing caller fail loudly in tests and dev builds — not a runtime enforcement.
 ///
-/// And it is a **no-op on Unix**, where a backslash is legitimate data: it only has teeth
-/// in the `rust (windows-latest)` CI job, not on the macOS dev machine (review round 2).
-/// It earned that keep immediately — it caught three of this branch's own tests on its
-/// first Windows run.
+/// Every writer that takes an index key calls it, including the job queue (`enqueue_job`,
+/// `enqueue_delete_job`, `enqueue_upload_then_delete`), `record_refused_move`,
+/// `defer_delta_local_delete`, `cancel_deferred_local_delete` and `add_conflict`, which
+/// were unasserted until DBSYNC-103. Several readers assert too (`get_local_file`,
+/// `get_remote_file`, ...).
 ///
-/// `enqueue_job`, `enqueue_delete_job` and `record_refused_move` also take index keys and
-/// are not asserted. Pre-existing, and left as it is rather than widened silently.
+/// Legacy non-NFC rows cannot exist at runtime: `Db::new_at` runs
+/// `key_migration::rekey_to_canonical_form` before it returns a handle, so every reader sees
+/// canonical rows from its first call, and a failed migration stops startup instead of
+/// continuing on unmigrated data (DBSYNC-103 #186). A tripped assert therefore means a new
+/// producer bypassed `key_from_disk`/`key_from_dropbox`, not old data.
 #[inline]
 fn debug_assert_canonical_key(_relative_path: &str) {
     #[cfg(windows)]
     debug_assert!(
         !_relative_path.contains('\\'),
         "index key {_relative_path:?} is not '/'-canonical: \
-         build it with path_util::relpath_under"
+         build it with path_util::key_from_disk"
     );
+    #[cfg(target_os = "macos")]
+    debug_assert!(
+        crate::path_util::is_canonical_form(_relative_path),
+        "index key {_relative_path:?} is not NFC: \
+         build it with path_util::key_from_disk or path_util::key_from_dropbox"
+    );
+}
+
+/// How long a connection waits for another writer before SQLITE_BUSY. Deliberately not the
+/// driver's default, so a test can pin that this line ran.
+const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10_000);
+
+/// Where the reason for a failed startup is persisted, next to the database.
+pub(crate) fn startup_error_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    db_path.with_file_name("startup-error.txt")
+}
+
+/// Writes `msg` with a timestamp to `file`, synchronously. Best effort: the caller decides
+/// what to say when this fails, and failing to write the diagnostic must not mask the error
+/// being reported.
+fn write_startup_error(file: &std::path::Path, msg: &str) -> std::io::Result<()> {
+    let body = format!("{}\n{msg}\n", Utc::now().to_rfc3339());
+    std::fs::write(file, body)
 }
 
 impl Db {
@@ -157,7 +190,45 @@ impl Db {
     /// from the production database (which `db_path()` resolves via OS-specific
     /// app-data dirs), so running `cargo test` never touches a user's real DB.
     pub fn new_at(path: &std::path::Path) -> AppResult<Self> {
+        let error_file = startup_error_path(path);
+        match Self::open_and_migrate(path) {
+            Ok(db) => {
+                // A previous launch's reason is stale only once startup has fully succeeded.
+                let _ = std::fs::remove_file(&error_file);
+                Ok(db)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "database initialisation failed");
+                // Synchronous on purpose: the tracing appender is non-blocking, so the line
+                // above can be lost when the caller panics right after this returns. Every
+                // failure is recorded, not only the migration's. The message points at the
+                // file only if it was written; otherwise the reason is already in the message.
+                let msg = e.to_string();
+                Err(AppError::Storage(
+                    match write_startup_error(&error_file, &msg) {
+                        Ok(()) => format!("{msg} (details also in {})", error_file.display()),
+                        Err(werr) => {
+                            tracing::error!(error = %werr, file = %error_file.display(), "could not write startup-error.txt");
+                            format!("{msg} (could not write {}: {werr})", error_file.display())
+                        }
+                    },
+                ))
+            }
+        }
+    }
+
+    fn open_and_migrate(path: &std::path::Path) -> AppResult<Self> {
         let mut write = Connection::open(path)?;
+        // DBSYNC-103 (L5): `Db::new` runs the schema migrate and the NFC re-key BEFORE
+        // `tauri_plugin_single_instance` can hand a second launch off to the first (the
+        // plugin is registered on the builder, after `Db::new`; reordering it is out of scope
+        // here). Two launches racing on the first start after an upgrade must queue on the
+        // database lock instead of failing at once with SQLITE_BUSY, which `lib.rs::run`
+        // would turn into a panic. Set explicitly and first, so it also covers the pragmas, the
+        // schema migrate and the re-key: the re-key opens its transaction `IMMEDIATE`, which
+        // is what makes it wait for this timeout (a deferred one fails at once on the
+        // read-to-write upgrade) and re-counts the legacy rows once it holds the lock.
+        write.busy_timeout(DB_BUSY_TIMEOUT)?;
         write.execute_batch(
             "
                 PRAGMA foreign_keys = ON;
@@ -167,10 +238,23 @@ impl Db {
         )?;
         migrate(&mut write)?;
 
+        // DBSYNC-103 #186: re-key legacy non-NFC paths BEFORE a `Db` exists. There is no
+        // handle to read or write a key with until this returns, so no scan, sweep, watcher,
+        // longpoll, overlay refresh, queue drain or Tauri command can ever see a legacy row.
+        // A failure is returned, not swallowed: `lib.rs::run` `expect`s `Db::new`, so the
+        // process stops before any loop is spawned (fail closed). The migration is one
+        // transaction, so a failure leaves the rows as they were.
+        super::key_migration::rekey_to_canonical_form(&mut write, path).map_err(|e| {
+            AppError::Storage(format!(
+                "NFC key migration failed (DBSYNC-103); the database was left unchanged: {e}"
+            ))
+        })?;
+
         let read = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        read.busy_timeout(DB_BUSY_TIMEOUT)?;
 
         Ok(Self {
             write: Mutex::new(write),
@@ -187,6 +271,21 @@ impl Db {
                 _ => PathBuf::from("."),
             },
         })
+    }
+
+    /// Runs the NFC re-key again on this handle (DBSYNC-103 #186). `new_at` already ran it,
+    /// so production never needs this; `db_file` is the path `new_at` was given. It exists so a test can plant legacy rows with raw
+    /// SQL after construction and then migrate them through the real entry point.
+    #[cfg(test)]
+    pub(crate) fn rekey_to_canonical_form(
+        &self,
+        db_file: &std::path::Path,
+    ) -> AppResult<super::key_migration::RekeyReport> {
+        let mut conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        super::key_migration::rekey_to_canonical_form(&mut conn, db_file)
     }
 
     /// The directory this database lives in. See the field's documentation for why sibling
@@ -1068,6 +1167,8 @@ impl Db {
         source_path: Option<&str>,
         target_path: Option<&str>,
     ) -> AppResult<()> {
+        source_path.map(debug_assert_canonical_key);
+        target_path.map(debug_assert_canonical_key);
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -1094,6 +1195,39 @@ impl Db {
         Ok(())
     }
 
+    /// DBSYNC-103 (#189): enqueue a `local_delete` that was INFERRED from a path's absence
+    /// in a remote snapshot, marked `delta_deferred = 1` so `dispatch_local_delete` routes
+    /// it through `verify_and_delete_local_file_core` instead of unlinking at once.
+    ///
+    /// The flag is reused rather than a new column because every consumer of it is the
+    /// same question ("must this delete re-check Dropbox before it runs?") and answers
+    /// it the same way for a snapshot-inferred delete: the dispatch verifies, a failed
+    /// verification retries with the flag intact, an exhausted one is dropped (the next
+    /// sweep re-derives it), and a delta re-add of the same path cancels it.
+    ///
+    /// Unlike `defer_delta_local_delete` this does NOT park the job in `retry_wait`: the
+    /// verification is the guard, so there is no grace window to wait out and the job is
+    /// due at once. On conflict with an active job for the path the flag is promoted, so
+    /// a still-`queued`/`retry_wait` undeferred delete cannot stay unverified.
+    pub fn enqueue_verified_local_delete(&self, target_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(target_path);
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "
+            INSERT INTO sync_jobs(job_type, source_path, target_path, status, attempt_count, next_retry_at, created_at, updated_at, delta_deferred)
+            VALUES('local_delete', ?1, ?1, 'queued', 0, NULL, ?2, ?2, 1)
+            ON CONFLICT(job_type, target_path) WHERE status IN ('queued','retry_wait','running')
+            DO UPDATE SET source_path=excluded.source_path, updated_at=excluded.updated_at, delta_deferred=1
+            ",
+            params![target_path, now],
+        )?;
+        Ok(())
+    }
+
     /// DBSYNC-65 (Slice 1): dedicated `delete` job enqueue that also captures the
     /// Dropbox `rev` of the file being deleted at enqueue time, so a later drain
     /// can detect (Slice 2) whether the remote copy changed since the local
@@ -1101,6 +1235,7 @@ impl Db {
     /// `DO UPDATE SET` additionally refreshes `delete_parent_rev` — re-enqueuing a
     /// delete for an already-queued path must NOT keep a stale captured rev.
     pub fn enqueue_delete_job(&self, target_path: &str, parent_rev: Option<&str>) -> AppResult<()> {
+        debug_assert_canonical_key(target_path);
         let now = Utc::now().to_rfc3339();
         let conn = self
             .write
@@ -1155,6 +1290,8 @@ impl Db {
         delete_path: &str,
         delete_parent_rev: Option<&str>,
     ) -> AppResult<bool> {
+        debug_assert_canonical_key(upload_path);
+        debug_assert_canonical_key(delete_path);
         let now = Utc::now().to_rfc3339();
         let mut conn = self
             .write
@@ -1301,6 +1438,8 @@ impl Db {
     /// proposing it. See the `refused_moves` table comment for why not remembering it means
     /// the rename never reaches Dropbox at all.
     pub fn record_refused_move(&self, from_path: &str, to_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(from_path);
+        debug_assert_canonical_key(to_path);
         let conn = self
             .write
             .lock()
@@ -1683,6 +1822,7 @@ impl Db {
         target_path: &str,
         next_retry_at: &str,
     ) -> AppResult<bool> {
+        debug_assert_canonical_key(target_path);
         let conn = self
             .write
             .lock()
@@ -1711,7 +1851,8 @@ impl Db {
     /// `pick_next_due_job` read could, in principle, leave the row `queued` an instant
     /// longer than expected, and this must still be able to cancel it then. Restricted to
     /// `delta_deferred=1` so this can never cancel an ordinary, undeferred `local_delete`
-    /// enqueued by the ordinary sweep path (DBSYNC-64) — only a delta-deferred one.
+    /// (e.g. a user-initiated one). A snapshot-originated delete (DBSYNC-103 #189) carries
+    /// the flag too, so a delta re-add of the same path correctly cancels it as well.
     ///
     /// The row is DELETED, not marked `done`. A cancelled delete never happened, and
     /// `list_recent_jobs` feeds the activity flyout, which renders every `local_delete`
@@ -1724,6 +1865,7 @@ impl Db {
     ///
     /// Returns whether a row actually changed.
     pub fn cancel_deferred_local_delete(&self, target_path: &str) -> AppResult<bool> {
+        debug_assert_canonical_key(target_path);
         let conn = self
             .write
             .lock()
@@ -1787,7 +1929,7 @@ impl Db {
     /// (e.g. an edit's `upload`), regardless of how old the observation behind it
     /// is. Nothing is lost by dropping it instead: a genuine remote deletion is
     /// re-derived by the periodic 300s snapshot sweep, which enqueues a fresh,
-    /// undeferred `local_delete` through the DBSYNC-64 breaker — this row was only
+    /// verified `local_delete` through the DBSYNC-64 breaker — this row was only
     /// ever a 60s-early guess at that same outcome.
     ///
     /// (review P4, accepted trade-off, not fixed here): going through the breaker
@@ -1960,7 +2102,17 @@ impl Db {
         Ok(None)
     }
 
-    /// Resets all `failed` jobs back to `queued` so they are retried. Returns the count.
+    /// Resets `failed` jobs back to `queued` so they are retried. Returns the count.
+    ///
+    /// A `failed` row is skipped when an active job exists for the same non-NULL
+    /// `(job_type, target_path)`: the partial unique index allows one active job, so
+    /// requeueing the shadowed row would make the whole `UPDATE` fail. The skipped row stays
+    /// `failed` (history the user can see); it is not deleted. A NULL target (for example
+    /// `hydrate_cloudsc`) never shadows anything.
+    ///
+    /// Known gap, tracked as DBSYNC-113: two `failed` rows with the same
+    /// `(job_type, target_path)` and no active job are both requeued and still collide with
+    /// a UNIQUE error. This function does not handle that case.
     pub fn requeue_failed_jobs(&self) -> AppResult<usize> {
         let conn = self
             .write
@@ -1972,6 +2124,12 @@ impl Db {
                 UPDATE sync_jobs
                 SET status='queued', attempt_count=0, next_retry_at=NULL, last_error=NULL, updated_at=?1
                 WHERE status='failed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sync_jobs a
+                    WHERE a.job_type = sync_jobs.job_type
+                      AND sync_jobs.target_path IS NOT NULL
+                      AND a.target_path = sync_jobs.target_path
+                      AND a.status IN ('queued','retry_wait','running'))
                 ",
                 params![Utc::now().to_rfc3339()],
             )
@@ -1987,6 +2145,9 @@ impl Db {
         conflicted_copy_path: Option<&str>,
         remote_deleted: bool,
     ) -> AppResult<()> {
+        debug_assert_canonical_key(local_path);
+        debug_assert_canonical_key(remote_path);
+        conflicted_copy_path.map(debug_assert_canonical_key);
         let conn = self
             .write
             .lock()
@@ -2136,7 +2297,7 @@ impl Db {
 /// must stay there — `journal_mode` cannot be changed inside a transaction, and moving it
 /// in would be a silent regression no test here would catch. The only PRAGMA reached from
 /// inside is `table_info`, a read, which is safe.
-fn migrate(conn: &mut Connection) -> AppResult<()> {
+pub(super) fn migrate(conn: &mut Connection) -> AppResult<()> {
     let tx = conn.transaction()?;
     migrate_in_tx(&tx)?;
     tx.commit()?;
@@ -2681,7 +2842,7 @@ mod app_data_dir_tests {
     }
 }
 
-fn db_path() -> AppResult<PathBuf> {
+pub(super) fn db_path() -> AppResult<PathBuf> {
     let mut path = app_data_dir()?;
     path.push("app.db");
     Ok(path)
@@ -3976,6 +4137,75 @@ mod tests {
         );
     }
 
+    /// DBSYNC-103 (L5). Two launches can race on the first start after an upgrade, because
+    /// `Db::new` (schema migrate plus NFC re-key) runs before the single-instance hand-off.
+    /// Both connections must wait for the lock rather than fail at once. The configured value
+    /// is deliberately not the driver's default, so this fails if either line goes away.
+    #[test]
+    fn both_connections_wait_for_a_busy_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new_at(&dir.path().join("app.db")).unwrap();
+        let ms = |m: &std::sync::Mutex<Connection>| -> i64 {
+            m.lock()
+                .unwrap()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap()
+        };
+        let want = crate::storage::db::DB_BUSY_TIMEOUT.as_millis() as i64;
+        assert_eq!(ms(&db.write), want, "write connection");
+        assert_eq!(ms(&db.read), want, "read connection");
+    }
+
+    /// Retry must not fail because a `failed` row has an active twin (the partial unique index
+    /// allows one active job per `(job_type, target_path)`; `enqueue_job` can create this
+    /// without any migration). The shadowed row stays `failed`; every other failed row is
+    /// requeued.
+    #[test]
+    fn requeue_failed_jobs_skips_a_row_with_an_active_twin_and_requeues_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let db = Db::new_at(&path).unwrap();
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "INSERT INTO sync_jobs(job_type, source_path, target_path, status, created_at, updated_at)
+                   VALUES('upload','a','a','failed','c','u'),
+                         ('upload','a','a','queued','c','u'),
+                         ('upload','b','b','failed','c','u'),
+                         ('download','a','a','failed','c','u');",
+            )
+            .unwrap();
+        }
+        assert_eq!(db.requeue_failed_jobs().expect("Retry must not error"), 2);
+        let c = Connection::open(&path).unwrap();
+        let statuses: Vec<String> = c
+            .prepare("SELECT id||':'||status FROM sync_jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(statuses, ["1:failed", "2:queued", "3:queued", "4:queued"]);
+    }
+
+    /// A NULL target (`hydrate_cloudsc`) must not count as "the same target": one active
+    /// hydrate must not block Retry for another path's failed hydrate.
+    #[test]
+    fn requeue_failed_jobs_does_not_treat_null_targets_as_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let db = Db::new_at(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO sync_jobs(job_type, source_path, target_path, status, created_at, updated_at)
+                   VALUES('hydrate_cloudsc','x.cloudsc',NULL,'failed','c','u'),
+                         ('hydrate_cloudsc','y.cloudsc',NULL,'queued','c','u');",
+            )
+            .unwrap();
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+    }
+
     /// DBSYNC-102 (#179): a database that already carries the modern `job_type`/`status`
     /// CHECKs (so the rebuild above is skipped entirely) must still pick up
     /// `delta_deferred` through the plain `add_column_if_missing` path, additively, with
@@ -4186,5 +4416,114 @@ mod tests {
             db.get_ignore_globs_csv().expect("get after set"),
             Some("Thumbs.db,*.log".to_string())
         );
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103: on macOS every writer that takes an index key asserts it is NFC.
+    // Assumed probe outcome: R-NFC + I-fold (recorded on #182). Each writer gets its own
+    // test, because the assert is per call site: the 12 older writers being covered says
+    // nothing about these 7.
+    // -------------------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    mod nfc_assert {
+        use super::{unique_db_path, Db};
+
+        const NFD: &str = "cafe\u{301}.txt";
+        const NFC: &str = "caf\u{e9}.txt";
+
+        fn db() -> Db {
+            Db::new_at(&unique_db_path()).expect("db init")
+        }
+
+        #[test]
+        fn canonical_nfc_keys_are_accepted_by_every_newly_asserted_writer() {
+            let db = db();
+            db.enqueue_job("upload", Some(NFC), Some(NFC)).unwrap();
+            db.enqueue_delete_job(NFC, None).unwrap();
+            db.enqueue_upload_then_delete(NFC, "other.txt", None)
+                .unwrap();
+            db.record_refused_move(NFC, "to.txt").unwrap();
+            db.enqueue_job("local_delete", Some("l.txt"), Some("l.txt"))
+                .unwrap();
+            db.defer_delta_local_delete("l.txt", "2999-01-01T00:00:00Z")
+                .unwrap();
+            db.cancel_deferred_local_delete(NFC).unwrap();
+            db.add_conflict(NFC, NFC, "reason", Some(NFC), false)
+                .unwrap();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn enqueue_job_rejects_an_nfd_target() {
+            db().enqueue_job("upload", Some("a.txt"), Some(NFD)).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn enqueue_job_rejects_an_nfd_source() {
+            db().enqueue_job("upload", Some(NFD), Some("a.txt")).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn enqueue_delete_job_rejects_an_nfd_key() {
+            db().enqueue_delete_job(NFD, None).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn enqueue_upload_then_delete_rejects_an_nfd_upload_path() {
+            db().enqueue_upload_then_delete(NFD, "b.txt", None).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn enqueue_upload_then_delete_rejects_an_nfd_delete_path() {
+            db().enqueue_upload_then_delete("a.txt", NFD, None).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn record_refused_move_rejects_an_nfd_source() {
+            db().record_refused_move(NFD, "b.txt").ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn record_refused_move_rejects_an_nfd_destination() {
+            db().record_refused_move("a.txt", NFD).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn defer_delta_local_delete_rejects_an_nfd_key() {
+            db().defer_delta_local_delete(NFD, "2999-01-01T00:00:00Z")
+                .ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn cancel_deferred_local_delete_rejects_an_nfd_key() {
+            db().cancel_deferred_local_delete(NFD).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn add_conflict_rejects_an_nfd_local_path() {
+            db().add_conflict(NFD, "b.txt", "r", None, false).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn add_conflict_rejects_an_nfd_remote_path() {
+            db().add_conflict("a.txt", NFD, "r", None, false).ok();
+        }
+
+        #[test]
+        #[should_panic(expected = "is not NFC")]
+        fn add_conflict_rejects_an_nfd_conflicted_copy_path() {
+            db().add_conflict("a.txt", "a.txt", "r", Some(NFD), false)
+                .ok();
+        }
     }
 }

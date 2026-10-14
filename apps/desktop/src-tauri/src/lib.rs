@@ -171,6 +171,16 @@ fn position_flyout(
 pub fn run() {
     logging::init_tracing();
 
+    // STARTUP ORDER (DBSYNC-103 #186). `Db::new` also runs the NFC key migration (macOS) before
+    // it returns, so no `Db` handle, and therefore no `AppState`, exists until every stored path
+    // is canonical. Everything below that reads or writes keys comes later: the Tauri builder
+    // and its commands, `setup` (job recovery, overlay refresh), the filesystem watcher, the
+    // longpoll loop, and the sweep loop (spawned by `commands::start_background_scheduler`, a
+    // frontend-invoked command, so it cannot run before `setup` either). A migration failure
+    // makes this `expect` panic: the process dies before any of them exists (fail closed).
+    // Any `Db::new` failure is also written to `startup-error.txt` next to the database
+    // (synchronously, so it survives this panic). The error text names the file only when
+    // that write succeeded, and otherwise carries the reason itself.
     let db = Db::new().expect("failed to initialize sqlite db");
     let mut sync_engine = SyncEngine::new();
     if let Ok(Some(folder)) = db.get_sync_folder() {

@@ -44,7 +44,6 @@
 //! by months are exactly the case that produces a contradiction nobody notices
 //! until it ships.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{Duration, Utc};
@@ -52,7 +51,7 @@ use chrono::{Duration, Utc};
 use crate::auth_session::get_access_token;
 use crate::error::{AppError, AppResult};
 use crate::models::{DropboxEntry, DropboxListFolderResponse};
-use crate::path_util::normalize_dropbox_path;
+use crate::path_util::{fold, key_from_dropbox, normalize_dropbox_path};
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
 
@@ -125,7 +124,7 @@ pub(crate) fn delta_action_from_entry(entry: &DropboxEntry) -> DeltaAction {
     let Some(path_display) = entry.path_display.as_deref() else {
         return DeltaAction::Ignore;
     };
-    let rel = path_display.trim_start_matches('/').to_string();
+    let rel = key_from_dropbox(path_display);
     match entry.tag.as_str() {
         "file" => {
             let content_hash = entry.content_hash.clone().unwrap_or_default();
@@ -299,15 +298,18 @@ pub(crate) fn collapse_delta_entries(entries: &[DropboxEntry]) -> Vec<&DropboxEn
     // `path_lower`, not the case-preserved `rel`. The winning entry's `rel` for
     // actually applying the change is still derived case-preserved, below in
     // `apply_delta_entries`, from the winning raw entry's own `path_display`.
-    fn collapse_key(entry: &DropboxEntry) -> Option<Cow<'_, str>> {
+    //
+    // DBSYNC-103: the key is `fold`ed (NFC then lowercase), so an NFD and an NFC spelling
+    // of one path — which Dropbox treats as one name — resolve to one winner. Never stored.
+    fn collapse_key(entry: &DropboxEntry) -> Option<String> {
         let path_display = entry.path_display.as_deref()?;
         Some(match entry.path_lower.as_deref() {
-            Some(lower) => Cow::Borrowed(lower.trim_start_matches('/')),
-            None => Cow::Owned(path_display.trim_start_matches('/').to_lowercase()),
+            Some(lower) => fold(lower.trim_start_matches('/')),
+            None => fold(path_display.trim_start_matches('/')),
         })
     }
 
-    let mut winners: BTreeMap<Cow<'_, str>, Resolution<'_>> = BTreeMap::new();
+    let mut winners: BTreeMap<String, Resolution<'_>> = BTreeMap::new();
 
     for entry in entries {
         let Some(key) = collapse_key(entry) else {
@@ -443,10 +445,10 @@ pub(crate) fn fetch_remote_file_metadata(
 }
 
 /// Maps a single `list_folder`/`list_folder/continue` entry to the
-/// `(lowercased path_display, RemoteFileMeta)` pair used to key the batched
+/// `(fold(path_display), RemoteFileMeta)` pair used to key the batched
 /// remote index, or `None` when the entry isn't an indexable file (folders,
 /// deleted entries, or files missing `content_hash`/`rev`/`path_display`).
-fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMeta)> {
+pub(crate) fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMeta)> {
     if entry.tag != "file" {
         return None;
     }
@@ -466,7 +468,7 @@ fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, RemoteFileMet
     // caller as "deleted remotely", so disqualifying entries on a field this function
     // merely records would enqueue local deletions for files that are still there.
     Some((
-        path_display.to_lowercase(),
+        fold(path_display),
         RemoteFileMeta {
             content_hash,
             rev,
@@ -550,9 +552,9 @@ pub(crate) fn fetch_all_remote_file_metadata(
                 if let (Some(path_display), Some(id)) =
                     (entry.path_display.as_deref(), entry.id.as_deref())
                 {
-                    let rel = path_display.trim_start_matches('/');
-                    if let Err(e) = state.db.set_known_folder_dropbox_id(rel, id) {
-                        tracing::warn!(rel, error = %e, "could not record folder identifier");
+                    let rel = key_from_dropbox(path_display);
+                    if let Err(e) = state.db.set_known_folder_dropbox_id(&rel, id) {
+                        tracing::warn!(rel = %rel, error = %e, "could not record folder identifier");
                     }
                 }
             }
@@ -596,14 +598,7 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     }
 
     let (remote_by_path, _cursor) = fetch_all_remote_file_metadata(state)?;
-    let pending_targets = pending_job_targets(state)?;
-
-    let enqueued = reconcile_remote_snapshot_with_breaker(
-        state,
-        &local_files,
-        &remote_by_path,
-        &pending_targets,
-    )?;
+    let enqueued = reconcile_fetched_snapshot(state, &local_files, &remote_by_path)?;
 
     // Summarise a remote-index refresh that enqueued work (DBSYNC-47); a no-op
     // refresh stays silent so the periodic sweep doesn't spam the log.
@@ -614,6 +609,20 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
         );
     }
     Ok(enqueued)
+}
+
+/// Everything `refresh_remote_index_and_enqueue_downloads_internal` does after the network
+/// fetch: read the active jobs and reconcile the snapshot through the mass-deletion breaker.
+///
+/// Split out (DBSYNC-103) as the seam for tests that need the REAL sweep body without
+/// `fetch_all_remote_file_metadata`, which reads the keychain and calls live Dropbox.
+pub(crate) fn reconcile_fetched_snapshot(
+    state: &AppState,
+    local_files: &[FileIndexRow],
+    remote_by_path: &HashMap<String, RemoteFileMeta>,
+) -> AppResult<usize> {
+    let pending_targets = pending_job_targets(state)?;
+    reconcile_remote_snapshot_with_breaker(state, local_files, remote_by_path, &pending_targets)
 }
 
 /// Reconciles a fetched remote snapshot against the local index, gating inferred
@@ -636,15 +645,12 @@ pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
 /// with the full local index still intact) gets the exact same guard as the
 /// periodic sweep (DBSYNC-64 CTO fix). Returns jobs enqueued.
 ///
-/// **Known, documented, not fixed here** (review round): this path infers absence
-/// from a snapshot, not from an explicit `deleted` delta entry, and it enqueues an
-/// ordinary, UNDEFERRED `local_delete` straight through `reconcile_remote_absent`
-/// — it never calls `defer_delta_local_delete`. If this sweep happens to land
-/// inside the ~3.45s window between a share conversion's delete and its re-add
-/// (the gap `DELTA_DELETE_GRACE_SECS` is sized from), it can infer the same false
-/// absence the cursor-delta path was fixed to tolerate, and the resulting delete
-/// runs immediately rather than waiting out a grace period. Pre-existing to this
-/// slice; left as-is.
+/// **Verified, not graced** (DBSYNC-103 #189): this path infers absence from a snapshot,
+/// not from an explicit `deleted` delta entry, so the `local_delete` it enqueues through
+/// `reconcile_remote_absent` is marked `delta_deferred` and asks Dropbox again at
+/// execution time (present -> kept, gone -> re-hash and delete, read failure -> retry).
+/// It is due at once: it never goes through `defer_delta_local_delete`'s grace window,
+/// because the verification, not a wait, is what protects a file that is still there.
 fn reconcile_remote_snapshot_with_breaker(
     state: &AppState,
     local_files: &[FileIndexRow],
@@ -665,7 +671,7 @@ fn reconcile_remote_snapshot_with_breaker(
         // so one path the helper could not normalise stopped downloads and delete
         // reconciliation for every other file. Same pattern as `cloudsc_ops`.
         let key = match normalize_dropbox_path(rel) {
-            Ok(p) => p.to_lowercase(),
+            Ok(p) => fold(&p),
             Err(error) => {
                 tracing::warn!(rel = %rel, error = %error, "skipping unnormalizable path in remote sweep");
                 continue;
@@ -740,7 +746,7 @@ fn remote_sweep_delete_candidates(
         // It used to be `?`, which aborted the whole sweep for every other file
         // (DBSYNC-104).
         let key = match normalize_dropbox_path(rel) {
-            Ok(p) => p.to_lowercase(),
+            Ok(p) => fold(&p),
             Err(error) => {
                 tracing::warn!(rel = %rel, error = %error, "skipping unnormalizable path in delete sweep");
                 continue;
@@ -869,7 +875,14 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
     if local.hash == prev.content_hash {
         // Local matches the last-synced remote content: safe remote-wins delete.
         // The local_delete job clears both index rows.
-        state.db.enqueue_job("local_delete", Some(rel), Some(rel))?;
+        //
+        // DBSYNC-103 (#189): enqueued as a VERIFIED delete (`delta_deferred = 1`), never
+        // an immediate one. This function is reached from a snapshot's inferred
+        // absence, where a key mismatch between the two sides once unlinked files that
+        // were present on Dropbox, and from the delta `Remove` arm, which then also
+        // parks the job in the DBSYNC-102 grace window. At execution time the job asks
+        // Dropbox: present -> kept, gone -> re-hash and delete, read failure -> retry.
+        state.db.enqueue_verified_local_delete(rel)?;
         Ok(1)
     } else {
         // Local was modified while the remote was deleted: keep it, flag conflict.
@@ -1290,7 +1303,7 @@ pub(crate) enum DeltaRunOutcome {
 /// makes the batch shape observable instead of assumed.
 static DELTA_INVOCATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn run_remote_delta(
+pub(crate) fn run_remote_delta(
     state: &AppState,
     starting_cursor: &str,
     mut fetch_page: impl FnMut(&str) -> AppResult<DeltaFetchOutcome>,
@@ -3818,12 +3831,14 @@ mod tests {
         );
     }
 
-    /// **The snapshot path never defers.** `reconcile_remote_snapshot_with_breaker`
-    /// (the full-sweep / cursor-reset caller) calls the SAME `reconcile_remote_absent`
-    /// the delta path does, but must never call `defer_delta_local_delete` — that call
-    /// exists only at the delta call site in `apply_delta_entries`'s Remove arm.
+    /// **The snapshot path enqueues a VERIFIED delete, with no grace window.**
+    /// `reconcile_remote_snapshot_with_breaker` (the full-sweep / cursor-reset caller)
+    /// calls the same `reconcile_remote_absent` the delta path does. DBSYNC-103 (#189):
+    /// the job it enqueues carries `delta_deferred = 1` so the runner verifies against
+    /// Dropbox before unlinking, but it is `queued` and due at once: only the delta
+    /// call site parks a job in `retry_wait` for `DELTA_DELETE_GRACE_SECS`.
     #[test]
-    fn snapshot_path_never_defers_its_local_delete() {
+    fn snapshot_path_enqueues_a_verified_local_delete_due_at_once() {
         let state = build_state();
         state
             .db
@@ -3850,11 +3865,13 @@ mod tests {
         let job = local_delete_job(&state, "snapshot/gone.txt").expect("job must exist");
         assert_eq!(
             job.status, "queued",
-            "the snapshot path's local_delete must be immediately runnable, never deferred"
+            "the snapshot path's local_delete must be due at once: the verification is \
+             the guard, there is no grace window to wait out"
         );
+        assert!(job.next_retry_at.is_none());
         assert!(
-            !job.delta_deferred,
-            "the snapshot path must never set delta_deferred"
+            job.delta_deferred,
+            "the snapshot path's local_delete must be verified against Dropbox before it runs"
         );
     }
 
@@ -3864,7 +3881,7 @@ mod tests {
     /// (`Db::drop_exhausted_deferred_local_delete`) loses nothing, because the
     /// periodic snapshot sweep (`reconcile_remote_snapshot_with_breaker`) re-derives
     /// the SAME genuine delete from an empty remote snapshot, through the ordinary
-    /// DBSYNC-64 mass-deletion breaker, as a fresh, undeferred `local_delete`.
+    /// DBSYNC-64 mass-deletion breaker, as a fresh `local_delete` (verified against Dropbox before it runs, DBSYNC-103).
     #[test]
     fn snapshot_sweep_rederives_a_dropped_exhausted_deferred_delete() {
         let state = build_state();
@@ -3921,9 +3938,9 @@ mod tests {
         );
         let rederived = local_delete_job(&state, "shared/c.txt").expect("rederived job");
         assert!(
-            !rederived.delta_deferred,
-            "the snapshot path's own guarantee still holds: the rederived delete is \
-             undeferred, going through the DBSYNC-64 breaker like any other \
+            rederived.delta_deferred,
+            "DBSYNC-103 (#189): the rederived delete is itself verified against Dropbox \
+             before it runs, and goes through the DBSYNC-64 breaker like any other \
              snapshot-inferred delete (review P4: an accepted trade-off, not fixed \
              here — see Db::drop_exhausted_deferred_local_delete's doc)"
         );
@@ -4022,6 +4039,7 @@ mod tests {
             // the level here does not leak into tests running in parallel.
             .with_max_level(tracing::Level::TRACE)
             .finish();
+        crate::dropbox_transfer::keep_tracing_dispatch_registry_multi();
         tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.lock().unwrap().clone();
         String::from_utf8(bytes).expect("tracing output must be valid utf-8")
@@ -4756,5 +4774,160 @@ mod tests {
             state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY).unwrap(),
             None
         );
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103: NFC keys and the one fold. Assumed probe outcome: R-NFC + I-fold
+    // (recorded on #182): Dropbox returns NFC and treats NFC and NFD as one name. The
+    // NFD entries below are therefore a defence against a producer that does not follow
+    // the probe, not a model of what Dropbox sends today.
+    // -------------------------------------------------------------------------------
+    const NFD_PATH: &str = "/Dir/cafe\u{301}.txt";
+    const NFC_PATH: &str = "/Dir/caf\u{e9}.txt";
+
+    fn deleted_entry(path_display: &str) -> DropboxEntry {
+        let mut e = file_entry(Some(path_display), None, None, None);
+        e.tag = "deleted".to_string();
+        e
+    }
+
+    /// (d) The collapse merges an NFD `deleted` and an NFC re-add of one path, so the
+    /// delete cannot survive next to the upsert and unlink a file Dropbox still has.
+    ///
+    /// Proof this test can fail: reverting `collapse_key` to the pre-fold lowercase keys
+    /// two winners and the NFD `deleted` entry is applied.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn collapse_merges_nfd_and_nfc_spellings_of_one_path() {
+        let entries = vec![
+            deleted_entry(NFD_PATH),
+            file_entry(Some(NFC_PATH), Some("H"), Some("rev1"), None),
+        ];
+        let winners = collapse_delta_entries(&entries);
+        assert_eq!(winners.len(), 1, "one path, one winner");
+        assert_eq!(winners[0].tag, "file", "the upsert beats the delete");
+    }
+
+    /// The Windows leg of (d): NTFS keeps the form it was given, so NFD and NFC stay two
+    /// paths and the collapse must not merge them.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn collapse_keeps_nfd_and_nfc_spellings_distinct_off_macos() {
+        let entries = vec![
+            deleted_entry(NFD_PATH),
+            file_entry(Some(NFC_PATH), Some("H"), Some("rev1"), None),
+        ];
+        assert_eq!(collapse_delta_entries(&entries).len(), 2);
+    }
+
+    /// The key a delta entry applies under is NFC even if the entry spells the path NFD.
+    ///
+    /// Proof this test can fail: reverting `delta_action_from_entry` to a bare
+    /// `trim_start_matches('/')` yields the NFD key here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_delta_entry_is_keyed_nfc_whatever_form_it_arrives_in() {
+        let nfd = file_entry(Some(NFD_PATH), Some("H"), Some("rev1"), None);
+        assert!(matches!(
+            delta_action_from_entry(&nfd),
+            DeltaAction::Upsert(ref rel, _) if rel == "Dir/caf\u{e9}.txt"
+        ));
+        assert_eq!(
+            delta_action_from_entry(&deleted_entry(NFD_PATH)),
+            DeltaAction::Remove("Dir/caf\u{e9}.txt".to_string())
+        );
+    }
+
+    /// A snapshot that spells a present file NFD must still match the NFC local row, so
+    /// the sweep reads it as present rather than deleted remotely.
+    ///
+    /// Proof this test can fail: reverting `remote_meta_from_entry` to a plain
+    /// `to_lowercase()` leaves the NFD map key unmatched, so the sweep enqueues a
+    /// `local_delete` for a file that is present on both sides.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_snapshot_entry_spelled_nfd_matches_the_nfc_local_row() {
+        let state = build_state();
+        state
+            .db
+            .upsert_remote_file("Dir/caf\u{e9}.txt", "H", "rev1", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_local_file("Dir/caf\u{e9}.txt", "H", 3, 0)
+            .unwrap();
+        let entry = file_entry(Some(NFD_PATH), Some("H"), Some("rev1"), None);
+        let snapshot: HashMap<String, RemoteFileMeta> = [&entry]
+            .into_iter()
+            .filter_map(remote_meta_from_entry)
+            .collect();
+        let local_files = state.db.list_local_files().unwrap();
+
+        reconcile_fetched_snapshot(&state, &local_files, &snapshot).unwrap();
+
+        assert!(job_targets(&state, "local_delete").is_empty());
+    }
+
+    /// A row written by a build older than DBSYNC-103 can still be NFD (the #186 migration
+    /// re-keys it). The delete decision must not read it as absent from an NFC snapshot.
+    /// The row is hand-written because the storage assert, correctly, refuses to write it.
+    ///
+    /// Proof this test can fail: reverting the local-side `fold` in
+    /// `remote_sweep_delete_candidates` makes the NFD row look absent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_legacy_nfd_local_row_is_not_absent_from_an_nfc_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("app.db");
+        let db = crate::storage::db::Db::new_at(&db_path).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for (table, cols) in [
+            (
+                "local_file_index",
+                "hash, size_bytes, modified_ts, updated_at",
+            ),
+            (
+                "remote_file_index",
+                "content_hash, rev, modified_ts, updated_at",
+            ),
+        ] {
+            let vals = if table == "local_file_index" {
+                "'H', 3, 0, 'x'"
+            } else {
+                "'H', 'rev1', 0, 'x'"
+            };
+            conn.execute(
+                &format!("INSERT INTO {table}(relative_path, {cols}) VALUES('Dir/cafe\u{301}.txt', {vals})"),
+                [],
+            )
+            .unwrap();
+        }
+        let state = AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: Arc::new(db),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        };
+        let entry = file_entry(Some(NFC_PATH), Some("H"), Some("rev1"), None);
+        let snapshot: HashMap<String, RemoteFileMeta> = [&entry]
+            .into_iter()
+            .filter_map(remote_meta_from_entry)
+            .collect();
+        let local_files = state.db.list_local_files().unwrap();
+
+        let (absent, candidates) =
+            remote_sweep_delete_candidates(&state, &local_files, &snapshot, &HashSet::new())
+                .unwrap();
+
+        assert!(
+            absent.is_empty(),
+            "present under another spelling is not absent"
+        );
+        assert_eq!(candidates, 0);
     }
 }

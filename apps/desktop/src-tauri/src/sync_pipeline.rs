@@ -14,7 +14,8 @@ use crate::models::SyncTickResult;
 use crate::overlay_state;
 use crate::path_util::{
     backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
-    is_editor_temp_path, is_ignored_local_path, normalize_dropbox_path, relpath_under, safe_join,
+    is_editor_temp_path, is_ignored_local_path, key_from_disk, normalize_dropbox_path, safe_join,
+    to_canonical_form,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
 use crate::state::AppState;
@@ -191,7 +192,22 @@ fn path_covered_by(path: &str, prefix: &str) -> bool {
 /// `pending_delete_covering`; this function keeps its own decision — "any active job at all
 /// covers this path" — around that shared check.
 pub(crate) fn covered_by_active_job(path: &str, active: &HashSet<String>) -> bool {
-    active.iter().any(|prefix| path_covered_by(path, prefix))
+    // DBSYNC-103 defence in depth: both sides in the canonical form. The startup migration
+    // means no legacy NFD key should reach here, but a mismatch in this predicate turns
+    // "a move is relocating this folder" into "this folder was deleted", and `delete_v2` is
+    // recursive. `Cow` keeps the common (already canonical) case allocation-free.
+    let path = canonical_cow(path);
+    active
+        .iter()
+        .any(|prefix| path_covered_by(&path, &canonical_cow(prefix)))
+}
+
+fn canonical_cow(s: &str) -> std::borrow::Cow<'_, str> {
+    if crate::path_util::is_canonical_form(s) {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(to_canonical_form(s))
+    }
 }
 
 /// **DBSYNC-102 #175 — diagnostic only, not a fix.** `covered_by_active_job` above
@@ -327,7 +343,7 @@ fn process_local_file_change(
             // of skipping this branch.
             if covered_by_active_job(relative, pending_targets) {
                 let conflicted_path = create_conflicted_copy(absolute)?;
-                let conflicted_rel = relpath_under(tracked_root, &conflicted_path)?;
+                let conflicted_rel = key_from_disk(tracked_root, &conflicted_path)?;
                 state.db.add_conflict(
                     relative,
                     relative,
@@ -475,7 +491,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     let known = state.db.list_local_files()?;
     let known_map: HashMap<String, FileIndexRow> = known
         .iter()
-        .map(|f| (f.relative_path.clone(), f.clone()))
+        .map(|f| (to_canonical_form(&f.relative_path), f.clone()))
         .collect();
     // DBSYNC-31: indexed active-job query instead of scanning list_recent_jobs(200)
     // (which silently missed pending jobs once the table grew past the limit).
@@ -493,7 +509,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         let rel = p.replace('\\', "/");
         #[cfg(not(windows))]
         let rel = p.to_string();
-        let rel = rel.trim_start_matches('/').to_string();
+        // NFC on macOS (DBSYNC-103): this string becomes an index key, and a caller-supplied
+        // path can arrive in either form while the index is byte-exact.
+        let rel = to_canonical_form(rel.trim_start_matches('/'));
         if rel.is_empty() || rel.ends_with(".cloudsc") || is_ignored_local_path(&rel) {
             continue;
         }
@@ -653,7 +671,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
                 continue;
             }
             // Skip-on-failure, not `?`: one unreadable entry must not abort the walk.
-            let child_rel = match relpath_under(&tracked_root, entry.path()) {
+            let child_rel = match key_from_disk(&tracked_root, entry.path()) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -1295,7 +1313,7 @@ pub(crate) fn mass_delete_pause_active(state: &AppState) -> AppResult<bool> {
 /// only the second needs credentials (DBSYNC-81). Keeping them apart lets the local
 /// decisions be exercised without an access token — which is what a test of the
 /// mass-deletion guard actually wants.
-fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
+pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     let folder = state
         .db
         .get_sync_folder()?
@@ -1317,7 +1335,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
 
     let known_map: HashMap<String, FileIndexRow> = known
         .iter()
-        .map(|f| (f.relative_path.clone(), f.clone()))
+        .map(|f| (to_canonical_form(&f.relative_path), f.clone()))
         .collect();
 
     let mut pending_targets = pending_targets;
@@ -1342,7 +1360,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         let absolute = entry.path().to_path_buf();
-        let relative = relpath_under(&tracked_root, &absolute)?;
+        let relative = key_from_disk(&tracked_root, &absolute)?;
 
         if relative.ends_with(".cloudsc") {
             continue;
@@ -1381,7 +1399,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         let absolute = entry.path().to_path_buf();
-        let relative = relpath_under(&tracked_root, &absolute)?;
+        let relative = key_from_disk(&tracked_root, &absolute)?;
 
         if relative.is_empty() {
             continue; // skip the sync root itself
@@ -1419,7 +1437,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             .filter(|rel| {
                 !rel.ends_with(".cloudsc")
                     && !is_ignored_local_path(rel)
-                    && !seen_paths.contains(rel)
+                    && !seen_paths.contains(&to_canonical_form(rel))
                     && !covered_by_active_job(rel, &pending)
             })
             .collect();
@@ -1429,7 +1447,7 @@ fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             .into_iter()
             .filter(|rel| {
                 !is_ignored_local_path(rel)
-                    && !seen_dirs.contains(rel)
+                    && !seen_dirs.contains(&to_canonical_form(rel))
                     && !covered_by_active_job(rel, &pending)
             })
             .collect();
@@ -1848,7 +1866,7 @@ fn apply_job_failure(
         // since (e.g. an edit's `upload`) the next time "Retry failed jobs" is
         // pressed, unlinking that edit before the upload ever ran. Dropping it loses
         // nothing: a genuine remote deletion is re-derived by the periodic 300s
-        // snapshot sweep, which enqueues a fresh, undeferred `local_delete` through
+        // snapshot sweep, which enqueues a fresh, verified (DBSYNC-103 #189) `local_delete` through
         // the DBSYNC-64 breaker.
         JobFailure::Permanent(PermanentReason::AttemptsExhausted)
             if job.job_type == "local_delete" && job.delta_deferred =>
@@ -2740,6 +2758,7 @@ mod tests {
             .without_time()
             .with_max_level(tracing::Level::TRACE)
             .finish();
+        crate::dropbox_transfer::keep_tracing_dispatch_registry_multi();
         tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.lock().unwrap().clone();
         String::from_utf8(bytes).expect("tracing output must be valid utf-8")
@@ -2826,15 +2845,18 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
 
+        // A key valid on every platform. The classification is driven by Dropbox's
+        // `malformed_path` body below, not by the name, and a `\` key cannot exist on
+        // Windows, where the storage assert rightly refuses it (DBSYNC-103).
         state
             .db
-            .enqueue_job("upload", None, Some("a\\b.txt"))
+            .enqueue_job("upload", None, Some("Informes/rejected.txt"))
             .unwrap();
         let job = state.db.pick_next_due_job().unwrap().expect("queued job");
 
         let rejected = crate::error::AppError::Dropbox {
             status: 409,
-            message: "upload for /a\\b.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
+            message: "upload for /Informes/rejected.txt: {\"error\":{\".tag\":\"path\",\"reason\":\
                       {\".tag\":\"malformed_path\",\"malformed_path\":null}},\
                       \"error_summary\":\"path/malformed_path/\"}"
                 .to_string(),
@@ -2857,7 +2879,10 @@ mod tests {
         );
 
         let err = row.last_error.expect("a message the user can act on");
-        assert!(err.contains("a\\b.txt"), "must name the file: {err}");
+        assert!(
+            err.contains("Informes/rejected.txt"),
+            "must name the file: {err}"
+        );
         assert!(err.contains("Rename it"), "must say what to do: {err}");
 
         assert!(
@@ -7305,5 +7330,947 @@ mod tests {
             still.delta_deferred,
             "the retry must still be verified: delta_deferred must survive"
         );
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103 (#189): a snapshot-originated `local_delete` verifies against Dropbox
+    // at execution time. ASCII names only, so none of the Unicode key guards is in play:
+    // the snapshot is simply EMPTY, which is the exact shape that made the sweep infer
+    // "deleted remotely" for a file that was still there.
+    // -------------------------------------------------------------------------------
+
+    /// Runs the REAL sweep body (`reconcile_fetched_snapshot`) against an empty remote
+    /// snapshot and returns how many jobs it enqueued.
+    fn sweep_with_empty_snapshot(state: &AppState) -> usize {
+        let local_files = state.db.list_local_files().unwrap();
+        crate::remote_index::reconcile_fetched_snapshot(
+            state,
+            &local_files,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+    }
+
+    fn present_on_dropbox(id: &str) -> AppResult<Option<crate::remote_index::RemoteFileMeta>> {
+        Ok(Some(crate::remote_index::RemoteFileMeta {
+            content_hash: "original".to_string(),
+            rev: "rev2".to_string(),
+            modified_ts: 0,
+            id: Some(id.to_string()),
+        }))
+    }
+
+    fn local_delete_rows(state: &AppState, rel: &str) -> Vec<crate::storage::db::SyncJobRow> {
+        state
+            .db
+            .list_recent_jobs(50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.job_type == "local_delete" && j.target_path.as_deref() == Some(rel))
+            .collect()
+    }
+
+    /// The sweep infers "gone" but Dropbox still has the file: the file is kept, the job
+    /// row is removed (never left as a completed delete) and both index rows survive.
+    ///
+    /// Proof this test can fail: making `Db::enqueue_verified_local_delete` insert
+    /// `delta_deferred = 0` sends the job down the direct arm, which unlinks the file.
+    #[test]
+    fn a_sweep_originated_local_delete_is_kept_when_dropbox_still_has_the_file() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/doc.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:DOC");
+
+        assert_eq!(sweep_with_empty_snapshot(&state), 1);
+        let queued = local_delete_rows(&state, rel);
+        assert_eq!(
+            queued.len(),
+            1,
+            "precondition: the sweep enqueued the delete"
+        );
+        assert!(
+            queued[0].delta_deferred,
+            "precondition: it is a verified delete"
+        );
+
+        let mut looked_up = Vec::new();
+        let ran = super::process_sync_queue_core(&state, |p| {
+            looked_up.push(p.to_string());
+            present_on_dropbox("id:DOC")
+        })
+        .unwrap();
+
+        assert!(
+            ran,
+            "the sweep's job must be due at once, with no grace window"
+        );
+        assert_eq!(
+            looked_up,
+            vec![rel.to_string()],
+            "must ask Dropbox, by path"
+        );
+        assert!(
+            path.exists(),
+            "a file Dropbox still has must never be unlinked"
+        );
+        assert!(state.db.get_local_file(rel).unwrap().is_some());
+        assert!(state.db.get_remote_file(rel).unwrap().is_some());
+        assert!(
+            local_delete_rows(&state, rel).is_empty(),
+            "the kept job's row must be gone, never left as a completed delete"
+        );
+    }
+
+    /// The sweep infers "gone" and Dropbox agrees, and the file is unchanged on disk: it
+    /// is deleted in ONE pick, with no grace wait.
+    ///
+    /// Proof this test can fail: giving the sweep's job the delta grace window
+    /// (`status='retry_wait'`, future `next_retry_at`) in `enqueue_verified_local_delete`
+    /// makes the pick find nothing due, so `ran` is false and the file survives.
+    #[test]
+    fn a_sweep_originated_local_delete_deletes_a_file_genuinely_gone_from_dropbox() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/gone.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:GONE");
+
+        assert_eq!(sweep_with_empty_snapshot(&state), 1);
+
+        let ran = super::process_sync_queue_core(&state, |_| Ok(None)).unwrap();
+
+        assert!(ran, "the sweep's job must be due at once");
+        assert!(
+            !path.exists(),
+            "a file gone from Dropbox and unchanged must be deleted"
+        );
+        assert!(state.db.get_local_file(rel).unwrap().is_none());
+        assert!(state.db.get_remote_file(rel).unwrap().is_none());
+        let rows = local_delete_rows(&state, rel);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "done");
+    }
+
+    /// The lookup fails: nothing is deleted, the job goes to `retry_wait` with the
+    /// verification marker intact.
+    ///
+    /// Proof this test can fail: the same `delta_deferred = 0` mutation as the "kept"
+    /// test unlinks the file without ever calling the lookup.
+    #[test]
+    fn a_sweep_originated_local_delete_is_retried_when_the_lookup_fails() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/flaky.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:FLAKY");
+
+        assert_eq!(sweep_with_empty_snapshot(&state), 1);
+
+        let ran = super::process_sync_queue_core(&state, |_| {
+            Err(crate::error::AppError::Network("offline".into()))
+        })
+        .unwrap();
+
+        assert!(ran);
+        assert!(
+            path.exists(),
+            "nothing may be deleted on a failed verification"
+        );
+        let rows = local_delete_rows(&state, rel);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "retry_wait");
+        assert_eq!(rows[0].attempt_count, 1);
+        assert!(rows[0].delta_deferred, "the retry must be verified again");
+        assert!(state.db.get_local_file(rel).unwrap().is_some());
+        assert!(state.db.get_remote_file(rel).unwrap().is_some());
+    }
+
+    /// After the lookup has failed on every attempt the job is DROPPED (no `failed` row),
+    /// and because Dropbox really did lose the file, the next sweep re-derives the delete
+    /// and, now that the network is back, it completes.
+    ///
+    /// Proof this test can fail: removing the exhausted-deferred arm in `apply_job_failure`
+    /// leaves a `failed` row (the `all` assertion below); making that arm also call
+    /// `remove_remote_file` leaves the next sweep nothing to re-derive (`== 1`).
+    #[test]
+    fn after_an_exhausted_drop_the_next_sweep_rederives_the_delete() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/lost.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:LOST");
+
+        assert_eq!(sweep_with_empty_snapshot(&state), 1);
+
+        // Five failed attempts through the real runner. A job in `retry_wait` is not due
+        // until its backoff elapses, so the test makes it due the way the clock would.
+        for attempt in 1..=5 {
+            let ran = super::process_sync_queue_core(&state, |_| {
+                Err(crate::error::AppError::Network("offline".into()))
+            })
+            .unwrap();
+            assert!(ran, "attempt {attempt} must have been due");
+            if attempt < 5 {
+                let row = local_delete_rows(&state, rel).remove(0);
+                assert_eq!(row.status, "retry_wait");
+                let past = (Utc::now() - Duration::seconds(1)).to_rfc3339();
+                state
+                    .db
+                    .mark_job_retry_wait(row.id, row.attempt_count, &past, None)
+                    .unwrap();
+            }
+        }
+
+        assert!(path.exists(), "an offline client must never delete");
+        assert!(
+            local_delete_rows(&state, rel).is_empty(),
+            "an exhausted verified delete is dropped, not left as a `failed` row"
+        );
+        assert!(state.db.get_remote_file(rel).unwrap().is_some());
+
+        // Dropbox really lost the file: the next sweep must derive the delete again.
+        assert_eq!(
+            sweep_with_empty_snapshot(&state),
+            1,
+            "the drop loses nothing: the next sweep re-derives the delete"
+        );
+        let rederived = local_delete_rows(&state, rel);
+        assert_eq!(rederived.len(), 1);
+        assert!(rederived[0].delta_deferred);
+
+        // Back online, Dropbox confirms the file is gone: it is deleted.
+        assert!(super::process_sync_queue_core(&state, |_| Ok(None)).unwrap());
+        assert!(!path.exists());
+    }
+
+    /// A delta re-add of the same id cancels a sweep-originated job exactly as it cancels a
+    /// delta-deferred one: both are `delta_deferred = 1` and due, and the cancel is keyed on
+    /// the flag alone.
+    #[test]
+    fn a_delta_readd_cancels_a_sweep_originated_local_delete() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let rel = "shared/readded.txt";
+        let (path, _hash) = seed_synced_hydrated_file(&state, rel, "id:RE");
+
+        assert_eq!(sweep_with_empty_snapshot(&state), 1);
+        assert!(state.db.cancel_deferred_local_delete(rel).unwrap());
+
+        assert!(local_delete_rows(&state, rel).is_empty());
+        assert!(path.exists());
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103: Unicode NFC/NFD path identity on macOS.
+    //
+    // Assumed probe outcome (measured live 2026-10-13, recorded on #182): Dropbox returns
+    // NFC in both `path_display` and `path_lower` for an NFD upload (R-NFC), and treats
+    // NFC and NFD as one name (I-fold). APFS is normalization-insensitive but
+    // preserving, so these tests create REAL NFD names in a temp dir on the real
+    // filesystem; the temp dir lives under the system temp root, which is APFS on macOS.
+    // -------------------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    mod dbsync103 {
+        use std::path::PathBuf;
+
+        use tempfile::tempdir;
+
+        use super::super::process_sync_queue_core;
+        use super::{build_state, scan_local_changes_only};
+        use crate::error::AppResult;
+        use crate::models::{DropboxEntry, DropboxListFolderResponse, UploadCommitResponse};
+        use crate::remote_index::{
+            reconcile_fetched_snapshot, remote_meta_from_entry, run_remote_delta,
+            DeltaFetchOutcome, DeltaRunOutcome,
+        };
+        use crate::state::AppState;
+
+        /// `cafe` + U+0301 COMBINING ACUTE ACCENT: what a keyboard-less producer such as
+        /// an old tool or a Linux share writes.
+        const NFD_NAME: &str = "cafe\u{301}.txt";
+        /// `café` with the precomposed U+00E9: what Dropbox returns.
+        const NFC_NAME: &str = "caf\u{e9}.txt";
+
+        fn sync_root(state: &AppState) -> PathBuf {
+            PathBuf::from(state.db.get_sync_folder().unwrap().unwrap())
+        }
+
+        /// The names `read_dir` reports, byte for byte: proves the fixture really is NFD
+        /// on disk instead of trusting the literal survived the filesystem.
+        fn names_on_disk(dir: &std::path::Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        fn remote_file_entry(path_display: &str, hash: &str, rev: &str) -> DropboxEntry {
+            DropboxEntry {
+                tag: "file".to_string(),
+                path_display: Some(path_display.to_string()),
+                // Dropbox sends the lowercased display path, in the same form.
+                path_lower: Some(path_display.to_lowercase()),
+                content_hash: Some(hash.to_string()),
+                rev: Some(rev.to_string()),
+                server_modified: None,
+                size: None,
+                id: Some("id:NFD1".to_string()),
+            }
+        }
+
+        fn one_page(
+            entries: Vec<DropboxEntry>,
+        ) -> impl FnMut(&str) -> AppResult<DeltaFetchOutcome> {
+            let mut page = Some(DropboxListFolderResponse {
+                entries,
+                cursor: "cursor-1".to_string(),
+                has_more: false,
+            });
+            move |_| Ok(DeltaFetchOutcome::Page(page.take().expect("one page only")))
+        }
+
+        fn queued_jobs(state: &AppState, job_type: &str) -> Vec<String> {
+            state
+                .db
+                .list_recent_jobs(200)
+                .unwrap()
+                .into_iter()
+                .filter(|j| j.job_type == job_type && j.status == "queued")
+                .filter_map(|j| j.target_path)
+                .collect()
+        }
+
+        /// Steps 1 and 2 of the observed failure, through the real pipeline: the scan keys
+        /// the file and enqueues the upload; the upload "commits" (the job's own key goes to
+        /// the real `record_upload_result`); the job is completed. Returns the key the job
+        /// carried and the content hash the scan computed.
+        fn scan_and_commit_upload(state: &AppState) -> (String, String) {
+            scan_local_changes_only(state).expect("scan");
+            let job = state
+                .db
+                .pick_next_due_job()
+                .unwrap()
+                .expect("the scan must have enqueued an upload");
+            assert_eq!(job.job_type, "upload");
+            let key = job.target_path.clone().expect("upload target");
+            let hash = state
+                .db
+                .get_local_file(&key)
+                .unwrap()
+                .expect("the scan must have indexed the file under the job's own key")
+                .hash;
+            crate::dropbox_transfer::record_upload_result(
+                state,
+                &key,
+                Some(UploadCommitResponse {
+                    id: Some("id:NFD1".to_string()),
+                    content_hash: Some(hash.clone()),
+                    rev: Some("rev1".to_string()),
+                    server_modified: None,
+                }),
+            );
+            state.db.mark_job_completed(job.id).unwrap();
+            (key, hash)
+        }
+
+        /// **DBSYNC-103, outcome 1, end to end** (reproduced live 2026-10-13).
+        ///
+        /// 1. An NFD file is created locally; the scan keys it.
+        /// 2. The upload commit writes `remote_file_index` under the job's key.
+        /// 3. The delta echo arrives NFC.
+        /// 4. The next snapshot sweep compares the local rows against the NFC snapshot.
+        ///
+        /// Before the fix step 4 missed the NFD local row, `reconcile_remote_absent` enqueued
+        /// an immediate `local_delete`, and the file the user had just created was unlinked.
+        ///
+        /// Proof this test can fail: reverting `key_from_disk` to `relpath_under` in
+        /// `scan_local_changes_only` fails it (two keys for one file, and a `local_delete`
+        /// once the storage assert is out of the way).
+        #[test]
+        fn an_nfd_file_survives_the_snapshot_sweep_that_follows_its_own_upload() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            let path = root.join(NFD_NAME);
+            std::fs::write(&path, b"hello").unwrap();
+            assert_eq!(
+                names_on_disk(&root),
+                vec![NFD_NAME.to_string()],
+                "fixture must be NFD on disk"
+            );
+
+            let (key, hash) = scan_and_commit_upload(&state);
+            assert_eq!(key, NFC_NAME, "the job must carry the canonical NFC key");
+
+            // 3. The delta echo, NFC as Dropbox sends it, through the real delta runner.
+            let echo = remote_file_entry(&format!("/{NFC_NAME}"), &hash, "rev1");
+            let outcome = run_remote_delta(
+                &state,
+                "cursor-0",
+                one_page(vec![remote_file_entry(
+                    &format!("/{NFC_NAME}"),
+                    &hash,
+                    "rev1",
+                )]),
+            )
+            .expect("delta");
+            assert!(matches!(outcome, DeltaRunOutcome::Applied { .. }));
+            assert!(
+                state.db.get_remote_file(NFC_NAME).unwrap().is_some(),
+                "the remote row lives under the NFC key"
+            );
+            // The reader asserts canonical keys, so count rows with a read-only connection.
+            let conn = rusqlite::Connection::open_with_flags(
+                tmp.path().join("db").join("app.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let remote_rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM remote_file_index", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(remote_rows, 1, "one file must be exactly one remote row");
+
+            // 4. The snapshot sweep, with the snapshot built by the production mapper.
+            let snapshot = [echo]
+                .iter()
+                .filter_map(remote_meta_from_entry)
+                .collect::<std::collections::HashMap<_, _>>();
+            let local_files = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(&state, &local_files, &snapshot).expect("sweep");
+
+            assert!(
+                queued_jobs(&state, "local_delete").is_empty(),
+                "the file is present on both sides: no local_delete may be enqueued"
+            );
+            // Execute whatever the sweep queued, exactly as the same tick would.
+            while !queued_jobs(&state, "local_delete").is_empty() {
+                process_sync_queue_core(&state, |_| Ok(None)).unwrap();
+            }
+            assert!(path.exists(), "the user's file must not be unlinked");
+        }
+
+        /// **Outcome 2 / folder variant**: a file and a folder whose disk names are NFD are
+        /// keyed NFC by the scan, and a second scan does not read either as deleted.
+        ///
+        /// Proof this test can fail: reverting `key_from_disk` in either scan loop makes the
+        /// key NFD (the file row, or `known_folders`), which the storage assert rejects.
+        /// With the assert also off, `known_map`/`seen_*` comparisons stop agreeing with the
+        /// stored rows and the rescan emits a delete.
+        #[test]
+        fn an_nfd_file_and_folder_scan_to_nfc_keys_and_a_rescan_deletes_nothing() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            let nfd_dir = "re\u{301}sume\u{301}";
+            let nfc_dir = "r\u{e9}sum\u{e9}";
+            std::fs::create_dir(root.join(nfd_dir)).unwrap();
+            std::fs::write(root.join(nfd_dir).join(NFD_NAME), b"inside").unwrap();
+            assert_eq!(names_on_disk(&root), vec![nfd_dir.to_string()]);
+
+            scan_local_changes_only(&state).expect("scan");
+            let keys: Vec<String> = state
+                .db
+                .list_local_files()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.relative_path)
+                .collect();
+            assert_eq!(keys, vec![format!("{nfc_dir}/{NFC_NAME}")]);
+            assert_eq!(
+                state.db.list_known_folders().unwrap(),
+                vec![nfc_dir.to_string()]
+            );
+
+            // Settle the upload so the rescan has no pending job to hide behind.
+            let job = state.db.pick_next_due_job().unwrap().expect("upload job");
+            state.db.mark_job_completed(job.id).unwrap();
+
+            scan_local_changes_only(&state).expect("rescan");
+            assert!(
+                queued_jobs(&state, "delete").is_empty()
+                    && queued_jobs(&state, "local_delete").is_empty(),
+                "a rescan of an unchanged NFD tree must not report anything deleted"
+            );
+            assert_eq!(state.db.list_local_files().unwrap().len(), 1);
+            assert_eq!(state.db.list_known_folders().unwrap().len(), 1);
+        }
+
+        /// The watcher path: `process_changed_paths` takes caller-supplied strings that
+        /// become keys. An NFD string for an NFD file must be keyed NFC.
+        ///
+        /// Proof this test can fail: dropping `to_canonical_form` from the path loop in
+        /// `process_changed_paths` keys the upload NFD.
+        #[test]
+        fn a_watcher_path_string_in_nfd_is_keyed_nfc() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            std::fs::write(root.join(NFD_NAME), b"watch").unwrap();
+
+            super::super::process_changed_paths(&state, &[NFD_NAME.to_string()]).expect("batch");
+
+            assert_eq!(queued_jobs(&state, "upload"), vec![NFC_NAME.to_string()]);
+            assert!(state.db.get_local_file(NFC_NAME).unwrap().is_some());
+        }
+
+        /// The watcher path for a moved-in NFD folder: the batch names the folder, and the
+        /// children found by the bounded walk are keyed from disk, so they must be NFC too.
+        ///
+        /// Proof this test can fail: reverting `child_rel` in the `present_dirs` loop of
+        /// `process_changed_paths` to `relpath_under` keys the child upload NFD.
+        #[test]
+        fn a_watcher_batch_naming_an_nfd_folder_keys_the_folder_and_its_children_nfc() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            let nfd_dir = "re\u{301}sume\u{301}";
+            let nfc_dir = "r\u{e9}sum\u{e9}";
+            std::fs::create_dir(root.join(nfd_dir)).unwrap();
+            std::fs::write(root.join(nfd_dir).join(NFD_NAME), b"inside").unwrap();
+
+            super::super::process_changed_paths(&state, &[nfd_dir.to_string()]).expect("batch");
+
+            assert_eq!(
+                queued_jobs(&state, "upload"),
+                vec![format!("{nfc_dir}/{NFC_NAME}")]
+            );
+            assert_eq!(state.db.list_known_folders().unwrap(), vec![nfc_dir]);
+        }
+
+        /// **Outcome 3**: a remote edit arrives NFC for a file whose local row came from an
+        /// NFD disk name. It must find that row and enqueue the download.
+        ///
+        /// Proof this test can fail: with the scan keying NFD, the local and remote rows sit
+        /// under the NFD key while the edit upserts the NFC key, which has no local row, so
+        /// no download is queued for the file the user actually has.
+        #[test]
+        fn a_remote_edit_arriving_nfc_enqueues_a_download_for_a_file_that_was_nfd_on_disk() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            std::fs::write(root.join(NFD_NAME), b"v1").unwrap();
+            let (_key, hash) = scan_and_commit_upload(&state);
+            // The remote edit: new content, so a different hash and revision.
+            let edit = remote_file_entry(&format!("/{NFC_NAME}"), "REMOTE-EDIT-HASH", "rev2");
+            assert_ne!(edit.content_hash.as_deref(), Some(hash.as_str()));
+
+            let outcome =
+                run_remote_delta(&state, "cursor-0", one_page(vec![edit])).expect("delta");
+            assert!(matches!(outcome, DeltaRunOutcome::Applied { enqueued: 1 }));
+            assert_eq!(
+                queued_jobs(&state, "download"),
+                vec![NFC_NAME.to_string()],
+                "the edit must reach the local row"
+            );
+        }
+    }
+    // -------------------------------------------------------------------------------
+    // DBSYNC-103 #186: legacy NFD rows written by a pre-103 build, and the startup
+    // migration that re-keys them before anything reads a key.
+    //
+    // Assumed probe outcome: R-NFC + I-fold (recorded on #182): Dropbox folds NFC and NFD
+    // into one name, so a `delete_v2` on the legacy NFD spelling deletes the real folder.
+    //
+    // Legacy rows are planted with raw SQL on purpose: the storage assert refuses NFD, and
+    // raw SQL is exactly what a pre-103 build wrote. In production `Db::new_at` runs the
+    // migration before a handle exists; these tests build the `AppState` first (an empty
+    // database, so that run is a no-op), plant the rows, and then either call the same
+    // entry point (`migrate`) or deliberately do not (`bypass`) to isolate one guard.
+    // -------------------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    mod dbsync103_migration {
+        use std::path::PathBuf;
+
+        use rusqlite::Connection;
+        use tempfile::tempdir;
+
+        use super::super::{covered_by_active_job, process_changed_paths};
+        use super::{build_state, scan_local_changes_only};
+        use crate::models::UploadCommitResponse;
+        use crate::state::AppState;
+        use std::collections::HashSet;
+
+        const NFD_DIR: &str = "re\u{301}sume\u{301}";
+        const NFC_DIR: &str = "r\u{e9}sum\u{e9}";
+
+        fn db_file(tmp: &std::path::Path) -> PathBuf {
+            tmp.join("db").join("app.db")
+        }
+
+        fn raw(tmp: &std::path::Path) -> Connection {
+            Connection::open(db_file(tmp)).unwrap()
+        }
+
+        fn root(state: &AppState) -> PathBuf {
+            PathBuf::from(state.db.get_sync_folder().unwrap().unwrap())
+        }
+
+        /// The startup migration, through the same entry point `Db::new_at` uses.
+        fn migrate(state: &AppState, tmp: &std::path::Path) {
+            state
+                .db
+                .rekey_to_canonical_form(&db_file(tmp))
+                .expect("migration");
+        }
+
+        fn job_types(state: &AppState) -> Vec<(String, String)> {
+            state
+                .db
+                .list_recent_jobs(200)
+                .unwrap()
+                .into_iter()
+                .map(|j| (j.job_type, j.status))
+                .collect()
+        }
+
+        fn delete_jobs(state: &AppState) -> Vec<(String, String)> {
+            job_types(state)
+                .into_iter()
+                .filter(|(t, _)| t == "delete" || t == "local_delete")
+                .collect()
+        }
+
+        /// The reviewer's critical scenario, end to end. `migrate_first` is the only knob.
+        ///
+        /// 1. `known_folders` holds the folder in NFD (legacy) and it exists on disk.
+        /// 2. The first scan runs and the upload settles.
+        /// 3. The user renames the folder; the watcher keys the move job.
+        /// 4. The move goes to `retry_wait`.
+        /// 5. The next scan runs its folder-deletion filter.
+        ///
+        /// Unmigrated, step 5 enqueues `delete` on the NFD path, and Dropbox folds NFC and
+        /// NFD into one name, so the real folder is deleted recursively.
+        ///
+        /// `scan_in_window` runs step 5 (a scan while the move is in `retry_wait`).
+        /// `complete_move` runs step 6 (the move completes, then a rescan). They are separate
+        /// scenarios because the step 5 scan registers the destination `CV` as a known
+        /// folder, which makes the later `move_index_subtree` collide on `CV` and strand the
+        /// source row (see the report on this round), a problem independent of Unicode.
+        fn critical_scenario(migrate_first: bool, scan_in_window: bool, complete_move: bool) {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = root(&state);
+            std::fs::create_dir(root.join(NFD_DIR)).unwrap();
+            std::fs::write(root.join(NFD_DIR).join("a.txt"), b"aaa").unwrap();
+            raw(tmp.path())
+                .execute(
+                    "INSERT INTO known_folders(relative_path, updated_at) VALUES(?1, 'x')",
+                    [NFD_DIR],
+                )
+                .unwrap();
+            if migrate_first {
+                migrate(&state, tmp.path());
+            }
+
+            // Step 2: first scan, then the upload settles.
+            scan_local_changes_only(&state).unwrap();
+            let job = state.db.pick_next_due_job().unwrap().expect("upload job");
+            let key = job.target_path.clone().unwrap();
+            let hash = state.db.get_local_file(&key).unwrap().unwrap().hash;
+            crate::dropbox_transfer::record_upload_result(
+                &state,
+                &key,
+                Some(UploadCommitResponse {
+                    id: Some("id:A".into()),
+                    content_hash: Some(hash),
+                    rev: Some("r1".into()),
+                    server_modified: None,
+                }),
+            );
+            state.db.mark_job_completed(job.id).unwrap();
+
+            // Steps 3-4: rename, the watcher correlates it, the move backs off.
+            std::fs::rename(root.join(NFD_DIR), root.join("CV")).unwrap();
+            process_changed_paths(&state, &[NFD_DIR.to_string(), "CV".to_string()]).unwrap();
+            let mv = state
+                .db
+                .list_recent_jobs(200)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.job_type == "move")
+                .expect("the watcher must correlate the rename into a move");
+            state
+                .db
+                .mark_job_retry_wait(mv.id, 1, "2999-01-01T00:00:00Z", Some("transient"))
+                .unwrap();
+
+            // Step 5: the periodic scan lands in the window.
+            if scan_in_window {
+                scan_local_changes_only(&state).unwrap();
+                assert!(
+                    delete_jobs(&state).is_empty(),
+                    "a delete was enqueued for the folder a pending move relocates: {:?}",
+                    job_types(&state)
+                );
+                let next = state.db.pick_next_due_job().unwrap();
+                assert!(
+                    next.is_none_or(|j| j.job_type != "delete"),
+                    "the next due job must not be a delete"
+                );
+            }
+
+            // Step 6 (DBSYNC-103 round 2, L2): the move COMPLETES, as `move_remote_file_internal`
+            // does once Dropbox accepts it (`apply_confirmed_move` is its index rewrite, the
+            // one part with no network in it), and the periodic scan runs again. This is the
+            // behaviour the row-count assertion below only stands in for. Unmigrated, the
+            // folder row is still NFD, so `apply_confirmed_move` takes the file branch and
+            // leaves it behind; the scan then sees a "deleted" folder and enqueues a
+            // recursive `delete` for a folder that exists on Dropbox under its new name
+            // (a debug build stops at the `enqueue_delete_job` assert, which is as good as
+            // evidence that a delete was attempted).
+            if complete_move {
+                let source = mv.source_path.clone().expect("move source");
+                crate::dropbox_transfer::apply_confirmed_move(&state, &source, "CV").unwrap();
+                state.db.mark_job_completed(mv.id).unwrap();
+                scan_local_changes_only(&state).unwrap();
+                assert!(
+                    delete_jobs(&state).is_empty(),
+                    "after the move completed, a rescan enqueued a delete: {:?}",
+                    job_types(&state)
+                );
+                assert_eq!(
+                    state.db.list_known_folders().unwrap(),
+                    vec!["CV".to_string()],
+                    "the renamed folder must be the only known folder"
+                );
+            }
+
+            // The migration's own outcome, asserted separately from the delete: no legacy
+            // spelling survives anywhere, so no later comparison can mis-read one. This is
+            // what fails when only the migration is bypassed, because the canonical
+            // `covered_by_active_job` independently keeps the delete away (two guards, two
+            // assertions).
+            let stored: Vec<String> = {
+                let conn = raw(tmp.path());
+                let mut stmt = conn
+                    .prepare("SELECT relative_path FROM known_folders")
+                    .unwrap();
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+                rows.map(|r| r.unwrap()).collect()
+            };
+            assert!(
+                stored
+                    .iter()
+                    .all(|k| crate::path_util::is_canonical_form(k)),
+                "a legacy NFD key survived in known_folders: {stored:?}"
+            );
+        }
+
+        /// Proof this test can fail: delete the `migrate(...)` call (run it with
+        /// `migrate_first = false`) and it fails. See the mutation notes on the PR.
+        #[test]
+        fn a_legacy_nfd_folder_survives_a_rename_whose_move_is_in_retry_wait() {
+            critical_scenario(true, true, false);
+        }
+
+        /// L2: the same legacy folder, but the move COMPLETES and the next scan runs.
+        /// Asserts the behaviour (no `delete` / `local_delete`, `known_folders == ["CV"]`),
+        /// not a row count. Proof it can fail: `critical_scenario(false, false, true)`, the
+        /// migration bypassed, stops at the `enqueue_delete_job` assert in a debug build.
+        #[test]
+        fn a_legacy_nfd_folder_survives_a_completed_rename_and_the_next_scan() {
+            critical_scenario(true, false, true);
+        }
+
+        /// The reviewer's probe2: legacy NFD folder AND file rows, an unchanged tree.
+        #[test]
+        fn legacy_nfd_folder_and_file_rows_survive_an_unchanged_rescan_after_migration() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = root(&state);
+            std::fs::create_dir(root.join(NFD_DIR)).unwrap();
+            std::fs::write(root.join(NFD_DIR).join("a.txt"), b"aaa").unwrap();
+            let (h, sz, mt) =
+                crate::path_util::hash_file(&root.join(NFD_DIR).join("a.txt")).unwrap();
+            let conn = raw(tmp.path());
+            conn.execute(
+                "INSERT INTO known_folders(relative_path, updated_at) VALUES(?1, 'x')",
+                [NFD_DIR],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO local_file_index(relative_path, hash, size_bytes, modified_ts, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, 'x')",
+                rusqlite::params![format!("{NFD_DIR}/a.txt"), h, sz, mt],
+            )
+            .unwrap();
+            migrate(&state, tmp.path());
+
+            scan_local_changes_only(&state).unwrap();
+            let jobs = job_types(&state);
+            assert!(
+                jobs.is_empty(),
+                "an unchanged legacy tree produced jobs: {jobs:?}"
+            );
+            assert_eq!(state.db.list_known_folders().unwrap(), vec![NFC_DIR]);
+            assert_eq!(state.db.list_local_files().unwrap().len(), 1);
+        }
+
+        /// M1. A `local_delete` the original bug enqueued (a snapshot sweep that judged an NFD
+        /// spelling absent, non-deferred) must not unlink on the strength of that verdict
+        /// once the migration has re-keyed it. Drives the real call site,
+        /// `process_sync_queue_core`, with an injected lookup that says the file still exists
+        /// on Dropbox. Proof it can fail: drop the `delta_deferred` promotion in
+        /// `key_migration::rekey_sync_jobs` and the job runs unverified and unlinks the file.
+        #[test]
+        fn a_migrated_legacy_local_delete_is_verified_and_a_file_still_on_dropbox_is_kept() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = root(&state);
+            let nfd_rel = format!("{NFD_DIR}/a.txt");
+            std::fs::create_dir(root.join(NFD_DIR)).unwrap();
+            let file = root.join(NFD_DIR).join("a.txt");
+            std::fs::write(&file, b"aaa").unwrap();
+            let (h, sz, mt) = crate::path_util::hash_file(&file).unwrap();
+            let conn = raw(tmp.path());
+            conn.execute(
+                "INSERT INTO local_file_index(relative_path, hash, size_bytes, modified_ts, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, 'x')",
+                rusqlite::params![nfd_rel, h, sz, mt],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at, dropbox_id) \
+                 VALUES(?1, ?2, 'r1', 0, 'x', 'id:A')",
+                rusqlite::params![nfd_rel, h],
+            )
+            .unwrap();
+            // As the unfixed sweep enqueued it: NOT deferred, on the NFD key.
+            conn.execute(
+                "INSERT INTO sync_jobs(job_type, source_path, target_path, status, created_at, updated_at) \
+                 VALUES('local_delete', ?1, ?1, 'queued', 'c', 'u')",
+                [&nfd_rel],
+            )
+            .unwrap();
+            migrate(&state, tmp.path());
+
+            let looked_up = std::cell::Cell::new(false);
+            let ran = super::super::process_sync_queue_core(&state, |rel| {
+                looked_up.set(true);
+                assert_eq!(rel, format!("{NFC_DIR}/a.txt"));
+                Ok(Some(crate::remote_index::RemoteFileMeta {
+                    content_hash: h.clone(),
+                    rev: "r1".to_string(),
+                    modified_ts: 0,
+                    id: Some("id:A".to_string()),
+                }))
+            })
+            .unwrap();
+            assert!(ran);
+            assert!(
+                looked_up.get(),
+                "the re-keyed job must be verified against Dropbox before it runs"
+            );
+            assert!(
+                file.exists(),
+                "a file that still exists on Dropbox was unlinked"
+            );
+            assert!(state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .iter()
+                .all(|j| j.job_type != "local_delete"));
+        }
+
+        /// M1(b). The same legacy delete, but already `failed` (retries exhausted before the
+        /// upgrade). After migration, Retry revives it; it must still be deferred, verified
+        /// against Dropbox, and a file Dropbox still holds must be kept.
+        #[test]
+        fn a_migrated_failed_legacy_local_delete_is_verified_after_retry_and_the_file_is_kept() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = root(&state);
+            let nfd_rel = format!("{NFD_DIR}/a.txt");
+            std::fs::create_dir(root.join(NFD_DIR)).unwrap();
+            let file = root.join(NFD_DIR).join("a.txt");
+            std::fs::write(&file, b"aaa").unwrap();
+            let (h, sz, mt) = crate::path_util::hash_file(&file).unwrap();
+            let conn = raw(tmp.path());
+            conn.execute(
+                "INSERT INTO local_file_index(relative_path, hash, size_bytes, modified_ts, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, 'x')",
+                rusqlite::params![nfd_rel, h, sz, mt],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at, dropbox_id) \
+                 VALUES(?1, ?2, 'r1', 0, 'x', 'id:A')",
+                rusqlite::params![nfd_rel, h],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_jobs(job_type, source_path, target_path, status, created_at, updated_at, attempt_count, last_error) \
+                 VALUES('local_delete', ?1, ?1, 'failed', 'c', 'u', 5, 'network')",
+                [&nfd_rel],
+            )
+            .unwrap();
+            migrate(&state, tmp.path());
+
+            assert_eq!(state.db.requeue_failed_jobs().unwrap(), 1);
+            let looked_up = std::cell::Cell::new(false);
+            let ran = super::super::process_sync_queue_core(&state, |_| {
+                looked_up.set(true);
+                Ok(Some(crate::remote_index::RemoteFileMeta {
+                    content_hash: h.clone(),
+                    rev: "r1".to_string(),
+                    modified_ts: 0,
+                    id: Some("id:A".to_string()),
+                }))
+            })
+            .unwrap();
+            assert!(ran);
+            assert!(looked_up.get(), "the revived job must be verified first");
+            assert!(file.exists(), "a file still on Dropbox was unlinked");
+        }
+
+        /// `covered_by_active_job`'s own guard, isolated from the migration: the migration
+        /// is bypassed, a legacy NFD folder row meets a queued NFC move for the same folder.
+        /// Every other canonicalisation in the scan is untouched, so the only thing standing
+        /// between this row and a recursive `delete_v2` is the predicate.
+        ///
+        /// Proof this test can fail: revert the `canonical_cow` calls in
+        /// `covered_by_active_job` and the scan reaches `enqueue_delete_job` with the NFD
+        /// path (a debug build stops at the storage assert, a release build enqueues the
+        /// delete).
+        #[test]
+        fn covered_by_active_job_protects_a_legacy_row_without_the_migration() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = root(&state);
+            std::fs::create_dir(root.join("CV")).unwrap();
+            raw(tmp.path())
+                .execute(
+                    "INSERT INTO known_folders(relative_path, updated_at) VALUES(?1, 'x')",
+                    [NFD_DIR],
+                )
+                .unwrap();
+            // The watcher keyed the move in NFC.
+            state
+                .db
+                .enqueue_job("move", Some(NFC_DIR), Some("CV"))
+                .unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+            assert!(
+                delete_jobs(&state).is_empty(),
+                "a legacy NFD row must not be deleted while an NFC move covers it: {:?}",
+                job_types(&state)
+            );
+        }
+
+        /// The predicate on its own: forms are equal, boundaries still hold.
+        #[test]
+        fn covered_by_active_job_matches_across_unicode_forms() {
+            let active: HashSet<String> = [NFC_DIR.to_string()].into();
+            assert!(covered_by_active_job(NFD_DIR, &active));
+            assert!(covered_by_active_job(
+                &format!("{NFD_DIR}/child.txt"),
+                &active
+            ));
+            assert!(!covered_by_active_job(&format!("{NFD_DIR}x"), &active));
+            let nfd_active: HashSet<String> = [NFD_DIR.to_string()].into();
+            assert!(covered_by_active_job(NFC_DIR, &nfd_active));
+        }
     }
 }

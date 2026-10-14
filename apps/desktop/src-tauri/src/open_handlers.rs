@@ -5,7 +5,7 @@ use tauri::AppHandle;
 use tauri::Manager;
 
 use crate::error::{AppError, AppResult};
-use crate::path_util::relpath_under;
+use crate::path_util::key_from_disk;
 use crate::state::AppState;
 use crate::sync_pipeline::{process_sync_queue_internal, refresh_queue_depth_internal};
 
@@ -21,7 +21,7 @@ pub(crate) fn resolve_cloudsc_rel_path(state: &AppState, abs: &Path) -> AppResul
     let sync_canon = sync_folder
         .canonicalize()
         .map_err(|e| AppError::Io(format!("invalid sync folder: {e}")))?;
-    let rel = relpath_under(&sync_canon, &abs_canon)?;
+    let rel = key_from_disk(&sync_canon, &abs_canon)?;
     if !rel.ends_with(".cloudsc") {
         return Err(AppError::Sync("not a .cloudsc placeholder".to_string()));
     }
@@ -118,5 +118,44 @@ pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<Pa
     }
     if any_queued {
         spawn_drain_sync_queue_if_idle(app_state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// DBSYNC-103. The rel path of a double-clicked placeholder becomes a `hydrate_cloudsc`
+    /// job key, so it must be NFC even when the placeholder's name is NFD on disk.
+    ///
+    /// Proof this test can fail: reverting `resolve_cloudsc_rel_path` to `relpath_under`
+    /// returns the NFD name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_placeholder_with_an_nfd_name_resolves_to_an_nfc_key() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().expect("root");
+        let db_dir = tempfile::tempdir().expect("db dir");
+        let db = crate::storage::db::Db::new_at(&db_dir.path().join("app.db")).expect("db");
+        db.set_sync_folder(&root.path().to_string_lossy())
+            .expect("set folder");
+        let state = crate::state::AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: Arc::new(db),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        };
+        let placeholder = root.path().join("cafe\u{301}.txt.cloudsc");
+        std::fs::write(&placeholder, b"{}").unwrap();
+
+        assert_eq!(
+            super::super::open_handlers::resolve_cloudsc_rel_path(&state, &placeholder).unwrap(),
+            "caf\u{e9}.txt.cloudsc"
+        );
     }
 }

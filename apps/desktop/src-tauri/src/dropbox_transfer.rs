@@ -15,8 +15,8 @@ use crate::models::{
     SyncConflictEvent, UploadCommitResponse, UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
-    create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed,
-    normalize_dropbox_path, parse_prefix_csv, relpath_under, safe_join,
+    create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed, key_from_disk,
+    key_from_dropbox, normalize_dropbox_path, parse_prefix_csv, safe_join,
 };
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
@@ -308,7 +308,7 @@ pub(crate) fn list_remote_folder(
         let Some(path_display) = entry.path_display else {
             continue;
         };
-        let relative = path_display.trim_start_matches('/').to_string();
+        let relative = key_from_dropbox(&path_display);
         // A poisoned remote entry that tries to traverse out of the sync root is
         // never "synced"; refuse the join and treat it as not present locally.
         let is_synced = safe_join(Path::new(&folder), &relative)
@@ -2235,7 +2235,7 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
-    let relative = path_display.trim_start_matches('/').to_string();
+    let relative = key_from_dropbox(path_display);
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
     let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
     if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
@@ -2264,7 +2264,7 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
         ) && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
         {
             let conflicted_path = create_conflicted_copy(&target)?;
-            let conflicted_rel = relpath_under(Path::new(&folder), &conflicted_path)?;
+            let conflicted_rel = key_from_disk(Path::new(&folder), &conflicted_path)?;
             let reason = format!(
                 "remote download would overwrite unsynced local changes; local copy preserved as {conflicted_rel}"
             );
@@ -2371,7 +2371,7 @@ pub(crate) fn hydrate_remote_folder_internal(
             let Some(path_display) = &entry.path_display else {
                 continue;
             };
-            let relative = path_display.trim_start_matches('/').to_string();
+            let relative = key_from_dropbox(path_display);
             if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
                 continue;
             }
@@ -2480,7 +2480,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
                 continue;
             };
 
-            let relative = path_display.trim_start_matches('/').to_string();
+            let relative = key_from_dropbox(path_display);
             let target = match safe_join(Path::new(&folder), &relative) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2532,6 +2532,29 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
     }
 
     Ok(downloaded)
+}
+
+/// Test-only: keeps one extra `tracing` dispatcher alive for the whole test process.
+///
+/// `tracing-core` computes a callsite's cached `Interest` once, on its FIRST hit. While
+/// at most one dispatcher is live it consults only the hitting thread's default — so a
+/// test thread with no subscriber (any ordinary test running in parallel with a
+/// `captured_tracing_output` one) can register a shared `tracing::info!` callsite as
+/// `never` while another thread's scoped subscriber is the only live dispatcher, and
+/// that subscriber then never sees the event (an entirely empty capture). With two live
+/// dispatchers, callsite registration consults every one of them. Call this before
+/// installing a scoped subscriber.
+#[cfg(test)]
+pub(crate) fn keep_tracing_dispatch_registry_multi() {
+    static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEPALIVE.get_or_init(|| {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .with_max_level(tracing::Level::TRACE)
+                .finish(),
+        )
+    });
 }
 
 #[cfg(test)]
@@ -3583,6 +3606,7 @@ mod tests {
             .without_time()
             .with_max_level(tracing::Level::TRACE)
             .finish();
+        crate::dropbox_transfer::keep_tracing_dispatch_registry_multi();
         tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.lock().unwrap().clone();
         String::from_utf8(bytes).expect("tracing output must be valid utf-8")
