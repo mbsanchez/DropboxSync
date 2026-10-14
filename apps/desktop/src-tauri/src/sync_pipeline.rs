@@ -4904,6 +4904,104 @@ mod tests {
             .collect()
     }
 
+    /// DBSYNC-112: a folder rename whose move sits in `retry_wait` while a scan runs.
+    ///
+    /// The scan registers the destination `CV` and `CV/sub` in `known_folders`. When the move
+    /// then completes, `move_index_subtree` used to lose the collision and strand `Docs` and
+    /// `Docs/sub`, which the next scan read as deleted folders and answered with recursive
+    /// `delete` jobs. Every step goes through the pipeline's own seams; nothing here reaches
+    /// the network.
+    #[test]
+    fn a_retried_folder_move_does_not_strand_the_old_folder_rows() {
+        let tmp = tempdir().unwrap();
+        let state = build_state(tmp.path());
+        let root = sync_root(&state);
+        std::fs::create_dir_all(root.join("Docs").join("sub")).unwrap();
+        std::fs::write(root.join("Docs").join("sub").join("a.txt"), b"aaa").unwrap();
+
+        // First scan, then the upload settles (the harness's own step).
+        super::scan_local_changes_only(&state).unwrap();
+        let upload = state.db.pick_next_due_job().unwrap().expect("upload job");
+        let key = upload.target_path.clone().unwrap();
+        assert_eq!(key, "Docs/sub/a.txt");
+        let hash = state.db.get_local_file(&key).unwrap().unwrap().hash;
+        crate::dropbox_transfer::record_upload_result(
+            &state,
+            &key,
+            Some(crate::models::UploadCommitResponse {
+                id: Some("id:A".into()),
+                content_hash: Some(hash),
+                rev: Some("r1".into()),
+                server_modified: None,
+            }),
+        );
+        state.db.mark_job_completed(upload.id).unwrap();
+        assert_eq!(state.db.list_known_folders().unwrap(), ["Docs", "Docs/sub"]);
+
+        // Rename; the watcher correlates it into a move, which then backs off.
+        std::fs::rename(root.join("Docs"), root.join("CV")).unwrap();
+        super::process_changed_paths(&state, &["Docs".to_string(), "CV".to_string()]).unwrap();
+        let mv = state
+            .db
+            .list_recent_jobs(200)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.job_type == "move")
+            .expect("the watcher must correlate the rename into a move");
+        state
+            .db
+            .mark_job_retry_wait(mv.id, 1, "2999-01-01T00:00:00Z", Some("transient"))
+            .unwrap();
+
+        // The periodic scan lands in the window and registers the destination folders.
+        super::scan_local_changes_only(&state).unwrap();
+        assert!(
+            state
+                .db
+                .list_known_folders()
+                .unwrap()
+                .contains(&"CV/sub".to_string()),
+            "the in-window scan must have registered the destination, or this test proves nothing"
+        );
+
+        // The move completes: `apply_confirmed_move` is the index rewrite of
+        // `move_remote_file_internal`, the one part with no network in it.
+        let source = mv.source_path.clone().expect("move source");
+        assert_eq!(source, "Docs");
+        crate::dropbox_transfer::apply_confirmed_move(&state, &source, "CV").unwrap();
+        state.db.mark_job_completed(mv.id).unwrap();
+        super::scan_local_changes_only(&state).unwrap();
+
+        assert_eq!(
+            state.db.list_known_folders().unwrap(),
+            ["CV", "CV/sub"],
+            "the old folder rows must travel, not be stranded"
+        );
+        // Nothing stranded in the file tables either (`apply_confirmed_move` only logs the
+        // stranded count, so assert the rows themselves).
+        assert!(state.db.get_local_file("Docs/sub/a.txt").unwrap().is_none());
+        assert!(state
+            .db
+            .get_remote_file("Docs/sub/a.txt")
+            .unwrap()
+            .is_none());
+        assert!(state.db.get_local_file("CV/sub/a.txt").unwrap().is_some());
+        assert!(state.db.get_remote_file("CV/sub/a.txt").unwrap().is_some());
+        let destructive: Vec<(String, Option<String>)> = state
+            .db
+            .list_recent_jobs(500)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.job_type == "delete" || j.job_type == "local_delete")
+            .map(|j| (j.job_type, j.target_path))
+            .collect();
+        assert!(
+            destructive.is_empty(),
+            "no delete may be enqueued for a folder that was only renamed: {destructive:?}"
+        );
+        assert!(delete_jobs(&state).is_empty());
+    }
+
     /// DBSYNC-99. Build a refused file move exactly as production does, then settle it.
     ///
     /// Returns `(upload_job_id, content_hash)`. Nothing here writes a
@@ -7942,10 +8040,11 @@ mod tests {
         /// NFD into one name, so the real folder is deleted recursively.
         ///
         /// `scan_in_window` runs step 5 (a scan while the move is in `retry_wait`).
-        /// `complete_move` runs step 6 (the move completes, then a rescan). They are separate
-        /// scenarios because the step 5 scan registers the destination `CV` as a known
-        /// folder, which makes the later `move_index_subtree` collide on `CV` and strand the
-        /// source row (see the report on this round), a problem independent of Unicode.
+        /// `complete_move` runs step 6 (the move completes, then a rescan). The step 5 scan
+        /// registers the destination `CV` as a known folder, so `move_index_subtree` meets a
+        /// colliding destination row; DBSYNC-112 made it discard that row in favour of the
+        /// source row, which is what lets the full combination `(true, true, true)` run.
+        /// The narrower cases stay as separate tests so a failure names the step that broke.
         fn critical_scenario(migrate_first: bool, scan_in_window: bool, complete_move: bool) {
             let tmp = tempdir().unwrap();
             let state = build_state(tmp.path());
@@ -8070,6 +8169,15 @@ mod tests {
         #[test]
         fn a_legacy_nfd_folder_survives_a_completed_rename_and_the_next_scan() {
             critical_scenario(true, false, true);
+        }
+
+        /// DBSYNC-112: the whole sequence, including the scan that lands in the `retry_wait`
+        /// window (it registers `CV`) followed by the move completing. Before the fix the
+        /// destination row won the collision, `known_folders` kept the old name, and the
+        /// rescan enqueued a recursive `delete` for it.
+        #[test]
+        fn a_legacy_nfd_folder_survives_a_scan_in_the_window_and_the_completed_move() {
+            critical_scenario(true, true, true);
         }
 
         /// The reviewer's probe2: legacy NFD folder AND file rows, an unchanged tree.

@@ -912,6 +912,32 @@ impl Db {
     /// whole watcher batch — but it also means the method used to report `Ok(())` while
     /// silently orphaning rows that kept their identity at a path no longer on disk. The
     /// caller decides what a non-zero count means; it is not this method's to swallow.
+    ///
+    /// **`known_folders` destination rows are discarded first.** A folder move can be retried
+    /// after a scan or the watcher already registered the new name, so `known_folders` may
+    /// hold the destination prefix and some descendants. `move_v2` is sent with
+    /// `autorename:false`, so once Dropbox confirmed the move the destination did not exist
+    /// there: such a row is local bookkeeping, not a second folder. Left in place it would
+    /// win the `UPDATE OR IGNORE` collision and strand the source row under the old name,
+    /// which the next scan reads as a deleted folder and answers with a recursive `delete`.
+    /// So a destination row that has a source counterpart (same tail under the old prefix)
+    /// is deleted and the source row, with whatever identity it has (`dropbox_id`, often
+    /// still NULL), moves onto its path. Any id on the destination row would name something
+    /// that is no longer at that path, so nothing is lost. Destination rows with no counterpart (a folder created inside the new name
+    /// meanwhile) are kept.
+    ///
+    /// Before that, `owns_content` is carried onto the source row when the destination row
+    /// holds it, so the moved row keeps the maximum of the two (the flag is never cleared).
+    ///
+    /// **Source rows are never deleted**, which also makes `X -> X` and overlapping moves
+    /// (`a -> a/b`, `a/b -> a`) safe. For `a/b -> a` every non-source row under `a` whose
+    /// tail matches a source row is a destination row with a counterpart and is replaced by
+    /// design: the ancestor `a` itself, and e.g. `a/x` when `a/b/x` exists. Dropbox refuses
+    /// that move, so production never reaches it.
+    ///
+    /// Only `known_folders` gets this treatment. The file tables carry real hashes and revs,
+    /// so a collision there is left stranded, counted in the return value and logged loudly
+    /// by the caller.
     pub fn move_index_subtree(&self, old_prefix: &str, new_prefix: &str) -> AppResult<usize> {
         debug_assert_canonical_key(old_prefix);
         debug_assert_canonical_key(new_prefix);
@@ -945,6 +971,31 @@ impl Db {
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         let tx = conn.transaction()?;
+
+        // `known_folders` only: drop destination rows that have a source counterpart so the
+        // source rows can take their paths (see the doc comment). Driven by the source rows,
+        // so the helpers keep binding `?1`; `?2 || tail` is `?2` for the prefix row itself.
+        let src = format!("(relative_path = ?1 OR {})", m("relative_path"));
+        let dest = format!("?2 || {}", tail("relative_path"));
+        let not_src = format!("relative_path <> ?1 AND NOT ({})", m("relative_path"));
+        // (a) Carry `owns_content` first: (b) deletes the rows it is read from.
+        tx.execute(
+            &format!(
+                "UPDATE known_folders SET owns_content = 1 \
+                 WHERE owns_content = 0 AND {src} \
+                   AND {dest} IN (SELECT relative_path FROM known_folders \
+                                  WHERE owns_content = 1 AND {not_src})"
+            ),
+            params![old_prefix, new_prefix],
+        )?;
+        // (b) Delete the destination rows, never a source row.
+        tx.execute(
+            &format!(
+                "DELETE FROM known_folders WHERE {not_src} \
+                   AND relative_path IN (SELECT {dest} FROM known_folders WHERE {src})"
+            ),
+            params![old_prefix, new_prefix],
+        )?;
 
         for table in ["local_file_index", "remote_file_index", "known_folders"] {
             // The folder / file at the prefix itself.
@@ -3232,6 +3283,204 @@ mod tests {
             );
             assert_eq!(stranded, 0, "prefix {old:?}: nothing may be left behind");
         }
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    fn folder_dropbox_id(db: &Db, path: &str) -> Option<String> {
+        let conn = db.write.lock().expect("lock");
+        conn.query_row(
+            "SELECT dropbox_id FROM known_folders WHERE relative_path = ?1",
+            rusqlite::params![path],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("known_folders row")
+    }
+
+    /// DBSYNC-112: a scan or the watcher registered the destination folder (the prefix plus a
+    /// descendant) while the move sat in `retry_wait`. `move_v2` runs with `autorename:false`,
+    /// so after a confirmed move that row is only local bookkeeping and must give way to the
+    /// source row. Non-ASCII names included: the discard must not reopen the byte/character
+    /// corruption, and `Ñoño`/`我的文档` as the *source* are where the offset overshoots.
+    #[test]
+    fn move_index_subtree_replaces_a_scan_registered_destination_in_known_folders() {
+        for (old, new) in [
+            ("artículos", "Papers"),
+            ("我的文档", "Docs"),
+            ("Ñoño", "Plain"),
+            ("résumé", "CV"),
+            ("Docs", "CV"),
+        ] {
+            let db = Db::new_at(&unique_db_path()).expect("db init");
+            db.upsert_known_folder(old).unwrap();
+            db.upsert_known_folder(&format!("{old}/sub")).unwrap();
+            // What the scan's directory walk registered under the destination name.
+            db.upsert_known_folder(new).unwrap();
+            db.upsert_known_folder(&format!("{new}/sub")).unwrap();
+
+            let stranded = db.move_index_subtree(old, new).expect("move subtree");
+
+            assert_eq!(
+                db.list_known_folders().unwrap(),
+                sorted(vec![new.to_string(), format!("{new}/sub")]),
+                "prefix {old:?}: exactly the moved set, nothing mangled, nothing left behind"
+            );
+            assert_eq!(stranded, 0, "prefix {old:?}: no source row may be stranded");
+        }
+    }
+
+    /// The source row carries whatever identity the folder has, so it must be the one that
+    /// survives.
+    #[test]
+    fn move_index_subtree_keeps_the_source_identity_over_a_scan_registered_destination() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("Docs").unwrap();
+        db.upsert_known_folder("Docs/sub").unwrap();
+        db.set_known_folder_dropbox_id("Docs", "id:docs").unwrap();
+        db.set_known_folder_dropbox_id("Docs/sub", "id:sub")
+            .unwrap();
+        // Scan-created: no dropbox_id. `owns_content` set the way production sets it.
+        db.upsert_known_folder("CV").unwrap();
+        db.upsert_known_folder("CV/sub").unwrap();
+        db.upsert_local_file("CV/x", "H", 1, 0).unwrap();
+        db.mark_known_folders_owning_content().unwrap();
+        db.remove_local_file("CV/x").unwrap();
+        assert_eq!(db.list_known_folders_owning_content().unwrap(), ["CV"]);
+
+        let stranded = db.move_index_subtree("Docs", "CV").expect("move subtree");
+
+        assert_eq!(stranded, 0);
+        assert_eq!(db.list_known_folders().unwrap(), ["CV", "CV/sub"]);
+        assert_eq!(folder_dropbox_id(&db, "CV").as_deref(), Some("id:docs"));
+        assert_eq!(folder_dropbox_id(&db, "CV/sub").as_deref(), Some("id:sub"));
+        assert_eq!(
+            db.list_known_folders_owning_content().unwrap(),
+            ["CV"],
+            "owns_content is the maximum of the two rows; the flag is never cleared"
+        );
+    }
+
+    /// A folder created inside the destination meanwhile has no source counterpart.
+    #[test]
+    fn move_index_subtree_keeps_destination_rows_without_a_source_counterpart() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("Docs").unwrap();
+        db.upsert_known_folder("Docs/sub").unwrap();
+        db.upsert_known_folder("CV").unwrap();
+        db.upsert_known_folder("CV/sub").unwrap();
+        db.upsert_known_folder("CV/new").unwrap();
+
+        let stranded = db.move_index_subtree("Docs", "CV").expect("move subtree");
+
+        assert_eq!(stranded, 0);
+        assert_eq!(db.list_known_folders().unwrap(), ["CV", "CV/new", "CV/sub"]);
+    }
+
+    /// `X -> X` is not reachable in production (Dropbox refuses it) but the method is `pub`.
+    /// It reports rows left under the old prefix, so the table is what is asserted.
+    #[test]
+    fn move_index_subtree_onto_itself_leaves_known_folders_unchanged() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("Docs").unwrap();
+        db.upsert_known_folder("Docs/sub").unwrap();
+        db.upsert_known_folder("Docs-other").unwrap();
+
+        let stranded = db.move_index_subtree("Docs", "Docs").expect("move subtree");
+
+        assert!(stranded > 0, "the rows are still under the old prefix");
+        assert_eq!(
+            db.list_known_folders().unwrap(),
+            ["Docs", "Docs-other", "Docs/sub"]
+        );
+    }
+
+    /// `a -> a/b`: the row at `a/b` is a source row (it is under `a/`) and also the
+    /// destination of `a` itself. It must not be deleted.
+    #[test]
+    fn move_index_subtree_into_its_own_descendant_deletes_no_source_row() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("a").unwrap();
+        db.upsert_known_folder("a/b").unwrap();
+        db.set_known_folder_dropbox_id("a/b", "id:ab").unwrap();
+        // Only `a/b` owns content. The owns_content carry must not read from a source row,
+        // or `a` (the destination of nothing it should inherit from) would be flagged too.
+        db.write
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE known_folders SET owns_content = 1 WHERE relative_path = 'a/b'",
+                [],
+            )
+            .unwrap();
+
+        db.move_index_subtree("a", "a/b").expect("move subtree");
+        assert_eq!(db.list_known_folders_owning_content().unwrap(), ["a/b/b"]);
+
+        // `a` could not move onto the occupied `a/b` and stays; the source row `a/b` moved
+        // down to `a/b/b` with its identity instead of being deleted.
+        assert_eq!(db.list_known_folders().unwrap(), ["a", "a/b/b"]);
+        assert_eq!(folder_dropbox_id(&db, "a/b/b").as_deref(), Some("id:ab"));
+    }
+
+    /// `a/b -> a`: the ancestor `a` is a destination row with a source counterpart (the
+    /// prefix row `a/b` itself), so it IS deleted, by design: the moved row replaces it and
+    /// brings its own identity. Every source row survives, at its new path.
+    #[test]
+    fn move_index_subtree_out_of_its_own_ancestor_replaces_the_ancestor_row() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("a").unwrap();
+        db.set_known_folder_dropbox_id("a", "id:ancestor").unwrap();
+        db.upsert_known_folder("a/b").unwrap();
+        db.set_known_folder_dropbox_id("a/b", "id:ab").unwrap();
+        db.upsert_known_folder("a/b/c").unwrap();
+
+        let stranded = db.move_index_subtree("a/b", "a").expect("move subtree");
+
+        assert_eq!(stranded, 0);
+        assert_eq!(db.list_known_folders().unwrap(), ["a", "a/c"]);
+        // The ancestor row was deleted on purpose; its dropbox_id is gone, `a/b`'s took over.
+        assert_eq!(folder_dropbox_id(&db, "a").as_deref(), Some("id:ab"));
+    }
+
+    /// The file tables hold real hashes and revs: a collision there stays stranded and loud.
+    #[test]
+    fn move_index_subtree_leaves_colliding_file_rows_alone_and_reports_them() {
+        let db = Db::new_at(&unique_db_path()).expect("db init");
+        db.upsert_known_folder("Docs").unwrap();
+        db.upsert_known_folder("CV").unwrap();
+        db.upsert_local_file("Docs/f.txt", "SRC", 1, 0).unwrap();
+        db.upsert_local_file("CV/f.txt", "DEST", 1, 0).unwrap();
+        db.upsert_remote_file("Docs/f.txt", "SRC", "rev-src", 0, None)
+            .unwrap();
+        db.upsert_remote_file("CV/f.txt", "DEST", "rev-dest", 0, None)
+            .unwrap();
+
+        let stranded = db.move_index_subtree("Docs", "CV").expect("move subtree");
+
+        // Docs/f.txt in both file tables.
+        assert_eq!(stranded, 2);
+        assert_eq!(db.list_known_folders().unwrap(), ["CV"]);
+        let local = db.get_local_file("CV/f.txt").unwrap().expect("dest local");
+        assert_eq!(local.hash, "DEST");
+        let remote = db
+            .get_remote_file("CV/f.txt")
+            .unwrap()
+            .expect("dest remote");
+        assert_eq!(
+            (remote.content_hash.as_str(), remote.rev.as_str()),
+            ("DEST", "rev-dest")
+        );
+        assert_eq!(
+            db.get_local_file("Docs/f.txt").unwrap().unwrap().hash,
+            "SRC"
+        );
+        assert_eq!(
+            db.get_remote_file("Docs/f.txt").unwrap().unwrap().rev,
+            "rev-src"
+        );
     }
 
     /// The subtree match is BINARY: `LIKE` is ASCII case-insensitive and this one DELETES.
