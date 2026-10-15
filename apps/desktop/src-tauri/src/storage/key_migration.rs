@@ -666,12 +666,13 @@ impl JobRow {
 /// * **Winner:** the newest *active* job (`queued`, `retry_wait`, `running`); if no member is
 ///   active, the newest `failed` one. "Newest" is `updated_at`, then highest `id`.
 /// * **Losers** (active or failed alike) are **deleted**, logged at `warn` with the full row
-///   (the `VACUUM INTO` backup holds it too). A loser is never left `failed`: "Retry failed
-///   jobs" (`requeue_failed_jobs`) would put it back to `queued` next to the winner, violating
-///   the partial unique index (Retry then errors for every job), showing its stale error in
-///   the tray, and, once the winner finished, reviving it, which for a non-deferred
-///   `local_delete` is a destructive job running unverified (DBSYNC-102 settled that such a
-///   job is dropped, not failed, and never re-aimed).
+///   (the `VACUUM INTO` backup holds it too). A loser is never left `failed`: before DBSYNC-113
+///   "Retry failed jobs" (`requeue_failed_jobs`) would put it back to `queued` next to the
+///   winner, violating the partial unique index (Retry then errored for every job); today
+///   Retry settles such a row as `done` instead, but a left-over `failed` loser would still
+///   show its stale error in the tray until then, and, once the winner finished, could be
+///   revived, which for a non-deferred `local_delete` is a destructive job running unverified
+///   (DBSYNC-102 settled that such a job is dropped, not failed, and never re-aimed).
 /// * **Upload debt.** An upload's source-deletion debt (`on_success_delete_path` / `_rev`)
 ///   follows `enqueue_upload_then_delete` (`COALESCE`: first debt wins, rev follows its path).
 ///   A winner without a debt inherits the loser's. A loser that owes a **different** deletion
