@@ -4893,6 +4893,67 @@ mod tests {
             .last_error
     }
 
+    /// Marks the next due job `failed`, as the queue does (never `apply_job_failure`).
+    fn fail_enqueued(state: &AppState, job_type: &str, p: &str) {
+        state.db.enqueue_job(job_type, Some(p), Some(p)).unwrap();
+        let job = state.db.pick_next_due_job().unwrap().expect("due job");
+        state.db.mark_job_failed(job.id, 3, Some("boom")).unwrap();
+    }
+
+    /// Precondition: before Retry the tray does show the failure, so a refresh that does
+    /// nothing cannot make the clean-tray assertion pass.
+    fn tray_shows_the_failure(state: &AppState) {
+        super::refresh_queue_depth_internal(state).unwrap();
+        assert!(
+            last_error(state).is_some(),
+            "fixture: the tray shows the failed row"
+        );
+    }
+
+    fn tray_is_clean(state: &AppState) {
+        super::refresh_queue_depth_internal(state).unwrap();
+        assert_eq!(last_error(state), None);
+        assert_ne!(
+            state
+                .sync_engine
+                .lock()
+                .unwrap()
+                .current_status(false)
+                .health,
+            "error"
+        );
+    }
+
+    /// DBSYNC-113: after Retry on duplicate `failed` rows, no stale error stays in the tray.
+    /// (No upload debts in this fixture: they feed the tray on their own.)
+    #[test]
+    fn tray_is_clean_after_retry_of_duplicate_failed_rows() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        fail_enqueued(&state, "upload", "a");
+        fail_enqueued(&state, "upload", "a");
+
+        tray_shows_the_failure(&state);
+        assert_eq!(state.db.requeue_failed_jobs().unwrap(), 1);
+        tray_is_clean(&state);
+    }
+
+    /// DBSYNC-113: same for a failed row shadowed by an active twin.
+    #[test]
+    fn tray_is_clean_after_retry_of_a_row_with_an_active_twin() {
+        let tmp = tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        fail_enqueued(&state, "upload", "a");
+        state
+            .db
+            .enqueue_job("upload", Some("a"), Some("a"))
+            .unwrap();
+
+        tray_shows_the_failure(&state);
+        assert_eq!(state.db.requeue_failed_jobs().unwrap(), 0);
+        tray_is_clean(&state);
+    }
+
     fn delete_jobs(state: &AppState) -> Vec<String> {
         state
             .db

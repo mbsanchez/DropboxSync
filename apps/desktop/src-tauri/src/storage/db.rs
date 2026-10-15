@@ -168,6 +168,12 @@ fn debug_assert_canonical_key(_relative_path: &str) {
 /// driver's default, so a test can pin that this line ran.
 const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10_000);
 
+/// `last_error` written on a `failed` row that `Db::requeue_failed_jobs` settles as `done`
+/// because another job for the same `(job_type, target_path)` took its place (DBSYNC-113).
+/// "Another", not "newer": the surviving active row can have a LOWER id, since the rename
+/// rewrite can move an older active row onto the key.
+const SUPERSEDED_REASON: &str = "superseded by another job for the same path (DBSYNC-113)";
+
 /// Where the reason for a failed startup is persisted, next to the database.
 pub(crate) fn startup_error_path(db_path: &std::path::Path) -> std::path::PathBuf {
     db_path.with_file_name("startup-error.txt")
@@ -853,7 +859,8 @@ impl Db {
             params![old_path, new_path],
         )?;
         // `failed` is in the status set deliberately. It looks transient, but
-        // `requeue_failed_jobs` resets every failed row back to `queued`, so a download that
+        // `requeue_failed_jobs` requeues failed rows (the newest per key; older duplicates are
+        // settled as `done`), so a download that
         // failed before a rename would be resurrected pointing at the pre-rename path — it
         // writes the file back under its old name and the next scan uploads it as untracked,
         // undoing the rename on the server. The partial-unique index only covers active
@@ -2153,39 +2160,147 @@ impl Db {
         Ok(None)
     }
 
-    /// Resets `failed` jobs back to `queued` so they are retried. Returns the count.
+    /// Resets `failed` jobs back to `queued` so they are retried. Returns the number of rows
+    /// requeued.
     ///
-    /// A `failed` row is skipped when an active job exists for the same non-NULL
-    /// `(job_type, target_path)`: the partial unique index allows one active job, so
-    /// requeueing the shadowed row would make the whole `UPDATE` fail. The skipped row stays
-    /// `failed` (history the user can see); it is not deleted. A NULL target (for example
-    /// `hydrate_cloudsc`) never shadows anything.
+    /// The partial unique index allows ONE active job per non-NULL `(job_type, target_path)`,
+    /// so a blanket `UPDATE` that requeued two rows of one key would abort as a whole and
+    /// requeue nothing (DBSYNC-113). Everything therefore runs in one transaction, in this
+    /// order:
     ///
-    /// Known gap, tracked as DBSYNC-113: two `failed` rows with the same
-    /// `(job_type, target_path)` and no active job are both requeued and still collide with
-    /// a UNIQUE error. This function does not handle that case.
+    /// 1. **Requeue** each `failed` row unless an active job exists for its key, or a NEWER
+    ///    `failed` row exists for the same non-NULL key (the highest id wins, whatever order
+    ///    SQLite visits the rows in). This step's row count is the return value.
+    /// 2. **Keep verification.** An active `local_delete` takes over `delta_deferred = 1` from
+    ///    any failed sibling on its key, so the surviving row does not run an unverified
+    ///    delete. The limit: a twin that is already `running` keeps the flag it was picked
+    ///    with for that run. This MUST run before step 3, which removes the failed siblings.
+    /// 3. **Keep the upload debt.** A `queued` or `retry_wait` `upload` with no
+    ///    source-deletion debt (`on_success_delete_path` / `_rev`) inherits it from the newest
+    ///    failed `upload` sibling that owes one. Then every failed `upload` sibling whose debt
+    ///    path equals that active row's debt path (including a debt the active row already
+    ///    owed on its own) has its debt cleared, so the debt has one owner (the rule
+    ///    `key_migration` applies: a winner without a debt inherits the loser's). The deletion
+    ///    is still gated by `destination_holds_the_bytes` at success time. The limits: a twin
+    ///    that is already `running` gets nothing carried, because it may have read its debt
+    ///    (as none) before this Retry, so the failed row is settled with its own debt intact
+    ///    and `unsettled_source_deletion` reports it; the same happens when the active upload
+    ///    owes a DIFFERENT deletion. This MUST run before step 4.
+    /// 4. **Settle** every `failed` row with a non-NULL target that still has an active row
+    ///    for the same `(job_type, target_path)`: it is marked `done` with
+    ///    [`SUPERSEDED_REASON`] as superseded history, not deleted and not left `failed`.
+    ///
+    /// A NULL target (for example `hydrate_cloudsc`) never shadows or supersedes anything:
+    /// the explicit `target_path IS NOT NULL` guards enforce that. Keys are also compared
+    /// with `=` rather than `IS`, which is defensive only.
     pub fn requeue_failed_jobs(&self) -> AppResult<usize> {
-        let conn = self
+        let mut conn = self
             .write
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
-        let n = conn
-            .execute(
-                "
-                UPDATE sync_jobs
-                SET status='queued', attempt_count=0, next_retry_at=NULL, last_error=NULL, updated_at=?1
-                WHERE status='failed'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM sync_jobs a
-                    WHERE a.job_type = sync_jobs.job_type
-                      AND sync_jobs.target_path IS NOT NULL
-                      AND a.target_path = sync_jobs.target_path
-                      AND a.status IN ('queued','retry_wait','running'))
-                ",
-                params![Utc::now().to_rfc3339()],
-            )
-            ?;
-        Ok(n)
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let requeued = tx.execute(
+            "
+            UPDATE sync_jobs
+            SET status='queued', attempt_count=0, next_retry_at=NULL, last_error=NULL, updated_at=?1
+            WHERE status='failed'
+              AND NOT EXISTS (
+                SELECT 1 FROM sync_jobs a
+                WHERE a.job_type = sync_jobs.job_type
+                  AND sync_jobs.target_path IS NOT NULL
+                  AND a.target_path = sync_jobs.target_path
+                  AND a.status IN ('queued','retry_wait','running'))
+              AND NOT EXISTS (
+                SELECT 1 FROM sync_jobs n
+                WHERE n.job_type = sync_jobs.job_type
+                  AND sync_jobs.target_path IS NOT NULL
+                  AND n.target_path = sync_jobs.target_path
+                  AND n.status = 'failed'
+                  AND n.id > sync_jobs.id)
+            ",
+            params![now],
+        )?;
+        tx.execute(
+            "
+            UPDATE sync_jobs
+            SET delta_deferred = 1
+            WHERE job_type = 'local_delete'
+              AND status IN ('queued','retry_wait','running')
+              AND delta_deferred = 0
+              AND EXISTS (
+                SELECT 1 FROM sync_jobs f
+                WHERE f.job_type = sync_jobs.job_type
+                  AND sync_jobs.target_path IS NOT NULL
+                  AND f.target_path = sync_jobs.target_path
+                  AND f.status = 'failed'
+                  AND f.delta_deferred = 1)
+            ",
+            [],
+        )?;
+        tx.execute(
+            "
+            UPDATE sync_jobs
+            SET on_success_delete_path = (
+                  SELECT f.on_success_delete_path FROM sync_jobs f
+                  WHERE f.job_type = 'upload'
+                    AND f.target_path = sync_jobs.target_path
+                    AND f.status = 'failed'
+                    AND f.on_success_delete_path IS NOT NULL
+                  ORDER BY f.id DESC LIMIT 1),
+                on_success_delete_rev = (
+                  SELECT f.on_success_delete_rev FROM sync_jobs f
+                  WHERE f.job_type = 'upload'
+                    AND f.target_path = sync_jobs.target_path
+                    AND f.status = 'failed'
+                    AND f.on_success_delete_path IS NOT NULL
+                  ORDER BY f.id DESC LIMIT 1)
+            WHERE job_type = 'upload'
+              AND status IN ('queued','retry_wait')
+              AND target_path IS NOT NULL
+              AND on_success_delete_path IS NULL
+              AND EXISTS (
+                SELECT 1 FROM sync_jobs f
+                WHERE f.job_type = 'upload'
+                  AND f.target_path = sync_jobs.target_path
+                  AND f.status = 'failed'
+                  AND f.on_success_delete_path IS NOT NULL)
+            ",
+            [],
+        )?;
+        tx.execute(
+            "
+            UPDATE sync_jobs
+            SET on_success_delete_path = NULL, on_success_delete_rev = NULL
+            WHERE job_type = 'upload'
+              AND status = 'failed'
+              AND target_path IS NOT NULL
+              AND on_success_delete_path IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM sync_jobs a
+                WHERE a.job_type = 'upload'
+                  AND a.target_path = sync_jobs.target_path
+                  AND a.status IN ('queued','retry_wait')
+                  AND a.on_success_delete_path = sync_jobs.on_success_delete_path)
+            ",
+            [],
+        )?;
+        tx.execute(
+            "
+            UPDATE sync_jobs
+            SET status='done', last_error=?1, updated_at=?2
+            WHERE status='failed'
+              AND target_path IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM sync_jobs a
+                WHERE a.job_type = sync_jobs.job_type
+                  AND a.target_path = sync_jobs.target_path
+                  AND a.status IN ('queued','retry_wait','running'))
+            ",
+            params![SUPERSEDED_REASON, now],
+        )?;
+        tx.commit()?;
+        Ok(requeued)
     }
 
     pub fn add_conflict(
@@ -4407,8 +4522,8 @@ mod tests {
 
     /// Retry must not fail because a `failed` row has an active twin (the partial unique index
     /// allows one active job per `(job_type, target_path)`; `enqueue_job` can create this
-    /// without any migration). The shadowed row stays `failed`; every other failed row is
-    /// requeued.
+    /// without any migration). The shadowed row is settled as superseded (`done`, DBSYNC-113);
+    /// every other failed row is requeued.
     #[test]
     fn requeue_failed_jobs_skips_a_row_with_an_active_twin_and_requeues_the_rest() {
         let dir = tempfile::tempdir().unwrap();
@@ -4434,7 +4549,462 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(statuses, ["1:failed", "2:queued", "3:queued", "4:queued"]);
+        assert_eq!(statuses, ["1:done", "2:queued", "3:queued", "4:queued"]);
+    }
+
+    // ---- DBSYNC-113: Retry with duplicate `failed` rows on one key ----
+
+    /// One `sync_jobs` row as `(id, job_type, target, status, last_error, delta_deferred,
+    /// attempt_count, delete_parent_rev, updated_at)`; NULL text columns read as "".
+    type JobTuple = (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        String,
+    );
+
+    fn job_rows(path: &std::path::Path) -> Vec<JobTuple> {
+        let c = Connection::open(path).unwrap();
+        let mut stmt = c
+            .prepare(
+                "SELECT id, job_type, COALESCE(target_path,''), status, COALESCE(last_error,''),
+                        delta_deferred, attempt_count, COALESCE(delete_parent_rev,''), updated_at
+                 FROM sync_jobs ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    /// `"id:status"` per row, ordered by id.
+    fn statuses(path: &std::path::Path) -> Vec<String> {
+        job_rows(path)
+            .into_iter()
+            .map(|r| format!("{}:{}", r.0, r.3))
+            .collect()
+    }
+
+    /// Runs `enqueue`, picks the row it created and marks it `failed`, exactly as the queue
+    /// does. One row at a time, so ids are predictable. Never `apply_job_failure`: it drops an
+    /// exhausted deferred `local_delete` instead of failing it.
+    fn fail_one(db: &Db, enqueue: impl FnOnce(&Db)) -> i64 {
+        enqueue(db);
+        let job = db
+            .pick_next_due_job()
+            .unwrap()
+            .expect("the enqueued job is due");
+        db.mark_job_failed(job.id, 3, Some("boom")).unwrap();
+        job.id
+    }
+
+    fn fail_job(db: &Db, job_type: &str, p: &str) -> i64 {
+        fail_one(db, |d| d.enqueue_job(job_type, Some(p), Some(p)).unwrap())
+    }
+
+    fn fresh_db() -> (tempfile::TempDir, PathBuf, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let db = Db::new_at(&path).unwrap();
+        (dir, path, db)
+    }
+
+    /// Three failed uploads of `a` (the real-world shape), unrelated failed `b` and a failed
+    /// download of `a`. Retry must requeue the newest `a` upload, `b` and the download, and
+    /// settle the two older `a` uploads.
+    #[test]
+    fn requeue_failed_jobs_requeues_only_the_newest_of_duplicate_failed_rows() {
+        let (_dir, path, db) = fresh_db();
+        fail_job(&db, "upload", "a");
+        fail_job(&db, "upload", "a");
+        fail_job(&db, "upload", "a");
+        fail_job(&db, "upload", "b");
+        fail_job(&db, "download", "a");
+
+        assert_eq!(db.requeue_failed_jobs().expect("Retry must not error"), 3);
+
+        let rows = job_rows(&path);
+        for older in [&rows[0], &rows[1]] {
+            assert_eq!(older.3, "done");
+            assert_eq!(older.4, super::SUPERSEDED_REASON);
+        }
+        for requeued in [&rows[2], &rows[3], &rows[4]] {
+            assert_eq!(requeued.3, "queued", "row {}", requeued.0);
+            assert_eq!(requeued.4, "", "last_error cleared");
+            assert_eq!(requeued.6, 0, "attempt_count reset");
+        }
+        let c = Connection::open(&path).unwrap();
+        let worst: i64 = c
+            .query_row(
+                "SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) n FROM sync_jobs
+                   WHERE status IN ('queued','retry_wait','running')
+                   GROUP BY job_type, target_path)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(worst, 1, "at most one active row per key");
+    }
+
+    /// A duplicate pair on one key must not block rows on other keys or of other types.
+    #[test]
+    fn requeue_failed_jobs_duplicates_do_not_block_unrelated_rows() {
+        let (_dir, path, db) = fresh_db();
+        fail_job(&db, "local_delete", "c");
+        fail_job(&db, "local_delete", "c");
+        fail_job(&db, "upload", "b");
+        fail_job(&db, "download", "d");
+        fail_job(&db, "upload", "c");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 4);
+        assert_eq!(
+            statuses(&path),
+            ["1:done", "2:queued", "3:queued", "4:queued", "5:queued"]
+        );
+    }
+
+    /// A failed row whose key already has an active twin is settled, the twin is untouched,
+    /// and nothing counts as requeued.
+    #[test]
+    fn requeue_failed_jobs_settles_a_failed_row_shadowed_by_an_active_twin() {
+        let (_dir, path, db) = fresh_db();
+        fail_job(&db, "upload", "a");
+        db.enqueue_job("upload", Some("a"), Some("a")).unwrap();
+        let before = job_rows(&path);
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        let after = job_rows(&path);
+        assert_eq!(after[0].3, "done");
+        assert_eq!(after[0].4, super::SUPERSEDED_REASON);
+        assert_eq!(after[1], before[1], "the active twin is untouched");
+    }
+
+    /// NULL targets are never "the same key": two failed hydrates and an active one are all
+    /// requeued / left alone, none settled.
+    #[test]
+    fn requeue_failed_jobs_never_settles_rows_with_null_targets() {
+        let (_dir, path, db) = fresh_db();
+        fail_one(&db, |d| {
+            d.enqueue_job("hydrate_cloudsc", Some("x"), None).unwrap()
+        });
+        fail_one(&db, |d| {
+            d.enqueue_job("hydrate_cloudsc", Some("y"), None).unwrap()
+        });
+        db.enqueue_job("hydrate_cloudsc", Some("z"), None).unwrap();
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 2);
+        assert_eq!(statuses(&path), ["1:queued", "2:queued", "3:queued"]);
+        assert!(
+            job_rows(&path).iter().all(|r| r.4.is_empty()),
+            "no row carries the superseded reason"
+        );
+    }
+
+    /// The newer failed row survives, but the verification flag lives on the older one: it
+    /// must be carried over, or the requeued delete runs unverified.
+    #[test]
+    fn requeue_failed_jobs_carries_verification_onto_the_requeued_local_delete() {
+        let (_dir, path, db) = fresh_db();
+        fail_one(&db, |d| d.enqueue_verified_local_delete("p").unwrap());
+        fail_job(&db, "local_delete", "p");
+        let before = job_rows(&path);
+        assert_eq!((before[0].5, before[1].5), (1, 0), "fixture");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+
+        let rows = job_rows(&path);
+        assert_eq!(rows[0].3, "done");
+        assert_eq!((rows[1].3.as_str(), rows[1].5), ("queued", 1));
+    }
+
+    /// Same, when the newer row is an active twin and nothing is requeued.
+    #[test]
+    fn requeue_failed_jobs_carries_verification_onto_an_active_local_delete_twin() {
+        let (_dir, path, db) = fresh_db();
+        fail_one(&db, |d| d.enqueue_verified_local_delete("p").unwrap());
+        db.enqueue_job("local_delete", Some("p"), Some("p"))
+            .unwrap();
+        assert_eq!(job_rows(&path)[1].5, 0, "fixture: the twin is unverified");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        let rows = job_rows(&path);
+        assert_eq!(rows[0].3, "done");
+        assert_eq!((rows[1].3.as_str(), rows[1].5), ("queued", 1));
+    }
+
+    /// Verification is only carried over when a failed sibling had it: plain stays plain.
+    #[test]
+    fn requeue_failed_jobs_does_not_invent_verification() {
+        let (_dir, path, db) = fresh_db();
+        fail_job(&db, "local_delete", "p");
+        fail_job(&db, "local_delete", "p");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+        let rows = job_rows(&path);
+        assert_eq!((rows[1].3.as_str(), rows[1].5), ("queued", 0));
+    }
+
+    /// The requeued `delete` keeps the newest captured `rev`, not an older one.
+    #[test]
+    fn requeue_failed_jobs_keeps_the_newest_delete_rev() {
+        let (_dir, path, db) = fresh_db();
+        fail_one(&db, |d| d.enqueue_delete_job("p", Some("rev1")).unwrap());
+        fail_one(&db, |d| d.enqueue_delete_job("p", Some("rev2")).unwrap());
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+
+        let rows = job_rows(&path);
+        assert_eq!(rows[0].3, "done");
+        assert_eq!((rows[1].3.as_str(), rows[1].7.as_str()), ("queued", "rev2"));
+    }
+
+    /// The debt row is the older one and the newest row owes nothing: the debt moves to the
+    /// requeued winner, and is no longer owed by the settled row.
+    #[test]
+    fn requeue_failed_jobs_moves_an_upload_debt_onto_the_requeued_winner() {
+        let (_dir, path, db) = fresh_db();
+        let debt_id = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("new.txt", "old.txt", Some("r1"))
+                .unwrap();
+        });
+        let winner = fail_job(&db, "upload", "new.txt");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+
+        let rows = job_rows(&path);
+        assert_eq!(
+            (rows[0].3.as_str(), rows[0].4.as_str()),
+            ("done", super::SUPERSEDED_REASON)
+        );
+        assert_eq!(rows[1].3, "queued");
+        assert_eq!(
+            db.peek_deferred_source_delete(winner).unwrap(),
+            Some(("old.txt".to_string(), Some("r1".to_string())))
+        );
+        assert_eq!(db.peek_deferred_source_delete(debt_id).unwrap(), None);
+    }
+
+    /// A refused move's upload failed, the user then edited the destination (a plain upload
+    /// with no debt is queued). Retry must not lose the debt: the twin inherits it.
+    #[test]
+    fn requeue_failed_jobs_moves_an_upload_debt_onto_an_active_twin() {
+        let (_dir, path, db) = fresh_db();
+        let debt_id = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "a", Some("r1")).unwrap();
+        });
+        db.enqueue_job("upload", Some("x"), Some("x")).unwrap();
+        let twin = job_rows(&path)[1].0;
+        assert_eq!(
+            db.peek_deferred_source_delete(twin).unwrap(),
+            None,
+            "fixture"
+        );
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        assert_eq!(job_rows(&path)[0].3, "done");
+        assert_eq!(
+            db.peek_deferred_source_delete(twin).unwrap(),
+            Some(("a".to_string(), Some("r1".to_string())))
+        );
+        assert_eq!(db.peek_deferred_source_delete(debt_id).unwrap(), None);
+    }
+
+    /// The winner already owes a DIFFERENT deletion: nothing is carried, and the settled row
+    /// keeps its own debt, which `unsettled_source_deletion` still reports.
+    #[test]
+    fn requeue_failed_jobs_keeps_a_different_upload_debt_on_the_settled_row() {
+        let (_dir, path, db) = fresh_db();
+        let old = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "a", Some("r1")).unwrap();
+        });
+        let winner = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "b", Some("r2")).unwrap();
+        });
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+
+        let rows = job_rows(&path);
+        assert_eq!((rows[0].3.as_str(), rows[1].3.as_str()), ("done", "queued"));
+        assert_eq!(
+            db.peek_deferred_source_delete(winner).unwrap(),
+            Some(("b".to_string(), Some("r2".to_string())))
+        );
+        assert_eq!(
+            db.peek_deferred_source_delete(old).unwrap(),
+            Some(("a".to_string(), Some("r1".to_string())))
+        );
+        assert_eq!(
+            db.unsettled_source_deletion().unwrap(),
+            None,
+            "no remote row yet"
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at, dropbox_id)
+                 VALUES('a', 'h', 'r1', 0, 'x', 'id:A')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.unsettled_source_deletion().unwrap(),
+            Some(("a".to_string(), "x".to_string()))
+        );
+    }
+
+    /// A `running` twin may already have read its debt as none, so nothing is carried onto
+    /// it; the settled row keeps the debt and `unsettled_source_deletion` reports it.
+    #[test]
+    fn requeue_failed_jobs_carries_no_upload_debt_onto_a_running_twin() {
+        let (_dir, path, db) = fresh_db();
+        let debt_id = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "a", Some("r1")).unwrap();
+        });
+        db.enqueue_job("upload", Some("x"), Some("x")).unwrap();
+        let twin = db.pick_next_due_job().unwrap().expect("twin is due").id;
+        assert_eq!(job_rows(&path)[1].3, "running", "fixture");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        assert_eq!(job_rows(&path)[0].3, "done");
+        assert_eq!(db.peek_deferred_source_delete(twin).unwrap(), None);
+        assert_eq!(
+            db.peek_deferred_source_delete(debt_id).unwrap(),
+            Some(("a".to_string(), Some("r1".to_string())))
+        );
+    }
+
+    /// Two failed debts and a plain newest row: the winner inherits the NEWER debt, and the
+    /// older row keeps its own (a different deletion).
+    #[test]
+    fn requeue_failed_jobs_carries_the_newest_upload_debt() {
+        let (_dir, _path, db) = fresh_db();
+        let a = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "a", Some("ra")).unwrap();
+        });
+        let b = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "b", Some("rb")).unwrap();
+        });
+        let winner = fail_job(&db, "upload", "x");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 1);
+
+        assert_eq!(
+            db.peek_deferred_source_delete(winner).unwrap(),
+            Some(("b".to_string(), Some("rb".to_string())))
+        );
+        assert_eq!(db.peek_deferred_source_delete(b).unwrap(), None);
+        assert_eq!(
+            db.peek_deferred_source_delete(a).unwrap(),
+            Some(("a".to_string(), Some("ra".to_string())))
+        );
+    }
+
+    /// The debt also reaches a twin waiting in `retry_wait`.
+    #[test]
+    fn requeue_failed_jobs_carries_an_upload_debt_onto_a_retry_wait_twin() {
+        let (_dir, path, db) = fresh_db();
+        fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "a", Some("r1")).unwrap();
+        });
+        db.enqueue_job("upload", Some("x"), Some("x")).unwrap();
+        let twin = job_rows(&path)[1].0;
+        db.mark_job_retry_wait(twin, 1, "2999-01-01T00:00:00+00:00", Some("later"))
+            .unwrap();
+        assert_eq!(job_rows(&path)[1].3, "retry_wait", "fixture");
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        assert_eq!(
+            db.peek_deferred_source_delete(twin).unwrap(),
+            Some(("a".to_string(), Some("r1".to_string())))
+        );
+    }
+
+    /// Same deleted path, different revs: the active twin's own debt stands and the older
+    /// row's copy is cleared whatever its rev.
+    #[test]
+    fn requeue_failed_jobs_clears_a_same_path_debt_with_a_different_rev() {
+        let (_dir, _path, db) = fresh_db();
+        let old = fail_one(&db, |d| {
+            d.enqueue_upload_then_delete("x", "s", Some("old")).unwrap();
+        });
+        db.enqueue_upload_then_delete("x", "s", Some("new"))
+            .unwrap();
+        let twin = db.pick_next_due_job().unwrap().expect("twin is due").id;
+        // Only `queued`/`retry_wait` twins take part, so park it in `retry_wait`.
+        db.mark_job_retry_wait(twin, 1, "2999-01-01T00:00:00+00:00", None)
+            .unwrap();
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        assert_eq!(db.peek_deferred_source_delete(old).unwrap(), None);
+        assert_eq!(
+            db.peek_deferred_source_delete(twin).unwrap(),
+            Some(("s".to_string(), Some("new".to_string())))
+        );
+    }
+
+    /// The verification flag also reaches a twin waiting in `retry_wait`, the realistic state.
+    #[test]
+    fn requeue_failed_jobs_carries_verification_onto_a_retry_wait_twin() {
+        let (_dir, path, db) = fresh_db();
+        fail_one(&db, |d| d.enqueue_verified_local_delete("p").unwrap());
+        db.enqueue_job("local_delete", Some("p"), Some("p"))
+            .unwrap();
+        let twin = job_rows(&path)[1].0;
+        db.mark_job_retry_wait(twin, 1, "2999-01-01T00:00:00+00:00", Some("later"))
+            .unwrap();
+        let before = job_rows(&path);
+        assert_eq!(
+            (before[1].3.as_str(), before[1].5),
+            ("retry_wait", 0),
+            "fixture"
+        );
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+
+        let rows = job_rows(&path);
+        assert_eq!(rows[0].3, "done");
+        assert_eq!((rows[1].3.as_str(), rows[1].5), ("retry_wait", 1));
+    }
+
+    /// A second Retry straight after the first returns 0 and changes no row.
+    #[test]
+    fn requeue_failed_jobs_is_idempotent() {
+        let (_dir, path, db) = fresh_db();
+        fail_job(&db, "upload", "a");
+        fail_job(&db, "upload", "a");
+        fail_job(&db, "upload", "b");
+        db.enqueue_job("download", Some("c"), Some("c")).unwrap();
+        fail_job(&db, "download", "c");
+        db.enqueue_job("download", Some("c"), Some("c")).unwrap();
+
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 2);
+        let first = job_rows(&path);
+        assert_eq!(db.requeue_failed_jobs().unwrap(), 0);
+        assert_eq!(job_rows(&path), first);
     }
 
     /// A NULL target (`hydrate_cloudsc`) must not count as "the same target": one active

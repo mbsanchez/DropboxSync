@@ -28,6 +28,24 @@ function isPendingJobStatus(status: string): boolean {
   return status === "queued" || status === "retry_wait" || status === "running";
 }
 
+/** DBSYNC-113: a job the backend settled as `done` WITH a reason (`lastError`) never
+ * completed its action: Retry superseded it by another job for the same path (or the
+ * DBSYNC-103 re-key kept it only for its debt), so it must not read as a completed
+ * action. The rule is one-way: a reason means "not performed", but
+ * `done` without a reason does NOT prove the job ran (the startup cleanup also
+ * resolves vanished-source uploads as plain `done`). `!!` because Rust serialises
+ * `lastError` as `null` for every status. Every label, icon and counter uses this
+ * one predicate. */
+function isSettledNotPerformed(job: SyncJob): boolean {
+  return job.status === "done" && !!job.lastError;
+}
+
+/** `row-sub` text for a settled row. The raw `lastError` is an English internal
+ * string carrying a ticket key, so the UI shows this fixed French text instead.
+ * Deliberately general: settled rows come from more than one writer (DBSYNC-113
+ * superseded, DBSYNC-103 kept-for-debt uploads), so it must not name a cause. */
+const SETTLED_NOT_PERFORMED_DETAIL = "Non effectuée";
+
 function queueActionLabel(job: SyncJob): string {
   switch (job.jobType) {
     case "upload":
@@ -35,6 +53,9 @@ function queueActionLabel(job: SyncJob): string {
     case "download":
       return "Download (Dropbox -> local)";
     case "delete":
+      if (isSettledNotPerformed(job)) {
+        return "Suppression sur Dropbox non effectuée";
+      }
       return "Supprimé sur Dropbox";
     case "local_delete":
       // (review P6): only a job that actually finished (`status === "done"`) may
@@ -48,6 +69,9 @@ function queueActionLabel(job: SyncJob): string {
       if (job.status === "failed") {
         return "Suppression échouée (retiré du remote)";
       }
+      if (isSettledNotPerformed(job)) {
+        return "Suppression non effectuée (retiré du remote)";
+      }
       return "Supprimé (retiré du remote)";
     case "hydrate_cloudsc":
       return "Hydrate (.cloudsc)";
@@ -59,6 +83,7 @@ function queueActionLabel(job: SyncJob): string {
 /** Maps a `SyncJob.jobType` to a badge kind for the recent-transfers icon. */
 function jobEventKind(job: SyncJob): EventKind {
   if (job.status === "failed") return "error";
+  if (isSettledNotPerformed(job)) return "sync";
   switch (job.jobType) {
     case "upload":
       return "upload";
@@ -222,7 +247,11 @@ function RecentTransferRow({ job }: RecentRowProps) {
       <div className="recent-row-body">
         <div className="row-main">{name}</div>
         <div className={`row-sub ${job.status === "failed" ? "error" : ""}`}>
-          {job.status === "failed" ? job.lastError ?? "Échec" : formatRelativeTime(job.updatedAt)}
+          {job.status === "failed"
+            ? job.lastError ?? "Échec"
+            : isSettledNotPerformed(job)
+              ? SETTLED_NOT_PERFORMED_DETAIL
+              : formatRelativeTime(job.updatedAt)}
         </div>
       </div>
     </li>
@@ -261,7 +290,11 @@ function JobActivityRow({ job }: JobActivityRowProps) {
       <div className="activity-row-body">
         <div className="row-main">{main}</div>
         <div className={`row-sub ${job.status === "failed" ? "error" : ""}`}>
-          {job.status === "failed" ? job.lastError ?? "Échec" : `${job.status} · ${formatRelativeTime(job.updatedAt)}`}
+          {job.status === "failed"
+            ? job.lastError ?? "Échec"
+            : isSettledNotPerformed(job)
+              ? SETTLED_NOT_PERFORMED_DETAIL
+              : `${job.status} · ${formatRelativeTime(job.updatedAt)}`}
         </div>
       </div>
     </li>
@@ -473,7 +506,7 @@ function FlyoutApp() {
   const pendingJobCount = jobs.filter(
     (job) => job.status === "queued" || job.status === "running" || job.status === "retry_wait",
   ).length;
-  const doneJobCount = jobs.filter((job) => job.status === "done").length;
+  const doneJobCount = jobs.filter((job) => job.status === "done" && !isSettledNotPerformed(job)).length;
   const runTotal = pendingJobCount + doneJobCount;
   // Note (DBSYNC-102 review, not fixed): a delta-deferred `local_delete` counts
   // toward `pendingJobCount`/`runTotal` for its whole 60s grace window
