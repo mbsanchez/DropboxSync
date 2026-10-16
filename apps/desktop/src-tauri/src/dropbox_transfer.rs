@@ -1741,6 +1741,22 @@ pub(crate) fn upload_would_clobber_unknown_content(
 ///   correlators guard on `get_remote_file(destination).is_some()`.
 /// - `RevConflict` (`path_write/conflict`) — the `parent_rev` precondition failed because the
 ///   file was restored or changed on the server. Dropbox **does** have it, so the row stays.
+/// - `AlreadyGone` (`path_lookup/malformed_path`) — Dropbox rejects the name itself (a `\` on
+///   macOS, the observed cause), so it can never have been stored there and cannot exist.
+///   Without this arm the delete burned its attempt budget, ended `failed`, and every
+///   "Retry failed jobs" revived it.
+///   Captured 2026-10-15 (jobs 90, 91, 445), HTTP 409:
+///   `{"error":{".tag":"path_lookup","path_lookup":{".tag":"malformed_path","malformed_path":null}},"error_summary":"path_lookup/malformed_path/"}`.
+///   Anchored on the `error_summary` key, so the text inside another field never matches.
+///   Unlike `AppError::is_unrepresentable_path`, which anchors the upload shape
+///   (`path/malformed_path`), this is the lookup shape; the upload shape was never observed
+///   from `delete_v2` and is deliberately not matched. Accepted risks; neither loses data, because
+///   the failure mode is a file kept, never a file removed:
+///   - a name Dropbox once listed but now rejects has its remote row cleared and may be
+///     downloaded again;
+///   - the arm matches every `malformed_path` lookup, not only the observed `\` cause, so a
+///     path this client ever built wrongly for a file Dropbox does have would settle without
+///     deleting it, and the file would stay on Dropbox.
 ///
 /// Anything else on a failure status is a real `Error`.
 pub(crate) fn classify_delete_response(status_success: bool, body: &str) -> DeleteOutcome {
@@ -1748,6 +1764,11 @@ pub(crate) fn classify_delete_response(status_success: bool, body: &str) -> Dele
         return DeleteOutcome::Deleted;
     }
     if body.contains("path_lookup/not_found") || body.contains("path/not_found") {
+        return DeleteOutcome::AlreadyGone;
+    }
+    if body.contains(r#""error_summary":"path_lookup/malformed_path"#) {
+        // Logged here because `apply_delete_outcome` cannot tell this cause from `not_found`.
+        tracing::info!("remote delete: Dropbox rejects the name (path_lookup/malformed_path), so it cannot exist there");
         return DeleteOutcome::AlreadyGone;
     }
     // parent_rev mismatch: Dropbox has no dedicated DeleteError tag for it
@@ -2853,8 +2874,100 @@ mod tests {
     }
 
     #[test]
-    fn classify_delete_response_malformed_or_empty_body_is_error() {
+    fn classify_delete_response_empty_body_is_error() {
         assert_eq!(classify_delete_response(false, ""), DeleteOutcome::Error);
+    }
+
+    /// Verbatim from the live `files/delete_v2` calls of 2026-10-15 (jobs 90, 91, 445).
+    const MALFORMED_PATH_DELETE_BODY: &str = r#"{"error":{".tag":"path_lookup","path_lookup":{".tag":"malformed_path","malformed_path":null}},"error_summary":"path_lookup/malformed_path/"}"#;
+
+    #[test]
+    fn classify_delete_response_malformed_path_is_already_gone() {
+        assert_eq!(
+            classify_delete_response(false, MALFORMED_PATH_DELETE_BODY),
+            DeleteOutcome::AlreadyGone,
+            "a name Dropbox rejects cannot exist there, so the delete is a no-op"
+        );
+    }
+
+    #[test]
+    fn classify_delete_response_malformed_path_match_is_anchored() {
+        let transient = r#"{"error_summary":"too_many_write_operations/..","error":{".tag":"too_many_write_operations"}}"#;
+        let write_denied_mentioning_it = r#"{"error_summary":"path_write/no_write_permission/..","user_message":"path_lookup/malformed_path"}"#;
+        // The upload shape: a different error, not this endpoint's lookup failure.
+        let upload_shape = r#"{"error":{".tag":"path","reason":{".tag":"malformed_path","malformed_path":null}},"error_summary":"path/malformed_path/"}"#;
+        for body in [
+            transient,
+            "Internal Server Error",
+            write_denied_mentioning_it,
+            upload_shape,
+        ] {
+            assert_eq!(
+                classify_delete_response(false, body),
+                DeleteOutcome::Error,
+                "must stay a real error: {body}"
+            );
+        }
+    }
+
+    /// The captured body, through the classifier and into the index: the remote row and its
+    /// subtree go, and the job settles. A path with no row settles too, with no error.
+    #[test]
+    fn a_malformed_path_delete_settles_and_clears_the_remote_rows() {
+        use super::apply_delete_outcome;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state
+            .db
+            .upsert_remote_file("qa116_y.txt", "H", "rev", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("qa116_y.txt/child.txt", "H", "rev", 0, None)
+            .unwrap();
+
+        let outcome = classify_delete_response(false, MALFORMED_PATH_DELETE_BODY);
+        assert!(apply_delete_outcome(&state, "qa116_y.txt", outcome).unwrap());
+        assert!(state.db.get_remote_file("qa116_y.txt").unwrap().is_none());
+        assert!(state
+            .db
+            .get_remote_file("qa116_y.txt/child.txt")
+            .unwrap()
+            .is_none());
+
+        // No remote row at all: still settled, nothing to clear. A plain key, because a `\`
+        // key trips `debug_assert_canonical_key` on Windows, where CI runs these tests.
+        let outcome = classify_delete_response(false, MALFORMED_PATH_DELETE_BODY);
+        assert!(apply_delete_outcome(&state, "qa116_none.txt", outcome).unwrap());
+    }
+
+    /// The real key shape on macOS, where `\` is an ordinary name character: the subtree clear
+    /// compares with `=` and `substr`, so the `\` matches only itself. Not built on Windows,
+    /// where a `\` key trips `debug_assert_canonical_key`.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_malformed_path_delete_clears_only_its_own_backslash_key() {
+        use super::apply_delete_outcome;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = build_state(tmp.path());
+        state
+            .db
+            .upsert_remote_file(r"qa116\y.txt", "H", "rev", 0, None)
+            .unwrap();
+        state
+            .db
+            .upsert_remote_file("qa116_y.txt", "H", "rev", 0, None)
+            .unwrap();
+
+        let outcome = classify_delete_response(false, MALFORMED_PATH_DELETE_BODY);
+        assert!(apply_delete_outcome(&state, r"qa116\y.txt", outcome).unwrap());
+        assert!(state.db.get_remote_file(r"qa116\y.txt").unwrap().is_none());
+        assert!(
+            state.db.get_remote_file("qa116_y.txt").unwrap().is_some(),
+            "a neighbouring key must survive"
+        );
     }
 
     /// DBSYNC-99. The two failure bodies are verbatim from a live `files/move_v2` probe on
