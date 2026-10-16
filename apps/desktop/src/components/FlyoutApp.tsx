@@ -53,6 +53,13 @@ function queueActionLabel(job: SyncJob): string {
     case "download":
       return "Download (Dropbox -> local)";
     case "delete":
+      // (DBSYNC-116): a pending or failed delete must not read as done.
+      if (isPendingJobStatus(job.status)) {
+        return "Suppression sur Dropbox en attente";
+      }
+      if (job.status === "failed") {
+        return "Suppression sur Dropbox échouée";
+      }
       if (isSettledNotPerformed(job)) {
         return "Suppression sur Dropbox non effectuée";
       }

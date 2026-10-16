@@ -1690,8 +1690,12 @@ fn process_sync_queue_core(
                     return Ok(());
                 }
                 delete_remote_file_internal(state, rel, job.delete_parent_rev.as_deref())?;
-                // DBSYNC-66 folder-delete completeness: the delete genuinely
-                // succeeded — walk up rel's ancestor chain pruning any empty
+                // DBSYNC-66 folder-delete completeness: the delete settled
+                // (Dropbox deleted the path; does not have it: `not_found` or,
+                // since DBSYNC-116, a name it rejects as `malformed_path`; or kept
+                // it on a rev-conflict, where the probe sees content and stops) —
+                // so an emptied ancestor Dropbox never had is pruned locally too.
+                // Walk up rel's ancestor chain pruning any empty
                 // ancestor folder it just emptied out (locally + Dropbox +
                 // known_folders). Best-effort: a prune failure must never fail
                 // the delete job that already succeeded.
