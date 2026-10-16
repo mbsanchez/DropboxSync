@@ -2943,8 +2943,9 @@ mod tests {
     }
 
     /// The real key shape on macOS, where `\` is an ordinary name character: the subtree clear
-    /// compares with `=` and `substr`, so the `\` matches only itself. Not built on Windows,
-    /// where a `\` key trips `debug_assert_canonical_key`.
+    /// compares with `=` and `substr`, which are binary. The neighbour differs only in case, so
+    /// a `LIKE`-based clear (case-insensitive in SQLite) would take it too. Not built on
+    /// Windows, where a `\` key trips `debug_assert_canonical_key`.
     #[cfg(not(windows))]
     #[test]
     fn a_malformed_path_delete_clears_only_its_own_backslash_key() {
@@ -2958,15 +2959,15 @@ mod tests {
             .unwrap();
         state
             .db
-            .upsert_remote_file("qa116_y.txt", "H", "rev", 0, None)
+            .upsert_remote_file(r"QA116\Y.TXT", "H", "rev", 0, None)
             .unwrap();
 
         let outcome = classify_delete_response(false, MALFORMED_PATH_DELETE_BODY);
         assert!(apply_delete_outcome(&state, r"qa116\y.txt", outcome).unwrap());
         assert!(state.db.get_remote_file(r"qa116\y.txt").unwrap().is_none());
         assert!(
-            state.db.get_remote_file("qa116_y.txt").unwrap().is_some(),
-            "a neighbouring key must survive"
+            state.db.get_remote_file(r"QA116\Y.TXT").unwrap().is_some(),
+            "a key differing only in case must survive"
         );
     }
 
