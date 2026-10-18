@@ -439,6 +439,8 @@ pub fn run() {
                 }
 
                 if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
+                    // Main thread, but safe: Tauri builds every config window before this
+                    // setup hook runs, so `setup` exists here and the helper never builds.
                     let _ = crate::commands::show_or_create_setup_window(app.handle());
                 }
             }
@@ -534,7 +536,9 @@ mod setup_window_tests {
         let ctx = app_context();
         let windows = &ctx.config().app.windows;
         let first = windows.first().expect("at least one window");
-        assert_ne!(first.label, "setup");
+        let cfg = setup_window_config(windows).expect("setup window configured");
+        // Identity, not label: the selector must not hand back `windows[0]` (`main`).
+        assert!(!std::ptr::eq(cfg, first));
     }
 
     #[test]
