@@ -167,6 +167,12 @@ fn position_flyout(
     let _ = window.show();
 }
 
+/// The build-time Tauri context (`tauri.conf.json`). One function so `run()` and the
+/// tests read the same real config.
+fn app_context() -> tauri::Context {
+    tauri::generate_context!()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     logging::init_tracing();
@@ -233,11 +239,11 @@ pub fn run() {
             // the `setup` window instead.
             if let Some(state) = app.try_state::<AppState>() {
                 if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
-                    if let Some(window) = app.get_webview_window("setup") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                    }
+                    // Off the callback thread: building a window can deadlock on Windows.
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        let _ = crate::commands::show_or_create_setup_window(&app);
+                    });
                 }
             }
         }));
@@ -357,11 +363,12 @@ pub fn run() {
                     if event.id.as_ref() == "quit" {
                         app.exit(0);
                     } else if event.id.as_ref() == "settings" {
-                        if let Some(window) = app.get_webview_window("setup") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        // Off the event-handler thread: building a window can deadlock
+                        // on Windows.
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let _ = crate::commands::show_or_create_setup_window(&app);
+                        });
                     }
                 });
 
@@ -432,10 +439,9 @@ pub fn run() {
                 }
 
                 if crate::commands::should_show_main_window_for_onboarding(state.inner()) {
-                    if let Some(setup_window) = app.get_webview_window("setup") {
-                        let _ = setup_window.show();
-                        let _ = setup_window.set_focus();
-                    }
+                    // Main thread, but safe: Tauri builds every config window before this
+                    // setup hook runs, so `setup` exists here and the helper never builds.
+                    let _ = crate::commands::show_or_create_setup_window(app.handle());
                 }
             }
 
@@ -497,10 +503,56 @@ pub fn run() {
             commands::get_startup_at_login,
             commands::set_startup_at_login
         ])
-        .build(tauri::generate_context!())
+        .build(app_context())
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
         run_events::handle_run_event(app_handle, event);
     });
+}
+
+#[cfg(test)]
+mod setup_window_tests {
+    use super::app_context;
+    use crate::commands::{setup_window_config, SETUP_WINDOW_LABEL};
+
+    #[test]
+    fn selector_returns_the_setup_entry_by_label() {
+        let ctx = app_context();
+        let cfg = setup_window_config(&ctx.config().app.windows).expect("setup window configured");
+        assert_eq!(cfg.label, "setup");
+        assert_eq!(SETUP_WINDOW_LABEL, "setup");
+    }
+
+    #[test]
+    fn setup_entry_is_hidden_so_a_fresh_window_needs_show() {
+        let ctx = app_context();
+        let cfg = setup_window_config(&ctx.config().app.windows).expect("setup window configured");
+        assert!(!cfg.visible);
+    }
+
+    #[test]
+    fn setup_entry_is_not_the_first_window() {
+        let ctx = app_context();
+        let windows = &ctx.config().app.windows;
+        let first = windows.first().expect("at least one window");
+        let cfg = setup_window_config(windows).expect("setup window configured");
+        // Identity, not label: the selector must not hand back `windows[0]` (`main`).
+        assert!(!std::ptr::eq(cfg, first));
+    }
+
+    #[test]
+    fn list_without_setup_yields_none() {
+        let ctx = app_context();
+        let without: Vec<_> = ctx
+            .config()
+            .app
+            .windows
+            .iter()
+            .filter(|w| w.label != "setup")
+            .cloned()
+            .collect();
+        assert!(!without.is_empty());
+        assert!(setup_window_config(&without).is_none());
+    }
 }

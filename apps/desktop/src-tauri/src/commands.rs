@@ -297,17 +297,63 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Shows the `setup` window (re-auth, folder/filter settings). Unlike `main` — a
-/// tray-click-only flyout toggled from `lib.rs` — `setup` is a normal window the
-/// frontend can request explicitly, e.g. from the flyout's "Settings" action.
-#[tauri::command]
-pub fn show_setup_window(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("setup") {
-        window.show().map_err(|e| e.to_string())?;
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+/// Label of the `setup` window in `tauri.conf.json`. The one place the label is spelled.
+pub const SETUP_WINDOW_LABEL: &str = "setup";
+
+/// Picks the `setup` entry out of the configured windows, by label (never by position:
+/// `main` is `windows[0]`).
+pub fn setup_window_config(
+    windows: &[tauri::utils::config::WindowConfig],
+) -> Option<&tauri::utils::config::WindowConfig> {
+    windows.iter().find(|w| w.label == SETUP_WINDOW_LABEL)
+}
+
+/// Returns the `setup` window, building it from its `tauri.conf.json` entry when it was
+/// closed (close destroys the window on purpose, see `run_events.rs`), then shows,
+/// unminimizes and focuses it. A freshly built window is hidden (`visible: false`), so
+/// `show()` is what makes it appear.
+///
+/// On Windows, building a window deadlocks inside synchronous commands and event
+/// handlers (WebView2); call this from an `async` command or a separate thread.
+pub fn show_or_create_setup_window(app: &AppHandle) -> tauri::Result<()> {
+    // Tauri checks the label and registers the new window in separate steps, so two
+    // triggers at once (tray + flyout gear) could both build one. Serialise them.
+    static SETUP_WINDOW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SETUP_WINDOW_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let window = match app.get_webview_window(SETUP_WINDOW_LABEL) {
+        Some(window) => window,
+        None => {
+            let Some(cfg) = setup_window_config(&app.config().app.windows) else {
+                tracing::error!(
+                    label = SETUP_WINDOW_LABEL,
+                    "no window config with this label; cannot recreate the Settings window"
+                );
+                return Err(tauri::Error::WindowNotFound);
+            };
+            tauri::WebviewWindowBuilder::from_config(app, cfg)
+                .and_then(tauri::WebviewWindowBuilder::build)
+                .inspect_err(
+                    |e| tracing::error!(error = %e, "failed to recreate the Settings window"),
+                )?
+        }
+    };
+    window
+        .show()
+        .inspect_err(|e| tracing::error!(error = %e, "failed to show the Settings window"))?;
+    let _ = window.unminimize();
+    let _ = window.set_focus();
     Ok(())
+}
+
+/// Shows the `setup` window (re-auth, folder/filter settings), recreating it if it was
+/// closed. Unlike `main` — a tray-click-only flyout toggled from `lib.rs` — `setup` is a
+/// normal window the frontend can request explicitly, e.g. from the flyout's "Settings"
+/// action. `async` so window creation runs off the main thread (see above).
+#[tauri::command]
+pub async fn show_setup_window(app: AppHandle) -> Result<(), String> {
+    show_or_create_setup_window(&app).map_err(|e| e.to_string())
 }
 
 /// Opens the most recent tracing log file (`dropbox-sync.<date>.log`, from
