@@ -40,7 +40,11 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3"
-# DBSYNC-114: mock IPC (`tauri::test`) for the command-argument tests. Dev only.
+
+# DBSYNC-114: mock IPC (`tauri::test`) for the command-argument tests. Dev only, and not on
+# Windows: tauri-build embeds the Common Controls v6 manifest in the app binaries only, so a
+# lib test binary linking this feature fails to start there (STATUS_ENTRYPOINT_NOT_FOUND).
+[target.'cfg(not(windows))'.dev-dependencies]
 tauri = { version = "2", features = ["test"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

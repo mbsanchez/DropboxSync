@@ -732,7 +732,8 @@ pub fn set_startup_at_login(_enabled: bool) -> Result<bool, String> {
     Err("startup-at-login is only supported on Windows".into())
 }
 
-#[cfg(test)]
+// Not on Windows: the `tauri` `test` feature is a non-Windows dev-dependency (see Cargo.toml).
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
