@@ -13,9 +13,9 @@ use crate::error::{AppError, AppResult};
 use crate::models::SyncTickResult;
 use crate::overlay_state;
 use crate::path_util::{
-    backoff_seconds, create_conflicted_copy, hash_file, is_builtin_ignored_local_path,
+    backoff_seconds, create_conflicted_copy, fold, hash_file, is_builtin_ignored_local_path,
     is_editor_temp_path, is_ignored_local_path, key_from_disk, normalize_dropbox_path, safe_join,
-    to_canonical_form,
+    to_canonical_form, PathScope, PrefixFilter,
 };
 use crate::remote_index::refresh_remote_index_and_enqueue_downloads_internal;
 use crate::state::AppState;
@@ -319,6 +319,13 @@ fn process_local_file_change(
             state
                 .db
                 .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
+            // DBSYNC-114: the row just written would make the drain believe this path is
+            // known to us. It is not: Dropbox may hold a version this client has never seen
+            // (a file kept on disk through an exclusion, or created inside the excluded zone).
+            // Keep the upload's clobber guard armed until the upload lands (the drain resolves
+            // a collision into a conflicted copy; see `upload_local_file_with`). The marker is
+            // short-lived: it is the "upload not landed yet" fact and nothing more.
+            state.db.mark_upload_unconfirmed(relative)?;
             pending_targets.insert(relative.to_string());
             Ok(1)
         }
@@ -377,14 +384,101 @@ fn process_local_file_change(
     }
 }
 
+#[derive(Clone, Copy)]
+enum DeletionKind {
+    File,
+    Folder,
+}
+
+/// Last line of defence for DBSYNC-114 H2, at the only two functions that turn a deletion
+/// candidate into a remote `delete` job: a path outside the synced zone (Excluded, or an
+/// Ancestor of an include) is never deleted on Dropbox, whoever asks.
+///
+/// Every caller filters its own candidate set first (that is where the breaker counts and
+/// the per-set tests live), so reaching this with an out-of-scope path is a programming
+/// error: it panics in debug builds, which is what makes a missing set-level filter fail its
+/// own test instead of being silently masked here, and refuses with an error log in release.
+fn refuse_out_of_scope_deletion(filter: &PrefixFilter, rel: &str, kind: DeletionKind) -> bool {
+    let out_of_scope = match kind {
+        DeletionKind::File => !filter.file_synced(rel),
+        DeletionKind::Folder => filter.not_deletable(rel),
+    };
+    if out_of_scope {
+        tracing::error!(
+            rel,
+            "refused a remote delete for a path outside the selective-sync scope (a caller \
+             did not filter its deletion candidates)"
+        );
+        debug_assert!(
+            false,
+            "deletion candidate {rel:?} is outside the selective-sync scope; the caller must filter it"
+        );
+    }
+    out_of_scope
+}
+
+/// Untracks a path that vanished from disk WITHOUT sending a remote delete for it, unless its
+/// first upload is still pending, in which case it does nothing and says so (`false`).
+///
+/// "Pending" is `unconfirmed_uploads` marker plus an upload job that is not `done` (queued,
+/// waiting to retry, running, or `failed` awaiting "Retry failed jobs"). Such a path never had
+/// OUR bytes on Dropbox as far as the index knows, and the upload job is the one place that
+/// can find out what is there (`upload_local_file_with`): it either lands (then the next
+/// deletion pass deletes it against our rev, I5) or meets the vanished file and settles the
+/// row itself. Untracking here would clear the marker, and everything that reads the marker
+/// afterwards (a recursive folder delete that follows in the same pass, in either order) would
+/// then be blind to a file that may sit beside someone else's content on Dropbox (I2).
+///
+/// A marker with no unfinished upload job is a stale leftover and is released with the row.
+fn untrack_vanished_without_delete(state: &AppState, rel: &str) -> AppResult<bool> {
+    if state.db.is_upload_unconfirmed(rel)? && state.db.has_unsettled_upload_job(rel)? {
+        tracing::debug!(
+            rel,
+            "vanished path with a pending first upload: left for the upload job to settle"
+        );
+        return Ok(false);
+    }
+    state.db.remove_local_file(rel)?;
+    Ok(true)
+}
+
 /// Propagate a single local FILE deletion to the remote, honoring the DBSYNC-45
 /// dehydration guard (a `<rel>.cloudsc`-backed path was dehydrated, not deleted,
 /// so it is only untracked, never remote-deleted). Returns jobs enqueued (0/1).
 fn process_local_file_deletion(
     state: &AppState,
+    filter: &PrefixFilter,
     tracked_root: &Path,
     prev_rel: &str,
 ) -> AppResult<usize> {
+    if refuse_out_of_scope_deletion(filter, prev_rel, DeletionKind::File) {
+        return Ok(0);
+    }
+    // DBSYNC-114 (CRIT-1): the row is re-read HERE, not trusted from the caller's snapshot. A
+    // path can be visited twice in one pass (a watcher batch lists children before their
+    // parent, a fallback untracks, then the folder walk re-lists the stale `known` snapshot);
+    // a visit after the path was untracked has nothing left to decide, and above all must not
+    // turn a deliberate "untrack without a remote delete" into a delete.
+    if state.db.get_local_file(prev_rel)?.is_none() {
+        return Ok(0);
+    }
+    // DBSYNC-114 (I2, I5): a path whose first upload has not landed never had OUR bytes on
+    // Dropbox as far as the index knows. Whatever Dropbox holds under that name may be someone
+    // else's file, and the remote row (written by a sweep) may carry THEIR rev, so no delete is
+    // built from it here. While the upload is still pending the decision belongs to that upload
+    // (see `untrack_vanished_without_delete`): if it lands, the next pass deletes against our
+    // rev; if the file is gone when it runs, it settles the row.
+    if state.db.is_upload_unconfirmed(prev_rel)? {
+        if !untrack_vanished_without_delete(state, prev_rel)? {
+            return Ok(0);
+        }
+        tracing::warn!(
+            rel = %prev_rel,
+            "a local file whose first upload never reached Dropbox was deleted or renamed: \
+             NOT sending a remote delete (the Dropbox version at this name is not ours)"
+        );
+        return Ok(0);
+    }
     // DBSYNC-62: within the sync-root (re)registration grace window, a locally-vanished
     // tracked file is almost certainly a placeholder the shell EVICTED (Unregister), not
     // a user delete — never propagate it. Keep the index row; the indexer re-materializes
@@ -413,9 +507,51 @@ fn process_local_file_deletion(
 /// honoring the DBSYNC-45 dehydration guard. Returns jobs enqueued (0/1).
 fn process_known_folder_deletion(
     state: &AppState,
+    filter: &PrefixFilter,
     tracked_root: &Path,
     rel: &str,
 ) -> AppResult<usize> {
+    if refuse_out_of_scope_deletion(filter, rel, DeletionKind::Folder) {
+        return Ok(0);
+    }
+    // DBSYNC-114 (I2): a recursive `delete_v2` takes everything Dropbox holds beneath the
+    // folder. A file beneath it whose first upload has not landed may sit next to a Dropbox
+    // version that is not ours (the collision the upload guard resolves at drain time), so
+    // no recursive delete is sent for the folder; its synced files are deleted one by one by
+    // the file-deletion pass, and the folder stays on Dropbox. Two reads, either protects:
+    // the snapshot the pass took BEFORE it released anything (`PrefixFilter::load_for_deletion_pass`), and the
+    // live table. The deletion pass DOES release a stale marker (`untrack_vanished_without_
+    // delete`: a path whose upload job was completed as "source missing" by the startup
+    // cleanup), and a file pass that ran first would otherwise hide that marker from a folder
+    // pass later in the same pass. The snapshot is what makes the order irrelevant; the live
+    // read catches a marker written during the pass.
+    if filter.unconfirmed_beneath(rel) || state.db.has_unconfirmed_upload_under(rel)? {
+        tracing::warn!(
+            rel,
+            "a folder deleted locally has a file beneath it whose first upload has not landed: \
+             not sending a recursive remote delete; its synced files are deleted one by one, \
+             the folder stays on Dropbox"
+        );
+        state.db.remove_known_folder(rel)?;
+        return Ok(0);
+    }
+    // DBSYNC-114 (maintainer decision on #213): a synced folder with an EXCLUDED path beneath
+    // it must not be removed with a recursive `delete_v2`, which would take the excluded
+    // content on Dropbox with it. The synced FILES beneath it are deleted one by one by the
+    // file-deletion sets of the same pass (scan `file_deletions`, watcher descendants), and
+    // the folder and its excluded subtree stay on Dropbox. This is the single sink every
+    // folder-delete source goes through, so no source can forget the rule. Empty synced
+    // subfolders are not removed: a folder delete is always recursive, and `delete_v2` has no
+    // "only if empty" form, so leaving them is the only safe choice.
+    if filter.excluded_beneath(rel) {
+        tracing::warn!(
+            rel,
+            "a folder deleted locally has an excluded path beneath it: not sending a recursive \
+             remote delete; only its synced files are deleted, the folder stays on Dropbox"
+        );
+        state.db.remove_known_folder(rel)?;
+        return Ok(0);
+    }
     // DBSYNC-62: suppress folder deletes during the registration grace window too — a
     // sync-root Unregister can strip a whole placeholder subtree at once.
     #[cfg(windows)]
@@ -488,6 +624,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         tracing::warn!(error = %e, "could not prune stale refused moves");
     }
 
+    // DBSYNC-114: folded once for the whole batch.
+    let filter = PrefixFilter::load_for_deletion_pass(&state.db)?;
+
     let known = state.db.list_local_files()?;
     let known_map: HashMap<String, FileIndexRow> = known
         .iter()
@@ -550,6 +689,14 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             // Symlink or other special file — not something we sync; skip.
             PathKind::Other => continue,
             PathKind::Absent => {
+                // DBSYNC-114 H2: an excluded path is no longer seen, so its absence is not a
+                // deletion, and it is not a rename SOURCE either (correlation sees excluded
+                // destinations, never excluded sources). Dropped before the confirm sleep.
+                // An Ancestor of an include stays: it may be a rename source (see below), and
+                // the deletion pass drops it from the deletion candidates.
+                if filter.scope(&rel) == PathScope::Excluded {
+                    continue;
+                }
                 // Confirm the absence is stable before propagating any remote
                 // delete, so a delete-then-recreate atomic save is treated as a
                 // modification (its recreate event/re-stat wins) rather than a
@@ -571,6 +718,18 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     // children to discover they moved would cost what the re-upload being avoided costs.
     let dir_moves =
         correlate_directory_renames(state, &known, &vanished, &present_dirs, &pending_targets)?;
+    for (old, new) in &dir_moves {
+        if filter.scope(old) == PathScope::Ancestor {
+            // Renaming a folder above an include moves its excluded siblings on Dropbox too.
+            // Allowed (the user did rename it), but never silent.
+            tracing::warn!(
+                from = %old,
+                to = %new,
+                "renamed a folder above a selective-sync include: the remote move also moves \
+                 the excluded siblings inside it"
+            );
+        }
+    }
     let dir_moved_from: Vec<String> = dir_moves.iter().map(|(old, _)| old.clone()).collect();
     let dir_moved_to: Vec<String> = dir_moves.iter().map(|(_, new)| new.clone()).collect();
     // A path is spoken for if it IS a moved directory or sits underneath one.
@@ -623,6 +782,11 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         if under_moved_dir(rel, &dir_moved_to) {
             continue; // it travelled with its directory
         }
+        // DBSYNC-114 E: an excluded destination took part in correlation above, but a new
+        // or changed file outside the synced zone is never uploaded.
+        if !filter.file_synced(rel) {
+            continue;
+        }
         enqueued += process_local_file_change(
             state,
             &tracked_root,
@@ -637,6 +801,13 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     for (rel, absolute) in &present_dirs {
         if under_moved_dir(rel, &dir_moved_to) {
             continue; // the subtree rewrite already put it where it belongs
+        }
+        // DBSYNC-114: an excluded dir is not recorded, not walked, and its stale file row (if
+        // any) is not turned into a delete. An ancestor of an include is walked for the
+        // included files below it, but is not recorded in `known_folders` either.
+        let dir_scope = filter.scope(rel);
+        if dir_scope == PathScope::Excluded {
+            continue;
         }
         // A moved-in / newly-created directory: record it and enqueue any
         // pre-existing children (a bounded walk of just this subtree, not
@@ -662,11 +833,23 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         // enqueued a remote `delete` for every directory in the batch, including ones that had
         // never been tracked files. Caught by `a_refused_folder_move_falls_back_instead_of_
         // looping`, which saw a spurious delete of the rename destination.
-        if state.db.get_local_file(rel)?.is_some() {
-            enqueued += process_local_file_deletion(state, &tracked_root, rel)?;
+        if dir_scope == PathScope::Synced {
+            if state.db.get_local_file(rel)?.is_some() {
+                enqueued += process_local_file_deletion(state, &filter, &tracked_root, rel)?;
+            }
+            state.db.upsert_known_folder(rel)?;
         }
-        state.db.upsert_known_folder(rel)?;
-        for entry in WalkDir::new(absolute).into_iter().flatten() {
+        let mut walker = WalkDir::new(absolute).into_iter();
+        while let Some(entry) = walker.next() {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_dir() {
+                if let Ok(child_dir) = key_from_disk(&tracked_root, entry.path()) {
+                    if filter.scope(&child_dir) == PathScope::Excluded {
+                        walker.skip_current_dir();
+                    }
+                }
+                continue;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -676,6 +859,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
                 Err(_) => continue,
             };
             if child_rel.ends_with(".cloudsc") || is_ignored_local_path(&child_rel) {
+                continue;
+            }
+            if !filter.file_synced(&child_rel) {
                 continue;
             }
             if moved_to.contains(child_rel.as_str()) || under_moved_dir(&child_rel, &dir_moved_to) {
@@ -707,7 +893,76 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             .filter(|row| !under_moved_dir(&row.relative_path, &dir_moved_from))
             .collect()
     };
+    // DBSYNC-114 C2: what is about to become a remote delete may instead have been moved into
+    // the excluded zone by a move the correlator could not pair (queued work, or bytes Dropbox
+    // does not hold). Never a delete then: a move where it pairs exactly, otherwise untracked
+    // and left to come back as a placeholder. Same rule, same function as the scan.
+    let mut known_after_moves = known_after_moves;
+    let mut postponed_batch = false;
+    if !filter.is_inactive() && !vanished.is_empty() {
+        let mut cand_files: Vec<String> = Vec::new();
+        let mut cand_folders: Vec<String> = Vec::new();
+        let all_folders = state.db.list_known_folders()?;
+        for rel in &vanished {
+            if moved_from.contains(rel.as_str())
+                || under_moved_dir(rel, &dir_moved_from)
+                || covered_by_active_job(rel, &pending_moves)
+            {
+                continue;
+            }
+            let prefix = format!("{rel}/");
+            for k in &known_after_moves {
+                let kp = &k.relative_path;
+                if (kp == rel || kp.starts_with(&prefix))
+                    && !kp.ends_with(".cloudsc")
+                    && !is_ignored_local_path(kp)
+                    && !covered_by_active_job(kp, &pending_moves)
+                    && filter.file_synced(kp)
+                    && !cand_files.contains(kp)
+                {
+                    cand_files.push(kp.clone());
+                }
+            }
+            for f in &all_folders {
+                if (f == rel || f.starts_with(&prefix))
+                    && !filter.not_deletable(f)
+                    && !covered_by_active_job(f, &pending_moves)
+                    && !cand_folders.contains(f)
+                {
+                    cand_folders.push(f.clone());
+                }
+            }
+        }
+        let all_candidates = cand_files.clone();
+        let fallback = excluded_zone_move_fallback(
+            state,
+            &filter,
+            &tracked_root,
+            &known_map,
+            &cand_files,
+            &cand_folders,
+            &pending_targets,
+        )?;
+        enqueued += apply_excluded_zone_outcome(
+            state,
+            &fallback,
+            &known_after_moves,
+            &mut pending_targets,
+            &mut cand_files,
+            &mut cand_folders,
+        )?;
+        postponed_batch = fallback.postpone_all;
+        // Whatever the rule took out of the candidates must not reach the deletion pass below.
+        let dropped: HashSet<String> = all_candidates
+            .into_iter()
+            .filter(|c| !cand_files.contains(c))
+            .collect();
+        known_after_moves.retain(|row| !dropped.contains(&row.relative_path));
+    }
     for rel in &vanished {
+        if postponed_batch {
+            break; // the next full scan re-derives these from the index rows that remain
+        }
         if moved_from.contains(rel.as_str()) || under_moved_dir(rel, &dir_moved_from) {
             continue; // it did not vanish, it moved
         }
@@ -717,6 +972,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             rel,
             &known_after_moves,
             &pending_moves,
+            &filter,
         )?;
     }
 
@@ -1084,6 +1340,7 @@ fn enqueue_targeted_deletions(
     rel: &str,
     known: &[FileIndexRow],
     pending_moves: &HashSet<String>,
+    filter: &PrefixFilter,
 ) -> AppResult<usize> {
     let mut enqueued = 0usize;
 
@@ -1110,13 +1367,16 @@ fn enqueue_targeted_deletions(
         return Ok(0);
     }
 
+    let prefix = format!("{rel}/");
+
     // The path itself, if it was a tracked file.
-    if known.iter().any(|k| k.relative_path == rel) {
-        enqueued += process_local_file_deletion(state, tracked_root, rel)?;
+    // DBSYNC-114 H2: each of the three sets below drops what is outside the synced zone, so
+    // an excluded subtree under (or an ancestor above) a vanished folder is never deleted.
+    if filter.file_synced(rel) && known.iter().any(|k| k.relative_path == rel) {
+        enqueued += process_local_file_deletion(state, filter, tracked_root, rel)?;
     }
 
     // Tracked descendants of a removed directory prefix.
-    let prefix = format!("{rel}/");
     for prev in known {
         if prev.relative_path == rel {
             continue; // already handled above
@@ -1125,8 +1385,10 @@ fn enqueue_targeted_deletions(
             && !prev.relative_path.ends_with(".cloudsc")
             && !is_ignored_local_path(&prev.relative_path)
             && !covered_by_active_job(&prev.relative_path, pending_moves)
+            && filter.file_synced(&prev.relative_path)
         {
-            enqueued += process_local_file_deletion(state, tracked_root, &prev.relative_path)?;
+            enqueued +=
+                process_local_file_deletion(state, filter, tracked_root, &prev.relative_path)?;
         }
     }
 
@@ -1135,8 +1397,10 @@ fn enqueue_targeted_deletions(
         if covered_by_active_job(&folder_rel, pending_moves) {
             continue;
         }
-        if folder_rel == rel || folder_rel.starts_with(&prefix) {
-            enqueued += process_known_folder_deletion(state, tracked_root, &folder_rel)?;
+        if (folder_rel == rel || folder_rel.starts_with(&prefix))
+            && !filter.not_deletable(&folder_rel)
+        {
+            enqueued += process_known_folder_deletion(state, filter, tracked_root, &folder_rel)?;
         }
     }
 
@@ -1347,8 +1611,11 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     // recursive remote `delete_v2`. Track that and skip deletion detection when
     // the walk was incomplete; uploads/downloads still proceed safely.
     let mut walk_had_error = false;
+    // DBSYNC-114: folded once for the whole pass (both walks and the deletion sets).
+    let filter = PrefixFilter::load_for_deletion_pass(&state.db)?;
 
-    for entry in WalkDir::new(&tracked_root).into_iter() {
+    let mut walker = WalkDir::new(&tracked_root).into_iter();
+    while let Some(entry) = walker.next() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -1356,6 +1623,16 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
                 continue;
             }
         };
+        if entry.file_type().is_dir() {
+            // An excluded subtree is not walked at all. An ancestor of an include is
+            // traversed, since the included folder lives below it.
+            if entry.depth() > 0
+                && filter.scope(&key_from_disk(&tracked_root, entry.path())?) == PathScope::Excluded
+            {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1366,6 +1643,12 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             continue;
         }
         if is_ignored_local_path(&relative) {
+            continue;
+        }
+        // DBSYNC-114 E: a file outside the synced zone is neither uploaded nor, being absent
+        // from `seen_paths`, kept alive by this walk; the deletion sets below drop it too.
+        // A file directly inside an Ancestor folder reports Excluded by the predicate.
+        if !filter.file_synced(&relative) {
             continue;
         }
 
@@ -1387,7 +1670,8 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     // that is no longer present on disk must have been deleted locally, so its
     // remote counterpart needs to be deleted too (delete_v2 is recursive).
     let mut seen_dirs: HashSet<String> = HashSet::new();
-    for entry in WalkDir::new(&tracked_root).into_iter() {
+    let mut walker = WalkDir::new(&tracked_root).into_iter();
+    while let Some(entry) = walker.next() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -1406,6 +1690,17 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
         }
         if is_ignored_local_path(&relative) {
             continue;
+        }
+        // DBSYNC-114: an excluded dir is never recorded in `known_folders` (and its subtree
+        // is not walked); an ancestor of an include is traversed but not recorded either,
+        // so no later pass can mistake its absence for a folder deletion.
+        match filter.scope(&relative) {
+            PathScope::Synced => {}
+            PathScope::Ancestor => continue,
+            PathScope::Excluded => {
+                walker.skip_current_dir();
+                continue;
+            }
         }
 
         seen_dirs.insert(relative.clone());
@@ -1431,7 +1726,7 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
         // landing in that window would propagate a remote delete of the very file the move is
         // about to relocate — and `delete_v2` on a folder is recursive.
         let pending = state.db.active_move_paths()?;
-        let file_deletions: Vec<String> = known
+        let mut file_deletions: Vec<String> = known
             .iter()
             .map(|f| f.relative_path.clone())
             .filter(|rel| {
@@ -1439,21 +1734,56 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
                     && !is_ignored_local_path(rel)
                     && !seen_paths.contains(&to_canonical_form(rel))
                     && !covered_by_active_job(rel, &pending)
+                    // DBSYNC-114 H2: the walk stopped seeing everything outside the synced
+                    // zone, so none of it may be read back as "deleted" (a tracked excluded
+                    // file would become a remote delete).
+                    && filter.file_synced(rel)
             })
             .collect();
-        let folder_deletions: Vec<String> = state
+        let mut folder_deletions: Vec<String> = state
             .db
             .list_known_folders()?
             .into_iter()
             .filter(|rel| {
                 !is_ignored_local_path(rel)
                     && !seen_dirs.contains(&to_canonical_form(rel))
+                    // DBSYNC-114 H2: an excluded or ancestor folder is not recorded by the
+                    // walk; a stale `known_folders` row would otherwise become a RECURSIVE
+                    // remote `delete_v2`.
+                    && !filter.not_deletable(rel)
                     && !covered_by_active_job(rel, &pending)
             })
             .collect();
 
+        // DBSYNC-114 F / H10 / C2: a vanished synced path whose content plausibly went into the
+        // excluded zone is a `move` when it pairs exactly, and otherwise is NOT a deletion
+        // either (the listing sweep writes a placeholder for it; see `excluded_zone_move_fallback`). Done
+        // BEFORE the breaker so these are not counted as deletion candidates.
+        let fallback = excluded_zone_move_fallback(
+            state,
+            &filter,
+            &tracked_root,
+            &known_map,
+            &file_deletions,
+            &folder_deletions,
+            &pending_targets,
+        )?;
+        enqueued_jobs += apply_excluded_zone_outcome(
+            state,
+            &fallback,
+            &known,
+            &mut pending_targets,
+            &mut file_deletions,
+            &mut folder_deletions,
+        )?;
+
         let candidate_count = file_deletions.len() + folder_deletions.len();
-        let tracked_count = known.len() + seen_dirs.len();
+        // DBSYNC-114: the breaker's denominator is the synced zone, like its numerator.
+        let tracked_count = known
+            .iter()
+            .filter(|f| filter.file_synced(&f.relative_path))
+            .count()
+            + seen_dirs.len();
 
         // Consume the one-shot override whenever THIS pass actually has deletions, so
         // a stale confirmation can't linger and silently authorize an unrelated future
@@ -1471,15 +1801,418 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
             // Not a mass deletion (or the user confirmed) → sync is not paused.
             clear_mass_delete_blocked(state, MassDeleteSource::LocalScan);
             for rel in &file_deletions {
-                enqueued_jobs += process_local_file_deletion(state, &tracked_root, rel)?;
+                enqueued_jobs += process_local_file_deletion(state, &filter, &tracked_root, rel)?;
             }
             for rel in &folder_deletions {
-                enqueued_jobs += process_known_folder_deletion(state, &tracked_root, rel)?;
+                enqueued_jobs += process_known_folder_deletion(state, &filter, &tracked_root, rel)?;
             }
         }
     }
 
     Ok(enqueued_jobs)
+}
+
+/// What [`excluded_zone_move_fallback`] decided (DBSYNC-114 F / H10 / C2).
+#[derive(Default, Debug)]
+struct ExcludedZoneFallback {
+    /// `(old, new)`: a vanished tracked file and the untracked excluded file with its bytes.
+    file_moves: Vec<(String, String)>,
+    /// Vanished tracked files whose content plausibly sits in the excluded zone but which
+    /// could not be paired into a `move` (edited since Dropbox saw it, queued work, ...).
+    /// NEVER a remote delete: the caller untracks them and leaves the remote copy alone; the
+    /// Dropbox listing sweep then writes a placeholder for the name under a folder it sweeps.
+    suppressed_files: HashSet<String>,
+    /// Vanished known folders that must NOT be deleted: their name reappeared in the excluded
+    /// zone. The caller untracks the folder and everything beneath it.
+    kept_folders: HashSet<String>,
+    /// The excluded zone could not be read in a way that is expected to pass (an entry
+    /// vanished mid-walk, an interrupted read), so "nothing matched" proves nothing about ANY
+    /// candidate: every deletion is postponed to the next scan.
+    postpone_all: bool,
+    /// Candidates a failed hash could have matched (same size as the file that could not be
+    /// hashed this time): postponed individually.
+    postponed_files: HashSet<String>,
+}
+
+impl ExcludedZoneFallback {
+    fn covers_folder(&self, rel: &str) -> bool {
+        self.kept_folders.iter().any(|f| {
+            rel == f
+                || rel
+                    .strip_prefix(f.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        })
+    }
+}
+
+/// Whether an I/O failure while reading the excluded zone is one that a later scan is
+/// expected to get past (the entry vanished, the read was interrupted) rather than a standing
+/// condition (permissions) that would otherwise block every deletion forever.
+pub(crate) fn walk_error_is_transient(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind as K;
+    matches!(
+        kind,
+        K::NotFound | K::Interrupted | K::WouldBlock | K::TimedOut
+    )
+}
+
+/// Records an unreadable entry of the excluded zone. Transient: postpone every deletion this
+/// scan. Persistent: the entry is simply not a move destination (its NAME was already
+/// considered by the caller), reported once per process.
+fn note_unreadable_excluded_entry(
+    state: &AppState,
+    out: &mut ExcludedZoneFallback,
+    what: &str,
+    kind: Option<std::io::ErrorKind>,
+) {
+    if kind.is_some_and(|k| !walk_error_is_transient(k)) {
+        if state.db.first_time(&format!("unreadable:{what}")) {
+            tracing::warn!(
+                path = what,
+                "an entry in the excluded zone cannot be read; it is not treated as the \
+                 destination of a moved file (deletions are NOT held back for it)"
+            );
+        }
+    } else {
+        out.postpone_all = true;
+    }
+}
+
+/// Scan/watcher-side handling of a synced path that vanished while a copy of it may have
+/// gone into the excluded zone, which the main walk never enters.
+///
+/// `candidates` is the vanished tracked files (about to become remote deletes) and
+/// `vanished_folders` the vanished known folders (about to become recursive remote deletes).
+///
+/// **Maintainer decision (2026-10-19): this never produces a remote delete for a path whose
+/// content may have moved into the excluded zone.** A wrongly kept path costs a placeholder
+/// that reappears at the old name; a wrongly sent delete costs the file. So the rule errs
+/// towards keeping, and it is the same for the scan and the watcher, files and folders:
+///
+/// - **File, exact:** an untracked excluded file with the same size AND content hash as a
+///   vanished tracked one, where Dropbox holds those very bytes under the old path (the
+///   conditions `correlate_renames` demands), pairs into a `move`.
+/// - **File, otherwise:** an untracked excluded file with the same content hash as the
+///   vanished file's index row, OR simply the same folded NAME (the last path component only,
+///   whatever its folder, size or content), makes the vanished file `suppressed`: no move
+///   (queued work, or bytes Dropbox does not hold, make a move unsafe) and no delete either.
+///   Precisely: the name test compares only the LAST path component, folded (case and Unicode
+///   form), ignoring the excluded file's folder, size and content; the folder rule below does
+///   the same with the folder's name. So an unrelated untracked excluded file that merely
+///   shares a file name with a file the user really deleted makes that delete be skipped, and
+///   the match needs no stronger evidence than that. Maintainer decision: err toward no
+///   delete. The cost is bounded and visible once: the file stays on Dropbox, its local rows
+///   are dropped, and the listing sweep later writes a placeholder for it; deleting that
+///   placeholder is then an ordinary delete.
+/// - **Folder:** a vanished known folder whose name reappears as an untracked excluded
+///   folder is `kept`, with everything beneath it.
+///
+/// Suppressed files and kept folders are untracked by the caller, so the decision is made once
+/// and not re-made (re-walked, re-logged) every tick; their remote rows are untouched.
+///
+/// Does nothing (and walks nothing) when the filter is inactive or nothing vanished.
+fn excluded_zone_move_fallback(
+    state: &AppState,
+    filter: &PrefixFilter,
+    tracked_root: &Path,
+    known_map: &HashMap<String, FileIndexRow>,
+    candidates: &[String],
+    vanished_folders: &[String],
+    active: &HashSet<String>,
+) -> AppResult<ExcludedZoneFallback> {
+    let mut out = ExcludedZoneFallback::default();
+    if filter.is_inactive() || (candidates.is_empty() && vanished_folders.is_empty()) {
+        return Ok(out);
+    }
+
+    // size -> [(old path, hash)] for tracked vanished files whose remote copy holds the same
+    // bytes and that no queued work names: the only ones a `move` may carry.
+    let mut by_size: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    // size -> [(old path, hash)] for every vanished file with a real row hash: what the
+    // suppression-by-content rule compares against (no remote condition).
+    let mut hash_cands: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    let mut files_by_name: HashMap<String, Vec<&String>> = HashMap::new();
+    for rel in candidates {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        files_by_name.entry(fold(name)).or_default().push(rel);
+        let Some(row) = known_map.get(&to_canonical_form(rel)) else {
+            continue;
+        };
+        if row.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN {
+            continue;
+        }
+        hash_cands
+            .entry(row.size_bytes)
+            .or_default()
+            .push((rel.clone(), row.hash.clone()));
+        if covered_by_active_job(rel, active) {
+            continue;
+        }
+        match state.db.get_remote_file(rel)? {
+            Some(remote) if remote.content_hash == row.hash => {}
+            _ => continue,
+        }
+        by_size
+            .entry(row.size_bytes)
+            .or_default()
+            .push((rel.clone(), row.hash.clone()));
+    }
+    let mut folders_by_name: HashMap<String, Vec<&String>> = HashMap::new();
+    for rel in vanished_folders {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        folders_by_name.entry(fold(name)).or_default().push(rel);
+    }
+
+    let known_folders: HashSet<String> = state.db.list_known_folders()?.into_iter().collect();
+    let refused = state.db.list_refused_moves()?;
+    let mut walker = WalkDir::new(tracked_root).min_depth(1).into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                let what = e
+                    .path()
+                    .and_then(|p| key_from_disk(tracked_root, p).ok())
+                    .unwrap_or_else(|| "?".to_string());
+                note_unreadable_excluded_entry(
+                    state,
+                    &mut out,
+                    &what,
+                    e.io_error().map(std::io::Error::kind),
+                );
+                continue;
+            }
+        };
+        let Ok(rel) = key_from_disk(tracked_root, entry.path()) else {
+            continue;
+        };
+        if is_ignored_local_path(&rel) {
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            match filter.scope(&rel) {
+                PathScope::Excluded => {
+                    // Only an untracked folder can be "the moved one"; a tracked excluded
+                    // folder is stale state the apply pass is about to clean.
+                    if known_folders.contains(&rel) {
+                        continue;
+                    }
+                    let name = rel.rsplit('/').next().unwrap_or(&rel);
+                    if let Some(sources) = folders_by_name.get(&fold(name)) {
+                        for source in sources {
+                            if out.kept_folders.insert((*source).clone()) {
+                                tracing::warn!(
+                                    folder = %source,
+                                    appeared_at = %rel,
+                                    "a tracked folder vanished and a folder with the same name \
+                                     appeared in an excluded path: treated as a move out of sync, \
+                                     NOT sending a remote delete for it (the listing sweep \
+                                     writes a placeholder for it under a swept parent)"
+                                );
+                            }
+                        }
+                    }
+                }
+                PathScope::Ancestor => {}
+                PathScope::Synced => {
+                    if !filter.excluded_beneath(&rel) {
+                        walker.skip_current_dir();
+                    }
+                }
+            }
+            continue;
+        }
+        if !entry.file_type().is_file()
+            || rel.ends_with(".cloudsc")
+            || candidates.is_empty()
+            || filter.file_scope(&rel) != PathScope::Excluded
+            || known_map.contains_key(&rel)
+            || covered_by_active_job(&rel, active)
+            || crate::path_util::is_dehydrated_placeholder(entry.path())
+        {
+            continue;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        let named: Vec<String> = files_by_name
+            .get(&fold(name))
+            .map(|v| v.iter().map(|s| (*s).clone()).collect())
+            .unwrap_or_default();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                note_unreadable_excluded_entry(
+                    state,
+                    &mut out,
+                    &rel,
+                    Some(
+                        e.io_error()
+                            .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+                    ),
+                );
+                out.suppressed_files.extend(named);
+                continue;
+            }
+        };
+        let len = meta.len() as i64;
+        let same_size = by_size.contains_key(&len) || hash_cands.contains_key(&len);
+        let mut hash: Option<String> = None;
+        if same_size {
+            match hash_file(entry.path()) {
+                Ok((h, size, _)) if size == len => hash = Some(h),
+                Ok(_) => {}
+                Err(_) => {
+                    // Vanished since the walk reached it: it might have been the destination,
+                    // so the candidates of this size wait for the next scan. Anything else
+                    // (permissions): not a destination, and not a reason to hold back.
+                    let gone = std::fs::symlink_metadata(entry.path())
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                    if gone {
+                        out.postponed_files.extend(
+                            hash_cands
+                                .get(&len)
+                                .into_iter()
+                                .flatten()
+                                .map(|(old, _)| old.clone()),
+                        );
+                    } else {
+                        note_unreadable_excluded_entry(
+                            state,
+                            &mut out,
+                            &rel,
+                            Some(std::io::ErrorKind::PermissionDenied),
+                        );
+                    }
+                }
+            }
+        }
+        // Exact pairing first: a destination consumed by a `move` is not also evidence for
+        // suppressing a namesake.
+        if let (Some(hash), Some(sources)) = (hash.as_ref(), by_size.get_mut(&len)) {
+            if state.db.get_remote_file(&rel)?.is_none() {
+                if let Some(idx) = sources.iter().rposition(|(old, old_hash)| {
+                    old_hash == hash && !refused.contains(&(old.clone(), rel.clone()))
+                }) {
+                    let (old, _) = sources.remove(idx);
+                    out.file_moves.push((old, rel));
+                    continue;
+                }
+            }
+        }
+        out.suppressed_files.extend(named);
+        if let (Some(hash), Some(cands)) = (hash.as_ref(), hash_cands.get(&len)) {
+            out.suppressed_files.extend(
+                cands
+                    .iter()
+                    .filter(|(_, h)| h == hash)
+                    .map(|(old, _)| old.clone()),
+            );
+        }
+    }
+    // A candidate that was paired into a move is not "suppressed" as well.
+    let moved: HashSet<&String> = out.file_moves.iter().map(|(old, _)| old).collect();
+    out.suppressed_files.retain(|rel| !moved.contains(rel));
+    Ok(out)
+}
+
+/// Acts on an [`ExcludedZoneFallback`] and narrows the deletion sets accordingly. Returns the
+/// jobs enqueued (the moves).
+///
+/// - `file_moves` become `move` jobs.
+/// - A suppressed file is UNTRACKED (its row removed) and dropped from the deletions; the
+///   remote row stays. Nothing here re-creates anything: it is the Dropbox listing sweep
+///   (`materialize_listing_entries`, run per folder it lists) that, finding the name on Dropbox
+///   with no local representation, writes a placeholder (native on Windows, a `.cloudsc`
+///   sidecar elsewhere). Until that sweep reaches the parent folder the name is simply absent.
+/// - A kept folder is untracked together with every `known_folders` row and file row beneath
+///   it, and neither it nor anything beneath it stays a deletion candidate.
+/// - Postponed candidates are dropped from the deletions for this scan only.
+///
+/// The decision is therefore made once: nothing is left behind to be re-walked next tick.
+fn apply_excluded_zone_outcome(
+    state: &AppState,
+    fallback: &ExcludedZoneFallback,
+    known: &[FileIndexRow],
+    pending_targets: &mut HashSet<String>,
+    file_deletions: &mut Vec<String>,
+    folder_deletions: &mut Vec<String>,
+) -> AppResult<usize> {
+    let mut enqueued = 0usize;
+    for (old, new) in &fallback.file_moves {
+        state.db.enqueue_job("move", Some(old), Some(new))?;
+        pending_targets.insert(old.clone());
+        pending_targets.insert(new.clone());
+        enqueued += 1;
+        tracing::info!(
+            from = %old,
+            to = %new,
+            "a tracked file vanished and the same bytes appeared in an excluded folder: \
+             enqueued a move instead of a delete"
+        );
+    }
+    if fallback.postpone_all {
+        tracing::warn!(
+            "the excluded zone could not be read completely (an entry vanished or a read was \
+             interrupted); deletions are postponed to the next scan so a move into it is not \
+             mistaken for a delete"
+        );
+        file_deletions.clear();
+        folder_deletions.clear();
+        return Ok(enqueued);
+    }
+    let moved_from: HashSet<&str> = fallback
+        .file_moves
+        .iter()
+        .map(|(old, _)| old.as_str())
+        .collect();
+    for rel in file_deletions
+        .iter()
+        .filter(|r| fallback.suppressed_files.contains(*r) || fallback.covers_folder(r))
+    {
+        if moved_from.contains(rel.as_str()) {
+            continue;
+        }
+        // DBSYNC-114 (CRIT-2): a never-landed file is not untracked here (its marker is what
+        // keeps a recursive delete of its folder from reaching Dropbox's version); its own
+        // upload job settles it.
+        if !untrack_vanished_without_delete(state, rel)? {
+            continue;
+        }
+        if state.db.first_time(&format!("suppressed:{rel}")) {
+            tracing::warn!(
+                rel = %rel,
+                "a tracked file vanished and its name or content appeared in an excluded path: \
+                 NOT sending a remote delete (the listing sweep writes a placeholder for it under a swept parent)"
+            );
+        }
+    }
+    for folder in &fallback.kept_folders {
+        let below = format!("{folder}/");
+        for kf in state.db.list_known_folders()? {
+            if kf == *folder || kf.starts_with(&below) {
+                state.db.remove_known_folder(&kf)?;
+            }
+        }
+        for row in known {
+            // A file of the folder that pairs into a `move` keeps its row: the move rewrites it
+            // once Dropbox confirms.
+            if row.relative_path.starts_with(&below)
+                && !moved_from.contains(row.relative_path.as_str())
+            {
+                untrack_vanished_without_delete(state, &row.relative_path)?;
+            }
+        }
+    }
+    file_deletions.retain(|rel| {
+        !moved_from.contains(rel.as_str())
+            && !fallback.suppressed_files.contains(rel)
+            && !fallback.postponed_files.contains(rel)
+            && !fallback.covers_folder(rel)
+    });
+    folder_deletions.retain(|rel| !fallback.covers_folder(rel));
+    Ok(enqueued)
 }
 
 /// Feed the watcher's deferred paths through the correlating path, before the full scan.
@@ -1545,7 +2278,35 @@ fn drain_deferred_watcher_paths(state: &AppState) -> usize {
 /// `scan_local_changes_internal`. That is a deliberate, named trade: one thin line, versus a
 /// test that hits a real account.
 fn scan_local_half(state: &AppState) -> AppResult<usize> {
-    Ok(drain_deferred_watcher_paths(state) + scan_local_changes_only(state)?)
+    let drained = drain_deferred_watcher_paths(state);
+    // DBSYNC-114: the apply pass runs AFTER the drain: a move into an excluded folder is
+    // correlated by the drain, and thereby covered by its job, before the pass looks at the
+    // excluded copy. Run the other way round, the pass meets that copy as an untracked file and
+    // reports (and WARNs, once per process) a "kept" file that is about to be moved
+    // (`scan_local_half_drains_before_it_applies_exclusions` pins this).
+    //
+    // Its position relative to the scan below is NOT load-bearing, and an earlier version of
+    // this comment claimed it was ("so the scan sees an index that already forgot the excluded
+    // files"). It is not: the scan walks, and builds every deletion set from, the synced zone
+    // only, so it never reads an excluded row either way. (Swapping the two was tried: nothing
+    // observable changed except a contrived case where a kept file's bytes equal a vanished
+    // synced file's, which is decided the same defensible way.) Never fails the scan: an
+    // unremoved excluded file is harmless, the engine ignores it either way.
+    match crate::cloudsc_ops::apply_exclusions(state) {
+        Ok(report) => {
+            if !report.is_empty() {
+                tracing::info!(
+                    removed = report.removed.len(),
+                    kept = report.kept.len(),
+                    busy = report.busy.len(),
+                    errors = report.errors.len(),
+                    "applied selective-sync exclusions to the local copy"
+                );
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "applying selective-sync exclusions failed"),
+    }
+    Ok(drained + scan_local_changes_only(state)?)
 }
 
 /// A full scan: the local half, then the remote refresh, then the bookkeeping.
@@ -1612,6 +2373,126 @@ pub(crate) fn dispatch_local_delete<T>(
     }
 }
 
+/// `last_error` of a job the drain settled `done` without running because selective sync
+/// excludes its path (DBSYNC-114 H7). Same "settled, not performed" marker as DBSYNC-113.
+pub(crate) const SKIPPED_EXCLUDED_REASON: &str = "skipped: excluded by selective sync (DBSYNC-114)";
+
+/// Pure drain-time rule: should this job be settled instead of run because selective sync
+/// excludes the path it acts on? `None` means run it.
+///
+/// A job can outlive the setting that excluded its path (queued before Save, or brought
+/// back by "Retry failed jobs"), and running it would upload, delete or download inside the
+/// excluded zone. Anything that is not [`PathScope::Synced`] (Excluded, and Ancestor of an
+/// include, which is a folder that is never itself synced) is skipped.
+///
+/// A `move` is the one two-path job, and it follows a different rule (DBSYNC-114 M1): it is
+/// skipped only when BOTH sides are [`PathScope::Excluded`]. A move between the zones is the
+/// propagated rename of decision F, and an Ancestor counts as in scope here, because renaming
+/// a folder above an include is queued as a move on purpose (with a WARN, see
+/// `process_changed_paths`): settling it as "excluded" would leave Dropbox with the old name
+/// while the local folder has the new one.
+///
+/// Each job reads the same field the dispatch arms read: `upload` and `hydrate_cloudsc` the
+/// source only, `delete`, `local_delete` and `download` the target, falling back to the source.
+/// An unknown job type, or one with no path, is left to fail where it always did.
+pub(crate) fn drain_skip_reason(
+    job: &crate::storage::db::SyncJobRow,
+    filter: &PrefixFilter,
+) -> Option<&'static str> {
+    let synced = |rel: &str| {
+        let rel = rel.strip_suffix(".cloudsc").unwrap_or(rel);
+        filter.scope(rel) == PathScope::Synced
+    };
+    let source = job.source_path.as_deref();
+    let target = job.target_path.as_deref();
+    let excluded = match job.job_type.as_str() {
+        "move" => match (source, target) {
+            (Some(from), Some(to)) => {
+                let out = |rel: &str| filter.scope(rel) == PathScope::Excluded;
+                out(from) && out(to)
+            }
+            _ => false,
+        },
+        // The dispatch reads the source only.
+        "upload" | "hydrate_cloudsc" => source.is_some_and(|p| !synced(p)),
+        "delete" | "local_delete" | "download" => target.or(source).is_some_and(|p| !synced(p)),
+        _ => false,
+    };
+    excluded.then_some(SKIPPED_EXCLUDED_REASON)
+}
+
+/// `last_error` of a folder `delete` the drain replaced by per-file deletes because an
+/// excluded path lies beneath the folder (DBSYNC-114).
+pub(crate) const SPLIT_PROTECTED_DELETE_REASON: &str =
+    "split: excluded content lies beneath this folder; its synced files are deleted one by one (DBSYNC-114)";
+
+/// Pure drain-time rule: is this a `delete` whose target is a synced folder with an excluded
+/// path beneath it, i.e. one whose recursive `delete_v2` would take excluded content with it?
+/// (A file target has nothing beneath it, so this is false for every file delete.)
+pub(crate) fn delete_job_endangers_excluded(
+    job: &crate::storage::db::SyncJobRow,
+    filter: &PrefixFilter,
+) -> bool {
+    job.job_type == "delete"
+        && job
+            .target_path
+            .as_deref()
+            .or(job.source_path.as_deref())
+            .is_some_and(|rel| filter.excluded_beneath(rel))
+}
+
+/// Decomposes a [`delete_job_endangers_excluded`] job and settles it. Returns whether it did.
+///
+/// Decomposed rather than settled, and from `remote_file_index` rather than the local index:
+/// the local rows were removed when the delete was enqueued, whereas the remote rows still
+/// describe exactly what Dropbox holds under the folder. Each synced file becomes its own
+/// `delete` job (carrying its rev, so a file changed remotely since is kept by the existing
+/// rev check); excluded rows are skipped. Empty subfolders are left, as at enqueue time. The
+/// per-file jobs are queued BEFORE the folder job is settled, so a crash in between re-runs
+/// this idempotently (the enqueue collapses onto an active job for the same path).
+fn split_protected_folder_delete(
+    state: &AppState,
+    filter: &PrefixFilter,
+    job: &crate::storage::db::SyncJobRow,
+) -> AppResult<bool> {
+    if !delete_job_endangers_excluded(job, filter) {
+        return Ok(false);
+    }
+    let rel = job
+        .target_path
+        .as_deref()
+        .or(job.source_path.as_deref())
+        .unwrap_or_default();
+    let mut queued = 0usize;
+    for row in state.db.list_remote_files_under(rel)? {
+        if row.relative_path == rel
+            || row.relative_path.ends_with(".cloudsc")
+            || is_ignored_local_path(&row.relative_path)
+            || !filter.file_synced(&row.relative_path)
+            // DBSYNC-114 (I2): a path whose first upload has not landed is not ours to delete;
+            // its row may be a version someone else put there.
+            || state.db.is_upload_unconfirmed(&row.relative_path)?
+        {
+            continue;
+        }
+        state
+            .db
+            .enqueue_delete_job(&row.relative_path, Some(&row.rev))?;
+        queued += 1;
+    }
+    state
+        .db
+        .mark_job_settled(job.id, SPLIT_PROTECTED_DELETE_REASON)?;
+    tracing::warn!(
+        job_id = job.id,
+        rel,
+        queued,
+        "folder delete not sent as a recursive remote delete: an excluded path lies beneath it; \
+         replaced by {queued} per-file delete(s)"
+    );
+    Ok(true)
+}
+
 /// Production entry point: picks and runs exactly one due job, wiring the real,
 /// live `fetch_remote_file_metadata` in as the `"local_delete"` arm's
 /// execution-time verification lookup. **Never call this from a test** — the
@@ -1639,11 +2520,55 @@ fn process_sync_queue_core(
     state: &AppState,
     local_delete_lookup: impl FnOnce(&str) -> AppResult<Option<crate::remote_index::RemoteFileMeta>>,
 ) -> AppResult<bool> {
+    process_sync_queue_with(
+        state,
+        local_delete_lookup,
+        |from, to| crate::dropbox_transfer::move_remote_file_internal(state, from, to),
+        |rel, job_id| upload_local_file_internal(state, rel, job_id),
+    )
+}
+
+/// [`process_sync_queue_core`] with the `move` and `upload` arms' network calls taken as
+/// parameters too (DBSYNC-114 M1), so a test can drain a real `move` or `upload` job through
+/// the real dispatch and settlement without a token or a request. Production passes
+/// `move_remote_file_internal` and `upload_local_file_internal`.
+fn process_sync_queue_with(
+    state: &AppState,
+    local_delete_lookup: impl FnOnce(&str) -> AppResult<Option<crate::remote_index::RemoteFileMeta>>,
+    move_remote: impl FnOnce(&str, &str) -> AppResult<()>,
+    upload: impl FnOnce(&str, i64) -> AppResult<()>,
+) -> AppResult<bool> {
     let next = state.db.pick_next_due_job()?;
     let Some(job) = next else {
         refresh_queue_depth_internal(state)?;
         return Ok(false);
     };
+
+    // DBSYNC-114 H7: defence in depth for a job that was queued before a path was excluded
+    // (or that a retry brought back). The filter is read per job rather than cached across
+    // the drain, so a Save made mid-drain takes effect on the very next job.
+    let filter = PrefixFilter::load(&state.db)?;
+    if let Some(reason) = drain_skip_reason(&job, &filter) {
+        state.db.mark_job_settled(job.id, reason)?;
+        tracing::info!(
+            job_id = job.id,
+            job_type = %job.job_type,
+            source = ?job.source_path,
+            target = ?job.target_path,
+            "sync job settled without running: {reason}"
+        );
+        refresh_queue_depth_internal(state)?;
+        return Ok(true);
+    }
+
+    // DBSYNC-114: a recursive `delete` queued BEFORE the exclusion (or by an older build) of a
+    // folder with an excluded path beneath it must not run: `delete_v2` would remove the
+    // excluded content. It is decomposed, not merely dropped: dropping it would leave the
+    // user's deleted files on Dropbox, and the remote sweep would download them back.
+    if split_protected_folder_delete(state, &filter, &job)? {
+        refresh_queue_depth_internal(state)?;
+        return Ok(true);
+    }
 
     let max_attempts = 5;
     let attempt = job.attempt_count + 1;
@@ -1676,7 +2601,7 @@ fn process_sync_queue_core(
             .source_path
             .as_deref()
             .ok_or_else(|| AppError::Sync("upload job missing source_path".to_string()))
-            .and_then(|rel| upload_local_file_internal(state, rel, job.id)),
+            .and_then(|rel| upload(rel, job.id)),
         "delete" => job
             .target_path
             .as_deref()
@@ -1740,10 +2665,7 @@ fn process_sync_queue_core(
         // where the item was and `target_path` is where it is, and neither can stand in for
         // the other. Missing either is a programming error, not a transient failure.
         "move" => match (job.source_path.as_deref(), job.target_path.as_deref()) {
-            (Some(from), Some(to)) => crate::dropbox_transfer::move_remote_file_internal(
-                state, from, to,
-            )
-            .map(|()| {
+            (Some(from), Some(to)) => move_remote(from, to).map(|()| {
                 // `move_remote_file_internal` rewrites the index itself, and only once
                 // Dropbox has confirmed — so there is nothing to do here on success, and
                 // nothing to undo on failure. That order is the whole design; see its doc
@@ -2139,10 +3061,46 @@ pub(crate) fn resolve_conflict_internal(
         (ConflictAction::KeepLocal, Some(copy_rel), _) => {
             let copy_abs = safe_join(root, copy_rel)?;
             let primary_abs = safe_join(root, primary_rel)?;
-            if copy_abs.exists() {
+            // DBSYNC-114: on an upload-collision conflict the primary has no local row (it was
+            // untracked to make room for Dropbox's version) and a sweep may have planted
+            // `<primary>.cloudsc` for that version. The user has seen both and chose theirs,
+            // so the promoted file must be allowed to REPLACE Dropbox's version on purpose:
+            // the clobber guard (no row, or a first-upload marker) would otherwise meet the
+            // foreign file again, make another conflicted copy, and the delete queued below
+            // would then remove the first copy from Dropbox.
+            let promoted = copy_abs.exists();
+            if promoted {
+                let sidecar = {
+                    let mut s = primary_abs.clone().into_os_string();
+                    s.push(".cloudsc");
+                    std::path::PathBuf::from(s)
+                };
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(AppError::Io(format!(
+                            "failed removing the placeholder of the replaced version: {e}"
+                        )));
+                    }
+                }
                 std::fs::rename(&copy_abs, &primary_abs)
                     .map_err(|e| AppError::Io(format!("failed promoting conflicted copy: {e}")))?;
                 state.db.remove_local_file(copy_rel)?;
+            }
+            // Only when a copy was actually promoted: with no copy (the user deleted or moved
+            // it and made a new file at the primary path) the bytes were never reviewed, so the
+            // row and marker stay as they are and the upload below keeps its collision guard.
+            if promoted && primary_abs.is_file() {
+                // Track the promoted bytes as the primary's own: no guard (the marker is
+                // cleared), and the upload below compares Dropbox's hash with THESE bytes, not
+                // with a row that still describes Dropbox's version (that would skip the send
+                // as "identical"), so it sends.
+                let (hash, size, modified) = hash_file(&primary_abs)?;
+                state
+                    .db
+                    .upsert_local_file(primary_rel, &hash, size, modified)?;
+                state.db.clear_upload_unconfirmed(primary_rel)?;
             }
             state
                 .db
@@ -2294,6 +3252,7 @@ mod tests {
         scan_local_changes_only, ConflictAction, MassDeleteSource, SYNC_BATCH_CAP,
     };
     use crate::error::AppResult;
+    use crate::path_util::PrefixFilter;
     use crate::state::AppState;
     use crate::storage::db::Db;
     use crate::storage::secure_store::SecureStore;
@@ -4799,8 +5758,15 @@ mod tests {
             .db
             .upsert_remote_file("foo.txt", "hash", "rev123", 0, None)
             .expect("seed remote row");
+        // The deletion handler re-reads the local row (DBSYNC-114): only a tracked file is one.
+        state
+            .db
+            .upsert_local_file("foo.txt", "hash", 1, 0)
+            .expect("seed local row");
 
-        let n = super::process_local_file_deletion(&state, &root, "foo.txt").expect("process");
+        let n =
+            super::process_local_file_deletion(&state, &PrefixFilter::default(), &root, "foo.txt")
+                .expect("process");
         assert_eq!(n, 1);
 
         let job = state
@@ -4817,9 +5783,16 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let state = build_state(tmp.path());
         let root = sync_root(&state);
-        // No `remote_file_index` row seeded for this path.
+        // No `remote_file_index` row seeded for this path. A local row is: the deletion
+        // handler re-reads it (DBSYNC-114), and only a tracked file can have been deleted.
+        state
+            .db
+            .upsert_local_file("gone.txt", "hash", 1, 0)
+            .expect("seed local row");
 
-        let n = super::process_local_file_deletion(&state, &root, "gone.txt").expect("process");
+        let n =
+            super::process_local_file_deletion(&state, &PrefixFilter::default(), &root, "gone.txt")
+                .expect("process");
         assert_eq!(n, 1);
 
         let job = state
@@ -4842,7 +5815,9 @@ mod tests {
             .upsert_remote_file("dir", "hash", "rev999", 0, None)
             .expect("seed remote row");
 
-        let n = super::process_known_folder_deletion(&state, &root, "dir").expect("process");
+        let n =
+            super::process_known_folder_deletion(&state, &PrefixFilter::default(), &root, "dir")
+                .expect("process");
         assert_eq!(n, 1);
 
         let job = state
@@ -5339,7 +6314,8 @@ mod tests {
     /// `upload_local_file_internal` before any network call — so this test cannot reach the
     /// guard. It is here to state that gap explicitly rather than leave it implied: the guard
     /// itself is pinned by `an_upload_over_unknown_remote_content_is_refused` below, which
-    /// calls the DB-level precondition directly.
+    /// calls the DB-level precondition directly, and by the drain tests of `selective_sync`
+    /// (a collision becomes a conflicted copy).
     #[test]
     fn a_path_with_no_local_row_is_the_state_the_overwrite_guard_defends() {
         let tmp = tempdir().expect("tempdir");
@@ -8444,6 +9420,4187 @@ mod tests {
             assert!(!covered_by_active_job(&format!("{NFD_DIR}x"), &active));
             let nfd_active: HashSet<String> = [NFD_DIR.to_string()].into();
             assert!(covered_by_active_job(NFC_DIR, &nfd_active));
+        }
+    }
+
+    // ===============================================================================
+    // DBSYNC-114 slice 2 (#213): the engine respects excluded prefixes in both
+    // directions, and an excluded path is never a deletion candidate (H2).
+    //
+    // State is built through the pipeline: files are written to disk and indexed by
+    // `scan_local_changes_only`, jobs are completed through `pick_next_due_job` +
+    // `mark_job_completed`, remote rows come from `reconcile_fetched_snapshot` /
+    // `apply_delta_entries` with synthetic entries, and the exclusion is applied LAST (what
+    // Save does), so the world a test asserts on is one production reaches. The exceptions are
+    // named where they occur: the pure-rule tests build `SyncJobRow` values (`job()`), a few
+    // tests put a queued job into `failed` / `retry_wait` (`mark_job_failed`,
+    // `mark_job_retry_wait`: what a failed attempt writes), `mark_job_settled` is called
+    // directly in its own test, and `settle` clears the unconfirmed-upload marker of a completed
+    // upload to stand in for a landed one (which needs the network). Nothing here reaches the
+    // keychain or the network.
+    // ===============================================================================
+    mod selective_sync {
+        use std::cell::{Cell, RefCell};
+        use std::collections::{HashMap, HashSet};
+        // Only the unix-gated read-only-root guard of the hydration test names a `PathBuf`.
+        #[cfg(unix)]
+        use std::path::PathBuf;
+
+        use super::super::{
+            drain_skip_reason, enqueue_targeted_deletions, mass_delete_pause_active,
+            process_changed_paths, process_sync_queue_core, process_sync_queue_with,
+            resolve_conflict_internal, scan_local_changes_only, ConflictAction,
+            SKIPPED_EXCLUDED_REASON,
+        };
+        use super::{build_state, captured_tracing_output, move_jobs, sync_root};
+        use crate::models::DropboxEntry;
+        use crate::path_util::PrefixFilter;
+        use crate::remote_index::{
+            apply_delta_entries, reconcile_fetched_snapshot, remote_meta_from_entry, RemoteFileMeta,
+        };
+        use crate::state::AppState;
+        use crate::storage::db::SyncJobRow;
+
+        fn write(state: &AppState, rel: &str, bytes: &[u8]) {
+            let path = sync_root(state).join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        fn mkdir(state: &AppState, rel: &str) {
+            std::fs::create_dir_all(sync_root(state).join(rel)).unwrap();
+        }
+
+        /// Completes every queued job the way a successful drain would (no network). A landed
+        /// upload also clears the path's unconfirmed-upload marker
+        /// (`upload_local_file_internal`, which needs the network): that one line is modelled
+        /// here, so a path indexed through `settle` is the confirmed, synced file production
+        /// has after a drain. Tests that need the unconfirmed world do not call this.
+        fn settle(state: &AppState) {
+            while let Some(job) = state.db.pick_next_due_job().unwrap() {
+                if job.job_type == "upload" {
+                    if let Some(path) = job.target_path.as_deref() {
+                        state.db.clear_upload_unconfirmed(path).unwrap();
+                    }
+                }
+                state.db.mark_job_completed(job.id).unwrap();
+            }
+        }
+
+        /// Indexes whatever is on disk through the real scan, then completes its uploads.
+        fn index_disk(state: &AppState) {
+            scan_local_changes_only(state).unwrap();
+            settle(state);
+        }
+
+        fn exclude(state: &AppState, csv: &str) {
+            state.db.set_exclude_prefixes_csv(csv).unwrap();
+        }
+
+        fn include(state: &AppState, csv: &str) {
+            state.db.set_include_prefixes_csv(csv).unwrap();
+        }
+
+        fn jobs(state: &AppState) -> Vec<SyncJobRow> {
+            state.db.list_recent_jobs(1000).unwrap()
+        }
+
+        /// Targets of the jobs of `job_type` that are still to run (not `done`), sorted.
+        fn pending(state: &AppState, job_type: &str) -> Vec<String> {
+            let mut v: Vec<String> = jobs(state)
+                .into_iter()
+                .filter(|j| j.job_type == job_type && j.status != "done")
+                .filter_map(|j| j.target_path)
+                .collect();
+            v.sort();
+            v
+        }
+
+        fn summary(state: &AppState) -> Vec<(String, Option<String>, String)> {
+            jobs(state)
+                .into_iter()
+                .map(|j| (j.job_type, j.target_path, j.status))
+                .collect()
+        }
+
+        fn known_folders(state: &AppState) -> Vec<String> {
+            state.db.list_known_folders().unwrap()
+        }
+
+        fn hash_of(state: &AppState, rel: &str) -> String {
+            crate::path_util::hash_file(&sync_root(state).join(rel))
+                .unwrap()
+                .0
+        }
+
+        fn file_entry(rel: &str, hash: &str, rev: &str) -> DropboxEntry {
+            DropboxEntry {
+                tag: "file".to_string(),
+                path_display: Some(format!("/{rel}")),
+                path_lower: Some(format!("/{rel}").to_lowercase()),
+                content_hash: Some(hash.to_string()),
+                rev: Some(rev.to_string()),
+                server_modified: Some("2024-01-02T03:04:05Z".to_string()),
+                size: None,
+                id: None,
+            }
+        }
+
+        fn deleted_entry(rel: &str) -> DropboxEntry {
+            DropboxEntry {
+                tag: "deleted".to_string(),
+                path_display: Some(format!("/{rel}")),
+                path_lower: Some(format!("/{rel}").to_lowercase()),
+                content_hash: None,
+                rev: None,
+                server_modified: None,
+                size: None,
+                id: None,
+            }
+        }
+
+        fn snapshot(files: &[(String, String)]) -> HashMap<String, RemoteFileMeta> {
+            files
+                .iter()
+                .map(|(rel, hash)| remote_meta_from_entry(&file_entry(rel, hash, "rev1")).unwrap())
+                .collect()
+        }
+
+        /// Records what Dropbox holds for each file (hash = the local bytes), through the real
+        /// snapshot reconcile, before any exclusion exists.
+        fn record_remote_state(state: &AppState, rels: &[&str]) {
+            let snap = snapshot(
+                &rels
+                    .iter()
+                    .map(|r| (r.to_string(), hash_of(state, r)))
+                    .collect::<Vec<_>>(),
+            );
+            let local = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(state, &local, &snap).unwrap();
+        }
+
+        fn remote_hash(state: &AppState, rel: &str) -> Option<String> {
+            state
+                .db
+                .get_remote_file(rel)
+                .unwrap()
+                .map(|r| r.content_hash)
+        }
+
+        // ---------------------------- scan: the five deletion sets ---------------------
+
+        /// H2/H3, scan FOLDER deletions. An excluded folder that is in `known_folders` and
+        /// missing on disk is not a recursive remote `delete_v2`. (An EMPTY folder, so only the
+        /// folder set is in play.) The in-scope folder deleted beside it still is.
+        #[test]
+        fn scan_excluded_known_folder_missing_on_disk_makes_no_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mkdir(&state, "Empty");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            assert!(known_folders(&state).contains(&"Empty".to_string()));
+
+            exclude(&state, "Empty");
+            std::fs::remove_dir(sync_root(&state).join("Empty")).unwrap();
+            std::fs::remove_dir_all(sync_root(&state).join("Keep")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Keep".to_string(), "Keep/k.txt".to_string()],
+                "only the in-scope folder and its file are deleted; never `Empty`"
+            );
+            assert!(
+                known_folders(&state).contains(&"Empty".to_string()),
+                "the excluded row is left alone, not deleted and not pruned"
+            );
+        }
+
+        /// H2, scan FILE deletions + breaker numerator. 30 excluded tracked files vanish.
+        /// Counted as candidates they would trip the breaker (>= 25 and >= 10%).
+        #[test]
+        fn scan_excluded_tracked_files_missing_on_disk_make_no_delete_and_do_not_trip_the_breaker()
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            for i in 0..30 {
+                write(
+                    &state,
+                    &format!("Priv/f{i}.txt"),
+                    format!("p{i}").as_bytes(),
+                );
+            }
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+
+            exclude(&state, "Priv");
+            for i in 0..30 {
+                std::fs::remove_file(sync_root(&state).join(format!("Priv/f{i}.txt"))).unwrap();
+            }
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(
+                !mass_delete_pause_active(&state).unwrap(),
+                "excluded paths are not breaker candidates"
+            );
+            assert_eq!(state.db.list_local_files().unwrap().len(), 31);
+        }
+
+        /// The breaker's DENOMINATOR is the synced zone too: 25 in-scope deletions out of 25
+        /// synced files is a mass deletion even when 300 excluded files are also tracked.
+        #[test]
+        fn scan_breaker_denominator_counts_only_the_synced_zone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            for i in 0..300 {
+                write(
+                    &state,
+                    &format!("Priv/f{i}.txt"),
+                    format!("p{i}").as_bytes(),
+                );
+            }
+            for i in 0..25 {
+                write(
+                    &state,
+                    &format!("Keep/k{i}.txt"),
+                    format!("k{i}").as_bytes(),
+                );
+            }
+            index_disk(&state);
+
+            exclude(&state, "Priv");
+            for i in 0..25 {
+                std::fs::remove_file(sync_root(&state).join(format!("Keep/k{i}.txt"))).unwrap();
+            }
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(
+                mass_delete_pause_active(&state).unwrap(),
+                "25 of 25 synced files vanishing must trip the breaker"
+            );
+            assert!(pending(&state, "delete").is_empty());
+        }
+
+        /// H9, scan: a missing Ancestor folder is never deleted (nor its excluded siblings);
+        /// the included subtree below it is deleted on its own account.
+        #[test]
+        fn scan_ancestor_folder_missing_is_never_a_deletion_candidate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/a.txt", b"a");
+            write(&state, "Fotos/Other/b.txt", b"b");
+            index_disk(&state);
+            assert!(known_folders(&state).contains(&"Fotos".to_string()));
+
+            include(&state, "Fotos/2024");
+            std::fs::remove_dir_all(sync_root(&state).join("Fotos")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Fotos/2024".to_string(), "Fotos/2024/a.txt".to_string()],
+                "never `Fotos` (Ancestor) or anything under `Fotos/Other` (Excluded)"
+            );
+        }
+
+        /// E, scan file walk: a new local file under an excluded path is never uploaded, and
+        /// never indexed; a file directly inside an Ancestor folder counts as excluded.
+        #[test]
+        fn scan_never_uploads_a_new_file_outside_the_synced_zone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            write(&state, "Priv/new.txt", b"x");
+            write(&state, "Keep/new.txt", b"y");
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "upload"), vec!["Keep/new.txt".to_string()]);
+            assert!(state.db.get_local_file("Priv/new.txt").unwrap().is_none());
+
+            let tmp2 = tempfile::tempdir().unwrap();
+            let state2 = build_state(tmp2.path());
+            include(&state2, "Fotos/2024");
+            write(&state2, "Fotos/loose.txt", b"l");
+            write(&state2, "Fotos/2024/in.txt", b"i");
+            write(&state2, "Other/x.txt", b"o");
+            scan_local_changes_only(&state2).unwrap();
+            assert_eq!(
+                pending(&state2, "upload"),
+                vec!["Fotos/2024/in.txt".to_string()]
+            );
+        }
+
+        /// H3, scan dir walk: `known_folders` is never upserted for an excluded dir, nor for an
+        /// Ancestor (it is traversed, not recorded).
+        #[test]
+        fn scan_never_records_an_excluded_or_ancestor_dir_in_known_folders() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv/sub");
+            mkdir(&state, "Keep/sub");
+            scan_local_changes_only(&state).unwrap();
+            let kf = known_folders(&state);
+            assert!(kf.contains(&"Keep/sub".to_string()), "{kf:?}");
+            assert!(!kf.iter().any(|f| f.starts_with("Priv")), "{kf:?}");
+
+            let tmp2 = tempfile::tempdir().unwrap();
+            let state2 = build_state(tmp2.path());
+            include(&state2, "Fotos/2024");
+            mkdir(&state2, "Fotos/2024/sub");
+            mkdir(&state2, "Fotos/Other");
+            scan_local_changes_only(&state2).unwrap();
+            let kf2 = known_folders(&state2);
+            assert!(kf2.contains(&"Fotos/2024/sub".to_string()), "{kf2:?}");
+            assert!(!kf2.contains(&"Fotos".to_string()), "{kf2:?}");
+            assert!(!kf2.contains(&"Fotos/Other".to_string()), "{kf2:?}");
+        }
+
+        // ------------------- watcher: vanished set and targeted deletions --------------
+
+        /// Watcher variant of the H2 fixtures: an excluded known folder and an excluded tracked
+        /// file, both missing on disk, produce no job from `process_changed_paths`.
+        #[test]
+        fn watcher_excluded_known_folder_and_file_missing_make_no_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mkdir(&state, "Empty");
+            write(&state, "Priv/a.txt", b"a");
+            index_disk(&state);
+
+            exclude(&state, "Empty,Priv");
+            std::fs::remove_dir(sync_root(&state).join("Empty")).unwrap();
+            std::fs::remove_file(sync_root(&state).join("Priv/a.txt")).unwrap();
+            let n = process_changed_paths(&state, &["Empty".to_string(), "Priv/a.txt".to_string()])
+                .unwrap();
+
+            assert_eq!(n, 0);
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+        }
+
+        /// The VANISHED set: an excluded vanished path is not a rename SOURCE. Its bytes turn up
+        /// at an included path; correlating them would enqueue a `move` out of the excluded zone.
+        #[test]
+        fn watcher_an_excluded_vanished_path_is_not_a_rename_source() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"same bytes");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+
+            exclude(&state, "Priv");
+            std::fs::remove_file(sync_root(&state).join("Priv/a.txt")).unwrap();
+            write(&state, "Moved/a.txt", b"same bytes");
+            process_changed_paths(
+                &state,
+                &["Priv/a.txt".to_string(), "Moved/a.txt".to_string()],
+            )
+            .unwrap();
+
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(pending(&state, "delete").is_empty());
+            assert_eq!(pending(&state, "upload"), vec!["Moved/a.txt".to_string()]);
+        }
+
+        /// Correlation still sees an excluded DESTINATION: an included file moved into an
+        /// excluded folder is a remote `move` (decision F), and the excluded copy is not
+        /// uploaded as a stranger. (Removing the local copy afterwards is slice 3.)
+        #[test]
+        fn watcher_a_move_into_an_excluded_folder_is_still_correlated_as_a_move() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/a.txt"),
+                sync_root(&state).join("Priv/a.txt"),
+            )
+            .unwrap();
+            process_changed_paths(&state, &["Src/a.txt".to_string(), "Priv/a.txt".to_string()])
+                .unwrap();
+
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Src/a.txt".to_string(), "Priv/a.txt".to_string())]
+            );
+            assert!(pending(&state, "upload").is_empty());
+            assert!(pending(&state, "delete").is_empty());
+        }
+
+        /// Watcher file and dir arms of E: a new excluded file and a new excluded directory
+        /// (with a child) are neither uploaded nor recorded.
+        #[test]
+        fn watcher_never_uploads_or_records_anything_new_under_an_excluded_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            write(&state, "Priv/new.txt", b"x");
+            write(&state, "Priv/deep/inner.txt", b"y");
+            write(&state, "Keep/new.txt", b"z");
+            process_changed_paths(
+                &state,
+                &[
+                    "Priv/new.txt".to_string(),
+                    "Priv".to_string(),
+                    "Keep".to_string(),
+                ],
+            )
+            .unwrap();
+
+            assert_eq!(pending(&state, "upload"), vec!["Keep/new.txt".to_string()]);
+            assert!(!known_folders(&state).iter().any(|f| f.starts_with("Priv")));
+        }
+
+        /// Watcher dir arm for an Ancestor: it is walked for the included files below it, but
+        /// neither it nor its loose files are recorded or uploaded.
+        #[test]
+        fn watcher_walks_an_ancestor_dir_without_recording_or_uploading_its_loose_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            include(&state, "Fotos/2024");
+            write(&state, "Fotos/loose.txt", b"l");
+            write(&state, "Fotos/2024/in.txt", b"i");
+            process_changed_paths(&state, &["Fotos".to_string()]).unwrap();
+            assert_eq!(
+                pending(&state, "upload"),
+                vec!["Fotos/2024/in.txt".to_string()]
+            );
+            assert!(!known_folders(&state).contains(&"Fotos".to_string()));
+        }
+
+        /// Targeted SELF set: a tracked excluded file named by `rel` is not deleted.
+        #[test]
+        fn targeted_deletions_skip_an_excluded_tracked_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            index_disk(&state);
+            exclude(&state, "Priv");
+
+            let known = state.db.list_local_files().unwrap();
+            let filter = PrefixFilter::load(&state.db).unwrap();
+            let n = enqueue_targeted_deletions(
+                &state,
+                &sync_root(&state),
+                "Priv/a.txt",
+                &known,
+                &HashSet::new(),
+                &filter,
+            )
+            .unwrap();
+            assert_eq!(n, 0);
+            assert!(pending(&state, "delete").is_empty());
+        }
+
+        /// Targeted DESCENDANTS set: under a vanished in-scope folder, an excluded tracked file
+        /// is skipped and its in-scope sibling is deleted.
+        #[test]
+        fn targeted_deletions_skip_excluded_descendants() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "A/secret.txt", b"s");
+            write(&state, "A/y.txt", b"y");
+            index_disk(&state);
+            exclude(&state, "A/secret.txt");
+
+            let known = state.db.list_local_files().unwrap();
+            let filter = PrefixFilter::load(&state.db).unwrap();
+            enqueue_targeted_deletions(
+                &state,
+                &sync_root(&state),
+                "A",
+                &known,
+                &HashSet::new(),
+                &filter,
+            )
+            .unwrap();
+            let deletes = pending(&state, "delete");
+            assert!(deletes.contains(&"A/y.txt".to_string()), "{deletes:?}");
+            assert!(
+                !deletes.contains(&"A/secret.txt".to_string()),
+                "{deletes:?}"
+            );
+        }
+
+        /// Targeted FOLDERS set: under a vanished in-scope folder, an excluded known sub-folder
+        /// is not recursively deleted.
+        #[test]
+        fn targeted_deletions_skip_excluded_known_folders() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mkdir(&state, "A/priv");
+            mkdir(&state, "A/pub");
+            index_disk(&state);
+            exclude(&state, "A/priv");
+
+            let known = state.db.list_local_files().unwrap();
+            let filter = PrefixFilter::load(&state.db).unwrap();
+            enqueue_targeted_deletions(
+                &state,
+                &sync_root(&state),
+                "A",
+                &known,
+                &HashSet::new(),
+                &filter,
+            )
+            .unwrap();
+            let deletes = pending(&state, "delete");
+            assert!(deletes.contains(&"A/pub".to_string()), "{deletes:?}");
+            assert!(!deletes.contains(&"A/priv".to_string()), "{deletes:?}");
+        }
+
+        /// Targeted, Ancestor: a vanished Ancestor deletes the included subtree on its own
+        /// account and nothing else (not itself, not its excluded siblings).
+        #[test]
+        fn targeted_deletions_never_delete_an_ancestor_or_its_excluded_siblings() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/a.txt", b"a");
+            write(&state, "Fotos/Other/b.txt", b"b");
+            index_disk(&state);
+            include(&state, "Fotos/2024");
+
+            let known = state.db.list_local_files().unwrap();
+            let filter = PrefixFilter::load(&state.db).unwrap();
+            enqueue_targeted_deletions(
+                &state,
+                &sync_root(&state),
+                "Fotos",
+                &known,
+                &HashSet::new(),
+                &filter,
+            )
+            .unwrap();
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Fotos/2024".to_string(), "Fotos/2024/a.txt".to_string()]
+            );
+        }
+
+        /// Watcher, Ancestor removed: the same, through the batch entry point (an Ancestor stays
+        /// in the vanished set; only its deletion candidates are filtered).
+        #[test]
+        fn watcher_a_removed_ancestor_deletes_only_the_included_subtree() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/a.txt", b"a");
+            write(&state, "Fotos/Other/b.txt", b"b");
+            index_disk(&state);
+            include(&state, "Fotos/2024");
+            std::fs::remove_dir_all(sync_root(&state).join("Fotos")).unwrap();
+
+            process_changed_paths(&state, &["Fotos".to_string()]).unwrap();
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Fotos/2024".to_string(), "Fotos/2024/a.txt".to_string()]
+            );
+        }
+
+        /// A local rename of an Ancestor folder becomes a remote `move`, with a WARN.
+        #[test]
+        fn watcher_an_ancestor_rename_is_a_move_with_a_warning() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/a.txt", b"a");
+            index_disk(&state);
+            record_remote_state(&state, &["Fotos/2024/a.txt"]);
+            include(&state, "Fotos/2024");
+            std::fs::rename(
+                sync_root(&state).join("Fotos"),
+                sync_root(&state).join("Pics"),
+            )
+            .unwrap();
+
+            let out = captured_tracing_output(|| {
+                process_changed_paths(&state, &["Fotos".to_string(), "Pics".to_string()]).unwrap();
+            });
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Fotos".to_string(), "Pics".to_string())]
+            );
+            assert!(pending(&state, "delete").is_empty());
+            assert!(
+                out.contains("WARN") && out.contains("above a selective-sync include"),
+                "{out}"
+            );
+        }
+
+        // ------------------------------ remote side (C1) -------------------------------
+
+        /// Snapshot PRESENT loop: a tracked excluded file whose remote hash changed gets no
+        /// remote-row write and no download; the in-scope neighbour does.
+        #[test]
+        fn snapshot_present_under_an_excluded_path_changes_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Keep/k.txt"]);
+            let priv_before = remote_hash(&state, "Priv/a.txt");
+            assert!(priv_before.is_some());
+
+            exclude(&state, "Priv");
+            let snap = snapshot(&[
+                ("Priv/a.txt".to_string(), "NEWHASH".to_string()),
+                ("Keep/k.txt".to_string(), "NEWHASH".to_string()),
+            ]);
+            let local = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(&state, &local, &snap).unwrap();
+
+            assert_eq!(remote_hash(&state, "Priv/a.txt"), priv_before);
+            assert_eq!(
+                remote_hash(&state, "Keep/k.txt").as_deref(),
+                Some("NEWHASH")
+            );
+            assert_eq!(pending(&state, "download"), vec!["Keep/k.txt".to_string()]);
+        }
+
+        /// Snapshot ABSENT loop: a tracked excluded file missing from the snapshot is not
+        /// "deleted remotely": no `local_delete`, remote row kept.
+        #[test]
+        fn snapshot_absent_under_an_excluded_path_enqueues_no_local_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Keep/k.txt"]);
+
+            exclude(&state, "Priv");
+            let snap = snapshot(&[("Keep/k.txt".to_string(), hash_of(&state, "Keep/k.txt"))]);
+            let local = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(&state, &local, &snap).unwrap();
+
+            assert!(
+                pending(&state, "local_delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(remote_hash(&state, "Priv/a.txt").is_some());
+            assert!(sync_root(&state).join("Priv/a.txt").exists());
+        }
+
+        /// Breaker count (numerator): 30 excluded files absent from the snapshot do not trip it.
+        #[test]
+        fn snapshot_breaker_does_not_count_excluded_paths() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let mut priv_rels = Vec::new();
+            for i in 0..30 {
+                let rel = format!("Priv/f{i}.txt");
+                write(&state, &rel, format!("p{i}").as_bytes());
+                priv_rels.push(rel);
+            }
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            let mut all: Vec<&str> = priv_rels.iter().map(String::as_str).collect();
+            all.push("Keep/k.txt");
+            record_remote_state(&state, &all);
+
+            exclude(&state, "Priv");
+            let snap = snapshot(&[("Keep/k.txt".to_string(), hash_of(&state, "Keep/k.txt"))]);
+            let local = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(&state, &local, &snap).unwrap();
+
+            assert!(!mass_delete_pause_active(&state).unwrap());
+            assert!(pending(&state, "local_delete").is_empty());
+        }
+
+        /// Breaker count (denominator): 25 of 25 synced files absent trips it even with 300
+        /// excluded tracked files that would dilute it below 10%.
+        #[test]
+        fn snapshot_breaker_denominator_counts_only_the_synced_zone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let mut rels = Vec::new();
+            for i in 0..300 {
+                let rel = format!("Priv/f{i}.txt");
+                write(&state, &rel, format!("p{i}").as_bytes());
+                rels.push(rel);
+            }
+            for i in 0..25 {
+                let rel = format!("Keep/k{i}.txt");
+                write(&state, &rel, format!("k{i}").as_bytes());
+                rels.push(rel);
+            }
+            index_disk(&state);
+            record_remote_state(&state, &rels.iter().map(String::as_str).collect::<Vec<_>>());
+
+            exclude(&state, "Priv");
+            let local = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(&state, &local, &HashMap::new()).unwrap();
+
+            assert!(
+                mass_delete_pause_active(&state).unwrap(),
+                "everything in scope vanishing from the snapshot is a mass deletion"
+            );
+            assert!(pending(&state, "local_delete").is_empty());
+        }
+
+        /// Delta Upsert arm: an upsert under an excluded path writes no row and enqueues no
+        /// download; the in-scope neighbour is processed normally.
+        #[test]
+        fn delta_upsert_under_an_excluded_path_changes_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            let first = vec![
+                file_entry("Priv/a.txt", &hash_of(&state, "Priv/a.txt"), "rev1"),
+                file_entry("Keep/k.txt", &hash_of(&state, "Keep/k.txt"), "rev1"),
+            ];
+            apply_delta_entries(&state, &first, &HashSet::new(), &[]).unwrap();
+            let priv_before = remote_hash(&state, "Priv/a.txt");
+            assert!(priv_before.is_some());
+
+            exclude(&state, "Priv");
+            let changed = vec![
+                file_entry("Priv/a.txt", "NEWHASH", "rev2"),
+                file_entry("Keep/k.txt", "NEWHASH", "rev2"),
+            ];
+            apply_delta_entries(&state, &changed, &HashSet::new(), &[]).unwrap();
+
+            assert_eq!(remote_hash(&state, "Priv/a.txt"), priv_before);
+            assert_eq!(
+                remote_hash(&state, "Keep/k.txt").as_deref(),
+                Some("NEWHASH")
+            );
+            assert_eq!(pending(&state, "download"), vec!["Keep/k.txt".to_string()]);
+        }
+
+        /// Delta Remove arm: a remote delete under an excluded path enqueues no `local_delete`
+        /// and keeps the row; the in-scope neighbour is handled normally.
+        #[test]
+        fn delta_remove_under_an_excluded_path_changes_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            let first = vec![
+                file_entry("Priv/a.txt", &hash_of(&state, "Priv/a.txt"), "rev1"),
+                file_entry("Keep/k.txt", &hash_of(&state, "Keep/k.txt"), "rev1"),
+            ];
+            apply_delta_entries(&state, &first, &HashSet::new(), &[]).unwrap();
+
+            exclude(&state, "Priv");
+            let removed = vec![deleted_entry("Priv/a.txt"), deleted_entry("Keep/k.txt")];
+            apply_delta_entries(&state, &removed, &HashSet::new(), &[]).unwrap();
+
+            assert_eq!(
+                pending(&state, "local_delete"),
+                vec!["Keep/k.txt".to_string()]
+            );
+            assert!(remote_hash(&state, "Priv/a.txt").is_some());
+        }
+
+        // ------------------------------- drain (H7) ------------------------------------
+
+        const NO_LOOKUP: fn(&str) -> crate::error::AppResult<Option<RemoteFileMeta>> =
+            |_| panic!("the verification lookup must not run");
+
+        fn job_row(state: &AppState, job_type: &str) -> SyncJobRow {
+            jobs(state)
+                .into_iter()
+                .find(|j| j.job_type == job_type)
+                .expect("job")
+        }
+
+        fn assert_settled_not_run(job: &SyncJobRow) {
+            assert_eq!(job.status, "done", "{:?}", (&job.job_type, &job.last_error));
+            assert_eq!(job.last_error.as_deref(), Some(SKIPPED_EXCLUDED_REASON));
+        }
+
+        /// An upload queued before the exclusion, source since gone. Run, it would cancel
+        /// itself and forget the local row; settled, the row stays.
+        #[test]
+        fn drain_settles_an_excluded_upload_with_a_missing_source() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            scan_local_changes_only(&state).unwrap();
+            exclude(&state, "Priv");
+            std::fs::remove_file(sync_root(&state).join("Priv/a.txt")).unwrap();
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            assert_settled_not_run(&job_row(&state, "upload"));
+            assert!(state.db.get_local_file("Priv/a.txt").unwrap().is_some());
+        }
+
+        /// A delete queued before the exclusion, a `.cloudsc` now on disk. Run, it would be
+        /// swallowed as a dehydration and finish with a NULL `last_error`.
+        #[test]
+        fn drain_settles_an_excluded_delete_with_a_cloudsc_on_disk() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            index_disk(&state);
+            std::fs::remove_file(sync_root(&state).join("Priv/a.txt")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "delete"), vec!["Priv/a.txt".to_string()]);
+            write(&state, "Priv/a.txt.cloudsc", b"{}");
+            exclude(&state, "Priv");
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            assert_settled_not_run(&job_row(&state, "delete"));
+        }
+
+        /// A verified `local_delete` (the snapshot's inferred absence) queued before the
+        /// exclusion: not executed, the lookup is never asked, the file stays.
+        #[test]
+        fn drain_settles_an_excluded_verified_local_delete_without_asking_dropbox() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            let local = state.db.list_local_files().unwrap();
+            reconcile_fetched_snapshot(&state, &local, &HashMap::new()).unwrap();
+            let queued = job_row(&state, "local_delete");
+            assert!(queued.delta_deferred, "fixture must be a verified delete");
+            exclude(&state, "Priv");
+
+            let asked = Cell::new(false);
+            assert!(process_sync_queue_core(&state, |_| {
+                asked.set(true);
+                Ok(None)
+            })
+            .unwrap());
+
+            assert!(!asked.get());
+            assert_settled_not_run(&job_row(&state, "local_delete"));
+            assert!(sync_root(&state).join("Priv/a.txt").exists());
+        }
+
+        /// A hydrate job for a placeholder that no longer exists. Run, it is an idempotent
+        /// no-op ending with a NULL `last_error`.
+        #[test]
+        fn drain_settles_an_excluded_hydrate_with_a_missing_placeholder() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            state
+                .db
+                .enqueue_job("hydrate_cloudsc", Some("Priv/a.txt.cloudsc"), None)
+                .unwrap();
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            assert_settled_not_run(&job_row(&state, "hydrate_cloudsc"));
+        }
+
+        /// "Retry failed jobs" brings an excluded failed job back; the drain settles it.
+        #[test]
+        fn drain_settles_a_retried_excluded_job() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            scan_local_changes_only(&state).unwrap();
+            let id = job_row(&state, "upload").id;
+            let picked = state.db.pick_next_due_job().unwrap().unwrap();
+            assert_eq!(picked.id, id);
+            state.db.mark_job_failed(id, 5, Some("boom")).unwrap();
+            exclude(&state, "Priv");
+            // Source gone, so a (wrongly) executed upload cancels itself locally and never
+            // reaches the token; the settled marker is what tells the two outcomes apart.
+            std::fs::remove_file(sync_root(&state).join("Priv/a.txt")).unwrap();
+            assert_eq!(state.db.requeue_failed_jobs().unwrap(), 1);
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            assert_settled_not_run(&job_row(&state, "upload"));
+        }
+
+        /// The control: an in-scope job still runs, and finishes with a NULL `last_error`.
+        #[test]
+        fn drain_still_runs_an_in_scope_job() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            state
+                .db
+                .enqueue_job("local_delete", None, Some("Keep/gone.txt"))
+                .unwrap();
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            let job = job_row(&state, "local_delete");
+            assert_eq!(job.status, "done");
+            assert_eq!(job.last_error, None);
+        }
+
+        /// M1, DRAINED (reviewer finding): renaming a folder above an include is enqueued as a
+        /// `move` with a WARN, and the drain used to settle it as "excluded" (Ancestor to
+        /// Excluded is neither side Synced), so the rename never reached Dropbox. The move is
+        /// run through the real dispatch with the network call replaced by a recorder.
+        #[test]
+        fn drain_runs_an_ancestor_rename_move_instead_of_settling_it() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/a.txt", b"a");
+            index_disk(&state);
+            record_remote_state(&state, &["Fotos/2024/a.txt"]);
+            include(&state, "Fotos/2024");
+            std::fs::rename(
+                sync_root(&state).join("Fotos"),
+                sync_root(&state).join("Pics"),
+            )
+            .unwrap();
+            // Through the watcher, as production does: the rename is correlated into a move.
+            process_changed_paths(&state, &["Fotos".to_string(), "Pics".to_string()]).unwrap();
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Fotos".to_string(), "Pics".to_string())],
+                "{:?}",
+                summary(&state)
+            );
+
+            let ran = Cell::new(None);
+            assert!(process_sync_queue_with(
+                &state,
+                NO_LOOKUP,
+                |from, to| {
+                    ran.set(Some((from.to_string(), to.to_string())));
+                    Ok(())
+                },
+                |rel, _| panic!("unexpected upload of {rel}"),
+            )
+            .unwrap());
+
+            assert_eq!(ran.take(), Some(("Fotos".to_string(), "Pics".to_string())));
+            let job = job_row(&state, "move");
+            assert_eq!(job.status, "done");
+            assert_eq!(job.last_error, None, "performed, not settled as excluded");
+        }
+
+        fn job(job_type: &str, source: Option<&str>, target: Option<&str>) -> SyncJobRow {
+            SyncJobRow {
+                id: 1,
+                job_type: job_type.to_string(),
+                source_path: source.map(str::to_string),
+                target_path: target.map(str::to_string),
+                status: "queued".to_string(),
+                attempt_count: 0,
+                next_retry_at: None,
+                updated_at: String::new(),
+                last_error: None,
+                delete_parent_rev: None,
+                delta_deferred: false,
+            }
+        }
+
+        /// The pure rule. `Priv` is excluded; with include `Fotos/2024`, `Fotos` is an
+        /// Ancestor and `Other` is outside the include.
+        #[test]
+        fn drain_skip_reason_rule() {
+            let some = Some(SKIPPED_EXCLUDED_REASON);
+            let ex = PrefixFilter::new(&[], &["Priv".to_string()]);
+            for ty in [
+                "upload",
+                "delete",
+                "local_delete",
+                "download",
+                "hydrate_cloudsc",
+            ] {
+                assert_eq!(
+                    drain_skip_reason(&job(ty, Some("Priv/a"), Some("Priv/a")), &ex),
+                    some,
+                    "{ty}"
+                );
+                assert_eq!(
+                    drain_skip_reason(&job(ty, Some("Keep/a"), Some("Keep/a")), &ex),
+                    None,
+                    "{ty}"
+                );
+            }
+            // `.cloudsc` is stripped; case and boundary follow the predicate.
+            assert_eq!(
+                drain_skip_reason(&job("hydrate_cloudsc", Some("priv/a.cloudsc"), None), &ex),
+                some
+            );
+            assert_eq!(
+                drain_skip_reason(&job("download", None, Some("Priv2/a")), &ex),
+                None
+            );
+            // The arms read the same field the dispatch does: `download` the target,
+            // `upload` and `hydrate_cloudsc` the SOURCE ONLY (an upload whose source is in
+            // scope is not skipped because its target is not).
+            assert_eq!(
+                drain_skip_reason(&job("download", None, Some("Priv/a")), &ex),
+                some
+            );
+            assert_eq!(
+                drain_skip_reason(&job("upload", Some("Priv/a"), None), &ex),
+                some
+            );
+            assert_eq!(
+                drain_skip_reason(&job("upload", Some("Keep/a"), Some("Priv/a")), &ex),
+                None
+            );
+            assert_eq!(
+                drain_skip_reason(&job("upload", None, Some("Priv/a")), &ex),
+                None,
+                "dispatch fails an upload with no source; it does not read the target"
+            );
+            assert_eq!(
+                drain_skip_reason(&job("hydrate_cloudsc", Some("Keep/a"), Some("Priv/a")), &ex),
+                None
+            );
+            // A job with no path, or an unknown type, is left to fail where it always did.
+            assert_eq!(drain_skip_reason(&job("upload", None, None), &ex), None);
+            assert_eq!(
+                drain_skip_reason(&job("mystery", Some("Priv/a"), None), &ex),
+                None
+            );
+
+            // move: skipped only when BOTH sides are Excluded.
+            let mv = |a: &str, b: &str| drain_skip_reason(&job("move", Some(a), Some(b)), &ex);
+            assert_eq!(mv("Priv/a", "Priv/b"), some);
+            assert_eq!(mv("Keep/a", "Priv/a"), None);
+            assert_eq!(mv("Priv/a", "Keep/a"), None);
+            assert_eq!(mv("Keep/a", "Keep/b"), None);
+            assert_eq!(
+                drain_skip_reason(&job("move", Some("Priv/a"), None), &ex),
+                None
+            );
+
+            // An Ancestor is not Synced; an include behaves like an exclude for the rest.
+            let inc = PrefixFilter::new(&["Fotos/2024".to_string()], &[]);
+            assert_eq!(
+                drain_skip_reason(&job("delete", None, Some("Fotos")), &inc),
+                some
+            );
+            assert_eq!(
+                drain_skip_reason(&job("delete", None, Some("Fotos/2024/a")), &inc),
+                None
+            );
+            assert_eq!(
+                drain_skip_reason(&job("upload", Some("Other/a"), None), &inc),
+                some
+            );
+            // M1: a move runs unless BOTH sides are Excluded; an Ancestor counts as in scope.
+            let mvi = |a: &str, b: &str| drain_skip_reason(&job("move", Some(a), Some(b)), &inc);
+            assert_eq!(mvi("Fotos", "Pics"), None, "Ancestor -> Excluded runs");
+            assert_eq!(mvi("Pics", "Fotos"), None, "Excluded -> Ancestor runs");
+            assert_eq!(mvi("Fotos", "Imgs"), None, "Ancestor -> Excluded runs");
+            assert_eq!(mvi("Other/a", "Pics/a"), some, "both Excluded");
+            assert_eq!(mvi("Fotos/2024/a", "Pics/a"), None, "Synced -> Excluded");
+            // No lists, nothing is ever skipped.
+            let none = PrefixFilter::default();
+            assert_eq!(
+                drain_skip_reason(&job("delete", None, Some("Priv/a")), &none),
+                None
+            );
+        }
+
+        /// `mark_job_settled` writes the DBSYNC-113 marker and nothing else changes status.
+        #[test]
+        fn mark_job_settled_writes_done_with_the_reason() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            state
+                .db
+                .enqueue_job("upload", Some("a"), Some("a"))
+                .unwrap();
+            let id = jobs(&state)[0].id;
+            state.db.mark_job_settled(id, "why").unwrap();
+            let row = &jobs(&state)[0];
+            assert_eq!(
+                (row.status.as_str(), row.last_error.as_deref()),
+                ("done", Some("why"))
+            );
+            assert!(state.db.pick_next_due_job().unwrap().is_none());
+        }
+
+        /// A download of an excluded path is an error, not a silent `Ok(())`, and the scope
+        /// check touches no token (`ensure_download_in_scope` is the pure part of the entry).
+        #[test]
+        fn download_scope_check_errors_for_an_excluded_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            let err = crate::dropbox_transfer::ensure_download_in_scope(&state, "Priv/a.txt")
+                .expect_err("excluded");
+            assert!(
+                err.to_string().contains("excluded by selective sync"),
+                "{err}"
+            );
+            crate::dropbox_transfer::ensure_download_in_scope(&state, "Keep/a.txt")
+                .expect("in scope");
+        }
+
+        // ===========================================================================
+        // Slice 3 (#214): applying an exclusion to the local copy, moves across the
+        // boundary, and the protected folder delete.
+        // ===========================================================================
+
+        use super::super::{scan_local_half as scan_local_half_raw, SPLIT_PROTECTED_DELETE_REASON};
+
+        /// `scan_local_half` drains the PROCESS-WIDE deferred-paths set, so any test that runs it
+        /// can steal the paths another one just remembered. Every test here takes the shared guard
+        /// for the call (the test that owns the set holds the guard itself and calls the raw one).
+        fn scan_local_half(state: &AppState) -> crate::error::AppResult<usize> {
+            let _serial = crate::fs_watcher::pending_test_guard();
+            scan_local_half_raw(state)
+        }
+        use crate::cloudsc_ops::{apply_exclusions, ExclusionReport};
+
+        fn apply(state: &AppState) -> ExclusionReport {
+            apply_exclusions(state).expect("apply_exclusions")
+        }
+
+        fn on_disk(state: &AppState, rel: &str) -> bool {
+            std::fs::symlink_metadata(sync_root(state).join(rel)).is_ok()
+        }
+
+        fn local_paths(state: &AppState) -> Vec<String> {
+            let mut v: Vec<String> = state
+                .db
+                .list_local_files()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.relative_path)
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// Every job that is not `done`, as `(type, target)`, sorted: what is still to run.
+        fn active(state: &AppState) -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = jobs(state)
+                .into_iter()
+                .filter(|j| j.status != "done")
+                .map(|j| (j.job_type, j.target_path.unwrap_or_default()))
+                .collect();
+            v.sort();
+            v
+        }
+
+        fn t(job_type: &str, target: &str) -> (String, String) {
+            (job_type.to_string(), target.to_string())
+        }
+
+        /// Completes the queued move the way a successful `move_v2` does: the production index
+        /// rewrite, then the job done (no network).
+        fn complete_move(state: &AppState, from: &str, to: &str) {
+            crate::dropbox_transfer::apply_confirmed_move(state, from, to).unwrap();
+            settle(state);
+        }
+
+        // ------------------------------- apply pass ------------------------------------
+
+        /// A: excluding a folder that is already local removes its synced copy (files,
+        /// subfolders, the folder), forgets it in every index, and never reaches Dropbox: no
+        /// delete job from the next scan or from a watcher batch over the removed paths.
+        #[test]
+        fn apply_removes_the_synced_copy_and_leaves_no_remote_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Priv/sub/b.txt", b"b");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Priv/sub/b.txt", "Keep/k.txt"]);
+            assert_eq!(known_folders(&state), vec!["Keep", "Priv", "Priv/sub"]);
+
+            exclude(&state, "Priv");
+            let report = apply(&state);
+
+            assert!(
+                !on_disk(&state, "Priv"),
+                "the whole excluded folder is gone"
+            );
+            assert!(on_disk(&state, "Keep/k.txt"));
+            assert!(
+                report.kept.is_empty() && report.errors.is_empty(),
+                "{report:?}"
+            );
+            let mut removed = report.removed.clone();
+            removed.sort();
+            assert_eq!(
+                removed,
+                vec!["Priv/", "Priv/a.txt", "Priv/sub/", "Priv/sub/b.txt"]
+            );
+            assert_eq!(local_paths(&state), vec!["Keep/k.txt"]);
+            assert_eq!(known_folders(&state), vec!["Keep"]);
+            assert!(remote_hash(&state, "Priv/a.txt").is_none());
+            assert!(remote_hash(&state, "Priv/sub/b.txt").is_none());
+            assert!(
+                remote_hash(&state, "Keep/k.txt").is_some(),
+                "in-scope rows untouched"
+            );
+
+            scan_local_changes_only(&state).unwrap();
+            process_changed_paths(
+                &state,
+                &[
+                    "Priv".to_string(),
+                    "Priv/a.txt".to_string(),
+                    "Priv/sub".to_string(),
+                    "Priv/sub/b.txt".to_string(),
+                ],
+            )
+            .unwrap();
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+        }
+
+        /// Un-excluding right after the removal enqueues nothing: no index row survived that
+        /// could read as a deletion (a stale `known_folders` row would be a RECURSIVE remote
+        /// delete of the folder; a stale file row a delete of the file).
+        #[test]
+        fn un_excluding_after_the_removal_enqueues_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Priv/sub/b.txt", b"b");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Priv/sub/b.txt"]);
+            exclude(&state, "Priv");
+            apply(&state);
+
+            exclude(&state, "");
+            scan_local_changes_only(&state).unwrap();
+            process_changed_paths(&state, &["Priv".to_string(), "Priv/a.txt".to_string()]).unwrap();
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+            assert!(apply(&state).is_empty(), "an inactive filter does nothing");
+        }
+
+        /// DBSYNC-114 C3 (reviewer probe `probe_stale_ancestor_row_after_unclude`). Folders get
+        /// their `known_folders` row while the filter is off. Including a subfolder turns their
+        /// parent into an Ancestor; the user then deletes the parent (everything outside the
+        /// include is already gone from disk, the include's content with it) and later removes
+        /// the include. The parent is Synced again and its stale row, missing on disk, used to
+        /// become a RECURSIVE remote `delete_v2` of `Fotos`, taking `Fotos/Other` with it.
+        #[test]
+        fn a_stale_ancestor_folder_row_cannot_become_a_recursive_delete_after_the_unincluding() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/a.txt", b"a");
+            write(&state, "Fotos/Other/b.txt", b"b");
+            index_disk(&state);
+            record_remote_state(&state, &["Fotos/2024/a.txt", "Fotos/Other/b.txt"]);
+            assert!(known_folders(&state).contains(&"Fotos".to_string()));
+
+            include(&state, "Fotos/2024");
+            scan_local_half(&state).unwrap();
+            assert!(
+                !known_folders(&state)
+                    .iter()
+                    .any(|f| f == "Fotos" || f == "Fotos/Other"),
+                "the apply pass forgets every non-Synced folder, Ancestor included: {:?}",
+                known_folders(&state)
+            );
+            assert!(!on_disk(&state, "Fotos/Other"));
+
+            std::fs::remove_dir_all(sync_root(&state).join("Fotos")).unwrap();
+            scan_local_half(&state).unwrap();
+            settle(&state);
+
+            include(&state, "");
+            scan_local_half(&state).unwrap();
+            let deletes = pending(&state, "delete");
+            assert!(
+                !deletes.iter().any(|d| d == "Fotos" || d == "Fotos/Other"),
+                "a recursive delete of the folder (and its excluded sibling): {:?}",
+                summary(&state)
+            );
+        }
+
+        /// A file with edits Dropbox does not have is kept (content intact, directory too) and
+        /// logged at WARN. It is forgotten by both indexes, so it is a stranger afterwards.
+        #[test]
+        fn apply_keeps_an_unsynced_file_and_makes_it_a_stranger() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"synced");
+            write(&state, "Priv/b.txt", b"synced too");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Priv/b.txt"]);
+            write(&state, "Priv/a.txt", b"edited, never uploaded");
+
+            exclude(&state, "Priv");
+            let mut report = ExclusionReport::default();
+            let logs = captured_tracing_output(|| report = apply(&state));
+
+            assert_eq!(report.kept, vec!["Priv/a.txt"]);
+            assert_eq!(
+                std::fs::read(sync_root(&state).join("Priv/a.txt")).unwrap(),
+                b"edited, never uploaded"
+            );
+            assert!(
+                !on_disk(&state, "Priv/b.txt"),
+                "the synced sibling is removed"
+            );
+            assert!(
+                on_disk(&state, "Priv"),
+                "a directory holding a kept file stays"
+            );
+            assert!(
+                logs.contains("WARN") && logs.contains("Priv/a.txt"),
+                "{logs}"
+            );
+            assert!(
+                local_paths(&state).is_empty(),
+                "the kept file's row is dropped"
+            );
+            assert!(remote_hash(&state, "Priv/a.txt").is_none());
+
+            // Un-exclude: the scan meets it as a brand-new file and enqueues its upload. At
+            // drain time the guard finds the different version Dropbox holds and resolves the
+            // collision (DBSYNC-114 C1, round 3): the local bytes become a conflicted copy, the
+            // original path is released to Dropbox's version, Dropbox is untouched, no failure.
+            exclude(&state, "");
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "upload"), vec!["Priv/a.txt".to_string()]);
+            assert!(pending(&state, "delete").is_empty());
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("Priv/a.txt");
+            drain(&state, &dbx);
+            assert!(
+                dbx.sent.borrow().is_empty(),
+                "nothing was sent over Dropbox"
+            );
+            assert_eq!(dbx.rev("Priv/a.txt").as_deref(), Some(FOREIGN_REV));
+            let copies = conflicted_copies(&state, "Priv");
+            assert_eq!(copies.len(), 1, "{copies:?}");
+            assert_eq!(
+                std::fs::read(sync_root(&state).join(&copies[0])).unwrap(),
+                b"edited, never uploaded"
+            );
+            assert!(jobs(&state).iter().all(|j| j.status != "failed"));
+        }
+
+        const FOREIGN_REV: &str = "FOREIGN-REV";
+        const FOREIGN_HASH: &str = "FOREIGN-HASH";
+
+        /// Dropbox behind the drain's two network halves (the remote lookup and the send), so
+        /// the REAL `upload_local_file_with` -- vanished-file branch, guard, conflicted-copy
+        /// resolution, identical skip, landing, the I5 follow-up -- runs against a world a test
+        /// controls. `send` stores the bytes it was handed under a fresh `OURS-n` rev (an
+        /// overwrite, like the real upload), and `files` is what Dropbox holds.
+        struct Dropbox {
+            /// Keyed by the FOLDED path, like real Dropbox (case-insensitive); the value keeps
+            /// the spelling the file was stored under.
+            files: RefCell<HashMap<String, (String, RemoteFileMeta)>>,
+            sent: RefCell<Vec<String>>,
+            rev_seq: Cell<u32>,
+        }
+
+        impl Dropbox {
+            fn new() -> Self {
+                Dropbox {
+                    files: RefCell::new(HashMap::new()),
+                    sent: RefCell::new(Vec::new()),
+                    rev_seq: Cell::new(0),
+                }
+            }
+
+            fn put(&self, rel: &str, hash: &str, rev: &str) {
+                let meta = RemoteFileMeta {
+                    content_hash: hash.to_string(),
+                    rev: rev.to_string(),
+                    modified_ts: 0,
+                    id: None,
+                };
+                let mut files = self.files.borrow_mut();
+                // An overwrite keeps the spelling the file already has, like Dropbox.
+                let display = files
+                    .get(&crate::path_util::fold(rel))
+                    .map_or_else(|| rel.to_string(), |(d, _)| d.clone());
+                files.insert(crate::path_util::fold(rel), (display, meta));
+            }
+
+            /// What Dropbox holds at `rel` (any spelling).
+            fn lookup(&self, rel: &str) -> Option<RemoteFileMeta> {
+                self.files
+                    .borrow()
+                    .get(&crate::path_util::fold(rel))
+                    .map(|(_, m)| m.clone())
+            }
+
+            fn remove(&self, rel: &str) {
+                self.files.borrow_mut().remove(&crate::path_util::fold(rel));
+            }
+
+            /// Someone else's file at `rel`, which this client has never seen.
+            fn holds_foreign(&self, rel: &str) {
+                self.put(rel, FOREIGN_HASH, FOREIGN_REV);
+            }
+
+            /// What the sweep records for `rel`: the real reconcile of Dropbox's current row.
+            fn sweep(&self, state: &AppState, rel: &str) {
+                let meta = self.lookup(rel).unwrap();
+                crate::remote_index::reconcile_remote_present(state, rel, &meta).unwrap();
+            }
+
+            fn rev(&self, rel: &str) -> Option<String> {
+                self.lookup(rel).map(|m| m.rev)
+            }
+
+            fn hash(&self, rel: &str) -> Option<String> {
+                self.lookup(rel).map(|m| m.content_hash)
+            }
+
+            fn paths(&self) -> Vec<String> {
+                let mut v: Vec<String> = self
+                    .files
+                    .borrow()
+                    .values()
+                    .map(|(d, _)| d.clone())
+                    .collect();
+                v.sort();
+                v
+            }
+
+            fn send(&self, rel: &str, hash: String) -> crate::models::UploadCommitResponse {
+                self.rev_seq.set(self.rev_seq.get() + 1);
+                let rev = format!("OURS-{}", self.rev_seq.get());
+                self.put(rel, &hash, &rev);
+                self.sent.borrow_mut().push(rel.to_string());
+                crate::models::UploadCommitResponse {
+                    id: None,
+                    content_hash: Some(hash),
+                    rev: Some(rev),
+                    server_modified: None,
+                }
+            }
+        }
+
+        /// Runs ONE due job through the real drain. `mid_flight(rel)` runs while an upload is
+        /// "on the wire": after the bytes were read for the send and before Dropbox has them,
+        /// which is when the user (or the watcher) can still act on the file.
+        fn drain_with(state: &AppState, dbx: &Dropbox, mid_flight: &dyn Fn(&str)) -> bool {
+            assert!(
+                pending(state, "delete").is_empty(),
+                "a delete job is queued; run it with `apply_deletes` (the drain would use the network)"
+            );
+            process_sync_queue_with(
+                state,
+                NO_LOOKUP,
+                |from, to| panic!("unexpected move {from} -> {to}"),
+                |rel, _job_id| {
+                    crate::dropbox_transfer::upload_local_file_with(
+                        state,
+                        rel,
+                        |p| Ok(dbx.lookup(p)),
+                        |_file, _len, dropbox_path| {
+                            let key = crate::path_util::key_from_dropbox(dropbox_path);
+                            let hash = hash_of(state, &key);
+                            mid_flight(&key);
+                            Ok(Some(dbx.send(&key, hash)))
+                        },
+                    )
+                },
+            )
+            .unwrap()
+        }
+
+        fn drain(state: &AppState, dbx: &Dropbox) -> bool {
+            drain_with(state, dbx, &|_| {})
+        }
+
+        /// Drains every due job.
+        fn drain_all(state: &AppState, dbx: &Dropbox) {
+            while drain(state, dbx) {}
+        }
+
+        /// Runs the queued remote deletions against the fake Dropbox with `delete_v2`'s
+        /// semantics: a `parent_rev` that no longer matches leaves the file alone, no rev
+        /// deletes the path, and a path takes everything beneath it with it. Returns what was
+        /// asked, `(target, parent_rev)`.
+        fn apply_deletes(state: &AppState, dbx: &Dropbox) -> Vec<(String, Option<String>)> {
+            let mut asked = Vec::new();
+            for j in jobs(state) {
+                if j.job_type != "delete" || j.status == "done" {
+                    continue;
+                }
+                let target = j.target_path.clone().unwrap();
+                asked.push((target.clone(), j.delete_parent_rev.clone()));
+                {
+                    match &j.delete_parent_rev {
+                        Some(rev) => {
+                            if dbx.lookup(&target).is_some_and(|m| &m.rev == rev) {
+                                dbx.remove(&target);
+                            }
+                        }
+                        None => {
+                            dbx.remove(&target);
+                            let under = crate::path_util::fold(&format!("{target}/"));
+                            dbx.files.borrow_mut().retain(|k, _| !k.starts_with(&under));
+                        }
+                    }
+                }
+                state.db.mark_job_completed(j.id).unwrap();
+            }
+            asked
+        }
+
+        /// I2 as the fake Dropbox sees it: the foreign file survived whatever was asked, and
+        /// nothing asked carried its rev or targeted it (or a folder above it).
+        fn assert_foreign_untouched(
+            dbx: &Dropbox,
+            foreign: &str,
+            asked: &[(String, Option<String>)],
+        ) {
+            assert_eq!(dbx.rev(foreign).as_deref(), Some(FOREIGN_REV), "{asked:?}");
+            for (target, rev) in asked {
+                assert_ne!(rev.as_deref(), Some(FOREIGN_REV), "{asked:?}");
+                assert!(
+                    foreign != target && !foreign.starts_with(&format!("{target}/")),
+                    "a delete targets the foreign file or a folder above it: {asked:?}"
+                );
+            }
+        }
+
+        /// Keys of the conflicted copies directly inside `dir` (a root-relative folder; `""`
+        /// is the root).
+        fn conflicted_copies(state: &AppState, dir: &str) -> Vec<String> {
+            let abs = sync_root(state).join(dir);
+            let mut v: Vec<String> = std::fs::read_dir(abs)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("(conflicted copy"))
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if dir.is_empty() {
+                        name
+                    } else {
+                        format!("{dir}/{name}")
+                    }
+                })
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// I1 + I3 + I4: a new local file that collides with a file Dropbox holds and this
+        /// client never saw. Resolved in ONE drain: Dropbox untouched, the local bytes kept as
+        /// a conflicted copy, the original path untracked and free for Dropbox's version, the
+        /// job `done` (no failure, so no tray Error), a conflict row for the Flyout, nothing
+        /// armed on the original path. The copy is then picked up like any new file.
+        #[test]
+        fn a_new_file_colliding_with_unseen_dropbox_content_becomes_a_conflicted_copy() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"my local bytes");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("Docs/a.txt");
+
+            assert!(drain(&state, &dbx));
+
+            assert!(dbx.sent.borrow().is_empty(), "I1: nothing was overwritten");
+            assert_eq!(dbx.rev("Docs/a.txt").as_deref(), Some(FOREIGN_REV));
+            assert_eq!(dbx.hash("Docs/a.txt").as_deref(), Some(FOREIGN_HASH));
+            // I3: the bytes survive, under the conflicted-copy name, and the original is released.
+            let copies = conflicted_copies(&state, "Docs");
+            assert_eq!(copies.len(), 1, "{copies:?}");
+            assert_eq!(
+                std::fs::read(sync_root(&state).join(&copies[0])).unwrap(),
+                b"my local bytes"
+            );
+            assert!(!on_disk(&state, "Docs/a.txt"));
+            // I4: nothing armed or tracked at the original path, the job is done.
+            assert!(state.db.get_local_file("Docs/a.txt").unwrap().is_none());
+            assert!(!state.db.is_upload_unconfirmed("Docs/a.txt").unwrap());
+            assert!(
+                state.db.get_remote_file("Docs/a.txt").unwrap().is_none(),
+                "Dropbox's version is not recorded under any row of ours"
+            );
+            let upload = job_row(&state, "upload");
+            assert_eq!(upload.status, "done", "{:?}", upload.last_error);
+            assert!(
+                jobs(&state).iter().all(|j| j.status != "failed"),
+                "no failed job, so no tray Error"
+            );
+            // The conflict is recorded the way a download conflict is.
+            let conflicts = state.db.list_recent_conflicts(10).unwrap();
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].local_path, "Docs/a.txt");
+            assert_eq!(
+                conflicts[0].conflicted_copy_path.as_deref(),
+                Some(copies[0].as_str())
+            );
+            assert!(!conflicts[0].remote_deleted);
+
+            // The copy is an ordinary new file: the scan picks it up and it uploads.
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "upload"), vec![copies[0].clone()]);
+            drain_all(&state, &dbx);
+            assert_eq!(dbx.sent.borrow().clone(), vec![copies[0].clone()]);
+            assert_eq!(dbx.hash(&copies[0]).unwrap(), hash_of(&state, &copies[0]));
+            assert_eq!(dbx.rev("Docs/a.txt").as_deref(), Some(FOREIGN_REV));
+            assert!(!state.db.is_upload_unconfirmed(&copies[0]).unwrap());
+        }
+
+        /// The production upload body against the fake Dropbox, outside the queue (so a test
+        /// controls each attempt). `lose_response`: Dropbox stores the bytes, the answer never
+        /// arrives.
+        fn upload_once(
+            state: &AppState,
+            dbx: &Dropbox,
+            rel: &str,
+            lose_response: bool,
+        ) -> crate::error::AppResult<()> {
+            crate::dropbox_transfer::upload_local_file_with(
+                state,
+                rel,
+                |p| Ok(dbx.lookup(p)),
+                |_file, _len, dropbox_path| {
+                    let key = crate::path_util::key_from_dropbox(dropbox_path);
+                    let hash = hash_of(state, &key);
+                    let answer = dbx.send(&key, hash);
+                    if lose_response {
+                        Err(crate::error::AppError::Network("response lost".into()))
+                    } else {
+                        Ok(Some(answer))
+                    }
+                },
+            )
+        }
+
+        fn conflict_id(state: &AppState) -> i64 {
+            state.db.list_recent_conflicts(1).unwrap()[0].id
+        }
+
+        /// A collision at `Docs/a.txt` that the drain resolved, then swept: Dropbox's version
+        /// is recorded, a `.cloudsc` sidecar is planted for it (what a macOS sweep does), the
+        /// local bytes sit in a conflicted copy. Returns `(state, dbx, copy_rel)`.
+        fn resolved_collision(tmp: &std::path::Path) -> (AppState, Dropbox, String) {
+            let state = build_state(tmp);
+            write(&state, "Docs/a.txt", b"my local bytes");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("Docs/a.txt");
+            assert!(drain(&state, &dbx));
+            dbx.sweep(&state, "Docs/a.txt");
+            write(&state, "Docs/a.txt.cloudsc", b"{}");
+            let copies = conflicted_copies(&state, "Docs");
+            assert_eq!(copies.len(), 1);
+            (state, dbx, copies[0].clone())
+        }
+
+        /// M2. Keep Local on an upload-collision conflict means "my version wins", on purpose:
+        /// the promoted file replaces Dropbox's version (the user saw both and chose), the
+        /// planted sidecar of the replaced version is gone, no second conflict is made, and a
+        /// copy that had already reached Dropbox is removed from it.
+        #[test]
+        fn keep_local_on_an_upload_collision_replaces_the_dropbox_version() {
+            for copy_uploaded in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (state, dbx, copy) = resolved_collision(tmp.path());
+                if copy_uploaded {
+                    scan_local_changes_only(&state).unwrap();
+                    drain_all(&state, &dbx);
+                    assert_eq!(dbx.sent.borrow().clone(), vec![copy.clone()]);
+                }
+                let ctx = format!("copy_uploaded={copy_uploaded}");
+
+                resolve_conflict_internal(&state, conflict_id(&state), ConflictAction::KeepLocal)
+                    .unwrap();
+
+                let root = sync_root(&state);
+                assert_eq!(
+                    std::fs::read(root.join("Docs/a.txt")).unwrap(),
+                    b"my local bytes",
+                    "{ctx}"
+                );
+                assert!(!root.join("Docs/a.txt.cloudsc").exists(), "{ctx}");
+                assert!(!on_disk(&state, &copy), "{ctx}");
+                assert_eq!(
+                    state.db.get_local_file("Docs/a.txt").unwrap().unwrap().hash,
+                    hash_of(&state, "Docs/a.txt"),
+                    "{ctx}"
+                );
+                let before_sent = dbx.sent.borrow().len();
+                apply_deletes(&state, &dbx);
+                drain_all(&state, &dbx);
+
+                assert_eq!(
+                    dbx.sent.borrow()[before_sent..].to_vec(),
+                    vec!["Docs/a.txt".to_string()],
+                    "{ctx}: the upload replaced Dropbox's version on purpose"
+                );
+                assert_eq!(
+                    dbx.hash("Docs/a.txt").unwrap(),
+                    hash_of(&state, "Docs/a.txt"),
+                    "{ctx}"
+                );
+                assert!(dbx.rev("Docs/a.txt").unwrap().starts_with("OURS"), "{ctx}");
+                assert!(
+                    conflicted_copies(&state, "Docs").is_empty(),
+                    "{ctx}: no second conflicted copy"
+                );
+                assert!(
+                    state.db.list_recent_conflicts(10).unwrap().is_empty(),
+                    "{ctx}: no new conflict row"
+                );
+                assert_eq!(dbx.paths(), vec!["Docs/a.txt".to_string()], "{ctx}");
+                assert!(jobs(&state).iter().all(|j| j.status == "done"), "{ctx}");
+                assert!(
+                    !state.db.is_upload_unconfirmed("Docs/a.txt").unwrap(),
+                    "{ctx}"
+                );
+            }
+        }
+
+        /// I1. Keep Local when the conflicted copy is gone (the user deleted or moved it and
+        /// made a NEW file at the primary path): nothing was promoted, so the guard stays
+        /// armed and the upload meets Dropbox's version as a collision, not an overwrite.
+        #[test]
+        fn keep_local_without_a_copy_leaves_the_collision_guard_armed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (state, dbx, copy) = resolved_collision(tmp.path());
+            std::fs::remove_file(sync_root(&state).join(&copy)).unwrap();
+            state.db.remove_local_file(&copy).unwrap();
+            write(&state, "Docs/a.txt", b"brand new bytes");
+
+            resolve_conflict_internal(&state, conflict_id(&state), ConflictAction::KeepLocal)
+                .unwrap();
+            assert!(
+                state.db.get_local_file("Docs/a.txt").unwrap().is_none(),
+                "no row was written for bytes nobody reviewed"
+            );
+            drain_all(&state, &dbx);
+
+            assert!(dbx.sent.borrow().is_empty(), "{:?}", dbx.sent.borrow());
+            assert_eq!(dbx.rev("Docs/a.txt").as_deref(), Some(FOREIGN_REV));
+            assert_eq!(conflicted_copies(&state, "Docs").len(), 1);
+        }
+
+        /// M2. Use Remote on the same conflict: the local copy is discarded, Dropbox's
+        /// version and its placeholder are untouched, nothing is sent.
+        #[test]
+        fn use_remote_on_an_upload_collision_keeps_the_dropbox_version() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (state, dbx, copy) = resolved_collision(tmp.path());
+
+            resolve_conflict_internal(&state, conflict_id(&state), ConflictAction::UseRemote)
+                .unwrap();
+            drain_all(&state, &dbx);
+
+            assert!(!on_disk(&state, &copy));
+            assert!(sync_root(&state).join("Docs/a.txt.cloudsc").exists());
+            assert!(dbx.sent.borrow().is_empty());
+            assert!(pending(&state, "delete").is_empty());
+            assert_eq!(dbx.rev("Docs/a.txt").as_deref(), Some(FOREIGN_REV));
+            assert!(state.db.list_recent_conflicts(10).unwrap().is_empty());
+        }
+
+        /// M2. Keep Both: the copy uploads as an ordinary new file, Dropbox's version stays.
+        #[test]
+        fn keep_both_on_an_upload_collision_uploads_the_copy_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (state, dbx, copy) = resolved_collision(tmp.path());
+
+            resolve_conflict_internal(&state, conflict_id(&state), ConflictAction::KeepBoth)
+                .unwrap();
+            drain_all(&state, &dbx);
+
+            assert_eq!(dbx.sent.borrow().clone(), vec![copy.clone()]);
+            assert_eq!(dbx.hash(&copy).unwrap(), hash_of(&state, &copy));
+            assert_eq!(dbx.rev("Docs/a.txt").as_deref(), Some(FOREIGN_REV));
+            assert!(on_disk(&state, &copy));
+            assert!(state.db.list_recent_conflicts(10).unwrap().is_empty());
+        }
+
+        /// M3. The colliding file is MOVED aside, not copied and unlinked: same inode (so a
+        /// writer that still holds the file open writes into the conflicted copy, and a byte
+        /// written just before the resolution is not lost).
+        #[cfg(unix)]
+        #[test]
+        fn the_colliding_file_is_renamed_so_an_open_writer_still_reaches_the_copy() {
+            use std::io::Write;
+            use std::os::unix::fs::MetadataExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"my local bytes");
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(sync_root(&state).join("Docs/a.txt"))
+                .unwrap();
+            let inode = std::fs::metadata(sync_root(&state).join("Docs/a.txt"))
+                .unwrap()
+                .ino();
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("Docs/a.txt");
+
+            drain(&state, &dbx);
+
+            let copies = conflicted_copies(&state, "Docs");
+            assert_eq!(copies.len(), 1);
+            let copy_abs = sync_root(&state).join(&copies[0]);
+            assert_eq!(std::fs::metadata(&copy_abs).unwrap().ino(), inode);
+            handle.write_all(b" +late").unwrap();
+            handle.flush().unwrap();
+            assert_eq!(std::fs::read(&copy_abs).unwrap(), b"my local bytes +late");
+        }
+
+        /// m2. The first upload landed but its answer was lost; the user edits before the retry.
+        /// Dropbox then holds OUR earlier bytes, not a stranger's file: the edit replaces them
+        /// instead of becoming a conflicted copy.
+        #[test]
+        fn an_edit_after_a_lost_upload_response_replaces_our_own_bytes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "n.txt", b"version one");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            assert!(upload_once(&state, &dbx, "n.txt", true).is_err());
+            // The attempts ran out (a `failed` job is not active, so the edit below is an
+            // ordinary plain change, not the concurrent-update conflict of a pending job).
+            let job = job_row(&state, "upload");
+            state
+                .db
+                .mark_job_failed(job.id, 5, Some("response lost"))
+                .unwrap();
+            assert_eq!(dbx.hash("n.txt").unwrap(), hash_of(&state, "n.txt"));
+            assert!(state.db.is_upload_unconfirmed("n.txt").unwrap());
+            write(&state, "n.txt", b"version two, edited");
+            scan_local_changes_only(&state).unwrap();
+
+            upload_once(&state, &dbx, "n.txt", false).unwrap();
+
+            assert!(conflicted_copies(&state, "").is_empty());
+            assert!(state.db.list_recent_conflicts(10).unwrap().is_empty());
+            assert_eq!(dbx.hash("n.txt").unwrap(), hash_of(&state, "n.txt"));
+            assert_eq!(dbx.sent.borrow().len(), 2);
+            assert!(!state.db.is_upload_unconfirmed("n.txt").unwrap());
+        }
+
+        /// m2, the other side: a stranger's file that is NOT what this client sent is still a
+        /// collision after a lost response.
+        #[test]
+        fn a_foreign_file_after_a_lost_upload_response_is_still_a_collision() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "n.txt", b"version one");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            assert!(upload_once(&state, &dbx, "n.txt", true).is_err());
+            // The attempts ran out (a `failed` job is not active, so the edit below is an
+            // ordinary plain change, not the concurrent-update conflict of a pending job).
+            let job = job_row(&state, "upload");
+            state
+                .db
+                .mark_job_failed(job.id, 5, Some("response lost"))
+                .unwrap();
+            dbx.holds_foreign("n.txt");
+            write(&state, "n.txt", b"version two, edited");
+            scan_local_changes_only(&state).unwrap();
+
+            upload_once(&state, &dbx, "n.txt", false).unwrap();
+
+            assert_eq!(conflicted_copies(&state, "").len(), 1);
+            assert_eq!(dbx.rev("n.txt").as_deref(), Some(FOREIGN_REV));
+        }
+
+        /// m3. The restart sequence: a new file's upload failed for good, its folder was
+        /// deleted, and the startup cleanup completes the failed job. The deletion pass then
+        /// releases the file's stale marker; the folder pass of the SAME pass must still see
+        /// it and send no recursive delete (it would take someone else's `D/f` with it).
+        #[test]
+        fn a_marker_released_in_the_pass_still_protects_the_folder_delete() {
+            for watcher in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let state = build_state(tmp.path());
+                write(&state, "D/f.txt", b"never uploaded");
+                write(&state, "Other/keep.txt", b"keep");
+                write(&state, "Other/keep2.txt", b"keep");
+                write(&state, "Other/keep3.txt", b"keep");
+                scan_local_changes_only(&state).unwrap();
+                assert!(state.db.is_upload_unconfirmed("D/f.txt").unwrap());
+                let job = jobs(&state)
+                    .into_iter()
+                    .find(|j| j.target_path.as_deref() == Some("D/f.txt"))
+                    .unwrap();
+                state.db.mark_job_failed(job.id, 5, Some("boom")).unwrap();
+                std::fs::remove_dir_all(sync_root(&state).join("D")).unwrap();
+                assert_eq!(
+                    super::super::cleanup_stale_upload_state(&state).unwrap(),
+                    1,
+                    "the startup cleanup completes the failed job"
+                );
+
+                if watcher {
+                    process_changed_paths(&state, &["D/f.txt".to_string(), "D".to_string()])
+                        .unwrap();
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+
+                let ctx = format!("watcher={watcher}");
+                assert!(
+                    !state.db.is_upload_unconfirmed("D/f.txt").unwrap(),
+                    "{ctx}: the file pass released the stale marker"
+                );
+                let deletes: Vec<_> = pending(&state, "delete")
+                    .into_iter()
+                    .filter(|t| t == "D" || t.starts_with("D/"))
+                    .collect();
+                assert!(deletes.is_empty(), "{ctx}: {deletes:?}");
+            }
+        }
+
+        /// W1. A plain `load` does not read the first-upload markers (it runs per drained job
+        /// and per download); only the deletion-pass constructor snapshots them, and its
+        /// lookup is boundary-safe.
+        #[test]
+        fn only_the_deletion_pass_filter_snapshots_the_markers() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            state.db.mark_upload_unconfirmed("D/sub/f.txt").unwrap();
+
+            let plain = PrefixFilter::load(&state.db).unwrap();
+            assert!(!plain.unconfirmed_beneath("D"));
+            assert!(!plain.unconfirmed_beneath("D/sub/f.txt"));
+
+            let pass = PrefixFilter::load_for_deletion_pass(&state.db).unwrap();
+            for hit in ["D", "D/sub", "D/sub/f.txt"] {
+                assert!(pass.unconfirmed_beneath(hit), "{hit}");
+            }
+            for miss in ["D/su", "D/sub/f", "D-other", "E"] {
+                assert!(!pass.unconfirmed_beneath(miss), "{miss}");
+            }
+        }
+
+        /// m4. A rename whose destination collides with a different Dropbox file: the debt of
+        /// the source deletion is settled with an accurate warning, no error is logged and no
+        /// "renamed to ... Dropbox holds both names" advisory is left to describe the foreign
+        /// file as the user's rename. The source is still not deleted.
+        #[test]
+        fn a_rename_destination_collision_settles_the_owed_deletion_quietly() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "new.txt", b"the renamed bytes");
+            state
+                .db
+                .upsert_remote_file("old.txt", "OLDHASH", "rev1", 0, None)
+                .unwrap();
+            state
+                .db
+                .enqueue_upload_then_delete("new.txt", "old.txt", Some("rev1"))
+                .unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("new.txt");
+            dbx.sweep(&state, "new.txt");
+
+            let mut ran = false;
+            let logs = captured_tracing_output(|| ran = drain(&state, &dbx));
+
+            assert!(ran);
+            assert!(!logs.contains("ERROR"), "{logs}");
+            assert!(logs.contains("collided"), "{logs}");
+            assert!(pending(&state, "delete").is_empty());
+            assert_eq!(state.db.list_recent_conflicts(10).unwrap().len(), 1);
+            assert_eq!(state.db.unsettled_source_deletion().unwrap(), None);
+            assert!(dbx.sent.borrow().is_empty());
+        }
+
+        /// m5. Dropbox is case-insensitive: a new local `A.txt` meets Dropbox's different
+        /// `a.txt` and is a collision, not a silent overwrite.
+        #[test]
+        fn a_case_variant_of_a_different_dropbox_file_is_a_collision() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "A.txt", b"mine");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("a.txt");
+
+            drain(&state, &dbx);
+
+            assert!(dbx.sent.borrow().is_empty());
+            assert_eq!(dbx.rev("A.txt").as_deref(), Some(FOREIGN_REV));
+            assert_eq!(conflicted_copies(&state, "").len(), 1);
+            assert_eq!(state.db.list_recent_conflicts(10).unwrap().len(), 1);
+        }
+
+        /// m5. Identical bytes under a case variant: nothing is sent and the file is not
+        /// indexed twice (no second remote row under the local spelling).
+        #[test]
+        fn identical_bytes_under_a_case_variant_do_not_make_a_second_remote_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "A.txt", b"same bytes");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.put("a.txt", &hash_of(&state, "A.txt"), "R1");
+            dbx.sweep(&state, "a.txt");
+
+            drain(&state, &dbx);
+
+            assert!(dbx.sent.borrow().is_empty());
+            let rows: Vec<String> = state
+                .db
+                .list_remote_files_under("")
+                .unwrap()
+                .into_iter()
+                .map(|r| r.relative_path)
+                .collect();
+            assert_eq!(rows, vec!["a.txt".to_string()]);
+            assert!(!state.db.is_upload_unconfirmed("A.txt").unwrap());
+            assert!(conflicted_copies(&state, "").is_empty());
+        }
+
+        /// m5. The same, with the PARENT folder spelled differently (`Docs/a.txt` locally,
+        /// `docs/a.txt` on Dropbox): still one remote row.
+        #[test]
+        fn identical_bytes_under_a_case_variant_parent_do_not_make_a_second_remote_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"same bytes");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.put("docs/a.txt", &hash_of(&state, "Docs/a.txt"), "R1");
+            dbx.sweep(&state, "docs/a.txt");
+
+            drain(&state, &dbx);
+
+            assert!(dbx.sent.borrow().is_empty());
+            let rows: Vec<String> = state
+                .db
+                .list_remote_files_under("")
+                .unwrap()
+                .into_iter()
+                .map(|r| r.relative_path)
+                .collect();
+            assert_eq!(rows, vec!["docs/a.txt".to_string()]);
+            assert!(!state.db.is_upload_unconfirmed("Docs/a.txt").unwrap());
+        }
+
+        /// The copy goes through the same guard: if Dropbox holds something different under the
+        /// copy's name too, it is conflicted again (a new name) and nothing is overwritten or lost.
+        #[test]
+        fn a_conflicted_copy_that_collides_again_is_conflicted_again() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "a.txt", b"mine");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("a.txt");
+            drain(&state, &dbx);
+            let first = conflicted_copies(&state, "");
+            assert_eq!(first.len(), 1);
+            dbx.holds_foreign(&first[0]);
+
+            scan_local_changes_only(&state).unwrap();
+            drain(&state, &dbx);
+
+            let second = conflicted_copies(&state, "");
+            assert_eq!(
+                second.len(),
+                1,
+                "the first copy was itself renamed: {second:?}"
+            );
+            assert_ne!(first, second);
+            assert_eq!(
+                std::fs::read(sync_root(&state).join(&second[0])).unwrap(),
+                b"mine"
+            );
+            assert!(dbx.sent.borrow().is_empty());
+            assert_eq!(dbx.rev("a.txt").as_deref(), Some(FOREIGN_REV));
+            assert_eq!(dbx.rev(&first[0]).as_deref(), Some(FOREIGN_REV));
+            scan_local_changes_only(&state).unwrap();
+            drain_all(&state, &dbx);
+            assert_eq!(dbx.sent.borrow().clone(), vec![second[0].clone()]);
+        }
+
+        /// DBSYNC-114 C1 (reviewer reproduction `rv_unexclude_stranger_has_local_row_before_
+        /// upload`), the second source: a file CREATED inside the excluded zone while it was
+        /// excluded (decision E; the apply pass had not seen it yet) and found by the scan
+        /// after the un-exclude. It collides with a Dropbox version the client never saw.
+        #[test]
+        fn a_file_created_while_excluded_is_kept_as_a_conflicted_copy_after_the_unexclude() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv");
+            write(&state, "Priv/new.txt", b"made while excluded");
+            exclude(&state, "");
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "upload"), vec!["Priv/new.txt".to_string()]);
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("Priv/new.txt");
+
+            drain(&state, &dbx);
+
+            assert!(dbx.sent.borrow().is_empty());
+            assert_eq!(dbx.rev("Priv/new.txt").as_deref(), Some(FOREIGN_REV));
+            let copies = conflicted_copies(&state, "Priv");
+            assert_eq!(copies.len(), 1);
+            assert_eq!(
+                std::fs::read(sync_root(&state).join(&copies[0])).unwrap(),
+                b"made while excluded"
+            );
+            assert!(jobs(&state).iter().all(|j| j.status != "failed"));
+        }
+
+        /// The guard's scope. A brand-new file still uploads when Dropbox has nothing at the
+        /// name, and is not re-sent when Dropbox already holds exactly its bytes (no copy
+        /// either); both record Dropbox's row and disarm the guard.
+        #[test]
+        fn the_guard_lets_a_new_file_through_when_dropbox_has_nothing_or_the_same_bytes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "n.txt", b"brand new");
+            write(&state, "same.txt", b"already there");
+            scan_local_changes_only(&state).unwrap();
+            assert!(crate::dropbox_transfer::upload_guard_applies(&state, "n.txt").unwrap());
+            let dbx = Dropbox::new();
+            dbx.put("same.txt", &hash_of(&state, "same.txt"), "THEIRS-1");
+
+            drain_all(&state, &dbx);
+
+            assert_eq!(dbx.sent.borrow().clone(), vec!["n.txt".to_string()]);
+            assert_eq!(dbx.rev("same.txt").as_deref(), Some("THEIRS-1"));
+            assert!(conflicted_copies(&state, "").is_empty());
+            for p in ["n.txt", "same.txt"] {
+                assert!(!state.db.is_upload_unconfirmed(p).unwrap(), "{p}");
+                assert!(state.db.get_remote_file(p).unwrap().is_some(), "{p}");
+            }
+            assert_eq!(
+                state.db.get_remote_file("n.txt").unwrap().unwrap().rev,
+                "OURS-1",
+                "the rev Dropbox returned is the one recorded"
+            );
+            assert!(jobs(&state).iter().all(|j| j.status == "done"));
+        }
+
+        /// Minor: a failure to disarm the marker after the bytes landed must not leave the
+        /// path guarded forever. The landing and the disarming are one transaction (so the
+        /// failed attempt records nothing), the job retries, and the retry passes the guard
+        /// because Dropbox now holds exactly the local bytes: no second upload, no conflicted copy.
+        #[test]
+        fn a_failed_marker_clear_after_a_landed_upload_does_not_guard_the_path_forever() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "a.txt", b"mine");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            let conn = rusqlite::Connection::open(tmp.path().join("db").join("app.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER inject_clear_failure BEFORE DELETE ON unconfirmed_uploads \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+
+            drain(&state, &dbx);
+
+            assert_eq!(dbx.sent.borrow().clone(), vec!["a.txt".to_string()]);
+            assert!(
+                state.db.is_upload_unconfirmed("a.txt").unwrap(),
+                "the injected failure left the marker"
+            );
+            assert!(
+                state.db.get_remote_file("a.txt").unwrap().is_none(),
+                "one transaction: nothing was recorded either"
+            );
+            assert_eq!(job_row(&state, "upload").status, "retry_wait");
+
+            conn.execute_batch(
+                "DROP TRIGGER inject_clear_failure; \
+                 UPDATE sync_jobs SET next_retry_at = '2000-01-01T00:00:00+00:00';",
+            )
+            .unwrap();
+            drain(&state, &dbx);
+
+            assert_eq!(
+                dbx.sent.borrow().len(),
+                1,
+                "the retry must not upload the same bytes again"
+            );
+            assert!(
+                conflicted_copies(&state, "").is_empty(),
+                "and must not conflict with its own upload"
+            );
+            assert!(!state.db.is_upload_unconfirmed("a.txt").unwrap());
+            assert_eq!(
+                state.db.get_remote_file("a.txt").unwrap().unwrap().rev,
+                "OURS-1"
+            );
+            assert_eq!(job_row(&state, "upload").status, "done");
+            // And an ordinary edit afterwards is not guarded.
+            write(&state, "a.txt", b"mine, edited");
+            scan_local_changes_only(&state).unwrap();
+            assert!(!crate::dropbox_transfer::upload_guard_applies(&state, "a.txt").unwrap());
+        }
+
+        /// K1 (round 2, redone for round 3): a remote edit arriving while the new file's
+        /// upload has not landed would be downloaded over bytes Dropbox never had. The
+        /// download's conflict guard keeps them as a conflicted copy, and the queued upload
+        /// then has nothing to overwrite with.
+        #[test]
+        fn a_remote_edit_before_the_upload_lands_never_overwrites_the_new_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "a.txt", b"local, never uploaded");
+            scan_local_changes_only(&state).unwrap();
+            assert!(state.db.is_upload_unconfirmed("a.txt").unwrap());
+            let meta = |h: &str, r: &str| RemoteFileMeta {
+                content_hash: h.into(),
+                rev: r.into(),
+                modified_ts: 0,
+                id: None,
+            };
+            // The sweep sees Dropbox's file, then an edit of it.
+            crate::remote_index::reconcile_remote_present(&state, "a.txt", &meta("R1", "rev1"))
+                .unwrap();
+            let n =
+                crate::remote_index::reconcile_remote_present(&state, "a.txt", &meta("R2", "rev2"))
+                    .unwrap();
+            assert_eq!(n, 1, "the remote edit enqueues a download");
+
+            let copied = land_download(&state, "a.txt", b"the collaborator's edit");
+            assert!(copied, "the never-uploaded bytes must be preserved first");
+            let copies = conflicted_copies(&state, "");
+            assert_eq!(copies.len(), 1);
+            assert_eq!(
+                std::fs::read(sync_root(&state).join(&copies[0])).unwrap(),
+                b"local, never uploaded"
+            );
+            assert!(!state.db.list_recent_conflicts(10).unwrap().is_empty());
+
+            // The upload job queued for a.txt now finds Dropbox holding the downloaded bytes.
+            let dbx = Dropbox::new();
+            dbx.put("a.txt", &hash_of(&state, "a.txt"), "rev2");
+            scan_local_changes_only(&state).unwrap();
+            assert!(pending(&state, "upload").contains(&copies[0]));
+            for j in jobs(&state).iter().filter(|j| j.job_type == "download") {
+                state.db.mark_job_completed(j.id).unwrap();
+            }
+            drain_all(&state, &dbx);
+            assert_eq!(dbx.sent.borrow().clone(), vec![copies[0].clone()]);
+            assert_eq!(dbx.rev("a.txt").as_deref(), Some("rev2"));
+        }
+
+        /// CRIT-1 world: a synced `Dir/b.txt`, and a new `Dir/a.txt` whose upload has not
+        /// landed while Dropbox holds someone else's `Dir/a.txt` (the sweep has recorded it).
+        /// Then `rm -rf Dir`. `failed_upload`: the upload had already failed (awaiting Retry).
+        fn crit1_world(state: &AppState, failed_upload: bool) -> Dropbox {
+            write(state, "Dir/b.txt", b"synced");
+            index_disk(state);
+            record_remote_state(state, &["Dir/b.txt"]);
+            write(state, "Dir/a.txt", b"local, never uploaded");
+            scan_local_changes_only(state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.put("Dir/b.txt", &hash_of(state, "Dir/b.txt"), "rev1");
+            dbx.holds_foreign("Dir/a.txt");
+            dbx.sweep(state, "Dir/a.txt");
+            if failed_upload {
+                let job = jobs(state)
+                    .into_iter()
+                    .find(|j| j.job_type == "upload")
+                    .unwrap();
+                state.db.mark_job_failed(job.id, 1, Some("boom")).unwrap();
+            }
+            std::fs::remove_dir_all(sync_root(state).join("Dir")).unwrap();
+            dbx
+        }
+
+        /// After the deletion events: Dropbox's own file is untouched, the synced sibling is
+        /// deleted one by one against ITS rev, and the never-landed file's upload job, when it
+        /// runs (after "Retry failed jobs" if it had failed), settles without a delete.
+        fn assert_crit1_outcome(state: &AppState, dbx: &Dropbox, ctx: &str) {
+            let asked = apply_deletes(state, dbx);
+            assert_foreign_untouched(dbx, "Dir/a.txt", &asked);
+            assert_eq!(
+                asked,
+                vec![("Dir/b.txt".to_string(), Some("rev1".to_string()))],
+                "{ctx}: only the synced file is deleted, one by one"
+            );
+            assert!(dbx.rev("Dir/b.txt").is_none(), "{ctx}");
+            state.db.requeue_failed_jobs().unwrap();
+            drain_all(state, dbx);
+            assert_foreign_untouched(dbx, "Dir/a.txt", &[]);
+            assert!(
+                pending(state, "delete").is_empty(),
+                "{ctx}: {:?}",
+                summary(state)
+            );
+            assert!(
+                state.db.get_local_file("Dir/a.txt").unwrap().is_none(),
+                "{ctx}"
+            );
+            assert!(
+                !state.db.is_upload_unconfirmed("Dir/a.txt").unwrap(),
+                "{ctx}"
+            );
+            assert!(dbx.sent.borrow().is_empty(), "{ctx}");
+        }
+
+        /// CRIT-1: a watcher `rm -rf Dir` reports the children before the parent. The first
+        /// visit of `Dir/a.txt` used to untrack it (clearing the marker) before `Dir` computed
+        /// whether anything beneath it was unconfirmed, and `Dir` then re-walked a stale
+        /// `known` snapshot: a recursive `delete Dir` AND a direct `delete Dir/a.txt` carrying
+        /// Dropbox's rev. Children first, parent first, two batches, the full scan, and with the
+        /// upload already failed.
+        #[test]
+        fn rm_rf_of_a_folder_with_a_never_landed_file_never_deletes_foreign_content() {
+            for (shape, failed_upload) in [
+                ("children first", false),
+                ("parent first", false),
+                ("two batches", false),
+                ("scan", false),
+                ("children first, upload failed", true),
+                ("two batches, upload failed", true),
+                ("scan, upload failed", true),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let state = build_state(tmp.path());
+                let dbx = crit1_world(&state, failed_upload);
+                let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+                if shape.starts_with("children first") {
+                    process_changed_paths(&state, &s(&["Dir/a.txt", "Dir/b.txt", "Dir"])).unwrap();
+                } else if shape == "parent first" {
+                    process_changed_paths(&state, &s(&["Dir", "Dir/a.txt", "Dir/b.txt"])).unwrap();
+                } else if shape.starts_with("two batches") {
+                    process_changed_paths(&state, &s(&["Dir/a.txt"])).unwrap();
+                    process_changed_paths(&state, &s(&["Dir"])).unwrap();
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                assert_crit1_outcome(&state, &dbx, shape);
+            }
+        }
+
+        /// CRIT-2: the excluded-zone fallback untracks a vanished file that cannot be paired
+        /// into a move, which used to clear its marker before the folder pass looked at it:
+        /// the same recursive `delete Dir`.
+        #[test]
+        fn a_never_landed_file_moved_into_the_excluded_zone_does_not_make_the_folder_delete_recursive(
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Dir/b.txt", b"synced");
+            write(&state, "X/keep.txt", b"k");
+            index_disk(&state);
+            record_remote_state(&state, &["Dir/b.txt", "X/keep.txt"]);
+            write(&state, "Dir/a.txt", b"local, never uploaded");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.put("Dir/b.txt", &hash_of(&state, "Dir/b.txt"), "rev1");
+            dbx.put("X/keep.txt", &hash_of(&state, "X/keep.txt"), "rev1");
+            dbx.holds_foreign("Dir/a.txt");
+            dbx.sweep(&state, "Dir/a.txt");
+            exclude(&state, "X");
+            apply(&state);
+            mkdir(&state, "X");
+            std::fs::rename(
+                sync_root(&state).join("Dir/a.txt"),
+                sync_root(&state).join("X/a.txt"),
+            )
+            .unwrap();
+            std::fs::remove_dir_all(sync_root(&state).join("Dir")).unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+
+            let asked = apply_deletes(&state, &dbx);
+            assert_foreign_untouched(&dbx, "Dir/a.txt", &asked);
+            assert!(
+                !asked.iter().any(|(t, _)| t == "X" || t.starts_with("X/")),
+                "{asked:?}"
+            );
+            assert_eq!(
+                std::fs::read(sync_root(&state).join("X/a.txt")).unwrap(),
+                b"local, never uploaded",
+                "the moved bytes stay where the user put them"
+            );
+        }
+
+        /// I5, MAJOR: the user deletes a new file while its upload is IN FLIGHT. The bytes land
+        /// anyway, so Dropbox must end without the file: the deletion is held until the
+        /// upload's own landing (the handler does not untrack a path whose upload may still
+        /// land) and then propagated against the rev Dropbox returned for OUR bytes.
+        #[test]
+        fn deleting_a_new_file_while_its_upload_is_in_flight_ends_with_it_gone_from_dropbox() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "n.txt", b"new");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+
+            drain_with(&state, &dbx, &|rel| {
+                std::fs::remove_file(sync_root(&state).join(rel)).unwrap();
+                process_changed_paths(&state, &[rel.to_string()]).unwrap();
+                assert!(
+                    pending(&state, "delete").is_empty(),
+                    "held: the bytes may still land: {:?}",
+                    summary(&state)
+                );
+                assert!(state.db.get_local_file(rel).unwrap().is_some());
+                assert!(state.db.is_upload_unconfirmed(rel).unwrap());
+            });
+
+            assert_eq!(dbx.rev("n.txt").as_deref(), Some("OURS-1"), "it landed");
+            let asked = apply_deletes(&state, &dbx);
+            assert_eq!(
+                asked,
+                vec![("n.txt".to_string(), Some("OURS-1".to_string()))],
+                "deleted against our own rev"
+            );
+            assert!(
+                dbx.paths().is_empty(),
+                "Dropbox matches the user: {:?}",
+                dbx.paths()
+            );
+            assert!(state.db.get_local_file("n.txt").unwrap().is_none());
+            assert!(!state.db.is_upload_unconfirmed("n.txt").unwrap());
+        }
+
+        /// I5, MAJOR, rename flavour: `n.txt` is renamed to `m.txt` while its upload is in
+        /// flight. Dropbox must end with `m.txt` only.
+        #[test]
+        fn renaming_a_new_file_while_its_upload_is_in_flight_ends_with_only_the_new_name() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "n.txt", b"new");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+
+            drain_with(&state, &dbx, &|rel| {
+                std::fs::rename(sync_root(&state).join(rel), sync_root(&state).join("m.txt"))
+                    .unwrap();
+                process_changed_paths(&state, &[rel.to_string(), "m.txt".to_string()]).unwrap();
+            });
+            assert_eq!(
+                dbx.paths(),
+                vec!["n.txt".to_string()],
+                "the old name landed"
+            );
+            let asked = apply_deletes(&state, &dbx);
+            assert_eq!(
+                asked,
+                vec![("n.txt".to_string(), Some("OURS-1".to_string()))]
+            );
+            drain_all(&state, &dbx);
+
+            assert_eq!(dbx.paths(), vec!["m.txt".to_string()]);
+            assert_eq!(dbx.hash("m.txt").unwrap(), hash_of(&state, "m.txt"));
+            assert!(state.db.get_local_file("n.txt").unwrap().is_none());
+        }
+
+        /// I5 + I2, the queued (not started) case, scan and watcher: the file is deleted or
+        /// renamed before its upload ran. Nothing was sent, so nothing is deleted on Dropbox --
+        /// least of all someone else's file at the name -- and the upload job settles the row.
+        #[test]
+        fn deleting_or_renaming_a_new_file_before_its_upload_runs_deletes_nothing_on_dropbox() {
+            for foreign in [false, true] {
+                for rename in [false, true] {
+                    for watcher in [false, true] {
+                        let ctx = format!("foreign={foreign} rename={rename} watcher={watcher}");
+                        let tmp = tempfile::tempdir().unwrap();
+                        let state = build_state(tmp.path());
+                        write(&state, "a.txt", b"made and removed");
+                        scan_local_changes_only(&state).unwrap();
+                        let dbx = Dropbox::new();
+                        if foreign {
+                            dbx.holds_foreign("a.txt");
+                            dbx.sweep(&state, "a.txt");
+                        }
+                        let root = sync_root(&state);
+                        if rename {
+                            std::fs::rename(root.join("a.txt"), root.join("b.txt")).unwrap();
+                        } else {
+                            std::fs::remove_file(root.join("a.txt")).unwrap();
+                        }
+                        let changed: Vec<String> = if rename {
+                            vec!["a.txt".into(), "b.txt".into()]
+                        } else {
+                            vec!["a.txt".into()]
+                        };
+                        if watcher {
+                            process_changed_paths(&state, &changed).unwrap();
+                        } else {
+                            scan_local_changes_only(&state).unwrap();
+                        }
+                        assert!(
+                            pending(&state, "delete").is_empty(),
+                            "{ctx}: {:?}",
+                            summary(&state)
+                        );
+                        assert!(pending(&state, "move").is_empty(), "{ctx}");
+
+                        drain_all(&state, &dbx);
+
+                        assert!(pending(&state, "delete").is_empty(), "{ctx}");
+                        let asked = apply_deletes(&state, &dbx);
+                        assert!(asked.is_empty(), "{ctx}: {asked:?}");
+                        let expected: Vec<String> = match (foreign, rename) {
+                            (true, true) => vec!["a.txt".into(), "b.txt".into()],
+                            (true, false) => vec!["a.txt".into()],
+                            (false, true) => vec!["b.txt".into()],
+                            (false, false) => vec![],
+                        };
+                        assert_eq!(dbx.paths(), expected, "{ctx}");
+                        if foreign {
+                            assert_foreign_untouched(&dbx, "a.txt", &asked);
+                        }
+                        assert!(state.db.get_local_file("a.txt").unwrap().is_none(), "{ctx}");
+                        assert!(!state.db.is_upload_unconfirmed("a.txt").unwrap(), "{ctx}");
+                        assert!(
+                            jobs(&state).iter().all(|j| j.status == "done"),
+                            "{ctx}: {:?}",
+                            summary(&state)
+                        );
+                    }
+                }
+            }
+        }
+
+        /// I2 + I5, the lost-response branch: the file is gone before the job sent anything and
+        /// Dropbox holds bytes IDENTICAL to the row's. That state is the same whether an earlier
+        /// attempt of this job landed (its answer lost) or another device put the same bytes
+        /// there, so the job never deletes: it untracks, and the file stays on Dropbox (a
+        /// resurrection as a placeholder in the first case, the other device's file untouched in
+        /// the second).
+        #[test]
+        fn a_deleted_new_file_never_deletes_identical_bytes_on_dropbox() {
+            for landed_ours in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let state = build_state(tmp.path());
+                write(&state, "n.txt", b"new");
+                scan_local_changes_only(&state).unwrap();
+                let dbx = Dropbox::new();
+                // Not ours: another device's identical file (nothing was sent); or ours, whose
+                // response was lost. Both look the same from here.
+                let rev = if landed_ours {
+                    "OURS-LOST"
+                } else {
+                    FOREIGN_REV
+                };
+                dbx.put("n.txt", &hash_of(&state, "n.txt"), rev);
+                std::fs::remove_file(sync_root(&state).join("n.txt")).unwrap();
+                process_changed_paths(&state, &["n.txt".to_string()]).unwrap();
+                assert!(pending(&state, "delete").is_empty());
+
+                assert!(
+                    drain(&state, &dbx),
+                    "the upload job meets the vanished file"
+                );
+
+                assert!(
+                    pending(&state, "delete").is_empty(),
+                    "landed_ours={landed_ours}"
+                );
+                let asked = apply_deletes(&state, &dbx);
+                assert!(asked.is_empty(), "landed_ours={landed_ours}: {asked:?}");
+                assert_eq!(dbx.rev("n.txt").as_deref(), Some(rev));
+                assert!(dbx.sent.borrow().is_empty());
+                assert!(state.db.get_local_file("n.txt").unwrap().is_none());
+                assert!(!state.db.is_upload_unconfirmed("n.txt").unwrap());
+                assert!(jobs(&state).iter().all(|j| j.status == "done"));
+            }
+        }
+
+        /// CRIT-1, second part: a path visited twice in one pass. The handler re-reads the
+        /// row; once the path is untracked there is nothing left to delete.
+        #[test]
+        fn a_second_visit_of_an_already_untracked_path_enqueues_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "a.txt", b"synced");
+            write(&state, "b.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["a.txt", "b.txt"]);
+            std::fs::remove_file(sync_root(&state).join("a.txt")).unwrap();
+            std::fs::remove_file(sync_root(&state).join("b.txt")).unwrap();
+            let filter = PrefixFilter::load(&state.db).unwrap();
+            let root = sync_root(&state);
+
+            let first =
+                super::super::process_local_file_deletion(&state, &filter, &root, "a.txt").unwrap();
+            let second =
+                super::super::process_local_file_deletion(&state, &filter, &root, "a.txt").unwrap();
+            assert_eq!((first, second), (1, 0));
+            assert_eq!(pending(&state, "delete"), vec!["a.txt".to_string()]);
+
+            // Untracked by something else (the excluded-zone fallback does exactly this).
+            state.db.remove_local_file("b.txt").unwrap();
+            let again =
+                super::super::process_local_file_deletion(&state, &filter, &root, "b.txt").unwrap();
+            assert_eq!(again, 0);
+            assert_eq!(pending(&state, "delete"), vec!["a.txt".to_string()]);
+        }
+
+        /// A recursive folder delete queued before an exclusion is decomposed into per-file
+        /// deletes from the remote rows (`split_protected_folder_delete`). A row whose path is a
+        /// never-landed local file may be someone else's version: no delete for it.
+        #[test]
+        fn a_split_folder_delete_skips_a_never_landed_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/b.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["Docs/b.txt"]);
+            write(&state, "Docs/a.txt", b"local, never uploaded");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("Docs/a.txt");
+            dbx.sweep(&state, "Docs/a.txt");
+            for j in jobs(&state) {
+                state.db.mark_job_completed(j.id).unwrap();
+            }
+            state.db.enqueue_delete_job("Docs", None).unwrap();
+            exclude(&state, "Docs/Archive");
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Docs/b.txt".to_string()],
+                "{:?}",
+                summary(&state)
+            );
+        }
+
+        /// The ordinary case still deletes: a file the client has uploaded (marker cleared by
+        /// the landed upload) is propagated as before, against the rev Dropbox returned.
+        #[test]
+        fn deleting_a_confirmed_file_still_propagates() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "c.txt", b"synced");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            drain_all(&state, &dbx);
+            std::fs::remove_file(sync_root(&state).join("c.txt")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            let asked = apply_deletes(&state, &dbx);
+            assert_eq!(
+                asked,
+                vec![("c.txt".to_string(), Some("OURS-1".to_string()))]
+            );
+            assert!(dbx.paths().is_empty());
+        }
+
+        /// Stands in for the network half of a download (the bytes arrive on disk), then runs
+        /// the real conflict guard and the real local-row write.
+        fn land_download(state: &AppState, rel: &str, remote_bytes: &[u8]) -> bool {
+            let root = sync_root(state);
+            let target = root.join(rel);
+            let copied =
+                crate::dropbox_transfer::preserve_local_before_download(state, &root, rel, &target)
+                    .unwrap();
+            std::fs::write(&target, remote_bytes).unwrap();
+            crate::dropbox_transfer::record_downloaded_file(state, rel, &target).unwrap();
+            copied
+        }
+
+        /// M-a: a download landing over a marked path clears the marker, so the next EDIT
+        /// uploads normally instead of being guarded against Dropbox's old bytes forever.
+        #[test]
+        fn a_download_landing_over_a_marked_path_disarms_the_guard() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "e.txt", b"v1");
+            scan_local_changes_only(&state).unwrap();
+            assert!(state.db.is_upload_unconfirmed("e.txt").unwrap());
+            // Dropbox holds a different version (the sweep recorded it), which is downloaded.
+            apply_delta_entries(
+                &state,
+                &[file_entry("e.txt", "REMOTE", "rev2")],
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap();
+            assert!(
+                state.db.is_upload_unconfirmed("e.txt").unwrap(),
+                "still guarded"
+            );
+            land_download(&state, "e.txt", b"remote v1");
+            assert!(!state.db.is_upload_unconfirmed("e.txt").unwrap());
+
+            write(&state, "e.txt", b"my edit");
+            scan_local_changes_only(&state).unwrap();
+            assert!(pending(&state, "upload").contains(&"e.txt".to_string()));
+            assert!(
+                !crate::dropbox_transfer::upload_guard_applies(&state, "e.txt").unwrap(),
+                "an edit to a synced file is not guarded"
+            );
+        }
+
+        /// M-a: a confirmed move retires the old name's marker (and the marker is not carried
+        /// to the new name), file and folder.
+        #[test]
+        fn a_confirmed_move_retires_the_marker() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "old.txt", b"x");
+            write(&state, "D/in.txt", b"y");
+            scan_local_changes_only(&state).unwrap();
+            assert!(state.db.is_upload_unconfirmed("old.txt").unwrap());
+            assert!(state.db.is_upload_unconfirmed("D/in.txt").unwrap());
+            crate::dropbox_transfer::apply_confirmed_move(&state, "old.txt", "new.txt").unwrap();
+            crate::dropbox_transfer::apply_confirmed_move(&state, "D", "E").unwrap();
+            for p in ["old.txt", "new.txt", "D/in.txt", "E/in.txt"] {
+                assert!(!state.db.is_upload_unconfirmed(p).unwrap(), "{p}");
+            }
+            assert!(!state.db.has_unconfirmed_upload_under("D").unwrap());
+        }
+
+        /// M-a: when the sweep finds Dropbox holding exactly the bytes of the local row, the
+        /// first upload is effectively confirmed; a DIFFERENT remote version keeps the guard.
+        #[test]
+        fn a_remote_row_equal_to_the_local_row_disarms_the_guard_and_a_different_one_does_not() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "s.txt", b"same");
+            write(&state, "d.txt", b"different");
+            scan_local_changes_only(&state).unwrap();
+            let meta = |h: String| RemoteFileMeta {
+                content_hash: h,
+                rev: "r".into(),
+                modified_ts: 0,
+                id: None,
+            };
+            crate::remote_index::reconcile_remote_present(
+                &state,
+                "s.txt",
+                &meta(hash_of(&state, "s.txt")),
+            )
+            .unwrap();
+            crate::remote_index::reconcile_remote_present(&state, "d.txt", &meta("other".into()))
+                .unwrap();
+            assert!(!state.db.is_upload_unconfirmed("s.txt").unwrap());
+            assert!(state.db.is_upload_unconfirmed("d.txt").unwrap());
+        }
+
+        /// After a collision nothing special remains: the collaborator deletes their file, the
+        /// sweep learns of it, and the user makes a new file at the name -- an ordinary new
+        /// file again.
+        #[test]
+        fn after_a_collision_the_original_name_is_an_ordinary_name_again() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "a.txt", b"local, never uploaded");
+            scan_local_changes_only(&state).unwrap();
+            let dbx = Dropbox::new();
+            dbx.holds_foreign("a.txt");
+            drain(&state, &dbx);
+            dbx.remove("a.txt");
+            crate::remote_index::reconcile_remote_absent(&state, "a.txt").unwrap();
+            assert!(pending(&state, "local_delete").is_empty());
+
+            write(&state, "a.txt", b"second try");
+            scan_local_changes_only(&state).unwrap();
+            drain_all(&state, &dbx);
+            assert_eq!(dbx.hash("a.txt").unwrap(), hash_of(&state, "a.txt"));
+        }
+
+        /// M-c: exclude -> un-exclude -> exclude of the SAME path must clean the remote rows
+        /// the sweep wrote while it was un-excluded.
+        #[test]
+        fn exclude_unexclude_reexclude_cleans_the_remote_rows_again() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            exclude(&state, "Priv");
+            apply(&state);
+            assert!(
+                remote_hash(&state, "Priv/a.txt").is_none(),
+                "first exclusion cleans"
+            );
+
+            exclude(&state, "");
+            apply(&state);
+            // The sweep, un-excluded, records Dropbox's file again.
+            apply_delta_entries(
+                &state,
+                &[file_entry("Priv/a.txt", "H", "rev9")],
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap();
+            assert!(remote_hash(&state, "Priv/a.txt").is_some());
+
+            exclude(&state, "Priv");
+            apply(&state);
+            assert!(
+                remote_hash(&state, "Priv/a.txt").is_none(),
+                "the second exclusion must clean again"
+            );
+        }
+
+        /// Minor (TOCTOU): the file is verified against Dropbox, then the user saves into it
+        /// before the unlink. The hook writes in exactly that window.
+        #[test]
+        fn apply_keeps_a_file_that_changed_between_the_hash_check_and_the_unlink() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            exclude(&state, "Priv");
+
+            let mut report = ExclusionReport::default();
+            let mut kept = HashSet::new();
+            let abs = sync_root(&state).join("Priv/a.txt");
+            crate::cloudsc_ops::remove_excluded_file_with(
+                &state,
+                &sync_root(&state),
+                "Priv/a.txt",
+                &abs,
+                &mut report,
+                &mut kept,
+                || std::fs::write(&abs, b"saved a moment too late for the hash").unwrap(),
+            );
+
+            assert_eq!(report.kept, vec!["Priv/a.txt"], "{report:?}");
+            assert!(report.removed.is_empty());
+            assert_eq!(
+                std::fs::read(&abs).unwrap(),
+                b"saved a moment too late for the hash"
+            );
+            assert!(local_paths(&state).is_empty(), "kept means untracked");
+        }
+
+        /// Minor: a file the pass cannot read to verify is KEPT, and kept means untracked. A
+        /// row left behind turns the file's later disappearance into a remote delete once the
+        /// path is synced again.
+        #[cfg(unix)]
+        #[test]
+        fn apply_untracks_a_file_it_could_not_read() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            let abs = sync_root(&state).join("Priv/a.txt");
+            std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(0o000)).unwrap();
+            exclude(&state, "Priv");
+
+            let report = apply(&state);
+            std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            assert_eq!(report.kept, vec!["Priv/a.txt"], "{report:?}");
+            assert!(!report.errors.is_empty());
+            assert!(abs.exists());
+            assert!(
+                local_paths(&state).is_empty(),
+                "the unreadable file's row must be dropped: {:?}",
+                local_paths(&state)
+            );
+        }
+
+        /// Minor: the row is keyed byte-exactly but the disk is not. A file renamed to another
+        /// case (APFS keeps one file) is walked under the new name; its row under the old name
+        /// must still go with it.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn apply_drops_the_case_variant_row_of_a_kept_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/Case.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/Case.txt"]);
+            let root = sync_root(&state);
+            std::fs::rename(root.join("Priv/Case.txt"), root.join("Priv/case.txt")).unwrap();
+            write(&state, "Priv/case.txt", b"edited, never uploaded");
+            exclude(&state, "Priv");
+
+            let report = apply(&state);
+
+            assert_eq!(report.kept, vec!["Priv/case.txt"], "{report:?}");
+            assert!(
+                local_paths(&state).is_empty(),
+                "a row under another case survived: {:?}",
+                local_paths(&state)
+            );
+        }
+
+        /// Minor: a file that stays kept is found by every scan; it is reported once, not on
+        /// every tick. A file that stops being kept and is kept again is reported again.
+        #[test]
+        fn a_kept_file_is_logged_once_not_every_tick() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"synced");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            write(&state, "Priv/a.txt", b"edited");
+            exclude(&state, "Priv");
+
+            let count = |logs: &str| logs.matches("kept an excluded file on disk").count();
+            let first = captured_tracing_output(|| {
+                apply(&state);
+            });
+            let second = captured_tracing_output(|| {
+                let again = apply(&state);
+                assert_eq!(again.kept, vec!["Priv/a.txt"], "still reported as kept");
+            });
+            assert_eq!(count(&first), 1, "{first}");
+            assert_eq!(count(&second), 0, "{second}");
+
+            // Gone, then back: a new condition, reported again.
+            std::fs::remove_file(sync_root(&state).join("Priv/a.txt")).unwrap();
+            apply(&state);
+            write(&state, "Priv/a.txt", b"back");
+            let third = captured_tracing_output(|| {
+                apply(&state);
+            });
+            assert_eq!(count(&third), 1, "{third}");
+        }
+
+        /// Minor (per-tick cost): the full remote listing is done once per filter, so a filter
+        /// that CHANGES must clean again.
+        #[test]
+        fn a_changed_filter_drops_the_remote_rows_of_the_newly_excluded_path() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "A/a.txt", b"a");
+            write(&state, "B/b.txt", b"b");
+            index_disk(&state);
+            record_remote_state(&state, &["A/a.txt", "B/b.txt"]);
+
+            exclude(&state, "A");
+            apply(&state);
+            assert!(remote_hash(&state, "A/a.txt").is_none());
+            assert!(remote_hash(&state, "B/b.txt").is_some());
+
+            exclude(&state, "A,B");
+            apply(&state);
+            assert!(
+                remote_hash(&state, "B/b.txt").is_none(),
+                "the second filter was never cleaned"
+            );
+        }
+
+        /// A file the index never knew (created or dropped in after the exclusion) is kept.
+        #[test]
+        fn apply_keeps_an_untracked_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            exclude(&state, "Priv");
+            write(&state, "Priv/new.txt", b"never synced from here");
+
+            let report = apply(&state);
+            assert_eq!(report.kept, vec!["Priv/new.txt"]);
+            assert!(report.removed.is_empty());
+            assert!(on_disk(&state, "Priv/new.txt"));
+            assert!(active(&state).is_empty());
+        }
+
+        /// A job that names the path (here an upload racing the exclusion) defers its removal
+        /// for the pass: nothing is unlinked or untracked, the path is reported busy. The file
+        /// is byte-identical to the synced copy, so only the job protects it.
+        #[test]
+        fn apply_respects_an_active_job() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"v1");
+            write(&state, "Priv/other.txt", b"o");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Priv/other.txt"]);
+            write(&state, "Priv/a.txt", b"v2");
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "upload"), vec!["Priv/a.txt".to_string()]);
+            write(&state, "Priv/a.txt", b"v1"); // back to the remote bytes: fully synced
+
+            exclude(&state, "Priv");
+            let report = apply(&state);
+
+            assert_eq!(report.busy, vec!["Priv/a.txt"]);
+            assert!(on_disk(&state, "Priv/a.txt"));
+            assert!(state.db.get_local_file("Priv/a.txt").unwrap().is_some());
+            assert!(
+                !on_disk(&state, "Priv/other.txt"),
+                "the idle sibling is removed"
+            );
+            assert!(
+                on_disk(&state, "Priv"),
+                "its directory stays while it is busy"
+            );
+        }
+
+        /// Inactive filters (none, or entries that parse to nothing) touch nothing.
+        #[test]
+        fn apply_with_an_inactive_filter_does_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            for csv in ["", " / ", "/,,"] {
+                exclude(&state, csv);
+                include(&state, csv);
+                assert!(apply(&state).is_empty(), "csv {csv:?}");
+                assert!(on_disk(&state, "Priv/a.txt"));
+            }
+        }
+
+        /// Excluded `.cloudsc` placeholders (file and folder) are removed; others stay.
+        #[test]
+        fn apply_removes_excluded_cloudsc_placeholders() {
+            use crate::cloudsc::write_cloudsc_placeholder_file;
+            use crate::models::CloudscMeta;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let ph = |rel: &str, tag: &str| {
+                write_cloudsc_placeholder_file(
+                    &sync_root(&state).join(format!("{rel}.cloudsc")),
+                    &CloudscMeta {
+                        version: 1,
+                        tag: tag.to_string(),
+                        remote_path_display: format!("/{rel}"),
+                    },
+                )
+                .unwrap();
+            };
+            ph("Priv/x.txt", "file");
+            ph("Priv/Deep", "folder");
+            ph("Keep/y.txt", "file");
+            exclude(&state, "Priv");
+
+            let report = apply(&state);
+            assert!(!on_disk(&state, "Priv"), "{report:?}");
+            assert!(on_disk(&state, "Keep/y.txt.cloudsc"));
+            assert!(report.removed.contains(&"Priv/x.txt.cloudsc".to_string()));
+            assert!(report.removed.contains(&"Priv/Deep.cloudsc".to_string()));
+            assert!(active(&state).is_empty());
+        }
+
+        /// Include list: everything outside the entries goes like an exclude, an Ancestor
+        /// folder stays as a directory but a synced file directly in it is removed, and the
+        /// included subtree is untouched. Placeholders follow the same rule (an Ancestor FOLDER
+        /// placeholder is kept, the way down).
+        #[test]
+        fn apply_under_an_include_list_removes_everything_outside_it() {
+            use crate::cloudsc::write_cloudsc_placeholder_file;
+            use crate::models::CloudscMeta;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Fotos/2024/p.jpg", b"p");
+            write(&state, "Fotos/loose.txt", b"l");
+            write(&state, "Other/o.txt", b"o");
+            write(&state, "r.txt", b"r");
+            index_disk(&state);
+            record_remote_state(
+                &state,
+                &[
+                    "Fotos/2024/p.jpg",
+                    "Fotos/loose.txt",
+                    "Other/o.txt",
+                    "r.txt",
+                ],
+            );
+            let ph = |rel: &str, tag: &str| {
+                write_cloudsc_placeholder_file(
+                    &sync_root(&state).join(format!("{rel}.cloudsc")),
+                    &CloudscMeta {
+                        version: 1,
+                        tag: tag.to_string(),
+                        remote_path_display: format!("/{rel}"),
+                    },
+                )
+                .unwrap();
+            };
+            ph("Z", "folder"); // outside the include: removed
+            ph("Fotos/f.txt", "file");
+
+            include(&state, "Fotos/2024");
+            apply(&state);
+
+            assert!(on_disk(&state, "Fotos/2024/p.jpg"));
+            assert!(on_disk(&state, "Fotos"), "the Ancestor stays a directory");
+            assert!(!on_disk(&state, "Fotos/loose.txt"));
+            assert!(!on_disk(&state, "Other"));
+            assert!(!on_disk(&state, "r.txt"));
+            assert!(!on_disk(&state, "Z.cloudsc"), "outside the include");
+            assert!(
+                !on_disk(&state, "Fotos/f.txt.cloudsc"),
+                "a file in an Ancestor"
+            );
+            assert_eq!(local_paths(&state), vec!["Fotos/2024/p.jpg"]);
+            assert!(known_folders(&state).contains(&"Fotos/2024".to_string()));
+
+            scan_local_changes_only(&state).unwrap();
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+        }
+
+        /// A failed unlink rolls the untrack back: the file stays, tracked, fully synced.
+        #[cfg(unix)]
+        #[test]
+        fn apply_rolls_the_untrack_back_when_the_unlink_fails() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt"]);
+            exclude(&state, "Priv");
+            let dir = sync_root(&state).join("Priv");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let report = apply(&state);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert!(on_disk(&state, "Priv/a.txt"));
+            assert_eq!(report.errors.len(), 1, "{report:?}");
+            assert!(report.removed.is_empty());
+            let row = state.db.get_local_file("Priv/a.txt").unwrap();
+            assert_eq!(
+                row.map(|r| r.hash),
+                Some(hash_of(&state, "Priv/a.txt")),
+                "tracked again with its hash"
+            );
+        }
+
+        /// The pass runs inside `scan_local_half`: one call both removes the excluded synced
+        /// file and enqueues nothing (not even for the folder it empties). It proves the pass
+        /// is called, NOT that it runs before the scan (it need not; see the comment there).
+        #[test]
+        fn scan_local_half_runs_the_apply_pass() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Priv/a.txt", b"a");
+            write(&state, "Keep/k.txt", b"k");
+            index_disk(&state);
+            record_remote_state(&state, &["Priv/a.txt", "Keep/k.txt"]);
+            exclude(&state, "Priv");
+
+            scan_local_half(&state).unwrap();
+
+            assert!(!on_disk(&state, "Priv"));
+            assert!(known_folders(&state) == vec!["Keep"]);
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+        }
+
+        /// The order that DOES have an observable effect: the deferred watcher paths are drained
+        /// (a move into the excluded folder is correlated and queued) BEFORE the apply pass looks
+        /// at the excluded copy. With the pass first, the moved file is reported as a "kept"
+        /// untracked file and WARNed about although it is about to be moved.
+        #[test]
+        fn scan_local_half_drains_before_it_applies_exclusions() {
+            let _serial = crate::fs_watcher::pending_test_guard();
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv");
+            std::fs::rename(
+                sync_root(&state).join("Src/a.txt"),
+                sync_root(&state).join("Priv/a.txt"),
+            )
+            .unwrap();
+            let _ = crate::fs_watcher::take_pending();
+            crate::fs_watcher::remember_dropped(&[
+                "Src/a.txt".to_string(),
+                "Priv/a.txt".to_string(),
+            ]);
+
+            let logs = captured_tracing_output(|| {
+                scan_local_half_raw(&state).unwrap();
+            });
+
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Src/a.txt".to_string(), "Priv/a.txt".to_string())]
+            );
+            assert!(!logs.contains("kept an excluded file"), "{logs}");
+            assert!(on_disk(&state, "Priv/a.txt"), "left for the move to finish");
+        }
+
+        // ---------------------------- hydration refused --------------------------------
+
+        #[test]
+        fn hydration_refusal_rule() {
+            use crate::cloudsc_ops::hydration_refusal;
+            let ex = PrefixFilter::new(&[], &["Priv".to_string()]);
+            assert!(hydration_refusal(&ex, "Priv/a.txt.cloudsc", "file").is_err());
+            assert!(hydration_refusal(&ex, "Priv.cloudsc", "folder").is_err());
+            assert!(
+                hydration_refusal(&ex, "priv/a.txt", "file").is_err(),
+                "case, no suffix"
+            );
+            assert!(
+                hydration_refusal(&ex, "Privy/a.txt.cloudsc", "file").is_ok(),
+                "boundary"
+            );
+            let inc = PrefixFilter::new(&["Fotos/2024".to_string()], &[]);
+            assert!(
+                hydration_refusal(&inc, "Fotos.cloudsc", "folder").is_ok(),
+                "the way down"
+            );
+            assert!(hydration_refusal(&inc, "Fotos.cloudsc", "file").is_err());
+            assert!(hydration_refusal(&inc, "Other.cloudsc", "folder").is_err());
+            assert!(hydration_refusal(&inc, "Fotos/2024/x.cloudsc", "file").is_ok());
+        }
+
+        /// H3/H5 end to end on real placeholders: an excluded folder placeholder is not turned
+        /// into an empty real directory, a file placeholder is not consumed. No token is read
+        /// (the refusal precedes every network call).
+        #[test]
+        fn hydrating_an_excluded_placeholder_errors_and_leaves_it() {
+            use crate::cloudsc::write_cloudsc_placeholder_file;
+            use crate::cloudsc_ops::hydrate_cloudsc_placeholder_internal;
+            use crate::models::CloudscMeta;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            for (rel, tag) in [("Priv", "folder"), ("Priv2/x.txt", "file")] {
+                write_cloudsc_placeholder_file(
+                    &sync_root(&state).join(format!("{rel}.cloudsc")),
+                    &CloudscMeta {
+                        version: 1,
+                        tag: tag.to_string(),
+                        remote_path_display: format!("/{rel}"),
+                    },
+                )
+                .unwrap();
+            }
+            exclude(&state, "Priv,Priv2");
+
+            // Fail-local fixture: were the refusal missing, hydrating the FOLDER placeholder
+            // would go on to list the folder on Dropbox (token, keychain, network). A read-only
+            // sync root makes its first step, creating the directory, fail instead, with a
+            // different error, so a broken refusal fails the assertions below without any I/O
+            // outside the temp dir.
+            #[cfg(unix)]
+            let _restore = {
+                use std::os::unix::fs::PermissionsExt;
+                struct Restore(PathBuf);
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        let _ = std::fs::set_permissions(
+                            &self.0,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+                }
+                let root = sync_root(&state);
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+                Restore(root)
+            };
+
+            for ph in ["Priv.cloudsc", "Priv2/x.txt.cloudsc"] {
+                let err = hydrate_cloudsc_placeholder_internal(&state, ph).expect_err(ph);
+                // `hydration_refusal`'s own message. The download helper that a file placeholder
+                // reaches without it says "it is not downloaded" instead, so asserting the
+                // shared "excluded by selective sync" prefix let the file leg pass with the
+                // refusal deleted.
+                assert!(
+                    err.to_string().contains("its placeholder is left as it is"),
+                    "{err}"
+                );
+                assert!(on_disk(&state, ph), "{ph} must stay");
+            }
+            assert!(
+                !on_disk(&state, "Priv"),
+                "no empty real directory was created"
+            );
+            assert!(!on_disk(&state, "Priv2/x.txt"));
+        }
+
+        // ------------------------ F: moves across the boundary -------------------------
+
+        /// F, watcher, file: the move is correlated (slice 2); once it completes, the apply
+        /// pass finds a fully synced copy under the excluded prefix and removes it, with no
+        /// delete or upload ever queued.
+        #[test]
+        fn watcher_move_into_excluded_file_is_a_move_then_the_copy_is_removed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/a.txt"),
+                sync_root(&state).join("Priv/a.txt"),
+            )
+            .unwrap();
+            process_changed_paths(&state, &["Src/a.txt".to_string(), "Priv/a.txt".to_string()])
+                .unwrap();
+            assert_eq!(active(&state), vec![t("move", "Priv/a.txt")]);
+
+            // While the move is queued the pass leaves the file alone.
+            let during = apply(&state);
+            assert_eq!(during.busy, vec!["Priv/a.txt"]);
+            assert!(on_disk(&state, "Priv/a.txt"));
+
+            complete_move(&state, "Src/a.txt", "Priv/a.txt");
+            let after = apply(&state);
+            assert!(
+                after.removed.contains(&"Priv/a.txt".to_string()),
+                "{after:?}"
+            );
+            assert!(!on_disk(&state, "Priv"));
+            assert!(local_paths(&state).is_empty());
+            assert!(remote_hash(&state, "Priv/a.txt").is_none());
+            scan_local_changes_only(&state).unwrap();
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+        }
+
+        /// F, watcher, folder: a folder moved into an excluded one is one folder `move`; after
+        /// it completes the whole copy goes, and the folder rows moved with it are untracked.
+        #[test]
+        fn watcher_move_into_excluded_folder_is_a_move_then_the_copy_is_removed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/d/a.txt", b"aaa");
+            write(&state, "Src/d/b.txt", b"bbb");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/d/a.txt", "Src/d/b.txt"]);
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/d"),
+                sync_root(&state).join("Priv/d"),
+            )
+            .unwrap();
+            process_changed_paths(&state, &["Src/d".to_string(), "Priv/d".to_string()]).unwrap();
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Src/d".to_string(), "Priv/d".to_string())]
+            );
+            assert_eq!(active(&state), vec![t("move", "Priv/d")]);
+
+            complete_move(&state, "Src/d", "Priv/d");
+            let report = apply(&state);
+            assert!(
+                report.kept.is_empty() && report.errors.is_empty(),
+                "{report:?}"
+            );
+            assert!(!on_disk(&state, "Priv"));
+            assert!(local_paths(&state).is_empty());
+            assert_eq!(known_folders(&state), vec!["Src"]);
+            scan_local_changes_only(&state).unwrap();
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+        }
+
+        /// H10, scan, file: the watcher missed the move. The scan pairs the vanished tracked
+        /// file with the untracked excluded file of the same size AND hash: a `move`, not a
+        /// `delete`. Driven through `scan_local_half`, so the pass that runs before it (which
+        /// sees an untracked excluded file) must not remove it. Then the whole flow completes.
+        #[test]
+        fn scan_fallback_turns_a_missed_move_into_an_excluded_folder_into_a_move() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/a.txt"),
+                sync_root(&state).join("Priv/a.txt"),
+            )
+            .unwrap();
+
+            scan_local_half(&state).unwrap();
+
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Src/a.txt".to_string(), "Priv/a.txt".to_string())]
+            );
+            assert_eq!(active(&state), vec![t("move", "Priv/a.txt")]);
+            assert!(on_disk(&state, "Priv/a.txt"), "kept until the move is done");
+
+            // A further tick while the move is queued adds nothing.
+            scan_local_half(&state).unwrap();
+            assert_eq!(active(&state), vec![t("move", "Priv/a.txt")]);
+
+            complete_move(&state, "Src/a.txt", "Priv/a.txt");
+            scan_local_half(&state).unwrap();
+            assert!(!on_disk(&state, "Priv"));
+            assert!(active(&state).is_empty(), "{:?}", summary(&state));
+        }
+
+        /// The fallback needs the SAME bytes: a same-size, different-content file under ANOTHER
+        /// name is not the moved file, so the vanished one is deleted as before and nothing in
+        /// the excluded zone is touched. (Under the SAME name it would be suppressed instead:
+        /// see `scan_a_same_named_file_in_the_excluded_zone_suppresses_the_delete`.)
+        #[test]
+        fn scan_fallback_requires_the_same_content_hash() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            exclude(&state, "Priv");
+            std::fs::remove_file(sync_root(&state).join("Src/a.txt")).unwrap();
+            write(&state, "Priv/other.txt", b"PAYLOAD"); // same size, different bytes, other name
+
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(move_jobs(&state).is_empty());
+            assert_eq!(pending(&state, "delete"), vec!["Src/a.txt".to_string()]);
+            assert!(on_disk(&state, "Priv/other.txt"));
+        }
+
+        /// DBSYNC-114 C2 (maintainer decision 2026-10-19): a vanished synced file whose NAME
+        /// reappears untracked in the excluded zone is never a remote delete, even when the
+        /// bytes differ. It is untracked so the decision is not re-made every tick, and the
+        /// remote row stays (the listing sweep writes the placeholder).
+        #[test]
+        fn scan_a_same_named_file_in_the_excluded_zone_suppresses_the_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            exclude(&state, "Priv");
+            std::fs::remove_file(sync_root(&state).join("Src/a.txt")).unwrap();
+            write(&state, "Priv/a.txt", b"PAYLOAD");
+
+            let first = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(move_jobs(&state).is_empty());
+            assert!(first.contains("NOT sending a remote delete"), "{first}");
+            assert!(
+                state.db.get_local_file("Src/a.txt").unwrap().is_none(),
+                "untracked, so it is not re-decided every tick"
+            );
+            assert!(
+                remote_hash(&state, "Src/a.txt").is_some(),
+                "the remote row stays"
+            );
+
+            let second = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+            assert!(pending(&state, "delete").is_empty());
+            assert!(!second.contains("NOT sending a remote delete"), "{second}");
+        }
+
+        /// H10, scan, folder: a vanished known folder whose name reappears as an untracked
+        /// excluded folder is NOT deleted on Dropbox, and the log says why. Its files pair
+        /// into moves by hash. (Empty `Src/e` has no files, so only the name rule protects it.)
+        #[test]
+        fn scan_fallback_never_deletes_a_folder_whose_name_reappears_in_the_excluded_zone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/d/a.txt", b"aaa");
+            mkdir(&state, "Src/e");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/d/a.txt"]);
+            assert!(known_folders(&state).contains(&"Src/d".to_string()));
+            assert!(known_folders(&state).contains(&"Src/e".to_string()));
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/d"),
+                sync_root(&state).join("Priv/d"),
+            )
+            .unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/e"),
+                sync_root(&state).join("Priv/e"),
+            )
+            .unwrap();
+
+            let logs = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Src/d/a.txt".to_string(), "Priv/d/a.txt".to_string())]
+            );
+            assert!(logs.contains("NOT sending a remote delete"), "{logs}");
+            assert!(logs.contains("Src/e") && logs.contains("Priv/e"), "{logs}");
+            // Decided once (C2): the folder rows are gone, so the next tick has nothing to
+            // re-walk, re-decide or re-log, and still sends no delete.
+            assert!(
+                !known_folders(&state)
+                    .iter()
+                    .any(|f| f == "Src/d" || f == "Src/e"),
+                "{:?}",
+                known_folders(&state)
+            );
+            let again = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+            assert!(pending(&state, "delete").is_empty());
+            assert!(!again.contains("NOT sending a remote delete"), "{again}");
+        }
+
+        /// The EXACT-pair move needs Dropbox to hold THESE bytes. Here the local edit was
+        /// queued for upload but never landed, so the remote copy differs from the index row:
+        /// moving it would move the OLD bytes and lose the edit, so no `move`. And since the
+        /// edited bytes now sit in the excluded zone, no `delete` either (C2): the file is
+        /// untracked and comes back as a placeholder of the Dropbox version. Reviewer
+        /// reproduction `rv_file_move_into_excluded_after_remote_edit...`, scan flavour.
+        #[test]
+        fn scan_an_edited_file_moved_into_the_excluded_zone_is_neither_moved_nor_deleted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"v1");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            write(&state, "Src/a.txt", b"v2");
+            index_disk(&state); // the upload "completes" without the remote row changing
+            assert_ne!(
+                remote_hash(&state, "Src/a.txt"),
+                Some(hash_of(&state, "Src/a.txt"))
+            );
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/a.txt"),
+                sync_root(&state).join("Priv/a.txt"),
+            )
+            .unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(move_jobs(&state).is_empty());
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(state.db.get_local_file("Src/a.txt").unwrap().is_none());
+            assert!(remote_hash(&state, "Src/a.txt").is_some());
+            assert_eq!(
+                std::fs::read(sync_root(&state).join("Priv/a.txt")).unwrap(),
+                b"v2"
+            );
+        }
+
+        /// C2, scan, file, content rule alone: edited, moved AND renamed (no namesake), its
+        /// bytes equal the row hash of the vanished file.
+        #[test]
+        fn scan_a_renamed_edited_file_in_the_excluded_zone_is_found_by_its_hash() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"v1");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]);
+            write(&state, "Src/a.txt", b"v2 edited");
+            index_disk(&state);
+            exclude(&state, "Priv");
+            std::fs::create_dir_all(sync_root(&state).join("Priv")).unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Src/a.txt"),
+                sync_root(&state).join("Priv/renamed.txt"),
+            )
+            .unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(move_jobs(&state).is_empty());
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+        }
+
+        /// C2, folder with a pending upload inside (reviewer reproduction
+        /// `rv_move_into_excluded_with_pending_upload_becomes_remote_delete`), watcher: the
+        /// correlator refuses (queued work on a child), and the fallback used to be a remote
+        /// delete of every child and the folder. Now: no delete of anything, no upload; the
+        /// rows are untracked; the edited file survives in the excluded zone.
+        #[test]
+        fn watcher_a_folder_with_a_pending_upload_moved_into_the_excluded_zone_deletes_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"aaaa");
+            write(&state, "Docs/b.txt", b"bbbb");
+            index_disk(&state);
+            record_remote_state(&state, &["Docs/a.txt", "Docs/b.txt"]);
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv");
+            write(&state, "Docs/b.txt", b"bbbb edited");
+            process_changed_paths(&state, &["Docs/b.txt".to_string()]).unwrap();
+            assert_eq!(pending(&state, "upload"), vec!["Docs/b.txt".to_string()]);
+            std::fs::rename(
+                sync_root(&state).join("Docs"),
+                sync_root(&state).join("Priv/Docs"),
+            )
+            .unwrap();
+
+            process_changed_paths(&state, &["Docs".to_string(), "Priv/Docs".to_string()]).unwrap();
+
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(!known_folders(&state).contains(&"Docs".to_string()));
+            // The clean child still pairs into a move (its row stays for the move to rewrite);
+            // the child with the pending upload is untracked.
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Docs/a.txt".to_string(), "Priv/Docs/a.txt".to_string())]
+            );
+            assert_eq!(local_paths(&state), vec!["Docs/a.txt".to_string()]);
+            assert_eq!(
+                std::fs::read(sync_root(&state).join("Priv/Docs/b.txt")).unwrap(),
+                b"bbbb edited"
+            );
+            assert!(remote_hash(&state, "Docs/b.txt").is_some());
+            // And it stays decided.
+            scan_local_changes_only(&state).unwrap();
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+        }
+
+        /// The same folder, found by the scan instead of the watcher: no delete (the folder
+        /// name rule), the pending-upload child included, and no repeat on the next tick.
+        #[test]
+        fn scan_a_folder_with_a_pending_upload_moved_into_the_excluded_zone_deletes_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"aaaa");
+            write(&state, "Docs/b.txt", b"bbbb");
+            index_disk(&state);
+            record_remote_state(&state, &["Docs/a.txt", "Docs/b.txt"]);
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv");
+            write(&state, "Docs/b.txt", b"bbbb edited");
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(pending(&state, "upload"), vec!["Docs/b.txt".to_string()]);
+            std::fs::rename(
+                sync_root(&state).join("Docs"),
+                sync_root(&state).join("Priv/Docs"),
+            )
+            .unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(!known_folders(&state).contains(&"Docs".to_string()));
+            let again = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+            assert!(pending(&state, "delete").is_empty());
+            assert!(
+                !again.contains("NOT sending a remote delete"),
+                "decided once: {again}"
+            );
+        }
+
+        /// C2, watcher, file (reviewer reproduction `rv_file_move_into_excluded_after_remote_
+        /// edit_becomes_remote_delete`): another device edited the file (delta applied, so
+        /// Dropbox holds bytes this client's row does not), then it was moved into the
+        /// excluded zone. The exact pairing needs Dropbox to hold the row's bytes, so no
+        /// `move`; it used to fall through to a remote delete of the other device's version.
+        #[test]
+        fn watcher_a_file_edited_remotely_then_moved_into_the_excluded_zone_is_not_deleted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"aaaa");
+            index_disk(&state);
+            record_remote_state(&state, &["Docs/a.txt"]);
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv");
+            let pending_downloads = HashSet::new();
+            apply_delta_entries(
+                &state,
+                &[file_entry("Docs/a.txt", "OTHERDEVICE", "rev2")],
+                &pending_downloads,
+                &[],
+            )
+            .unwrap();
+            std::fs::rename(
+                sync_root(&state).join("Docs/a.txt"),
+                sync_root(&state).join("Priv/a.txt"),
+            )
+            .unwrap();
+
+            process_changed_paths(
+                &state,
+                &["Docs/a.txt".to_string(), "Priv/a.txt".to_string()],
+            )
+            .unwrap();
+
+            assert!(
+                pending(&state, "delete").is_empty(),
+                "{:?}",
+                summary(&state)
+            );
+            assert!(move_jobs(&state).is_empty());
+            assert!(state.db.get_local_file("Docs/a.txt").unwrap().is_none());
+            assert!(remote_hash(&state, "Docs/a.txt").is_some());
+        }
+
+        /// C2: the false positive is bounded. A file deleted for real while an UNRELATED file of
+        /// the same name sits in the excluded zone is not deleted on Dropbox either (it comes
+        /// back as a placeholder), but the decision is made ONCE: untracked, no job, no repeat,
+        /// and nothing else is held back (an unrelated real delete in the same scan goes out).
+        #[test]
+        fn a_wrongly_suppressed_delete_ends_as_a_placeholder_once_and_blocks_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/notes.txt", b"mine");
+            write(&state, "Src/other.txt", b"other");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/notes.txt", "Src/other.txt"]);
+            exclude(&state, "Priv");
+            write(&state, "Priv/notes.txt", b"somebody else's, unrelated");
+            std::fs::remove_file(sync_root(&state).join("Src/notes.txt")).unwrap();
+            std::fs::remove_file(sync_root(&state).join("Src/other.txt")).unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+            scan_local_changes_only(&state).unwrap();
+
+            assert_eq!(pending(&state, "delete"), vec!["Src/other.txt".to_string()]);
+            assert!(remote_hash(&state, "Src/notes.txt").is_some());
+            assert!(state.db.get_local_file("Src/notes.txt").unwrap().is_none());
+        }
+
+        /// An excluded file the index already tracks is not "the moved file" (it is stale state
+        /// the apply pass will clean up), even when its bytes equal the vanished one's.
+        #[test]
+        fn scan_fallback_ignores_a_tracked_excluded_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/a.txt", b"same bytes");
+            write(&state, "Priv/a.txt", b"same bytes");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/a.txt"]); // Dropbox has no row for Priv/a.txt
+            exclude(&state, "Priv");
+            std::fs::remove_file(sync_root(&state).join("Src/a.txt")).unwrap();
+
+            scan_local_changes_only(&state).unwrap();
+
+            assert!(move_jobs(&state).is_empty());
+            assert_eq!(pending(&state, "delete"), vec!["Src/a.txt".to_string()]);
+        }
+
+        /// A vanished folder with no namesake in the excluded zone is deleted as always.
+        #[test]
+        fn scan_fallback_leaves_an_ordinary_folder_delete_alone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/d/a.txt", b"aaa");
+            index_disk(&state);
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv/unrelated");
+            std::fs::remove_dir_all(sync_root(&state).join("Src/d")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Src/d".to_string(), "Src/d/a.txt".to_string()]
+            );
+        }
+
+        // ----------------------- M4: an unreadable corner of the excluded zone -----------
+
+        /// A directory in the excluded zone nobody can list (permissions) is a STANDING
+        /// condition. It used to set `walk_incomplete`, which cleared every deletion of every
+        /// scan, forever. Now: a vanished synced file with no counterpart is still deleted, and
+        /// the unreadable entry is reported once, not every tick.
+        #[cfg(unix)]
+        #[test]
+        fn a_permanently_unreadable_excluded_folder_does_not_block_deletions() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Src/gone.txt", b"payload");
+            index_disk(&state);
+            record_remote_state(&state, &["Src/gone.txt"]);
+            exclude(&state, "Priv");
+            mkdir(&state, "Priv/locked");
+            let locked = sync_root(&state).join("Priv/locked");
+            write(&state, "Priv/locked/inner.txt", b"x");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            std::fs::remove_file(sync_root(&state).join("Src/gone.txt")).unwrap();
+
+            let first = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+            let second = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Src/gone.txt".to_string()],
+                "{first}"
+            );
+            assert!(!first.contains("postponed"), "{first}");
+            assert_eq!(first.matches("cannot be read").count(), 1, "{first}");
+            assert_eq!(
+                second.matches("cannot be read").count(),
+                0,
+                "once: {second}"
+            );
+        }
+
+        /// The classification itself, and its two outcomes. A vanished entry or an interrupted
+        /// read is expected to pass by the next scan: postpone ALL deletions (any candidate
+        /// could have moved into what could not be read). A standing error holds nothing back.
+        #[test]
+        fn walk_errors_are_classified_and_only_transient_ones_postpone() {
+            use super::super::{note_unreadable_excluded_entry, walk_error_is_transient};
+            use std::io::ErrorKind as K;
+            for k in [K::NotFound, K::Interrupted, K::WouldBlock, K::TimedOut] {
+                assert!(walk_error_is_transient(k), "{k:?}");
+            }
+            for k in [K::PermissionDenied, K::InvalidData, K::Other] {
+                assert!(!walk_error_is_transient(k), "{k:?}");
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let mut transient = super::super::ExcludedZoneFallback::default();
+            note_unreadable_excluded_entry(&state, &mut transient, "Priv/x", Some(K::NotFound));
+            assert!(transient.postpone_all);
+            let mut standing = super::super::ExcludedZoneFallback::default();
+            note_unreadable_excluded_entry(
+                &state,
+                &mut standing,
+                "Priv/y",
+                Some(K::PermissionDenied),
+            );
+            assert!(!standing.postpone_all);
+        }
+
+        /// A postponement is applied to the deletion sets, never as a deletion: `postpone_all`
+        /// clears them (the rows remain, so the next scan decides), `postponed_files` clears
+        /// only the named candidates (those a failed hash could have matched).
+        #[test]
+        fn postponement_removes_candidates_from_the_deletions_and_nothing_else() {
+            use super::super::{apply_excluded_zone_outcome, ExcludedZoneFallback};
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let mut pending_targets = HashSet::new();
+            let files = || vec!["A/x.txt".to_string(), "B/y.txt".to_string()];
+            let folders = || vec!["A".to_string(), "B".to_string()];
+
+            let mut some = ExcludedZoneFallback::default();
+            some.postponed_files.insert("A/x.txt".to_string());
+            let (mut f, mut d) = (files(), folders());
+            apply_excluded_zone_outcome(&state, &some, &[], &mut pending_targets, &mut f, &mut d)
+                .unwrap();
+            assert_eq!(f, vec!["B/y.txt".to_string()]);
+            assert_eq!(d, folders(), "folders are untouched by a file postponement");
+
+            let all = ExcludedZoneFallback {
+                postpone_all: true,
+                ..Default::default()
+            };
+            let (mut f, mut d) = (files(), folders());
+            apply_excluded_zone_outcome(&state, &all, &[], &mut pending_targets, &mut f, &mut d)
+                .unwrap();
+            assert!(f.is_empty() && d.is_empty());
+        }
+
+        /// Excluded -> included: the destination is a new file that uploads; the excluded
+        /// source is never a rename source, so no move, no delete. Watcher and scan.
+        ///
+        /// The source is TRACKED and known to Dropbox (the state right after the Save, before
+        /// the apply pass ran): that is what makes this test able to fail. An untracked source
+        /// never correlates or deletes anyway, so with one the assertions held on `main`.
+        #[test]
+        fn moving_out_of_an_excluded_folder_uploads_as_new_without_move_or_delete() {
+            for via_watcher in [true, false] {
+                let tmp = tempfile::tempdir().unwrap();
+                let state = build_state(tmp.path());
+                write(&state, "Priv/a.txt", b"payload");
+                index_disk(&state);
+                record_remote_state(&state, &["Priv/a.txt"]);
+                exclude(&state, "Priv"); // Save; the apply pass has not run yet
+                std::fs::create_dir_all(sync_root(&state).join("Keep")).unwrap();
+                std::fs::rename(
+                    sync_root(&state).join("Priv/a.txt"),
+                    sync_root(&state).join("Keep/a.txt"),
+                )
+                .unwrap();
+                if via_watcher {
+                    process_changed_paths(
+                        &state,
+                        &["Priv/a.txt".to_string(), "Keep/a.txt".to_string()],
+                    )
+                    .unwrap();
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                assert!(move_jobs(&state).is_empty(), "watcher={via_watcher}");
+                assert_eq!(
+                    active(&state),
+                    vec![t("upload", "Keep/a.txt")],
+                    "watcher={via_watcher}"
+                );
+            }
+        }
+
+        // ------------------------ protected delete of a parent -------------------------
+
+        /// Builds: `Docs/a.txt`, `Docs/sub/c.txt` and `Docs/Archive/b.txt` indexed and on
+        /// Dropbox, then `Docs/Archive` excluded and its copy removed by the real pass.
+        fn protected_fixture(state: &AppState) {
+            write(state, "Docs/a.txt", b"a");
+            write(state, "Docs/sub/c.txt", b"c");
+            write(state, "Docs/Archive/b.txt", b"b");
+            index_disk(state);
+            record_remote_state(
+                state,
+                &["Docs/a.txt", "Docs/sub/c.txt", "Docs/Archive/b.txt"],
+            );
+            exclude(state, "Docs/Archive");
+            let report = apply(state);
+            assert!(
+                report.kept.is_empty() && report.errors.is_empty(),
+                "{report:?}"
+            );
+            assert!(!on_disk(state, "Docs/Archive"));
+        }
+
+        /// The recursive delete of `Docs` is never sent; the synced files go one by one, the
+        /// unprotected subfolder (nothing excluded beneath it) may still be deleted whole.
+        const PROTECTED_EXPECTED: [&str; 3] = ["Docs/a.txt", "Docs/sub", "Docs/sub/c.txt"];
+
+        #[test]
+        fn protected_parent_delete_via_the_scan_only_deletes_the_synced_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            protected_fixture(&state);
+            std::fs::remove_dir_all(sync_root(&state).join("Docs")).unwrap();
+
+            let logs = captured_tracing_output(|| {
+                scan_local_changes_only(&state).unwrap();
+            });
+
+            assert_eq!(pending(&state, "delete"), PROTECTED_EXPECTED);
+            assert!(logs.contains("excluded path beneath"), "{logs}");
+            assert!(!known_folders(&state).contains(&"Docs".to_string()));
+        }
+
+        #[test]
+        fn protected_parent_delete_via_the_watcher_only_deletes_the_synced_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            protected_fixture(&state);
+            std::fs::remove_dir_all(sync_root(&state).join("Docs")).unwrap();
+
+            process_changed_paths(&state, &["Docs".to_string()]).unwrap();
+
+            assert_eq!(pending(&state, "delete"), PROTECTED_EXPECTED);
+        }
+
+        #[test]
+        fn protected_parent_delete_via_targeted_deletions_only_deletes_the_synced_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            protected_fixture(&state);
+            std::fs::remove_dir_all(sync_root(&state).join("Docs")).unwrap();
+            let known = state.db.list_local_files().unwrap();
+            let filter = PrefixFilter::load(&state.db).unwrap();
+
+            enqueue_targeted_deletions(
+                &state,
+                &sync_root(&state),
+                "Docs",
+                &known,
+                &HashSet::new(),
+                &filter,
+            )
+            .unwrap();
+
+            assert_eq!(pending(&state, "delete"), PROTECTED_EXPECTED);
+        }
+
+        /// Without an excluded path beneath, the same delete is the ordinary recursive one.
+        #[test]
+        fn an_unprotected_parent_delete_is_still_recursive() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"a");
+            index_disk(&state);
+            exclude(&state, "Elsewhere");
+            std::fs::remove_dir_all(sync_root(&state).join("Docs")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(
+                pending(&state, "delete"),
+                vec!["Docs".to_string(), "Docs/a.txt".to_string()]
+            );
+        }
+
+        /// Puts every queued job except the one for `keep_due` into `retry_wait` with a future
+        /// retry time, exactly what one transient failure does: they stay queued work, but only
+        /// `keep_due` is picked by the drain (no job that would reach the network runs).
+        fn park_all_but(state: &AppState, keep_due: &str) {
+            for j in jobs(state) {
+                if j.status == "queued" && j.target_path.as_deref() != Some(keep_due) {
+                    let later = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+                    state
+                        .db
+                        .mark_job_retry_wait(j.id, 1, &later, Some("transient"))
+                        .unwrap();
+                }
+            }
+        }
+
+        fn delete_jobs_for(state: &AppState, target: &str) -> Vec<SyncJobRow> {
+            jobs(state)
+                .into_iter()
+                .filter(|j| j.job_type == "delete" && j.target_path.as_deref() == Some(target))
+                .collect()
+        }
+
+        /// M3, case 1 (the file deletes are still QUEUED work, in `retry_wait` after one
+        /// transient failure, when the recursive folder `delete` of `Docs` comes up; `Docs/
+        /// Archive` was excluded in between). The folder job is settled with the split reason
+        /// and never run; the split COLLAPSES onto the queued file delete (same row, still one,
+        /// rev refreshed from the remote row) instead of adding a second; the excluded file's
+        /// own delete is left alone to be settled as excluded when it comes due.
+        #[test]
+        fn drain_split_collapses_onto_file_deletes_that_are_still_queued() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            write(&state, "Docs/a.txt", b"a");
+            write(&state, "Docs/Archive/b.txt", b"b");
+            index_disk(&state);
+            record_remote_state(&state, &["Docs/a.txt", "Docs/Archive/b.txt"]);
+            std::fs::remove_dir_all(sync_root(&state).join("Docs")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            let a_before = delete_jobs_for(&state, "Docs/a.txt");
+            assert_eq!(a_before.len(), 1, "{:?}", summary(&state));
+            park_all_but(&state, "Docs");
+            write(&state, "Docs.cloudsc", b"{}"); // a wrongly RUN delete ends locally, not on the network
+            exclude(&state, "Docs/Archive");
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            let docs = delete_jobs_for(&state, "Docs");
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].status, "done");
+            assert_eq!(
+                docs[0].last_error.as_deref(),
+                Some(SPLIT_PROTECTED_DELETE_REASON)
+            );
+            let a_after = delete_jobs_for(&state, "Docs/a.txt");
+            assert_eq!(
+                a_after.len(),
+                1,
+                "collapsed, not duplicated: {:?}",
+                summary(&state)
+            );
+            assert_eq!(a_after[0].id, a_before[0].id);
+            assert_eq!(
+                a_after[0].status, "retry_wait",
+                "the same row, untouched but for its rev"
+            );
+            assert_eq!(a_after[0].delete_parent_rev.as_deref(), Some("rev1"));
+            let b = delete_jobs_for(&state, "Docs/Archive/b.txt");
+            assert_eq!(
+                b.len(),
+                1,
+                "no second delete for the excluded file: {:?}",
+                summary(&state)
+            );
+            assert_eq!(b[0].status, "retry_wait", "left alone");
+        }
+
+        /// M3, case 2, the one that FAILS if the split queues nothing: no file delete exists
+        /// for `Docs/a.txt` (its local row never existed: it is a `.cloudsc` placeholder, which
+        /// is what a never-downloaded file is, so the folder delete was the only job). The
+        /// split must derive the file delete from the REMOTE rows.
+        #[test]
+        fn drain_split_queues_the_file_deletes_a_placeholder_only_folder_needs() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = build_state(tmp.path());
+            // Two files Dropbox has and this machine never downloaded: a remote row each (from
+            // the delta, as production writes them), no local row, a placeholder on disk.
+            write(&state, "Docs/a.txt.cloudsc", b"{}");
+            write(&state, "Docs/Archive/b.txt.cloudsc", b"{}");
+            apply_delta_entries(
+                &state,
+                &[
+                    file_entry("Docs/a.txt", "HA", "rev1"),
+                    file_entry("Docs/Archive/b.txt", "HB", "rev1"),
+                ],
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap();
+            scan_local_changes_only(&state).unwrap();
+            settle(&state);
+            assert!(state.db.get_local_file("Docs/a.txt").unwrap().is_none());
+            assert!(remote_hash(&state, "Docs/a.txt").is_some());
+            std::fs::remove_dir_all(sync_root(&state).join("Docs")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(
+                delete_jobs_for(&state, "Docs/a.txt").is_empty(),
+                "no file delete exists, only folder deletes: {:?}",
+                summary(&state)
+            );
+            park_all_but(&state, "Docs");
+            exclude(&state, "Docs/Archive");
+
+            assert!(process_sync_queue_core(&state, NO_LOOKUP).unwrap());
+
+            assert_eq!(delete_jobs_for(&state, "Docs")[0].status, "done");
+            let a = delete_jobs_for(&state, "Docs/a.txt");
+            assert_eq!(a.len(), 1, "{:?}", summary(&state));
+            assert_eq!(a[0].status, "queued");
+            assert_eq!(a[0].delete_parent_rev.as_deref(), Some("rev1"));
+            assert!(
+                delete_jobs_for(&state, "Docs/Archive/b.txt").is_empty(),
+                "the excluded file is never queued"
+            );
+        }
+
+        #[test]
+        fn delete_job_endangers_excluded_rule() {
+            use super::super::delete_job_endangers_excluded;
+            let job = |ty: &str, target: &str| self::job(ty, Some(target), Some(target));
+            let f = PrefixFilter::new(&[], &["Docs/Archive".to_string()]);
+            assert!(delete_job_endangers_excluded(&job("delete", "Docs"), &f));
+            assert!(
+                delete_job_endangers_excluded(&job("delete", ""), &f),
+                "the root"
+            );
+            assert!(!delete_job_endangers_excluded(
+                &job("delete", "Docs/a.txt"),
+                &f
+            ));
+            assert!(!delete_job_endangers_excluded(&job("delete", "Other"), &f));
+            assert!(
+                !delete_job_endangers_excluded(&job("delete", "Docs/Archive"), &f),
+                "that one is settled as excluded"
+            );
+            assert!(!delete_job_endangers_excluded(&job("upload", "Docs"), &f));
+            assert!(!delete_job_endangers_excluded(
+                &job("delete", "Docs"),
+                &PrefixFilter::default()
+            ));
         }
     }
 }

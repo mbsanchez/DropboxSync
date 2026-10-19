@@ -51,7 +51,7 @@ use chrono::{Duration, Utc};
 use crate::auth_session::get_access_token;
 use crate::error::{AppError, AppResult};
 use crate::models::{DropboxEntry, DropboxListFolderResponse};
-use crate::path_util::{fold, key_from_dropbox, normalize_dropbox_path};
+use crate::path_util::{fold, key_from_dropbox, normalize_dropbox_path, PrefixFilter};
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
 
@@ -658,11 +658,16 @@ fn reconcile_remote_snapshot_with_breaker(
     pending_targets: &HashSet<String>,
 ) -> AppResult<usize> {
     let mut enqueued = 0usize;
+    // DBSYNC-114: folded once per pass. A tracked row outside the synced zone is left
+    // completely alone: no remote-row write, no download, no `local_delete`, and it does not
+    // count toward the breaker (numerator or denominator).
+    let filter = PrefixFilter::load(&state.db)?;
 
     // PRESENT files: reconcile immediately, never gated by the breaker.
     for local in local_files {
         let rel = &local.relative_path;
         if rel.ends_with(".cloudsc")
+            || !filter.file_synced(rel)
             || crate::sync_pipeline::covered_by_active_job(rel, pending_targets)
         {
             continue;
@@ -683,9 +688,17 @@ fn reconcile_remote_snapshot_with_breaker(
     }
 
     // ABSENT files + mass-deletion circuit breaker.
-    let (absent, delete_candidates) =
-        remote_sweep_delete_candidates(state, local_files, remote_by_path, pending_targets)?;
-    let tracked = local_files.len();
+    let (absent, delete_candidates) = remote_sweep_delete_candidates(
+        state,
+        local_files,
+        remote_by_path,
+        pending_targets,
+        &filter,
+    )?;
+    let tracked = local_files
+        .iter()
+        .filter(|f| filter.file_synced(&f.relative_path))
+        .count();
 
     let overridden =
         delete_candidates > 0 && crate::sync_pipeline::consume_mass_delete_override(state)?;
@@ -726,6 +739,7 @@ fn remote_sweep_delete_candidates(
     local_files: &[FileIndexRow],
     remote_by_path: &HashMap<String, RemoteFileMeta>,
     pending_targets: &HashSet<String>,
+    filter: &PrefixFilter,
 ) -> AppResult<(Vec<String>, usize)> {
     let mut absent = Vec::new();
     let mut delete_candidates = 0usize;
@@ -733,6 +747,9 @@ fn remote_sweep_delete_candidates(
     for local in local_files {
         let rel = &local.relative_path;
         if rel.ends_with(".cloudsc")
+            // DBSYNC-114 C1: `absent` is read as "deleted remotely" and becomes a
+            // `local_delete`; an excluded path is never a candidate, however absent.
+            || !filter.file_synced(rel)
             || crate::sync_pipeline::covered_by_active_job(rel, pending_targets)
         {
             continue;
@@ -810,6 +827,17 @@ pub(crate) fn reconcile_remote_present(
         remote_meta.modified_ts,
         remote_meta.id.as_deref(),
     )?;
+
+    // DBSYNC-114: Dropbox now holds exactly the bytes the local row describes, so the first
+    // upload of this path is, in effect, confirmed: stop guarding it. Left armed it would
+    // turn the next ordinary edit into a conflicted copy (Dropbox holds the OLD bytes, which
+    // differ from the edit).
+    // Only an exact content match counts; a different remote version keeps the guard.
+    if let Some(local) = state.db.get_local_file(rel)? {
+        if local.hash == remote_meta.content_hash {
+            state.db.clear_upload_unconfirmed(rel)?;
+        }
+    }
 
     if should_download {
         if let Some(local) = state.db.get_local_file(rel)? {
@@ -1008,12 +1036,18 @@ pub(crate) fn apply_delta_entries(
     // DBSYNC-102 (#179): see the doc above for why this must be an owned, mutable,
     // per-invocation copy rather than the borrowed snapshot the caller passed in.
     let mut pending_targets: HashSet<String> = pending_targets.clone();
+    // DBSYNC-114 C1: folded once per batch.
+    let filter = PrefixFilter::load(&state.db)?;
 
     for entry in collapse_delta_entries(entries) {
         match delta_action_from_entry(entry) {
             DeltaAction::Upsert(rel, meta) => {
                 if rel.ends_with(".cloudsc") {
                     // Sidecar bookkeeping path, never actionable here — unchanged.
+                } else if !filter.file_synced(&rel) {
+                    // DBSYNC-114 C1: nothing under an excluded path is read or written —
+                    // no remote-row upsert, no download, not even the re-add cancellation
+                    // below. The cursor still advances (the caller persists it).
                 } else {
                     // DBSYNC-102 (#179, D1+D3) — cancel-on-re-add, BEFORE
                     // `covered_by_active_job` below: if a `local_delete` is still
@@ -1131,6 +1165,7 @@ pub(crate) fn apply_delta_entries(
                             let path_display = entry.path_display.clone().unwrap_or_default();
                             crate::cloudsc_ops::materialize_remote_only_file_if_absent(
                                 state,
+                                &filter,
                                 &rel,
                                 &path_display,
                                 &meta.content_hash,
@@ -1144,6 +1179,9 @@ pub(crate) fn apply_delta_entries(
             }
             DeltaAction::Remove(rel) => {
                 if !rel.ends_with(".cloudsc")
+                    // DBSYNC-114 C1: a remote delete under an excluded path touches no row
+                    // and enqueues no `local_delete` (decision B/C: nothing happens).
+                    && filter.file_synced(&rel)
                     && !crate::sync_pipeline::covered_by_active_job(&rel, &pending_targets)
                 {
                     let removed = reconcile_remote_absent(state, &rel)?;
@@ -4401,9 +4439,14 @@ mod tests {
         let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
         let pending_targets: HashSet<String> = HashSet::new();
 
-        let (absent, delete_candidates) =
-            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
-                .expect("an unnormalizable path must not abort the sweep");
+        let (absent, delete_candidates) = remote_sweep_delete_candidates(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+            &PrefixFilter::default(),
+        )
+        .expect("an unnormalizable path must not abort the sweep");
 
         assert!(
             absent.is_empty(),
@@ -4435,9 +4478,14 @@ mod tests {
         let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
         let pending_targets: HashSet<String> = HashSet::new();
 
-        let (absent, delete_candidates) =
-            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
-                .expect("the batch must survive one bad row");
+        let (absent, delete_candidates) = remote_sweep_delete_candidates(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+            &PrefixFilter::default(),
+        )
+        .expect("the batch must survive one bad row");
 
         assert_eq!(
             absent,
@@ -4504,9 +4552,14 @@ mod tests {
         let remote_by_path: HashMap<String, RemoteFileMeta> = HashMap::new();
         let pending_targets: HashSet<String> = HashSet::new();
 
-        let (absent, delete_candidates) =
-            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
-                .unwrap();
+        let (absent, delete_candidates) = remote_sweep_delete_candidates(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+            &PrefixFilter::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             absent.len(),
@@ -4593,9 +4646,14 @@ mod tests {
         let mut pending_targets: HashSet<String> = HashSet::new();
         pending_targets.insert("pending.txt".to_string());
 
-        let (absent, delete_candidates) =
-            remote_sweep_delete_candidates(&state, &local_files, &remote_by_path, &pending_targets)
-                .unwrap();
+        let (absent, delete_candidates) = remote_sweep_delete_candidates(
+            &state,
+            &local_files,
+            &remote_by_path,
+            &pending_targets,
+            &PrefixFilter::default(),
+        )
+        .unwrap();
 
         let mut absent_sorted = absent.clone();
         absent_sorted.sort();
@@ -4920,9 +4978,14 @@ mod tests {
             .collect();
         let local_files = state.db.list_local_files().unwrap();
 
-        let (absent, candidates) =
-            remote_sweep_delete_candidates(&state, &local_files, &snapshot, &HashSet::new())
-                .unwrap();
+        let (absent, candidates) = remote_sweep_delete_candidates(
+            &state,
+            &local_files,
+            &snapshot,
+            &HashSet::new(),
+            &PrefixFilter::default(),
+        )
+        .unwrap();
 
         assert!(
             absent.is_empty(),

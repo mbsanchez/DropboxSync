@@ -47,7 +47,44 @@ pub fn set_selective_sync_filters(
 ) -> Result<(), String> {
     state.db.set_include_prefixes_csv(&include_csv)?;
     state.db.set_exclude_prefixes_csv(&exclude_csv)?;
+    // DBSYNC-114: apply the change now instead of at the next scheduled tick. Only with a
+    // sync folder (there is nothing to apply without one), through the same single-flight
+    // gate as the manual sync, so it never races a cycle in flight; if one IS running, the
+    // pass reaches the local half of the next cycle. The outcome is not an error of Save.
+    if state.db.get_sync_folder()?.is_some() {
+        let _ = request_sync_cycle(state.inner());
+    }
     Ok(())
+}
+
+/// Starts one full sync cycle on a worker thread unless one is already running. The single
+/// place that owns the `sync_running` compare-exchange for a user-requested cycle, shared by
+/// `trigger_sync_tick` and Save (`set_selective_sync_filters`).
+pub(crate) fn request_sync_cycle(state: &AppState) -> TriggerSyncResponse {
+    if state
+        .sync_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return TriggerSyncResponse {
+            accepted: false,
+            reason: TriggerSyncReason::AlreadyRunning,
+        };
+    }
+
+    // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
+    crate::auth_session::refresh_tray_tooltip(state);
+    let app_state = state.clone();
+    std::thread::spawn(move || {
+        crate::sync_pipeline::full_sync_cycle(&app_state);
+        app_state.sync_running.store(false, Ordering::Release);
+        crate::auth_session::refresh_tray_tooltip(&app_state);
+    });
+
+    TriggerSyncResponse {
+        accepted: true,
+        reason: TriggerSyncReason::Started,
+    }
 }
 
 #[tauri::command]
@@ -536,30 +573,7 @@ pub fn sync_tick(state: tauri::State<AppState>) -> Result<SyncTickResult, String
 
 #[tauri::command]
 pub fn trigger_sync_tick(state: tauri::State<AppState>) -> Result<TriggerSyncResponse, String> {
-    if state
-        .sync_running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Ok(TriggerSyncResponse {
-            accepted: false,
-            reason: TriggerSyncReason::AlreadyRunning,
-        });
-    }
-
-    // Reflect the sync start in the tray tooltip immediately (DBSYNC-48).
-    crate::auth_session::refresh_tray_tooltip(state.inner());
-    let app_state = state.inner().clone();
-    std::thread::spawn(move || {
-        crate::sync_pipeline::full_sync_cycle(&app_state);
-        app_state.sync_running.store(false, Ordering::Release);
-        crate::auth_session::refresh_tray_tooltip(&app_state);
-    });
-
-    Ok(TriggerSyncResponse {
-        accepted: true,
-        reason: TriggerSyncReason::Started,
-    })
+    Ok(request_sync_cycle(state.inner()))
 }
 
 #[tauri::command]
@@ -716,4 +730,104 @@ pub fn set_startup_at_login(enabled: bool) -> Result<bool, String> {
 #[tauri::command]
 pub fn set_startup_at_login(_enabled: bool) -> Result<bool, String> {
     Err("startup-at-login is only supported on Windows".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
+    use tauri::webview::InvokeRequest;
+    use tauri::{Manager, WebviewWindowBuilder};
+
+    use crate::state::AppState;
+
+    /// A mock app whose only state is an `AppState` over a fresh DB. The tempdir is returned
+    /// so the caller holds it for the whole test (no leak). No sync folder is configured and
+    /// the two commands under test touch only `app_config`, so nothing is spawned.
+    fn mock_app() -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Arc<crate::storage::db::Db>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(crate::storage::db::Db::new_at(&dir.path().join("app.db")).expect("db"));
+        let state = AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: db.clone(),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        };
+        let app = mock_builder()
+            .manage(state)
+            .invoke_handler(tauri::generate_handler![
+                super::get_selective_sync_filters,
+                super::set_selective_sync_filters
+            ])
+            .build(mock_context(noop_assets()))
+            .expect("mock app");
+        (app, db, dir)
+    }
+
+    fn invoke(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        cmd: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let webview = app.get_webview_window("ipc-test").unwrap_or_else(|| {
+            WebviewWindowBuilder::new(app, "ipc-test", Default::default())
+                .build()
+                .expect("webview")
+        });
+        get_ipc_response(
+            &webview,
+            InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            },
+        )
+        .map(|b| b.deserialize::<serde_json::Value>().expect("json body"))
+    }
+
+    #[test]
+    fn selective_sync_filters_ipc_takes_camel_case_and_rejects_snake_case() {
+        let (app, db, _dir) = mock_app();
+
+        let ok = invoke(
+            &app,
+            "set_selective_sync_filters",
+            serde_json::json!({"includeCsv": "A", "excludeCsv": "B"}),
+        );
+        assert!(ok.is_ok(), "camelCase must be accepted: {ok:?}");
+        assert_eq!(db.get_include_prefixes_csv().unwrap().as_deref(), Some("A"));
+        assert_eq!(db.get_exclude_prefixes_csv().unwrap().as_deref(), Some("B"));
+
+        // The bug this slice fixes: the old frontend sent snake_case keys.
+        let bad = invoke(
+            &app,
+            "set_selective_sync_filters",
+            serde_json::json!({"include_csv": "X", "exclude_csv": "Y"}),
+        );
+        assert!(bad.is_err(), "snake_case must be rejected: {bad:?}");
+        assert_eq!(db.get_include_prefixes_csv().unwrap().as_deref(), Some("A"));
+        assert_eq!(db.get_exclude_prefixes_csv().unwrap().as_deref(), Some("B"));
+
+        let got =
+            invoke(&app, "get_selective_sync_filters", serde_json::json!({})).expect("get ok");
+        assert_eq!(
+            got,
+            serde_json::json!({"includeCsv": "A", "excludeCsv": "B"})
+        );
+    }
 }

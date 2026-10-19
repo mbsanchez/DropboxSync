@@ -15,8 +15,8 @@ use crate::models::{
     SyncConflictEvent, UploadCommitResponse, UploadProgressEvent, UploadSessionStartResponse,
 };
 use crate::path_util::{
-    create_conflicted_copy, hash_file, is_ignored_local_path, is_path_allowed, key_from_disk,
-    key_from_dropbox, normalize_dropbox_path, parse_prefix_csv, safe_join,
+    create_conflicted_copy, hash_file, is_ignored_local_path, key_from_disk, key_from_dropbox,
+    normalize_dropbox_path, safe_join, unique_conflicted_name,
 };
 use crate::state::AppState;
 use crate::storage::db::FileIndexRow;
@@ -266,8 +266,8 @@ pub(crate) fn list_remote_folder(
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
 
-    let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
-    let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
+    // Folded once for the whole listing, not per entry (DBSYNC-114).
+    let scope_filter = crate::path_util::PrefixFilter::load(&state.db)?;
 
     let dropbox_path = normalize_dropbox_path(&path)?;
 
@@ -314,7 +314,7 @@ pub(crate) fn list_remote_folder(
         let is_synced = safe_join(Path::new(&folder), &relative)
             .map(|p| p.exists())
             .unwrap_or(false);
-        let is_excluded = !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes);
+        let is_excluded = !scope_filter.file_synced(&relative);
 
         entries.push(RemoteEntry {
             tag: entry.tag,
@@ -914,6 +914,46 @@ pub(crate) fn upload_local_file_internal(
     relative: &str,
     job_id: i64,
 ) -> AppResult<()> {
+    upload_local_file_with(
+        state,
+        relative,
+        |rel| crate::remote_index::fetch_remote_file_metadata(state, rel),
+        |file, len, dropbox_path| send_to_dropbox(state, job_id, file, len, dropbox_path),
+    )
+}
+
+/// The real upload body with its two network halves injected (DBSYNC-114): `fetch` is the
+/// remote lookup (what Dropbox holds at the path right now) and `send` puts the bytes on
+/// Dropbox and returns the commit metadata. Everything else -- the vanished-file handling, the
+/// clobber guard, the conflicted-copy resolution, the identical-content skip, recording the
+/// landed upload -- is production code in both cases, so a test drives the real thing.
+///
+/// # Invariants this function enforces (DBSYNC-114, selective sync)
+///
+/// - **I1 Never overwrite remote content the app has not seen.** A path with no local row, or
+///   whose first upload has not landed (`unconfirmed_uploads`), is looked up before it is
+///   sent; if Dropbox holds different content, the upload does not happen.
+/// - **I3 Never delete or overwrite local bytes that never reached Dropbox.** The colliding
+///   file is moved (renamed, same inode) to a conflicted copy before the original path is
+///   released to Dropbox's version; bytes are never copied and then unlinked.
+/// - **I4 No long-lived special state.** There is no refusal. A collision is resolved inside
+///   this one drain into two ordinary files (Dropbox's version at the name, the local bytes
+///   at the conflicted-copy name, which uploads like any new file), the job ends `done`, and
+///   nothing is left armed on the original path.
+/// - **I2 / I5** are enforced on the deletion side (`sync_pipeline::process_local_file_deletion`)
+///   and in the vanished-file branch below: a delete is only ever sent against a rev of
+///   bytes the app uploaded or saw; a delete or rename of a file whose upload is queued or in
+///   flight is decided by that upload: when the upload answers, the deletion runs against OUR
+///   rev; when the file is gone before the job sends anything, the job only untracks it and
+///   never deletes on Dropbox. Trade-off: if an upload landed but its response was lost and
+///   the user then deleted the file, the file stays on Dropbox and returns as a placeholder
+///   (resurrection, not loss).
+pub(crate) fn upload_local_file_with(
+    state: &AppState,
+    relative: &str,
+    fetch: impl Fn(&str) -> AppResult<Option<crate::remote_index::RemoteFileMeta>>,
+    send: impl FnOnce(File, u64, &str) -> AppResult<Option<UploadCommitResponse>>,
+) -> AppResult<()> {
     if relative.ends_with(".cloudsc") {
         return Ok(());
     }
@@ -943,6 +983,28 @@ pub(crate) fn upload_local_file_internal(
             // unguarded delete from here could wrongly wipe a live remote file
             // during an atomic save.
             tracing::info!(file_path = %relative, "upload cancelled: local file no longer exists");
+            if state.db.is_upload_unconfirmed(relative)? {
+                // DBSYNC-114 (I2 / I5). The path's first upload never landed as far as the
+                // index knows, and the deletion handler left the row for THIS job to settle
+                // (it never decides for an upload that is queued, running or failed). This
+                // branch only UNTRACKS: it never deletes on Dropbox, whatever Dropbox holds.
+                //
+                // Why not delete when Dropbox holds bytes identical to the row's: that state
+                // is the same whether an earlier attempt of THIS job landed and its answer was
+                // lost, or another device put identical bytes there while this job sent
+                // nothing. A delete against that rev is wrong in the second case (I2) and
+                // nothing here can tell the two apart. The repo rule is that a duplicate is
+                // recoverable and a wrong deletion is not.
+                //
+                // The trade-off, stated exactly (I5): if our upload really landed and only the
+                // response was lost, the file the user deleted STAYS on Dropbox and returns
+                // to this device as a placeholder at the next sweep (a resurrection, never a
+                // loss). That is the price of never deleting a file this client cannot prove
+                // it uploaded; a deletion of a file whose upload ANSWERED is propagated
+                // (`record_upload_landed` hands over to `process_changed_paths`).
+                state.db.remove_local_file(relative)?;
+                return Ok(());
+            }
             let had_remote = state.db.get_remote_file(relative)?.is_some();
             if !had_remote || is_ignored_local_path(relative) {
                 state.db.remove_local_file(relative)?;
@@ -973,8 +1035,6 @@ pub(crate) fn upload_local_file_internal(
         }
     }
 
-    let token = get_access_token(state)?;
-
     // **Never overwrite content this client has never seen.**
     //
     // Every upload sends `"mode": "overwrite"`, and the only guard against clobbering an
@@ -991,8 +1051,18 @@ pub(crate) fn upload_local_file_internal(
     //
     // `settle_owed_source_deletion`'s doc used to claim the hashes would disagree and protect
     // this. They cannot: the upload runs BEFORE the comparison and is what makes them agree.
-    if state.db.get_local_file(relative)?.is_none() {
-        if let Some(remote) = crate::remote_index::fetch_remote_file_metadata(state, relative)? {
+    //
+    // DBSYNC-114: "a path with no local row" is NOT enough on its own. The scan writes the
+    // local row at the moment it enqueues a brand-new file's upload (`process_local_file_change`
+    // None arm), so by the time this runs the row exists and the guard was skipped for every
+    // new file, including the one selective sync promises never to let overwrite Dropbox (a
+    // file kept on disk when its folder was excluded, or created inside it, and found again
+    // after the un-exclude). The scan now also records the path in `unconfirmed_uploads`,
+    // cleared when the upload lands, so the guard stays armed across retries.
+    let remote = fetch(relative)?;
+    let guarded = upload_guard_applies(state, relative)?;
+    if let Some(remote) = &remote {
+        if guarded {
             let disk_hash = crate::path_util::hash_file(&local_path)
                 .map(|(h, _, _)| h)
                 .ok();
@@ -1001,40 +1071,39 @@ pub(crate) fn upload_local_file_internal(
                 Some(&remote.content_hash),
                 disk_hash.as_deref(),
             ) {
-                // Record what Dropbox actually holds, so the next scan reasons about the
-                // collision instead of re-proposing the same move, and refuse the job.
-                state.db.upsert_remote_file(
-                    relative,
-                    &remote.content_hash,
-                    &remote.rev,
-                    remote.modified_ts,
-                    remote.id.as_deref(),
-                )?;
-                tracing::error!(
-                    rel = %relative,
-                    "refusing to upload over content this client has never indexed — Dropbox holds a different file at this path"
-                );
-                return Err(AppError::Sync(format!(
-                    "upload refused: Dropbox already holds different content at {relative}, and this client has no record of it"
-                )));
+                // Dropbox holds what THIS client sent on an earlier attempt of this first
+                // upload (the attempt landed and its response was lost, or the confirm
+                // failed) and the file was edited since: the content is ours, not a stranger's,
+                // so the edit replaces it normally instead of becoming a false conflict.
+                let ours = state.db.unconfirmed_sent_hash(relative)?.as_deref()
+                    == Some(remote.content_hash.as_str());
+                if !ours {
+                    resolve_upload_collision(state, Path::new(&folder), relative, &local_path)?;
+                    return Ok(());
+                }
+                // fall through to the ordinary overwrite upload
+            } else {
+                // Dropbox already holds exactly these bytes: nothing to send, and the guard
+                // has nothing left to do (this also recovers a marker whose clear failed).
+                return record_identical_remote(state, relative, remote);
+            }
+        } else if let Some(local) = state.db.get_local_file(relative)? {
+            // Skip the upload when Dropbox already holds identical content. This avoids
+            // re-uploading files that originated from Dropbox (e.g. after a sync-state
+            // reset re-indexes existing downloads as "new" local files).
+            if remote.content_hash == local.hash {
+                return record_identical_remote(state, relative, remote);
             }
         }
     }
 
-    // Skip the upload when Dropbox already holds identical content. This avoids
-    // re-uploading files that originated from Dropbox (e.g. after a sync-state
-    // reset re-indexes existing downloads as "new" local files).
-    if let Some(local) = state.db.get_local_file(relative)? {
-        if let Some(remote) = crate::remote_index::fetch_remote_file_metadata(state, relative)? {
-            if remote.content_hash == local.hash {
-                state.db.upsert_remote_file(
-                    relative,
-                    &remote.content_hash,
-                    &remote.rev,
-                    remote.modified_ts,
-                    remote.id.as_deref(),
-                )?;
-                return Ok(());
+    if guarded {
+        // Remember what is about to be sent, so a lost response is recognised on the retry.
+        // The row hash is what the scan saw; if the file raced it the hashes simply differ
+        // and the retry resolves as a collision (a conflicted copy, nothing lost).
+        if let Some(row) = state.db.get_local_file(relative)? {
+            if row.hash != crate::storage::db::Db::HASH_NEEDS_RESCAN {
+                state.db.record_upload_attempt(relative, &row.hash)?;
             }
         }
     }
@@ -1047,7 +1116,72 @@ pub(crate) fn upload_local_file_internal(
         .len();
 
     let dropbox_path = normalize_dropbox_path(relative)?;
+    let committed = send(file, len, &dropbox_path)?;
 
+    // The bytes are on Dropbox: the first upload is confirmed and the guard has done its job.
+    // One transaction with the remote row; a failure fails the job, and the retry passes the
+    // guard because Dropbox then holds exactly the local bytes (never "guarded forever").
+    record_upload_landed(state, relative, committed)?;
+
+    // I5: the file was deleted or renamed while this upload was in flight. The deletion
+    // handler left the row for this job (it does not decide for an upload that may land),
+    // and now that it HAS landed, with our rev recorded, the deletion the user asked for is
+    // propagated against that rev instead of waiting for the next periodic scan.
+    if matches!(
+        std::fs::symlink_metadata(&local_path),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    ) {
+        if let Err(e) = crate::sync_pipeline::process_changed_paths(state, &[relative.to_string()])
+        {
+            tracing::warn!(rel = %relative, error = %e, "could not propagate the deletion of a file removed while its upload was in flight; the next scan will");
+        }
+    }
+    Ok(())
+}
+
+/// Dropbox already holds the local bytes: record its row and disarm the guard.
+///
+/// Dropbox paths are case-insensitive, so the lookup that found `remote` may have matched a
+/// case variant (`A.txt` locally, `a.txt` on Dropbox). The row of that file already exists
+/// under the sweep's spelling; writing a second row under the local spelling would index one
+/// Dropbox file twice. An existing row that folds to the same path is updated in place and
+/// the local spelling gets only its marker cleared.
+fn record_identical_remote(
+    state: &AppState,
+    relative: &str,
+    remote: &crate::remote_index::RemoteFileMeta,
+) -> AppResult<()> {
+    let existing_key = state.db.find_remote_file_key_folding_to(relative)?;
+    let landed = crate::storage::db::LandedUpload {
+        content_hash: &remote.content_hash,
+        rev: &remote.rev,
+        modified_ts: remote.modified_ts,
+        dropbox_id: remote.id.as_deref(),
+    };
+    match existing_key {
+        Some(variant) => {
+            state.db.upsert_remote_file(
+                &variant,
+                landed.content_hash,
+                landed.rev,
+                landed.modified_ts,
+                landed.dropbox_id,
+            )?;
+            state.db.confirm_upload_landed(relative, None)
+        }
+        None => state.db.confirm_upload_landed(relative, Some(landed)),
+    }
+}
+
+/// The network half of an upload: single-shot or session, per size.
+fn send_to_dropbox(
+    state: &AppState,
+    job_id: i64,
+    file: File,
+    len: u64,
+    dropbox_path: &str,
+) -> AppResult<Option<UploadCommitResponse>> {
+    let token = get_access_token(state)?;
     match choose_upload_strategy(len) {
         UploadStrategy::SingleShot => {
             let client = &state.http_client;
@@ -1087,18 +1221,77 @@ pub(crate) fn upload_local_file_internal(
                     message: format!("upload for {dropbox_path}: {body}"),
                 });
             }
-            record_upload_result(state, relative, resp.json::<UploadCommitResponse>().ok());
+            Ok(resp.json::<UploadCommitResponse>().ok())
         }
         UploadStrategy::Session => {
-            let committed = upload_via_session(state, &token, file, len, &dropbox_path, job_id)?;
-            record_upload_result(state, relative, committed);
+            upload_via_session(state, &token, file, len, dropbox_path, job_id)
         }
     }
-
-    Ok(())
 }
 
-/// Record what Dropbox says it now holds, immediately after an upload commits.
+/// DBSYNC-114: does this upload owe the "never overwrite what this client has not seen"
+/// check? True for a path with no local index row (a refused move's fallback) and for a path
+/// the scan met as a brand-new file whose first upload has not yet landed.
+pub(crate) fn upload_guard_applies(state: &AppState, relative: &str) -> AppResult<bool> {
+    Ok(state.db.get_local_file(relative)?.is_none() || state.db.is_upload_unconfirmed(relative)?)
+}
+
+/// Resolves a collision (a new local file, Dropbox holds different content the app never
+/// saw) the way Dropbox itself does: the local bytes move to a conflicted copy next to the
+/// file, the original path is released to Dropbox's version, and the conflict is recorded.
+/// Returns the copy's key.
+///
+/// In order, each step safe to repeat or to be interrupted after:
+/// 1. The original is RENAMED to a fresh conflicted-copy name (`unique_conflicted_name`, the
+///    naming downloads use, which never reuses an existing name). A rename is atomic and
+///    moves the very same inode: a byte written a moment ago is in the copy, a writer that
+///    still holds the file open keeps writing into the copy, no second copy of a large file
+///    is written (no double disk usage, so no ENOSPC retries that would contradict I4), and
+///    there is no window in which the bytes exist only at a path that is about to be
+///    unlinked (I3). Nothing is re-hashed: there is no copy to verify.
+/// 2. The original path is untracked (`remove_local_file`, which also clears the marker). Until
+///    then its row is still there, with the marker, and the upload job is `running`, so a scan
+///    or watcher event arriving now defers (it never turns the vanished row into a delete).
+///    Dropbox's version is deliberately NOT recorded under any local row; the listing sweep
+///    brings it down to the name (placeholder or download) like any remote file.
+/// 3. The copy is NOT enqueued here: it is a new file, and the watcher / scan pick it up
+///    through the same path as any other, including this same guard.
+pub(crate) fn resolve_upload_collision(
+    state: &AppState,
+    folder: &Path,
+    relative: &str,
+    local_path: &Path,
+) -> AppResult<String> {
+    let copy = unique_conflicted_name(local_path)?;
+    std::fs::rename(local_path, &copy).map_err(|e| {
+        AppError::Io(format!(
+            "could not move {relative} aside to its conflicted copy: {e}"
+        ))
+    })?;
+    let copy_rel = key_from_disk(folder, &copy)?;
+    state.db.remove_local_file(relative)?;
+
+    let reason = format!(
+        "a new local file collides with a different file already on Dropbox; the local copy was kept as {copy_rel}"
+    );
+    state
+        .db
+        .add_conflict(relative, relative, &reason, Some(&copy_rel), false)?;
+    if let Ok(mut engine) = state.sync_engine.lock() {
+        engine.record_conflict();
+    }
+    tracing::warn!(
+        path = %relative,
+        conflicted_copy = %copy_rel,
+        "sync conflict: a new local file collides with different Dropbox content; kept as a conflicted copy, Dropbox untouched"
+    );
+    emit_sync_conflict(relative, &copy_rel, &reason);
+    crate::sharing::notify_conflict(relative);
+    Ok(copy_rel)
+}
+
+/// Record what Dropbox says it now holds, immediately after an upload commits, and disarm the
+/// path's first-upload marker in the same transaction.
 ///
 /// **Found by manual QA, not by a test.** Nothing used to write a `remote_file_index` row on
 /// the success path — only the skip-if-identical early return did — so after a real upload
@@ -1113,30 +1306,44 @@ pub(crate) fn upload_local_file_internal(
 /// slice 2 deferred using it on the grounds that the sweep fills the row eventually. It does;
 /// arriving late is the defect.
 ///
-/// Best-effort throughout: the bytes are already on Dropbox, and failing the job here would
-/// re-upload a file that is already there.
-pub(crate) fn record_upload_result(
+/// An error is returned, not swallowed (DBSYNC-114): a swallowed failure to clear the marker
+/// guarded the path forever. The retry it causes does not re-upload (see
+/// `upload_local_file_with`: Dropbox then holds the local bytes).
+pub(crate) fn record_upload_landed(
     state: &AppState,
     relative: &str,
     committed: Option<UploadCommitResponse>,
-) {
+) -> AppResult<()> {
     let Some(entry) = committed else {
         tracing::warn!(rel = %relative, "upload committed but its metadata could not be parsed; the remote row waits for the next sweep");
-        return;
-    };
-    let (Some(hash), Some(rev)) = (entry.content_hash.as_deref(), entry.rev.as_deref()) else {
-        return;
+        return state.db.confirm_upload_landed(relative, None);
     };
     let modified_ts = entry
         .server_modified
         .as_deref()
         .map(crate::remote_index::parse_rfc3339_ts_to_unix)
         .unwrap_or(0);
-    if let Err(e) =
-        state
-            .db
-            .upsert_remote_file(relative, hash, rev, modified_ts, entry.id.as_deref())
-    {
+    let landed = match (entry.content_hash.as_deref(), entry.rev.as_deref()) {
+        (Some(content_hash), Some(rev)) => Some(crate::storage::db::LandedUpload {
+            content_hash,
+            rev,
+            modified_ts,
+            dropbox_id: entry.id.as_deref(),
+        }),
+        _ => None,
+    };
+    state.db.confirm_upload_landed(relative, landed)
+}
+
+/// Best-effort form of [`record_upload_landed`] for callers that only want the row written
+/// (tests that stand in for a landed upload). The drain uses the fallible form.
+#[cfg(test)]
+pub(crate) fn record_upload_result(
+    state: &AppState,
+    relative: &str,
+    committed: Option<UploadCommitResponse>,
+) {
+    if let Err(e) = record_upload_landed(state, relative, committed) {
         tracing::warn!(rel = %relative, error = %e, "upload committed but the remote row could not be recorded");
     }
 }
@@ -1419,10 +1626,11 @@ pub(crate) fn rederive_refused_move(
 /// **The `to/conflict` case is NOT protected by this comparison, and an earlier version of
 /// this doc claimed it was.** It said that if the destination's content differs the hashes
 /// disagree and the source stays. They cannot disagree: the upload runs BEFORE this check and
-/// is what makes them agree. The protection lives in `upload_local_file_internal`, which now
-/// refuses to overwrite content this client has never indexed — which is the only place it
-/// can live, because the ordinary scan would upload the renamed file even if this recovery
-/// enqueued nothing at all.
+/// is what makes them agree. The protection lives in `upload_local_file_with`, which never
+/// overwrites content this client has never indexed (a collision becomes a conflicted copy, so
+/// the destination does NOT hold the user's bytes and this debt is declined below) — which is
+/// the only place it can live, because the ordinary scan would upload the renamed file even if
+/// this recovery enqueued nothing at all.
 ///
 /// **Never fails the job.** An owed deletion that cannot be enqueued leaves a duplicate on
 /// Dropbox; a `?` here would leave the job `running`, which `pick_next_due_job` never picks
@@ -1460,6 +1668,27 @@ pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destina
                 "upload landed but the move source could not be enqueued for deletion; it stays on Dropbox as a duplicate"
             ),
         },
+        Ok(false) if upload_collided_at(state, destination) => {
+            // DBSYNC-114. Not a failure: the destination already held a DIFFERENT file this
+            // client had never seen, so the upload resolved the collision (the user's bytes
+            // now live in a conflicted copy, Dropbox's file is untouched) instead of
+            // overwriting it. The source is deliberately not deleted -- a duplicate is
+            // recoverable, a wrong deletion is not -- and the debt is settled, not left to
+            // surface the "renamed to ... Dropbox holds both names" advisory, which would
+            // describe the foreign file as the user's rename. The old name comes back as a
+            // placeholder at the next sweep; the conflict row tells the user the rest.
+            match state.db.clear_deferred_source_delete(job_id) {
+                Ok(()) => tracing::warn!(
+                    job_id,
+                    source = %source,
+                    destination = %destination,
+                    "the rename's destination collided with a different file on Dropbox and was kept as a conflicted copy: the move source is NOT deleted and stays on Dropbox"
+                ),
+                Err(e) => {
+                    tracing::warn!(job_id, error = %e, "the destination collided but the owed source deletion could not be cleared")
+                }
+            }
+        }
         Ok(false) => {
             tracing::error!(
                 job_id,
@@ -1477,6 +1706,17 @@ pub(crate) fn settle_owed_source_deletion(state: &AppState, job_id: i64, destina
             );
         }
     }
+}
+
+/// Whether the upload of `relative` just resolved a collision at that name (an unresolved
+/// conflict row exists for it). A failed read answers `false`: the caller then takes its
+/// conservative branch.
+fn upload_collided_at(state: &AppState, relative: &str) -> bool {
+    state
+        .db
+        .list_unresolved_conflict_local_paths()
+        .map(|paths| paths.iter().any(|p| p == relative))
+        .unwrap_or(false)
 }
 
 /// Does Dropbox hold, at `relative`, the bytes the user has there?
@@ -1571,6 +1811,12 @@ pub(crate) fn apply_confirmed_move(
     } else {
         state.db.move_index_row(from_relative, to_relative)?;
     }
+    // DBSYNC-114: a move INTO the excluded zone is the one thing that writes remote index rows
+    // there while it is excluded; the exclusion pass drops them only once per filter, so tell
+    // it to look again.
+    state
+        .db
+        .set_app_config(crate::cloudsc_ops::REMOTE_ROWS_CLEANED_KEY, "")?;
     Ok(())
 }
 
@@ -2249,19 +2495,115 @@ fn file_unchanged_since_delta_check(state: &AppState, rel: &str) -> AppResult<bo
     }
 }
 
+/// Refuses a download whose path is outside the selective-sync scope (DBSYNC-114).
+///
+/// It used to be `Ok(())`: a download job, a `.cloudsc` hydration and a manual download all
+/// "succeeded" as no-ops, which advanced state the user never got the bytes for (H1). An
+/// error is the honest answer. Pure DB reads; no token, no network, no filesystem.
+pub(crate) fn ensure_download_in_scope(state: &AppState, relative: &str) -> AppResult<()> {
+    let filter = crate::path_util::PrefixFilter::load(&state.db)?;
+    if filter.file_synced(relative) {
+        Ok(())
+    } else {
+        Err(AppError::Sync(format!(
+            "{relative} is excluded by selective sync; it is not downloaded"
+        )))
+    }
+}
+
+/// The local baseline a download is judged against (DBSYNC-114).
+///
+/// Normally the hash of the local index row. A path whose first upload is still
+/// **unconfirmed** is different: its row was written by the scan the moment it enqueued the
+/// upload, so row hash == disk hash says "in sync" about bytes that have NEVER reached
+/// Dropbox (the sweep may meanwhile record a different Dropbox version as the remote row, which
+/// is what makes a remote edit enqueue a download over them). Such a path is reported as
+/// [`crate::storage::db::Db::HASH_NEEDS_RESCAN`] to the conflict check: the same answer the
+/// existing DBSYNC-56 handling gives for "unuploaded local bytes, no trustworthy record" (it
+/// is conflict unless the remote already holds exactly these bytes), so no new conflict
+/// semantics are introduced. The index row itself is deliberately NOT rewritten with that
+/// marker: the scan treats a marked row as a pending re-hash and would enqueue another upload
+/// on every tick. The marker is short-lived (it lasts until the upload lands), so this protects
+/// a window, not a state.
+pub(crate) fn download_baseline(state: &AppState, relative: &str) -> AppResult<Option<String>> {
+    if state.db.is_upload_unconfirmed(relative)? {
+        return Ok(Some(crate::storage::db::Db::HASH_NEEDS_RESCAN.to_string()));
+    }
+    Ok(state.db.get_local_file(relative)?.map(|row| row.hash))
+}
+
+/// The remote-wins conflict guard of a download, separated from the network so it is
+/// testable: when `target` holds local bytes Dropbox does not have, keep them as a
+/// `(conflicted copy ...)` sibling and record the conflict. Returns whether a copy was made.
+pub(crate) fn preserve_local_before_download(
+    state: &AppState,
+    folder: &Path,
+    relative: &str,
+    target: &Path,
+) -> AppResult<bool> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    let (on_disk_hash, _size, _mtime) = hash_file(target)?;
+    let baseline_hash = download_baseline(state, relative)?;
+    let remote_hash = state.db.get_remote_file(relative)?.map(|r| r.content_hash);
+
+    if !download_would_destroy_local(
+        remote_hash.as_deref(),
+        &on_disk_hash,
+        baseline_hash.as_deref(),
+    ) || conflict_copy_with_content_exists(target, &on_disk_hash)?
+    {
+        return Ok(false);
+    }
+    let conflicted_path = create_conflicted_copy(target)?;
+    let conflicted_rel = key_from_disk(folder, &conflicted_path)?;
+    let reason = format!(
+        "remote download would overwrite unsynced local changes; local copy preserved as {conflicted_rel}"
+    );
+    state
+        .db
+        .add_conflict(relative, relative, &reason, Some(&conflicted_rel), false)?;
+    if let Ok(mut engine) = state.sync_engine.lock() {
+        engine.record_conflict();
+    }
+    tracing::warn!(
+        path = %relative,
+        conflicted_copy = %conflicted_rel,
+        "sync conflict: local copy preserved before remote overwrite"
+    );
+    emit_sync_conflict(relative, &conflicted_rel, &reason);
+    crate::sharing::notify_conflict(relative);
+    Ok(true)
+}
+
+/// Records a file just written FROM Dropbox as the local row. The row now describes Dropbox's
+/// bytes, so the path owes no first upload: the unconfirmed-upload marker is cleared with it
+/// (DBSYNC-114). A marker left behind would turn the next ordinary edit of this file into a conflicted copy.
+/// Returns `(hash, size, mtime)` of what is on disk.
+pub(crate) fn record_downloaded_file(
+    state: &AppState,
+    relative: &str,
+    target: &Path,
+) -> AppResult<(String, i64, i64)> {
+    let (hash, size_bytes, modified_ts) = hash_file(target)?;
+    state
+        .db
+        .upsert_local_file(relative, &hash, size_bytes, modified_ts)?;
+    state.db.clear_upload_unconfirmed(relative)?;
+    Ok((hash, size_bytes, modified_ts))
+}
+
 pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> AppResult<()> {
+    // The scope check comes BEFORE the token: an excluded path must not cost a keychain read
+    // or a network call, and must fail the same way whether or not the user is signed in.
+    let relative = key_from_dropbox(path_display);
+    ensure_download_in_scope(state, &relative)?;
     let token = get_access_token(state)?;
     let folder = state
         .db
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
-
-    let relative = key_from_dropbox(path_display);
-    let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
-    let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
-    if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
-        return Ok(());
-    }
 
     // Refuse a remote path that would escape the sync root before writing.
     let target = safe_join(Path::new(&folder), &relative)?;
@@ -2272,45 +2614,11 @@ pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str
     // tick re-detects it as a local change. A `None` baseline, only possible for
     // the manual/hydration call sites, is intentionally NOT treated as a conflict:
     // with no last-synced hash there is nothing to prove a local modification.)
-    if target.exists() {
-        let (on_disk_hash, _size, _mtime) = hash_file(&target)?;
-        let baseline_hash = state.db.get_local_file(&relative)?.map(|row| row.hash);
-
-        let remote_hash = state.db.get_remote_file(&relative)?.map(|r| r.content_hash);
-
-        if download_would_destroy_local(
-            remote_hash.as_deref(),
-            &on_disk_hash,
-            baseline_hash.as_deref(),
-        ) && !conflict_copy_with_content_exists(&target, &on_disk_hash)?
-        {
-            let conflicted_path = create_conflicted_copy(&target)?;
-            let conflicted_rel = key_from_disk(Path::new(&folder), &conflicted_path)?;
-            let reason = format!(
-                "remote download would overwrite unsynced local changes; local copy preserved as {conflicted_rel}"
-            );
-            state
-                .db
-                .add_conflict(&relative, &relative, &reason, Some(&conflicted_rel), false)?;
-            if let Ok(mut engine) = state.sync_engine.lock() {
-                engine.record_conflict();
-            }
-            tracing::warn!(
-                path = %relative,
-                conflicted_copy = %conflicted_rel,
-                "sync conflict: local copy preserved before remote overwrite"
-            );
-            emit_sync_conflict(&relative, &conflicted_rel, &reason);
-            crate::sharing::notify_conflict(&relative);
-        }
-    }
+    preserve_local_before_download(state, Path::new(&folder), &relative, &target)?;
 
     fetch_and_write_file(&state.http_client, &token, path_display, &target)?;
 
-    let (hash, size_bytes, modified_ts) = hash_file(&target)?;
-    state
-        .db
-        .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
+    let (hash, _, modified_ts) = record_downloaded_file(state, &relative, &target)?;
 
     // DBSYNC-45: record remote provenance for the (re-)hydrated file so that a
     // later remote deletion propagates as a local delete. Without this row the
@@ -2338,14 +2646,21 @@ pub(crate) fn hydrate_remote_folder_internal(
     state: &AppState,
     folder_path_display: &str,
 ) -> AppResult<usize> {
+    // DBSYNC-114 H5: a manual download of an excluded folder is refused, before the token.
+    // (An Ancestor of an include is allowed through: its included children are the point.)
+    let folder_rel = key_from_dropbox(folder_path_display);
+    // Loaded once: this filter also gates every file of the walk below.
+    let filter = crate::path_util::PrefixFilter::load(&state.db)?;
+    if filter.scope(&folder_rel) == crate::path_util::PathScope::Excluded {
+        return Err(AppError::Sync(format!(
+            "{folder_rel} is excluded by selective sync; it is not downloaded"
+        )));
+    }
     let token = get_access_token(state)?;
     let folder = state
         .db
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
-
-    let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
-    let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
 
     fs::create_dir_all(&folder)
         .map_err(|e| AppError::Io(format!("failed to create sync folder: {e}")))?;
@@ -2393,7 +2708,7 @@ pub(crate) fn hydrate_remote_folder_internal(
                 continue;
             };
             let relative = key_from_dropbox(path_display);
-            if !is_path_allowed(&relative, &include_prefixes, &exclude_prefixes) {
+            if !filter.file_synced(&relative) {
                 continue;
             }
 
@@ -2405,12 +2720,15 @@ pub(crate) fn hydrate_remote_folder_internal(
                     continue;
                 }
             };
+            // DBSYNC-114: local bytes that have never reached Dropbox are not ours to
+            // overwrite, and this walk (unlike the single-file path) has no conflict copy.
+            if target.exists() && state.db.is_upload_unconfirmed(&relative)? {
+                tracing::warn!(path = %relative, "not downloading over a local file whose first upload is unconfirmed");
+                continue;
+            }
             fetch_and_write_file(client, &token, path_display, &target)?;
 
-            let (hash, size_bytes, modified_ts) = hash_file(&target)?;
-            state
-                .db
-                .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
+            record_downloaded_file(state, &relative, &target)?;
             downloaded += 1;
         }
 
@@ -2515,10 +2833,7 @@ pub(crate) fn pull_remote_snapshot_internal(state: &AppState) -> AppResult<usize
             }
 
             fetch_and_write_file(client, &token, path_display, &target)?;
-            let (hash, size_bytes, modified_ts) = hash_file(&target)?;
-            state
-                .db
-                .upsert_local_file(&relative, &hash, size_bytes, modified_ts)?;
+            record_downloaded_file(state, &relative, &target)?;
             downloaded += 1;
         }
 

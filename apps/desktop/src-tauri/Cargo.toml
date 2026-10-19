@@ -40,6 +40,8 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3"
+# DBSYNC-114: mock IPC (`tauri::test`) for the command-argument tests. Dev only.
+tauri = { version = "2", features = ["test"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Already in Cargo.lock transitively via Tauri, but a transitive crate cannot be imported —
