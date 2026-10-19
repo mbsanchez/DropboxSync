@@ -6,6 +6,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// What Dropbox reported for an upload that landed (see `Db::confirm_upload_landed`).
+pub struct LandedUpload<'a> {
+    pub content_hash: &'a str,
+    pub rev: &'a str,
+    pub modified_ts: i64,
+    pub dropbox_id: Option<&'a str>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileIndexRow {
@@ -106,6 +114,9 @@ pub struct Db {
     /// `new_at`'s own doc already promised that "running `cargo test` never touches a
     /// user's real DB". This extends the same promise to everything written beside it.
     data_dir: PathBuf,
+    /// Keys of "log this once per condition" lines already written by this process
+    /// (DBSYNC-114: the exclusion pass must not repeat the same kept-file WARN every tick).
+    logged_once: Mutex<HashSet<String>>,
 }
 
 /// Debug-only contract check: every index key reaching the storage layer is already
@@ -276,7 +287,25 @@ impl Db {
                 Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
                 _ => PathBuf::from("."),
             },
+            logged_once: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// True the FIRST time `key` is seen by this `Db` (process lifetime), false afterwards.
+    /// For lines a periodic pass would otherwise repeat every tick while a condition holds.
+    pub fn first_time(&self, key: &str) -> bool {
+        self.logged_once
+            .lock()
+            .map(|mut set| set.insert(key.to_string()))
+            .unwrap_or(true)
+    }
+
+    /// Forgets every remembered key for which `keep` is false, so a condition that ends and
+    /// later recurs is reported again.
+    pub fn retain_first_time(&self, keep: impl Fn(&str) -> bool) {
+        if let Ok(mut set) = self.logged_once.lock() {
+            set.retain(|k| keep(k));
+        }
     }
 
     /// Runs the NFC re-key again on this handle (DBSYNC-103 #186). `new_at` already ran it,
@@ -354,6 +383,9 @@ impl Db {
         // change a colliding pair suppresses a legitimate rename correlation in the NEW
         // folder. Added here when the table was added; the next table needs the same line.
         tx.execute("DELETE FROM refused_moves", [])?;
+        // DBSYNC-114: paths whose upload still owes the clobber guard. Path-keyed like the
+        // index it guards, so it goes with it.
+        tx.execute("DELETE FROM unconfirmed_uploads", [])?;
         tx.execute("DELETE FROM sync_conflicts", [])?;
         tx.execute("DELETE FROM known_folders", [])?;
         // Drop the cursor-delta cursor so remote change detection re-seeds
@@ -850,6 +882,13 @@ impl Db {
             "UPDATE remote_file_index SET relative_path = ?2, updated_at = ?3 WHERE relative_path = ?1",
             params![old_path, new_path, now],
         )?;
+        // DBSYNC-114: a CONFIRMED move means Dropbox relocated bytes it already held, so the
+        // old name owes nothing any more and the marker does not travel: carried to the new
+        // name it would be stale there and keep the next edit guarded (see `unconfirmed_uploads`).
+        tx.execute(
+            "DELETE FROM unconfirmed_uploads WHERE relative_path = ?1",
+            params![old_path],
+        )?;
         tx.execute(
             "UPDATE sync_conflicts SET local_path = ?2 WHERE local_path = ?1",
             params![old_path, new_path],
@@ -1069,6 +1108,16 @@ impl Db {
             params![old_prefix, new_prefix, now],
         )?;
 
+        // DBSYNC-114: as in `move_index_row`, a confirmed move retires the markers of the old
+        // names (they are not carried: bytes Dropbox already held moved with the folder).
+        tx.execute(
+            &format!(
+                "DELETE FROM unconfirmed_uploads WHERE relative_path = ?1 OR {w}",
+                w = m("relative_path")
+            ),
+            params![old_prefix],
+        )?;
+
         // Anything still under the old prefix could not be moved, because the destination was
         // occupied. Count it across ALL THREE tables the rewrite touches: counting only
         // `local_file_index` was blind to the collision most likely to happen — a destination
@@ -1100,6 +1149,181 @@ impl Db {
             "DELETE FROM local_file_index WHERE relative_path = ?1",
             params![relative_path],
         )?;
+        // DBSYNC-114: an untracked path owes nothing; a later file at the same name is met
+        // afresh by the scan, which re-arms the guard.
+        conn.execute(
+            "DELETE FROM unconfirmed_uploads WHERE relative_path = ?1",
+            params![relative_path],
+        )?;
+        Ok(())
+    }
+
+    /// DBSYNC-114: arms the upload clobber guard for a path the client met as a brand-new local
+    /// file. Idempotent. See the `unconfirmed_uploads` table comment.
+    pub fn mark_upload_unconfirmed(&self, relative_path: &str) -> AppResult<()> {
+        debug_assert_canonical_key(relative_path);
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO unconfirmed_uploads(relative_path, marked_at) VALUES(?1, ?2)",
+            params![relative_path, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the path's first upload is still unconfirmed (the clobber guard applies).
+    pub fn is_upload_unconfirmed(&self, relative_path: &str) -> AppResult<bool> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM unconfirmed_uploads WHERE relative_path = ?1",
+            params![relative_path],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// DBSYNC-114: remembers the content hash this client is about to send for a guarded path.
+    /// If the upload lands and its response is lost, the retry finds Dropbox holding exactly
+    /// this hash and knows the content is its own (see `upload_local_file_with`). No effect on
+    /// a path without a marker.
+    pub fn record_upload_attempt(&self, relative_path: &str, sent_hash: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE unconfirmed_uploads SET sent_hash = ?2 WHERE relative_path = ?1",
+            params![relative_path, sent_hash],
+        )?;
+        Ok(())
+    }
+
+    /// The hash recorded by [`Self::record_upload_attempt`], if any.
+    pub fn unconfirmed_sent_hash(&self, relative_path: &str) -> AppResult<Option<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let hash: Option<Option<String>> = conn
+            .query_row(
+                "SELECT sent_hash FROM unconfirmed_uploads WHERE relative_path = ?1",
+                params![relative_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hash.flatten())
+    }
+
+    /// Every path whose first upload is still unconfirmed (DBSYNC-114): the marker snapshot a
+    /// deletion pass takes before it releases any marker.
+    pub fn list_unconfirmed_uploads(&self) -> AppResult<Vec<String>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare("SELECT relative_path FROM unconfirmed_uploads")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether any path at or beneath the folder `prefix` is still unconfirmed (DBSYNC-114).
+    /// Boundary-safe (`d` does not match `d-other`), BINARY comparison like the subtree moves.
+    pub fn has_unconfirmed_upload_under(&self, prefix: &str) -> AppResult<bool> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM unconfirmed_uploads \
+             WHERE relative_path = ?1 OR substr(relative_path, 1, length(?1) + 1) = ?1 || '/'",
+            params![prefix],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether an upload job for `path` has not finished yet: queued, waiting for a retry,
+    /// running, or `failed` (waiting for the user's "Retry failed jobs"). Only `done` is
+    /// settled. A deletion of a never-landed file defers to such a job instead of deciding
+    /// for it (see `process_local_file_deletion`).
+    pub fn has_unsettled_upload_job(&self, path: &str) -> AppResult<bool> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sync_jobs WHERE job_type='upload' AND target_path = ?1 \
+             AND status IN ('queued','retry_wait','running','failed')",
+            params![path],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Records that an upload LANDED, in one transaction: the remote row Dropbox returned (our
+    /// rev, when it sent one) and the disarming of the path's `unconfirmed_uploads` marker.
+    /// One transaction so a failure can never leave the marker behind a recorded upload (a
+    /// stale marker would keep the path guarded forever); the caller propagates the error, the
+    /// job retries, and the guard lets the retry through because Dropbox then holds exactly
+    /// the local bytes.
+    pub fn confirm_upload_landed(
+        &self,
+        relative_path: &str,
+        landed: Option<LandedUpload<'_>>,
+    ) -> AppResult<()> {
+        debug_assert_canonical_key(relative_path);
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        if let Some(l) = landed {
+            tx.execute(
+                "
+                INSERT INTO remote_file_index(relative_path, content_hash, rev, modified_ts, updated_at, dropbox_id)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(relative_path) DO UPDATE SET
+                  content_hash=excluded.content_hash,
+                  rev=excluded.rev,
+                  modified_ts=excluded.modified_ts,
+                  updated_at=excluded.updated_at,
+                  dropbox_id=COALESCE(excluded.dropbox_id, remote_file_index.dropbox_id)
+                ",
+                params![
+                    relative_path,
+                    l.content_hash,
+                    l.rev,
+                    l.modified_ts,
+                    now,
+                    l.dropbox_id
+                ],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM unconfirmed_uploads WHERE relative_path = ?1",
+            params![relative_path],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Disarms the guard: the upload landed (or Dropbox verifiably holds identical bytes), or
+    /// the file is no longer tracked.
+    pub fn clear_upload_unconfirmed(&self, relative_path: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM unconfirmed_uploads WHERE relative_path = ?1",
+            params![relative_path],
+        )?;
         Ok(())
     }
 
@@ -1128,6 +1352,63 @@ impl Db {
             }));
         }
         Ok(None)
+    }
+
+    /// Every remote index row at or under `prefix` (boundary-safe, binary compare, like
+    /// `remove_remote_subtree`). An empty `prefix` lists the whole index (DBSYNC-114: the
+    /// exclusion pass and the protected folder delete both need the rows of a subtree).
+    pub fn list_remote_files_under(&self, prefix: &str) -> AppResult<Vec<RemoteFileIndexRow>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT relative_path, content_hash, rev, modified_ts, dropbox_id
+            FROM remote_file_index
+            WHERE ?1 = '' OR relative_path = ?1 OR substr(relative_path, 1, length(?1) + 1) = ?1 || '/'
+            ORDER BY relative_path
+            ",
+        )?;
+        let rows = stmt.query_map(params![prefix], |row| {
+            Ok(RemoteFileIndexRow {
+                relative_path: row.get(0)?,
+                content_hash: row.get(1)?,
+                rev: row.get(2)?,
+                modified_ts: row.get(3)?,
+                dropbox_id: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The key of the remote row that folds (case, normalization) to the same path as
+    /// `relative` but is spelled differently, if any (DBSYNC-114). An ASCII path is looked up
+    /// through the `lower(relative_path)` index, then confirmed with [`fold`]; a path with
+    /// non-ASCII characters falls back to a whole-table fold scan, because SQLite's `lower`
+    /// is ASCII-only and would miss `É` / `é`.
+    pub fn find_remote_file_key_folding_to(&self, relative: &str) -> AppResult<Option<String>> {
+        let wanted = crate::path_util::fold(relative);
+        let keys: Vec<String> = {
+            let conn = self
+                .read
+                .lock()
+                .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+            if relative.is_ascii() {
+                let mut stmt = conn.prepare(
+                    "SELECT relative_path FROM remote_file_index WHERE lower(relative_path) = lower(?1)",
+                )?;
+                let rows = stmt.query_map(params![relative], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else {
+                let mut stmt = conn.prepare("SELECT relative_path FROM remote_file_index")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok(keys
+            .into_iter()
+            .find(|k| k != relative && crate::path_util::fold(k) == wanted))
     }
 
     /// Upsert a remote index row, carrying Dropbox's item identifier when the caller
@@ -1809,6 +2090,25 @@ impl Db {
         conn.execute(
             "UPDATE sync_jobs SET status='done', last_error=NULL, updated_at=?2 WHERE id=?1",
             params![id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Settles a job as `done` WITHOUT having performed it, recording why in `last_error`.
+    ///
+    /// This is the same "settled, not performed" marker `requeue_failed_jobs` writes for a
+    /// superseded job (DBSYNC-113 `SUPERSEDED_REASON`): `status='done'` with a non-NULL
+    /// `last_error`. `mark_job_completed` writes NULL there, which is how the two stay
+    /// distinguishable. Used by the drain for a job whose path selective sync excludes
+    /// (DBSYNC-114).
+    pub fn mark_job_settled(&self, id: i64, reason: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "UPDATE sync_jobs SET status='done', last_error=?2, updated_at=?3 WHERE id=?1",
+            params![id, reason, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
@@ -2542,6 +2842,20 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
             PRIMARY KEY (from_path, to_path)
         );
 
+        -- DBSYNC-114: paths the scan met as brand-new local files (no index row) whose first
+        -- upload has NOT YET LANDED. Short-lived by design: it exists from the scan that
+        -- enqueued the upload until that upload lands (cleared in one transaction with the
+        -- remote row it returns), the file is untracked, or a download writes the path. It
+        -- does two things only: (1) it arms the upload's clobber guard (the scan writes the
+        -- local row when it enqueues the upload, so a missing row can no longer arm it), and
+        -- (2) it makes `download_baseline` treat the path's bytes as never uploaded. There is
+        -- no refused state: a guard hit renames the file to a conflicted copy and untracks
+        -- the path in the same drain.
+        CREATE TABLE IF NOT EXISTS unconfirmed_uploads (
+            relative_path TEXT PRIMARY KEY,
+            marked_at TEXT NOT NULL
+        );
+
         -- DBSYNC-99: the allocator behind `local_file_index.item_id`. AUTOINCREMENT is
         -- the point: SQLite keeps the high-water mark in `sqlite_sequence` and never
         -- reuses a rowid, so an identity belonging to a deleted file is never handed to
@@ -2574,6 +2888,9 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
     // upload. Back-fill is free: `seed_remote_delta_cursor` already re-snapshots, and legacy
     // rows pick up an `item_id` the next time their path is indexed.
     add_column_if_missing(conn, "remote_file_index", "dropbox_id", "TEXT")?;
+    // DBSYNC-114: the content hash of the bytes this client last tried to send for a guarded
+    // path. Recognises "Dropbox holds what WE sent" when the response was lost.
+    add_column_if_missing(conn, "unconfirmed_uploads", "sent_hash", "TEXT")?;
     add_column_if_missing(conn, "known_folders", "dropbox_id", "TEXT")?;
     // DBSYNC-106: "this folder is a folder in its own right", as opposed to "a directory we
     // have seen on disk". See `mark_known_folders_owning_content`.
@@ -2758,6 +3075,7 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
         "
         CREATE INDEX IF NOT EXISTS idx_sync_jobs_status_retry ON sync_jobs(status, next_retry_at);
         CREATE INDEX IF NOT EXISTS idx_sync_conflicts_resolved ON sync_conflicts(resolved);
+        CREATE INDEX IF NOT EXISTS idx_remote_file_index_lower ON remote_file_index(lower(relative_path));
         ",
     )?;
 

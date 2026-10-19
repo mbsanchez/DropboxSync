@@ -426,44 +426,215 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> AppResult<PathBuf> {
     Ok(joined)
 }
 
-/// Parses a comma-separated selective-sync prefix list. Each prefix loses its leading `/`
-/// and is put in the canonical key form (NFC on macOS, identity elsewhere; DBSYNC-103
-/// #188), so an NFD-typed exclude prefix still matches the NFC keys. The stored CSV is not
-/// rewritten.
+/// Parses a comma-separated selective-sync prefix list. Each entry is trimmed, loses its
+/// leading and trailing `/`, and is put in the canonical key form (NFC on macOS, identity
+/// elsewhere; DBSYNC-103 #188). Entries that are empty **after** the slashes are stripped
+/// are dropped, so a lone `/` yields no prefix instead of an empty one that matches every
+/// path (DBSYNC-114 H8). The stored CSV is not rewritten.
+///
+/// Case folding is deliberately not done here: [`path_scope`] folds both sides at compare
+/// time, once, so a prefix list built by hand (tests, callers) behaves the same as a parsed one.
 pub(crate) fn parse_prefix_csv(csv: Option<String>) -> Vec<String> {
     match csv {
         None => Vec::new(),
         Some(s) => s
             .split(',')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|p| to_canonical_form(p.trim_start_matches('/')))
+            .map(|p| p.trim().trim_matches('/'))
+            // `.` and `..` name no folder in the index (keys never contain them), so as an
+            // entry they would never match anything: an exclude would silently do nothing, and
+            // under an include they would put every real path outside the include list.
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .map(to_canonical_form)
             .collect(),
     }
 }
 
+/// Where a relative path sits with respect to the selective-sync lists (DBSYNC-114).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathScope {
+    /// Inside the include list (or the list is empty) and not under an exclude.
+    Synced,
+    /// Outside the include list, or under an exclude.
+    Excluded,
+    /// A strict folder-ancestor of an include entry (`Fotos` for include `Fotos/2024`).
+    /// The predicate cannot tell a file from a directory, so it reports `Ancestor` for any
+    /// path that *would be* such a folder; callers know whether the entry is a directory
+    /// (the directory itself must be traversed, a file directly inside it is `Excluded`
+    /// semantically and they must treat it so). [`is_path_allowed`] treats it as not allowed.
+    Ancestor,
+}
+
+/// True if `path` equals `prefix` or lies under it, on a `/` boundary. Both already folded.
+fn under_prefix(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Classifies `relative` against the include and exclude prefix lists.
+///
+/// Both sides go through [`fold`] (case-insensitive, NFC on macOS) and a leading or trailing
+/// `/` on a prefix is ignored; prefixes that are empty after that are skipped. Matching is on
+/// folder boundaries: `Fotos` covers `Fotos` and `Fotos/x`, not `Fotos2024`. Exclude wins
+/// over include. An empty include list means everything is included.
+#[cfg(test)]
+pub(crate) fn path_scope(
+    relative: &str,
+    include_prefixes: &[String],
+    exclude_prefixes: &[String],
+) -> PathScope {
+    PrefixFilter::new(include_prefixes, exclude_prefixes).scope(relative)
+}
+
+/// The include and exclude lists folded ONCE, so a pass that classifies thousands of paths
+/// (the scan walk, a delta batch, the queue drain) does not re-fold every prefix per path
+/// (DBSYNC-114). [`path_scope`] is a thin wrapper over this; the two cannot disagree.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrefixFilter {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    /// The paths whose first upload had not landed when the filter was loaded (DBSYNC-114).
+    /// A pass loads its filter before it releases anything, so this is the marker set as it
+    /// stood BEFORE any file-level release in the pass; see [`Self::unconfirmed_beneath`].
+    /// Not part of the scope rules or of [`Self::signature`].
+    /// Every marked path AND every ancestor folder of one, so a lookup is one hash probe.
+    unconfirmed: std::collections::HashSet<String>,
+}
+
+impl PrefixFilter {
+    /// Folds both lists (trim, strip `/`, [`fold`]); entries empty after that are dropped.
+    pub(crate) fn new(include_prefixes: &[String], exclude_prefixes: &[String]) -> Self {
+        let fold_prefixes = |list: &[String]| -> Vec<String> {
+            list.iter()
+                .map(|p| fold(p.trim().trim_matches('/')))
+                .filter(|p| !p.is_empty())
+                .collect()
+        };
+        Self {
+            include: fold_prefixes(include_prefixes),
+            exclude: fold_prefixes(exclude_prefixes),
+            unconfirmed: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Reads and folds the two stored CSVs. Marker-free: the first-upload markers are NOT read
+    /// (that is a whole-table read, and this runs per drained job and per download); only a
+    /// deletion pass needs them, see [`Self::load_for_deletion_pass`].
+    pub(crate) fn load(db: &crate::storage::db::Db) -> AppResult<Self> {
+        Ok(Self::new(
+            &parse_prefix_csv(db.get_include_prefixes_csv()?),
+            &parse_prefix_csv(db.get_exclude_prefixes_csv()?),
+        ))
+    }
+
+    /// [`Self::load`] plus a snapshot of the first-upload markers. Used ONLY where a deletion
+    /// pass loads its filter (the scan and the watcher batch); call it BEFORE the pass
+    /// releases anything so [`Self::unconfirmed_beneath`] sees the markers as they stood.
+    pub(crate) fn load_for_deletion_pass(db: &crate::storage::db::Db) -> AppResult<Self> {
+        let mut filter = Self::load(db)?;
+        for path in db.list_unconfirmed_uploads()? {
+            let mut end = path.len();
+            filter.unconfirmed.insert(path.clone());
+            while let Some(i) = path[..end].rfind('/') {
+                filter.unconfirmed.insert(path[..i].to_string());
+                end = i;
+            }
+        }
+        Ok(filter)
+    }
+
+    /// Whether a path at or beneath the folder `prefix` was still awaiting its first upload
+    /// when a deletion-pass filter was loaded. Boundary-safe (`d` does not match `d-other`),
+    /// exact (binary) comparison like the table it mirrors. Always false for a plain `load`.
+    pub(crate) fn unconfirmed_beneath(&self, prefix: &str) -> bool {
+        self.unconfirmed.contains(prefix)
+    }
+
+    /// A stable string for the folded lists, to tell "the filter changed" from "it did not".
+    pub(crate) fn signature(&self) -> String {
+        format!(
+            "i:{}|x:{}",
+            self.include.join("\u{1f}"),
+            self.exclude.join("\u{1f}")
+        )
+    }
+
+    /// True when no list has an effective entry: every path is [`PathScope::Synced`].
+    pub(crate) fn is_inactive(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Classifies `relative`; see [`path_scope`] for the rules.
+    pub(crate) fn scope(&self, relative: &str) -> PathScope {
+        if self.is_inactive() {
+            return PathScope::Synced;
+        }
+        let path = fold(relative);
+        let path = path.trim_matches('/');
+        if self.exclude.iter().any(|p| under_prefix(path, p)) {
+            return PathScope::Excluded;
+        }
+        if self.include.is_empty() || self.include.iter().any(|p| under_prefix(path, p)) {
+            return PathScope::Synced;
+        }
+        // Strict ancestor: the include entry lies under `path` (and is not equal to it).
+        if self
+            .include
+            .iter()
+            .any(|p| p != path && (path.is_empty() || under_prefix(p, path)))
+        {
+            return PathScope::Ancestor;
+        }
+        PathScope::Excluded
+    }
+
+    /// Scope of a path known to be a FILE: `Ancestor` is a folder-only notion, so a file
+    /// reported as one is not under any include and is `Excluded`.
+    pub(crate) fn file_scope(&self, relative: &str) -> PathScope {
+        match self.scope(relative) {
+            PathScope::Ancestor => PathScope::Excluded,
+            other => other,
+        }
+    }
+
+    /// True if a file at `relative` is in the synced zone.
+    pub(crate) fn file_synced(&self, relative: &str) -> bool {
+        self.file_scope(relative) == PathScope::Synced
+    }
+
+    /// True when `relative` is itself in the synced zone but an EXCLUDED path lies strictly
+    /// beneath it (DBSYNC-114, maintainer decision on #213). A recursive remote `delete_v2` of
+    /// such a folder would take the excluded content with it, so every folder-delete source
+    /// refuses it and deletes the synced files one by one instead.
+    ///
+    /// Only an exclude prefix can be beneath a Synced folder: under an include list a Synced
+    /// folder lies wholly inside an include entry, and the folders ABOVE an entry are
+    /// [`PathScope::Ancestor`], which is [`Self::not_deletable`] already. The empty path (the
+    /// sync root) reports `true` when any exclude exists.
+    pub(crate) fn excluded_beneath(&self, relative: &str) -> bool {
+        if self.exclude.is_empty() || self.scope(relative) != PathScope::Synced {
+            return false;
+        }
+        let path = fold(relative);
+        let path = path.trim_matches('/');
+        self.exclude
+            .iter()
+            .any(|p| p != path && (path.is_empty() || under_prefix(p, path)))
+    }
+
+    /// True if `relative` must never be a deletion candidate, whatever kind of entry it is:
+    /// anything not [`PathScope::Synced`] (Excluded and Ancestor alike; DBSYNC-114 H2).
+    pub(crate) fn not_deletable(&self, relative: &str) -> bool {
+        self.scope(relative) != PathScope::Synced
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn is_path_allowed(
     relative: &str,
     include_prefixes: &[String],
     exclude_prefixes: &[String],
 ) -> bool {
-    // DBSYNC-103 #188: compare in canonical form; the prefixes were canonicalised at parse.
-    let relative = &*canonical_cow(relative);
-    let included = if include_prefixes.is_empty() {
-        true
-    } else {
-        include_prefixes.iter().any(|p| relative.starts_with(p))
-    };
-
-    if !included {
-        return false;
-    }
-
-    if exclude_prefixes.iter().any(|p| relative.starts_with(p)) {
-        return false;
-    }
-
-    true
+    path_scope(relative, include_prefixes, exclude_prefixes) == PathScope::Synced
 }
 
 /// Block size used by the Dropbox content_hash algorithm (4 MiB).
@@ -541,7 +712,9 @@ pub(crate) fn hash_file(path: &Path) -> AppResult<(String, i64, i64)> {
     Ok((format!("{:x}", content_hash), size, modified))
 }
 
-pub(crate) fn create_conflicted_copy(path: &Path) -> AppResult<PathBuf> {
+/// A name for a conflicted copy of `path` that nothing occupies yet, in the same folder
+/// (`stem (conflicted copy <stamp>[ n]).ext`). Nothing is created or moved.
+pub(crate) fn unique_conflicted_name(path: &Path) -> AppResult<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Other("file has no parent for conflict copy".to_string()))?;
@@ -552,12 +725,34 @@ pub(crate) fn create_conflicted_copy(path: &Path) -> AppResult<PathBuf> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_string());
     let ts = Utc::now().format("%Y%m%d%H%M%S");
 
-    let name = match ext {
-        Some(ext) => format!("{} (conflicted copy {}).{}", stem, ts, ext),
-        None => format!("{} (conflicted copy {})", stem, ts),
+    // The stamp has one-second resolution, so a second copy of the same file within the same
+    // second would silently overwrite the first with `fs::copy`. A copy exists because its
+    // bytes are not anywhere else (DBSYNC-114: the local bytes of a colliding new file), so an
+    // existing name is never reused: a counter makes the name unique.
+    let mut attempt = 1u32;
+    let dest = loop {
+        let tag = if attempt == 1 {
+            ts.to_string()
+        } else {
+            format!("{ts} {attempt}")
+        };
+        let name = match &ext {
+            Some(ext) => format!("{} (conflicted copy {}).{}", stem, tag, ext),
+            None => format!("{} (conflicted copy {})", stem, tag),
+        };
+        let candidate = parent.join(name);
+        if fs::symlink_metadata(&candidate).is_err() {
+            break candidate;
+        }
+        attempt += 1;
     };
+    Ok(dest)
+}
 
-    let dest = parent.join(name);
+/// Copies `path` to a fresh conflicted-copy name (see [`unique_conflicted_name`]); an existing
+/// file is never overwritten.
+pub(crate) fn create_conflicted_copy(path: &Path) -> AppResult<PathBuf> {
+    let dest = unique_conflicted_name(path)?;
     fs::copy(path, &dest)
         .map_err(|e| AppError::Io(format!("failed to create conflicted copy: {e}")))?;
     Ok(dest)
@@ -586,7 +781,28 @@ mod tests {
         DROPBOX_BLOCK_SIZE,
     };
     use super::{fold, is_canonical_form, key_from_disk, key_from_dropbox};
-    use super::{is_path_allowed, parse_ignore_globs_csv, parse_prefix_csv};
+    use super::{is_path_allowed, parse_ignore_globs_csv, parse_prefix_csv, path_scope, PathScope};
+
+    #[test]
+    fn a_conflicted_copy_never_overwrites_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, b"first").unwrap();
+        let c1 = super::create_conflicted_copy(&a).unwrap();
+        std::fs::write(&a, b"second").unwrap();
+        let c2 = super::create_conflicted_copy(&a).unwrap();
+        std::fs::write(&a, b"third").unwrap();
+        let c3 = super::create_conflicted_copy(&a).unwrap();
+        // Three copies made in (almost certainly) the same second: three distinct files.
+        let mut names = vec![c1.clone(), c2.clone(), c3.clone()];
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 3);
+        assert_eq!(std::fs::read(&c1).unwrap(), b"first");
+        assert_eq!(std::fs::read(&c2).unwrap(), b"second");
+        assert_eq!(std::fs::read(&c3).unwrap(), b"third");
+        assert!(c1.to_string_lossy().ends_with(".txt"));
+    }
 
     #[test]
     fn dehydrated_placeholder_is_false_for_plain_and_missing_files() {
@@ -1247,5 +1463,190 @@ mod tests {
             &[format!("{NFD}dir")]
         ));
         assert!(!matches_ignore_globs(NFC, &[NFD.to_string()]));
+    }
+
+    // -------------------------------------------------------------------------------
+    // DBSYNC-114 slice 1: one folder-boundary, case-insensitive scope predicate.
+    // -------------------------------------------------------------------------------
+
+    fn csv(s: &str) -> Vec<String> {
+        parse_prefix_csv(Some(s.to_string()))
+    }
+
+    #[test]
+    fn parse_prefix_csv_strips_slashes_before_dropping_empties() {
+        assert!(csv("/").is_empty(), "a lone slash is no prefix (H8)");
+        assert!(csv("//, ,/").is_empty());
+        assert!(csv("").is_empty());
+        assert!(parse_prefix_csv(None).is_empty());
+        assert_eq!(csv("/a/,b//, ,,c"), vec!["a", "b", "c"]);
+    }
+
+    /// `.` and `..` name no folder, so they are no entry (an include of `.` would put every
+    /// real path outside the include list and remove all local copies).
+    #[test]
+    fn parse_prefix_csv_drops_dot_and_dotdot_entries() {
+        assert!(csv(".").is_empty());
+        assert!(csv("./, .., /../").is_empty());
+        assert_eq!(csv("a,.,b,..,c"), vec!["a", "b", "c"]);
+        assert_eq!(csv("./x"), vec!["./x"], "only the bare entry is dropped");
+    }
+
+    #[test]
+    fn path_scope_table() {
+        use PathScope::{Ancestor, Excluded, Synced};
+        // (include csv, exclude csv, path, expected)
+        let cases: &[(&str, &str, &str, PathScope)] = &[
+            // empty lists: everything
+            ("", "", "anything/at/all", Synced),
+            // boundary
+            ("", "Fotos", "Fotos", Excluded),
+            ("", "Fotos", "Fotos/x", Excluded),
+            ("", "Fotos", "Fotos2024", Synced),
+            ("", "Fotos", "Fotos2024/x", Synced),
+            ("", "Fotos", "Otra/Fotos", Synced),
+            ("Fotos", "", "Fotos/x", Synced),
+            ("Fotos", "", "Fotos", Synced),
+            ("Fotos", "", "Fotos2024", Excluded),
+            // case
+            ("", "fotos", "Fotos/x", Excluded),
+            ("", "FOTOS", "fotos/x", Excluded),
+            ("fotos", "", "FOTOS/x", Synced),
+            // leading / trailing slash on either side
+            ("", "/Fotos/", "Fotos/x", Excluded),
+            ("", "Fotos/", "Fotos", Excluded),
+            ("/Fotos/", "", "Fotos/x", Synced),
+            ("", "Fotos", "/Fotos/x", Excluded),
+            // "/" excludes nothing
+            ("", "/", "Fotos/x", Synced),
+            ("", "/", "x", Synced),
+            // empty CSV entries
+            ("", ",, ,Fotos,,", "Fotos/x", Excluded),
+            ("", ",, ,Fotos,,", "Docs/x", Synced),
+            (",,", "", "Docs/x", Synced),
+            // exclude wins over include
+            ("Fotos", "Fotos", "Fotos/x", Excluded),
+            ("Fotos", "Fotos/Privado", "Fotos/Privado/a", Excluded),
+            ("Fotos", "Fotos/Privado", "Fotos/Publico/a", Synced),
+            ("Fotos", "fotos", "Fotos", Excluded),
+            // include only
+            ("Fotos", "", "Docs/x", Excluded),
+            // ancestor of a nested include
+            ("Fotos/2024", "", "Fotos", Ancestor),
+            ("Fotos/2024", "", "fotos", Ancestor),
+            ("Fotos/2024", "", "Fotos/2024/a", Synced),
+            ("Fotos/2024", "", "Fotos/2024", Synced),
+            ("Fotos/2024", "", "Fotos/2023/a", Excluded),
+            ("Fotos/2024", "", "Fotos/20", Excluded),
+            ("Fotos/2024", "", "Fotos2", Excluded),
+            ("Fotos/2024", "", "Otra/a", Excluded),
+            // an excluded ancestor is Excluded, not Ancestor
+            ("Fotos/2024", "Fotos", "Fotos", Excluded),
+            // several includes, deeper nesting
+            ("A/B/C, D", "", "A", Ancestor),
+            ("A/B/C, D", "", "A/B", Ancestor),
+            ("A/B/C, D", "", "A/B/C/x", Synced),
+            ("A/B/C, D", "", "D/x", Synced),
+            ("A/B/C, D", "", "A/X", Excluded),
+            // include inside an include
+            ("A, A/B", "", "A/Z", Synced),
+            // the root (empty path) is an ancestor of any include entry
+            ("Fotos/2024", "", "", Ancestor),
+        ];
+        for (inc, exc, path, want) in cases {
+            assert_eq!(
+                path_scope(path, &csv(inc), &csv(exc)),
+                *want,
+                "include={inc:?} exclude={exc:?} path={path:?}"
+            );
+            assert_eq!(
+                is_path_allowed(path, &csv(inc), &csv(exc)),
+                *want == Synced,
+                "is_path_allowed include={inc:?} exclude={exc:?} path={path:?}"
+            );
+        }
+    }
+
+    /// The predicate must not depend on the caller having parsed the lists.
+    /// `excluded_beneath`: only a Synced folder with an exclude strictly under it.
+    #[test]
+    fn excluded_beneath_table() {
+        let f = |inc: &[&str], exc: &[&str]| {
+            super::PrefixFilter::new(
+                &inc.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &exc.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        let ex = f(&[], &["Docs/Archive"]);
+        assert!(ex.excluded_beneath("Docs"));
+        assert!(ex.excluded_beneath("docs/"), "case and slash");
+        assert!(ex.excluded_beneath(""), "the sync root");
+        assert!(
+            !ex.excluded_beneath("Docs/Archive"),
+            "the excluded folder itself"
+        );
+        assert!(
+            !ex.excluded_beneath("Docs/Archive/x"),
+            "beneath the excluded one"
+        );
+        assert!(!ex.excluded_beneath("Docs/Other"));
+        assert!(!ex.excluded_beneath("Docs2"), "folder boundary");
+        assert!(
+            !f(&[], &["Docs2/x"]).excluded_beneath("Docs"),
+            "folder boundary, other way"
+        );
+        assert!(!f(&[], &[]).excluded_beneath("Docs"), "inactive");
+        assert!(
+            !f(&["Fotos"], &[]).excluded_beneath("Fotos"),
+            "an include has no excluded beneath"
+        );
+        assert!(
+            !f(&["Fotos/2024"], &[]).excluded_beneath("Fotos"),
+            "Ancestor is not deletable anyway"
+        );
+        assert!(f(&["Fotos"], &["Fotos/Priv"]).excluded_beneath("Fotos"));
+    }
+
+    #[test]
+    fn path_scope_tolerates_unparsed_prefixes() {
+        let raw = |s: &str| vec![s.to_string()];
+        assert_eq!(
+            path_scope("Fotos/x", &[], &raw("/FOTOS/")),
+            PathScope::Excluded
+        );
+        assert_eq!(path_scope("Fotos/x", &[], &raw("/")), PathScope::Synced);
+        assert_eq!(path_scope("Fotos/x", &[], &raw("")), PathScope::Synced);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_scope_folds_nfc_and_nfd_on_both_sides() {
+        let nfd_dir = format!("{NFD}dir");
+        let nfc_dir = format!("{NFC}dir");
+        assert_eq!(
+            path_scope(&format!("{nfc_dir}/a"), &[], std::slice::from_ref(&nfd_dir)),
+            PathScope::Excluded
+        );
+        assert_eq!(
+            path_scope(&format!("{nfd_dir}/a"), &[], std::slice::from_ref(&nfc_dir)),
+            PathScope::Excluded
+        );
+        assert_eq!(
+            path_scope(
+                &format!("{}dir/a", NFD.to_uppercase()),
+                std::slice::from_ref(&nfc_dir),
+                &[]
+            ),
+            PathScope::Synced
+        );
+        assert_eq!(
+            path_scope(&nfd_dir, &[format!("{nfc_dir}/sub")], &[]),
+            PathScope::Ancestor
+        );
+        assert_eq!(
+            path_scope(&format!("{nfc_dir}x/a"), &[nfd_dir], &[]),
+            PathScope::Excluded,
+            "boundary holds across normalisation forms"
+        );
     }
 }

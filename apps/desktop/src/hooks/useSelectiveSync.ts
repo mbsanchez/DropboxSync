@@ -19,9 +19,10 @@ export function useSelectiveSync(pushLog: (line: string) => void) {
 
   const saveSelectiveSync = useCallback(async () => {
     try {
+      // Tauri v2 expects camelCase keys for Rust snake_case args (DBSYNC-114).
       await invoke("set_selective_sync_filters", {
-        include_csv: includeCsv,
-        exclude_csv: excludeCsv,
+        includeCsv,
+        excludeCsv,
       });
       pushLog("Selective sync filters saved.");
     } catch (e) {

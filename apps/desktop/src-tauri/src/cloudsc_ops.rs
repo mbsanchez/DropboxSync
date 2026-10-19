@@ -13,7 +13,7 @@ use crate::dropbox_transfer::{delete_remote_file_internal, download_remote_file_
 use crate::error::{AppError, AppResult};
 use crate::models::{CloudscMeta, CloudscPlaceholderInfo, DropboxEntry, DropboxListFolderResponse};
 use crate::path_util::{
-    fold, hash_file, is_ignored_local_path, is_path_allowed, key_from_disk, key_from_dropbox,
+    fold, hash_file, is_ignored_local_path, key_from_disk, key_from_dropbox,
     normalize_dropbox_path, parse_prefix_csv, safe_join,
 };
 use crate::state::AppState;
@@ -103,8 +103,9 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             .map_err(|e| AppError::Other(format!("list_folder parse failed: {e}")))?
     };
 
-    // Names of every remote child in this folder (regardless of selective-sync
-    // filtering), used below to prune placeholders whose remote target is gone.
+    // Names of the remote children in this folder that selective sync still covers (DBSYNC-114:
+    // no longer "regardless of filtering"), used below to prune placeholders whose remote
+    // target is gone or now excluded.
     let mut names = SweepNames {
         remote_child_names: HashSet::new(),
         created_names: Vec::new(),
@@ -160,8 +161,8 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
 /// Names tracked across the pages of one sweep (DBSYNC-103).
 struct SweepNames {
-    /// [`fold`] of every remote child of the folder, selective-sync filtering aside: the
-    /// prune keeps a `.cloudsc` whose folded target is in here.
+    /// [`fold`] of every remote child of the folder that selective sync still covers (an
+    /// excluded child is left out, DBSYNC-114): the prune keeps a `.cloudsc` whose folded target is in here.
     remote_child_names: HashSet<String>,
     /// Display names of the placeholders created, for the one summary event.
     created_names: Vec<String>,
@@ -189,6 +190,8 @@ fn materialize_listing_entries(
     #[cfg(windows)] cfapi_active: bool,
 ) -> AppResult<usize> {
     let mut created = 0usize;
+    // Folded once for the page, not per entry.
+    let scope_filter = crate::path_util::PrefixFilter::new(include_prefixes, exclude_prefixes);
     for entry in entries {
         let tag = entry.tag;
         #[cfg(windows)]
@@ -210,10 +213,22 @@ fn materialize_listing_entries(
             .next()
             .unwrap_or(&path_display)
             .to_string();
-        names.remote_child_names.insert(fold(&child_name));
-
         let relative = key_from_dropbox(&path_display);
-        if !is_path_allowed(&relative, include_prefixes, exclude_prefixes) {
+        // DBSYNC-114: the prune keeps only what selective sync still covers. An existing
+        // placeholder under an EXCLUDED path is no longer protected by being in the remote
+        // listing (removing the synced local copy of an excluded path is the apply pass).
+        // An ancestor FOLDER of an include is kept, as before: it is the way down to the
+        // include. Creating new placeholders is unchanged: Synced only.
+        let scope = scope_filter.scope(&relative);
+        let keep_name = match scope {
+            crate::path_util::PathScope::Synced => true,
+            crate::path_util::PathScope::Ancestor => tag == "folder",
+            crate::path_util::PathScope::Excluded => false,
+        };
+        if keep_name {
+            names.remote_child_names.insert(fold(&child_name));
+        }
+        if scope != crate::path_util::PathScope::Synced {
             continue;
         }
 
@@ -431,6 +446,10 @@ fn create_remote_only_placeholder(
     {
         tracing::warn!(rel, error = %e, "remote-only placeholder: local index upsert failed");
     }
+    // DBSYNC-114: the row now describes Dropbox's content, so no first upload is owed.
+    if let Err(e) = state.db.clear_upload_unconfirmed(rel) {
+        tracing::warn!(rel, error = %e, "remote-only placeholder: could not clear the unconfirmed-upload marker");
+    }
     if let Err(e) = state
         .db
         .upsert_remote_file(rel, content_hash, rev, modified_ts, None)
@@ -451,6 +470,7 @@ fn create_remote_only_placeholder(
 #[cfg(windows)]
 pub(crate) fn materialize_remote_only_file_if_absent(
     state: &AppState,
+    filter: &crate::path_util::PrefixFilter,
     rel: &str,
     path_display: &str,
     content_hash: &str,
@@ -467,9 +487,8 @@ pub(crate) fn materialize_remote_only_file_if_absent(
     if !crate::cloud_filter::placeholders_active(&folder) {
         return;
     }
-    let include = parse_prefix_csv(state.db.get_include_prefixes_csv().unwrap_or_default());
-    let exclude = parse_prefix_csv(state.db.get_exclude_prefixes_csv().unwrap_or_default());
-    if !is_path_allowed(rel, &include, &exclude) {
+    // The caller's per-batch filter (DBSYNC-114): not rebuilt from the database per entry.
+    if !filter.file_synced(rel) {
         return;
     }
     let root = Path::new(&folder);
@@ -704,6 +723,34 @@ pub(crate) fn list_cloudsc_placeholder_rels(state: &AppState) -> AppResult<Vec<S
     Ok(out)
 }
 
+/// Pure check behind [`hydrate_cloudsc_placeholder_internal`] (DBSYNC-114 H3/H5): `Err` when
+/// the placeholder at `placeholder_rel` (with or without its `.cloudsc` suffix) stands for a
+/// path selective sync does not cover. A file placeholder must be [`PathScope::Synced`]; a
+/// folder placeholder may also be an `Ancestor` of an include (expanding it is the way down to
+/// the included folder), but never `Excluded`.
+pub(crate) fn hydration_refusal(
+    filter: &crate::path_util::PrefixFilter,
+    placeholder_rel: &str,
+    tag: &str,
+) -> AppResult<()> {
+    use crate::path_util::PathScope;
+    let target = placeholder_rel
+        .strip_suffix(".cloudsc")
+        .unwrap_or(placeholder_rel);
+    let allowed = match filter.scope(target) {
+        PathScope::Synced => true,
+        PathScope::Ancestor => tag != "file",
+        PathScope::Excluded => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Sync(format!(
+            "{target} is excluded by selective sync; its placeholder is left as it is"
+        )))
+    }
+}
+
 pub(crate) fn hydrate_cloudsc_placeholder_internal(
     state: &AppState,
     placeholder_local_rel_path: &str,
@@ -733,6 +780,16 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
 
     let meta = read_cloudsc_placeholder_file(&placeholder_path)?;
     let target_path = cloudsc_target_path(&placeholder_path);
+
+    // DBSYNC-114 H3/H5: an excluded placeholder is left exactly as it is. Checked before
+    // anything is created or removed: hydrating a FOLDER placeholder creates a real directory
+    // first, and an empty real directory in the excluded zone is a stray the engine would
+    // then have to explain.
+    hydration_refusal(
+        &crate::path_util::PrefixFilter::load(&state.db)?,
+        placeholder_local_rel_path,
+        &meta.tag,
+    )?;
 
     if meta.tag == "file" {
         download_remote_file_internal(state, &meta.remote_path_display)?;
@@ -1311,6 +1368,417 @@ fn untrack_folders_subtree(state: &AppState, folder_rel: &str) -> AppResult<()> 
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DBSYNC-114: applying an exclusion to the local copy
+// ---------------------------------------------------------------------------
+
+/// What one [`apply_exclusions`] pass did. Every path is an index key (`/`-separated).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExclusionReport {
+    /// Fully synced files unlinked, `.cloudsc` placeholders removed, and (with a trailing
+    /// `/`) emptied directories removed.
+    pub removed: Vec<String>,
+    /// Files left on disk because removing them could lose data: unsynced edits, or files
+    /// the index never knew (including a file moved in from elsewhere).
+    pub kept: Vec<String>,
+    /// Paths skipped because a queued or running job names them, or a parent of them.
+    pub busy: Vec<String>,
+    /// Things that went wrong (unreadable file, unlink refused); the pass carries on.
+    pub errors: Vec<String>,
+    /// How many kept files this pass logged for the first time (the rest were already
+    /// reported by an earlier pass of this process). Bookkeeping for the log cap only.
+    pub logged_new: usize,
+}
+
+impl ExclusionReport {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.removed.is_empty()
+            && self.kept.is_empty()
+            && self.busy.is_empty()
+            && self.errors.is_empty()
+    }
+}
+
+/// Per-pass cap on newly logged kept files, so a large unsynced folder in the excluded zone
+/// does not write one WARN line per file at once.
+const KEPT_LOG_CAP: usize = 20;
+
+/// `app_config` key holding the filter signature whose excluded-zone remote rows were last
+/// dropped completely. See [`apply_exclusions`].
+pub(crate) const REMOTE_ROWS_CLEANED_KEY: &str = "selective_sync_remote_rows_cleaned";
+
+/// Removes the synced local copy of everything selective sync no longer covers (DBSYNC-114
+/// decision A; under an include list, of everything outside the include entries).
+///
+/// **Never a remote operation.** Every file is UNTRACKED before it is unlinked, so neither
+/// the scan nor the watcher can read its absence as a deletion, and afterwards the index rows
+/// of the excluded zone are dropped. Order and safety rules, each load-bearing:
+///
+/// - A file is unlinked only if [`is_file_fully_synced`] re-hashed it against the remote
+///   copy. If the unlink fails the untrack is rolled back, as in [`dehydrate_one_file`].
+/// - An unsynced or untracked file is KEPT and logged at WARN. Its index rows are dropped, so
+///   after an un-exclude the scan meets it as a brand-new file: it enqueues the upload AND
+///   records the path in `unconfirmed_uploads`, which keeps the upload's clobber guard armed
+///   (`upload_guard_applies`). At drain time the upload looks up what Dropbox holds at that
+///   path; when it is a different file, the local bytes are moved aside to a conflicted copy
+///   (renamed, never copied and unlinked), the path is released to Dropbox's version, a
+///   conflict row is recorded, and the job ends `done` (nothing is overwritten or deleted).
+///   The limits are exact: the lookup and the
+///   upload are two requests and the upload is sent as `overwrite` without a revision
+///   precondition, so a version Dropbox gains between them is not protected; and the guard
+///   exists only for uploads enqueued AFTER the scan has met the file (an upload job already
+///   queued or running when the filter changes is not covered by this pass). (Dropping the
+///   rows alone does NOT arm the guard: the scan re-creates the local row when it enqueues the
+///   upload, and the guard used to key on that row.)
+/// - Anything named by an active job (or under a folder one names) is skipped for this pass.
+/// - `known_folders` rows of the excluded zone are removed BEFORE any directory is, because
+///   a surviving row for a vanished folder is a recursive remote `delete_v2`. Directories go
+///   deepest-first with `remove_dir` (empty-only); `remove_dir_all` is never used.
+/// - Ancestor folders of an include are kept as directories; files directly in them are
+///   removed like any other excluded file.
+///
+/// Does nothing when the filter is inactive. A failure on one entry is reported and the pass
+/// continues. Windows CfAPI placeholders are never opened (DBSYNC-89).
+pub(crate) fn apply_exclusions(state: &AppState) -> AppResult<ExclusionReport> {
+    use crate::path_util::{PathScope, PrefixFilter};
+    let mut report = ExclusionReport::default();
+    let filter = PrefixFilter::load(&state.db)?;
+    if filter.is_inactive() {
+        // With no filter the sweep writes remote rows for every path, so a "cleaned" record
+        // from an earlier filter no longer describes the index. Forget it, or exclude ->
+        // un-exclude -> exclude of the same path reads as already cleaned and skips the pass,
+        // leaving the remote rows of the excluded zone behind (DBSYNC-114).
+        if state
+            .db
+            .get_app_config(REMOTE_ROWS_CLEANED_KEY)?
+            .is_some_and(|s| !s.is_empty())
+        {
+            state.db.set_app_config(REMOTE_ROWS_CLEANED_KEY, "")?;
+        }
+        return Ok(report);
+    }
+    let Some(folder) = state.db.get_sync_folder()? else {
+        return Ok(report);
+    };
+    let root = PathBuf::from(folder);
+    // An unmounted or missing root must not read as "everything is gone".
+    if !root.is_dir() {
+        return Ok(report);
+    }
+    let active = state.db.active_job_paths()?;
+    let busy = |rel: &str| crate::sync_pipeline::covered_by_active_job(rel, &active);
+
+    // Folded keys (see the leftover-row loop below).
+    let mut kept_tracked: HashSet<String> = HashSet::new();
+    let mut excluded_dirs: Vec<(usize, PathBuf, String)> = Vec::new();
+    let mut removed_placeholders: Vec<String> = Vec::new();
+
+    let mut walker = WalkDir::new(&root).min_depth(1).into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                report.errors.push(format!("walk: {e}"));
+                continue;
+            }
+        };
+        let Ok(rel) = key_from_disk(&root, entry.path()) else {
+            continue;
+        };
+        if is_ignored_local_path(&rel) {
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            match filter.scope(&rel) {
+                PathScope::Excluded => {
+                    excluded_dirs.push((entry.depth(), entry.path().to_path_buf(), rel));
+                }
+                PathScope::Ancestor => {}
+                PathScope::Synced => {
+                    // Nothing excluded beneath: the whole subtree stays, do not read it.
+                    if !filter.excluded_beneath(&rel) {
+                        walker.skip_current_dir();
+                    }
+                }
+            }
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        if let Some(target) = rel.strip_suffix(".cloudsc") {
+            // A placeholder of an excluded path is only a pointer; it holds no user data.
+            let excluded = match filter.scope(target) {
+                PathScope::Excluded => true,
+                PathScope::Ancestor => read_cloudsc_placeholder_file(entry.path())
+                    .map(|m| m.tag == "file")
+                    .unwrap_or(false),
+                PathScope::Synced => false,
+            };
+            if !excluded {
+                continue;
+            }
+            if busy(target) || busy(&rel) {
+                report.busy.push(rel);
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {
+                    removed_placeholders.push(
+                        entry
+                            .path()
+                            .file_name()
+                            .map(|n| n.to_string_lossy().trim_end_matches(".cloudsc").to_string())
+                            .unwrap_or_default(),
+                    );
+                    report.removed.push(rel);
+                }
+                Err(e) => report.errors.push(format!("{rel}: {e}")),
+            }
+            continue;
+        }
+
+        if filter.file_scope(&rel) != PathScope::Excluded {
+            continue;
+        }
+        if busy(&rel) {
+            report.busy.push(rel);
+            continue;
+        }
+        remove_excluded_file(
+            state,
+            &root,
+            &rel,
+            entry.path(),
+            &mut report,
+            &mut kept_tracked,
+        );
+    }
+
+    // Stale index state outside the synced zone, dropped BEFORE any directory is removed.
+    //
+    // Folder rows go for every folder that is not Synced: Excluded AND Ancestor (DBSYNC-114
+    // C3). The scan never upserts or removes either kind, so a row written while the filter
+    // was off would outlive the include for good; once the include is removed the folder is
+    // Synced again and a row for a folder missing on disk is a RECURSIVE remote delete.
+    for folder in state.db.list_known_folders()? {
+        if filter.scope(&folder) != PathScope::Synced && !busy(&folder) {
+            state.db.remove_known_folder(&folder)?;
+        }
+    }
+    for row in state.db.list_local_files()? {
+        let rel = &row.relative_path;
+        if filter.file_scope(rel) != PathScope::Excluded || busy(rel) {
+            continue;
+        }
+        let gone = safe_join(&root, rel)
+            .map(|abs| fs::symlink_metadata(abs).is_err())
+            .unwrap_or(false);
+        // Folded: the index is byte-exact but the disk is not (APFS is case-insensitive and
+        // form-insensitive), so a row that differs from the walked path by case or Unicode
+        // form is still the kept file and would otherwise outlive the pass.
+        if gone || kept_tracked.contains(&fold(rel)) {
+            state.db.remove_local_file(rel)?;
+        }
+    }
+    // The remote rows of the excluded zone only need dropping once per filter: nothing writes
+    // one while the path is excluded (the sweep and the delta skip it), so after a clean pass
+    // for this filter a full listing every tick would find nothing. Re-done when the lists
+    // change, and whenever a job kept the previous pass from finishing.
+    let signature = filter.signature();
+    let cleaned = state
+        .db
+        .get_app_config(REMOTE_ROWS_CLEANED_KEY)?
+        .is_some_and(|s| s == signature);
+    if !cleaned {
+        let mut complete = true;
+        for row in state.db.list_remote_files_under("")? {
+            if filter.file_scope(&row.relative_path) != PathScope::Excluded {
+                continue;
+            }
+            if busy(&row.relative_path) {
+                complete = false;
+                continue;
+            }
+            state.db.remove_remote_file(&row.relative_path)?;
+        }
+        if complete {
+            state
+                .db
+                .set_app_config(REMOTE_ROWS_CLEANED_KEY, &signature)?;
+        }
+    }
+
+    // Empty-only, deepest first; the folder rows of each subtree are already gone.
+    excluded_dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+    for (_, dir, rel) in &excluded_dirs {
+        if busy(rel) {
+            report.busy.push(format!("{rel}/"));
+            continue;
+        }
+        untrack_folders_subtree(state, rel)?;
+        remove_junk_only_dir_contents(dir);
+        match fs::remove_dir(dir) {
+            Ok(()) => report.removed.push(format!("{rel}/")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // Not empty is the expected, safe outcome (a kept file inside); anything else
+                // on an empty directory is worth reporting.
+                let empty = fs::read_dir(dir)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(false);
+                if empty {
+                    report.errors.push(format!("{rel}/: {e}"));
+                }
+            }
+        }
+    }
+
+    // A file no longer kept (synced, deleted, handled by the user) is reported again if it is
+    // ever kept again.
+    let still_kept: HashSet<&str> = report.kept.iter().map(String::as_str).collect();
+    state.db.retain_first_time(|k| {
+        k.strip_prefix("kept:")
+            .is_none_or(|rel| still_kept.contains(rel))
+    });
+
+    emit_placeholder_changed(&[], &removed_placeholders);
+    Ok(report)
+}
+
+/// What identifies the bytes that were verified: size and modification time.
+fn file_stamp(abs: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let m = fs::symlink_metadata(abs).ok()?;
+    Some((m.len(), m.modified().ok()))
+}
+
+/// Untrack-then-unlink of one excluded file, or keep it. See [`apply_exclusions`].
+fn remove_excluded_file(
+    state: &AppState,
+    root: &Path,
+    rel: &str,
+    abs: &Path,
+    report: &mut ExclusionReport,
+    kept_tracked: &mut HashSet<String>,
+) {
+    remove_excluded_file_with(state, root, rel, abs, report, kept_tracked, || {});
+}
+
+/// [`remove_excluded_file`] with a hook that runs right after the file was verified against
+/// Dropbox and before it is unlinked: the window in which the user can still save an edit.
+/// The hook exists so a test can write into that window; production passes a no-op.
+pub(crate) fn remove_excluded_file_with(
+    state: &AppState,
+    root: &Path,
+    rel: &str,
+    abs: &Path,
+    report: &mut ExclusionReport,
+    kept_tracked: &mut HashSet<String>,
+    after_verified: impl FnOnce(),
+) {
+    // Logged once per file per process, not once per tick: a kept file stays kept (and is
+    // found again by every scan) until the user deals with it.
+    let keep = |report: &mut ExclusionReport, why: &str| {
+        if state.db.first_time(&format!("kept:{rel}")) {
+            if report.logged_new < KEPT_LOG_CAP {
+                tracing::warn!(rel, "kept an excluded file on disk: {why}");
+            } else if report.logged_new == KEPT_LOG_CAP {
+                tracing::warn!(
+                    "more excluded files kept on disk; further ones are not logged one by one"
+                );
+            }
+            report.logged_new += 1;
+        }
+        report.kept.push(rel.to_string());
+    };
+    // Never open a CfAPI dehydrated placeholder: the re-hash would download it (DBSYNC-59).
+    if crate::path_util::is_dehydrated_placeholder(abs) {
+        keep(report, "an online-only placeholder, not a local copy");
+        return;
+    }
+    let row = match state.db.get_local_file(rel) {
+        Ok(r) => r,
+        Err(e) => {
+            report.errors.push(format!("{rel}: {e}"));
+            return;
+        }
+    };
+    let stamp_before = file_stamp(abs);
+    match is_file_fully_synced(state, root, rel) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Folded and unconditional: the row (if any) may carry another case or Unicode
+            // form of this very path, and `row` above only saw the byte-exact one.
+            kept_tracked.insert(fold(rel));
+            if row.is_some() {
+                keep(report, "it has changes that are not on Dropbox");
+            } else {
+                keep(
+                    report,
+                    "it is not tracked, so it was never synced from here",
+                );
+            }
+            return;
+        }
+        Err(e) => {
+            // Could not read it to verify it: KEPT, and kept means untracked. A row left
+            // behind would turn the file's later disappearance into a remote delete once the
+            // path is synced again.
+            report.errors.push(format!("{rel}: {e}"));
+            kept_tracked.insert(fold(rel));
+            keep(report, "it could not be read to verify it");
+            return;
+        }
+    }
+    after_verified();
+    // Untrack first, so no scan or watcher event can read the unlink as a deletion.
+    let Some(row) = row else { return };
+    if let Err(e) = state.db.remove_local_file(rel) {
+        report.errors.push(format!("{rel}: {e}"));
+        return;
+    }
+    // Saved to between the hash check and now? Then these are not the bytes Dropbox has.
+    // Kept, and (like any kept file) left untracked: it is a stranger from here on.
+    if stamp_before.is_none() || file_stamp(abs) != stamp_before {
+        kept_tracked.insert(fold(rel));
+        keep(report, "it changed while it was being checked");
+        return;
+    }
+    match fs::remove_file(abs) {
+        Ok(()) => report.removed.push(rel.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.removed.push(rel.to_string()),
+        Err(e) => {
+            // Locked or refused: restore the tracked, fully synced state.
+            if let Err(e2) =
+                state
+                    .db
+                    .upsert_local_file(rel, &row.hash, row.size_bytes, row.modified_ts)
+            {
+                report.errors.push(format!("{rel}: rollback failed: {e2}"));
+            }
+            report.errors.push(format!("{rel}: {e}"));
+        }
+    }
+}
+
+/// Finder litters folders with `.DS_Store`; a directory holding nothing else is empty for our
+/// purposes. Removes those files only when they are ALL there is, so `remove_dir` can succeed.
+fn remove_junk_only_dir_contents(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let names: Vec<_> = entries.filter_map(Result::ok).collect();
+    if !names.is_empty() && names.iter().all(|e| e.file_name() == ".DS_Store") {
+        for e in names {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,6 +2614,60 @@ mod tests {
         let removed =
             prune_stale_cloudsc_placeholders(dir, &names.remote_child_names).expect("prune");
         (created, removed)
+    }
+
+    /// DBSYNC-114: the prune no longer protects a placeholder just because its excluded
+    /// name is still in the remote listing; an ancestor folder of an include is still kept.
+    #[cfg(not(windows))]
+    #[test]
+    fn prune_stops_keeping_excluded_placeholders_but_keeps_an_include_ancestor() {
+        let sweep = |dir: &Path, state: &AppState, include: &[&str], exclude: &[&str]| {
+            let inc: Vec<String> = include.iter().map(|s| s.to_string()).collect();
+            let exc: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
+            let mut names = SweepNames {
+                remote_child_names: HashSet::new(),
+                created_names: Vec::new(),
+            };
+            let created = materialize_listing_entries(
+                state,
+                vec![
+                    listing_entry("folder", "/Priv"),
+                    listing_entry("file", "/Keep.txt"),
+                    listing_entry("folder", "/Fotos"),
+                    listing_entry("folder", "/Other"),
+                ],
+                dir,
+                &inc,
+                &exc,
+                &mut names,
+            )
+            .expect("materialize");
+            let removed =
+                prune_stale_cloudsc_placeholders(dir, &names.remote_child_names).expect("prune");
+            (created, removed)
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let sync = tmp.path().join("sync");
+        let state = build_state(&sync);
+        for name in ["Priv", "Keep.txt", "Fotos", "Other"] {
+            std::fs::write(sync.join(format!("{name}.cloudsc")), b"x").unwrap();
+        }
+        let (created, removed) = sweep(&sync, &state, &[], &["Priv"]);
+        assert_eq!(created, 0);
+        assert_eq!(removed, vec!["Priv".to_string()]);
+        assert_eq!(
+            dir_names(&sync),
+            vec!["Fotos.cloudsc", "Keep.txt.cloudsc", "Other.cloudsc"]
+        );
+
+        // With an include list: `Fotos` is the way down to `Fotos/2024` (kept); the rest
+        // is outside the include (pruned).
+        let (_, removed) = sweep(&sync, &state, &["Fotos/2024"], &[]);
+        let mut removed = removed;
+        removed.sort();
+        assert_eq!(removed, vec!["Keep.txt".to_string(), "Other".to_string()]);
+        assert_eq!(dir_names(&sync), vec!["Fotos.cloudsc"]);
     }
 
     fn dir_names(dir: &Path) -> Vec<String> {
