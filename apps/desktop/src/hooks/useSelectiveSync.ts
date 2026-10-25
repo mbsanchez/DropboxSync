@@ -27,6 +27,7 @@ export function useSelectiveSync(pushLog: (line: string) => void) {
       pushLog("Selective sync filters saved.");
     } catch (e) {
       pushLog(`Failed to save selective sync filters: ${String(e)}`);
+      throw e; // let useSaveAction show the failure instead of "Saved"
     }
   }, [includeCsv, excludeCsv, pushLog]);
 

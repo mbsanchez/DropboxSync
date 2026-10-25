@@ -22,6 +22,7 @@ export function useIgnoreGlobs(pushLog: (line: string) => void) {
       pushLog("Ignored files patterns saved.");
     } catch (e) {
       pushLog(`Failed to save ignore globs: ${String(e)}`);
+      throw e; // let useSaveAction show the failure instead of "Saved"
     }
   }, [ignoreGlobsCsv, pushLog]);
 

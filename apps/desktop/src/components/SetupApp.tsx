@@ -8,6 +8,7 @@ import { useSelectiveSync } from "../hooks/useSelectiveSync";
 import { useIgnoreGlobs } from "../hooks/useIgnoreGlobs";
 import { useDisconnect } from "../hooks/useDisconnect";
 import { useStartupAtLogin } from "../hooks/useStartupAtLogin";
+import { useSaveAction, type SaveStatus } from "../hooks/useSaveAction";
 import "../App.css";
 
 /**
@@ -17,6 +18,19 @@ import "../App.css";
  * configured, it stays open as a small settings panel (reconnect / change folder /
  * selective sync) instead of instantly closing.
  */
+function SaveResult({ status }: { status: SaveStatus | null }) {
+  if (!status) return null;
+  return status.kind === "ok" ? (
+    <p role="status" style={{ color: "#166534", margin: 0, fontSize: "0.9rem" }}>
+      {status.text}
+    </p>
+  ) : (
+    <p role="alert" style={{ color: "#b00020", margin: 0, fontSize: "0.9rem", whiteSpace: "pre-wrap" }}>
+      {status.text}
+    </p>
+  );
+}
+
 function SetupApp() {
   const { pushLog } = useActivityLog();
   const {
@@ -48,6 +62,10 @@ function SetupApp() {
     busy: startupAtLoginBusy,
     toggle: toggleStartupAtLogin,
   } = useStartupAtLogin(pushLog);
+
+  const folderSave = useSaveAction();
+  const selectiveSave = useSaveAction();
+  const ignoreSave = useSaveAction();
 
   const [showFolderSetup, setShowFolderSetup] = useState(false);
 
@@ -86,6 +104,7 @@ function SetupApp() {
       await refreshStartupRequirements();
     } catch (e) {
       pushLog(`Failed to save sync folder: ${String(e)}`);
+      throw e; // let useSaveAction show the failure instead of "Saved"
     }
   };
 
@@ -102,6 +121,7 @@ function SetupApp() {
       const selected = await invoke<string | null>("pick_sync_folder_dialog");
       if (selected) {
         setSyncFolder(selected);
+        folderSave.clearStatus();
       }
     } catch (e) {
       pushLog(`Folder picker failed: ${String(e)}`);
@@ -160,12 +180,18 @@ function SetupApp() {
           <div style={{ display: "flex", gap: 8 }}>
             <input
               value={syncFolder}
-              onChange={(e) => setSyncFolder(e.currentTarget.value)}
+              onChange={(e) => {
+                setSyncFolder(e.currentTarget.value);
+                folderSave.clearStatus();
+              }}
               placeholder="/Users/me/DropboxSync"
             />
             <button onClick={pickFolder}>...</button>
-            <button onClick={saveFolder}>Save</button>
+            <button disabled={folderSave.saving} onClick={() => void folderSave.run(saveFolder)}>
+              {folderSave.saving ? "Saving…" : "Save"}
+            </button>
           </div>
+          <SaveResult status={folderSave.status} />
         </section>
       )}
 
@@ -203,26 +229,44 @@ function SetupApp() {
           <div style={{ display: "flex", gap: 8 }}>
             <input
               value={syncFolder}
-              onChange={(e) => setSyncFolder(e.currentTarget.value)}
+              onChange={(e) => {
+                setSyncFolder(e.currentTarget.value);
+                folderSave.clearStatus();
+              }}
               placeholder="/Users/me/DropboxSync"
             />
             <button onClick={pickFolder}>...</button>
-            <button onClick={saveFolder}>Save</button>
+            <button disabled={folderSave.saving} onClick={() => void folderSave.run(saveFolder)}>
+              {folderSave.saving ? "Saving…" : "Save"}
+            </button>
           </div>
+          <SaveResult status={folderSave.status} />
 
           <h3>Selective sync</h3>
           <div style={{ display: "grid", gap: 8 }}>
             <input
               value={includeCsv}
-              onChange={(e) => setIncludeCsv(e.currentTarget.value)}
+              onChange={(e) => {
+                setIncludeCsv(e.currentTarget.value);
+                selectiveSave.clearStatus();
+              }}
               placeholder="Include prefixes (CSV), e.g. Fotos,Videos/2024"
             />
             <input
               value={excludeCsv}
-              onChange={(e) => setExcludeCsv(e.currentTarget.value)}
+              onChange={(e) => {
+                setExcludeCsv(e.currentTarget.value);
+                selectiveSave.clearStatus();
+              }}
               placeholder="Exclude prefixes (CSV), e.g. Videos/Secret"
             />
-            <button onClick={() => void saveSelectiveSync()}>Save selective sync</button>
+            <button
+              disabled={selectiveSave.saving}
+              onClick={() => void selectiveSave.run(saveSelectiveSync)}
+            >
+              {selectiveSave.saving ? "Saving…" : "Save selective sync"}
+            </button>
+            <SaveResult status={selectiveSave.status} />
           </div>
 
           <h3>Ignored files</h3>
@@ -243,10 +287,16 @@ function SetupApp() {
           >
             <input
               value={ignoreGlobsCsv}
-              onChange={(e) => setIgnoreGlobsCsv(e.currentTarget.value)}
+              onChange={(e) => {
+                setIgnoreGlobsCsv(e.currentTarget.value);
+                ignoreSave.clearStatus();
+              }}
               placeholder="Ignore patterns (CSV), e.g. *.log,Notes/scratch.txt"
             />
-            <button onClick={() => void saveIgnoreGlobs()}>Save ignored files</button>
+            <button disabled={ignoreSave.saving} onClick={() => void ignoreSave.run(saveIgnoreGlobs)}>
+              {ignoreSave.saving ? "Saving…" : "Save ignored files"}
+            </button>
+            <SaveResult status={ignoreSave.status} />
           </div>
 
           {startupAtLoginSupported && (
