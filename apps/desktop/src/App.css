@@ -95,6 +95,18 @@ button:disabled {
   box-shadow: none;
 }
 
+/* Settings window only (.container is the SetupApp root); the tray flyout is untouched. */
+.container button:active:not(:disabled) {
+  transform: translateY(1px);
+  filter: brightness(0.92);
+  box-shadow: 0 1px 3px rgba(37, 99, 235, 0.3);
+}
+
+.container button:focus-visible {
+  outline: 2px solid #4f7df0;
+  outline-offset: 2px;
+}
+
 a {
   color: #2563eb;
   word-break: break-all;
