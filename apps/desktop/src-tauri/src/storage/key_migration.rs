@@ -1067,6 +1067,14 @@ mod tests {
             ("known_folders", "updated_at"),
             ("known_folders", "dropbox_id"),
             ("refused_moves", "refused_at"),
+            // DBSYNC-114: created after the NFC migration existed and only ever written by the
+            // scan with `key_from_disk` keys, so there is nothing legacy to re-key; a row whose
+            // key somehow differed would only lose a marker (the guard then keys on the local
+            // row alone), never a file.
+            ("unconfirmed_uploads", "relative_path"),
+            ("unconfirmed_uploads", "marked_at"),
+            // A content hash, not a path.
+            ("unconfirmed_uploads", "sent_hash"),
         ];
         let (_p, conn) = legacy_db();
         let tables = col_strings(
