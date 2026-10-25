@@ -11,13 +11,7 @@ import { useStartupAtLogin } from "../hooks/useStartupAtLogin";
 import { useSaveAction, type SaveStatus } from "../hooks/useSaveAction";
 import "../App.css";
 
-/**
- * Decorated onboarding/settings window. Connect Dropbox -> choose sync folder ->
- * (once both are OK) auto-closes itself so the app drops back to the tray flyout.
- * If opened later via the flyout's settings affordance while already fully
- * configured, it stays open as a small settings panel (reconnect / change folder /
- * selective sync) instead of instantly closing.
- */
+/** Inline result under a Settings Save button: "Saved", or the save's error. */
 function SaveResult({ status }: { status: SaveStatus | null }) {
   if (!status) return null;
   return status.kind === "ok" ? (
@@ -31,6 +25,13 @@ function SaveResult({ status }: { status: SaveStatus | null }) {
   );
 }
 
+/**
+ * Decorated onboarding/settings window. Connect Dropbox -> choose sync folder ->
+ * (once both are OK) auto-closes itself so the app drops back to the tray flyout.
+ * If opened later via the flyout's settings affordance while already fully
+ * configured, it stays open as a small settings panel (reconnect / change folder /
+ * selective sync) instead of instantly closing.
+ */
 function SetupApp() {
   const { pushLog } = useActivityLog();
   const {
@@ -185,8 +186,9 @@ function SetupApp() {
                 folderSave.clearStatus();
               }}
               placeholder="/Users/me/DropboxSync"
+              disabled={folderSave.saving}
             />
-            <button onClick={pickFolder}>...</button>
+            <button disabled={folderSave.saving} onClick={pickFolder}>...</button>
             <button disabled={folderSave.saving} onClick={() => void folderSave.run(saveFolder)}>
               {folderSave.saving ? "Saving…" : "Save"}
             </button>
@@ -234,8 +236,9 @@ function SetupApp() {
                 folderSave.clearStatus();
               }}
               placeholder="/Users/me/DropboxSync"
+              disabled={folderSave.saving}
             />
-            <button onClick={pickFolder}>...</button>
+            <button disabled={folderSave.saving} onClick={pickFolder}>...</button>
             <button disabled={folderSave.saving} onClick={() => void folderSave.run(saveFolder)}>
               {folderSave.saving ? "Saving…" : "Save"}
             </button>
