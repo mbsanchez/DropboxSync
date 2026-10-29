@@ -1541,11 +1541,15 @@ pub(crate) fn rederive_refused_move(
         // while the UI reads `synced`. An earlier version of this comment claimed doing
         // nothing was "exactly what `main` does, and `main` loses nothing". It is not:
         // `main` has no directory correlation, so the fallback runs there and converges.
+        // DBSYNC-111: for a folder that holds only placeholders the "ordinary delete-plus-
+        // upload" is NOT safe: the upload carries nothing, so the recursive delete of the
+        // source would be the loss. The pair recorded here is what makes the watcher and the
+        // scan untrack that folder and leave Dropbox alone (`pair_placeholder_only_folder`).
         state.db.record_refused_move(from_relative, to_relative)?;
         tracing::warn!(
             from = %from_relative,
             to = %to_relative,
-            "remote folder move refused — recorded so the correlator steps aside and the ordinary delete-plus-upload runs; no folder recovery is attempted (DBSYNC-100)"
+            "remote folder move refused — recorded so the correlator steps aside and the ordinary delete-plus-upload runs; no folder recovery is attempted (DBSYNC-100). A folder holding only placeholders is untracked instead and never deleted (DBSYNC-111)"
         );
         return Ok(());
     }
@@ -1789,11 +1793,23 @@ pub(crate) fn apply_confirmed_move(
     from_relative: &str,
     to_relative: &str,
 ) -> AppResult<()> {
-    let moving_a_directory = state
+    // DBSYNC-111: a folder move that failed was set aside and its source untracked; a retry
+    // that then lands is still a folder move, and the destination on disk says so.
+    let destination_is_a_directory = state
         .db
-        .list_known_folders()?
-        .iter()
-        .any(|folder| folder == from_relative);
+        .get_sync_folder()
+        .ok()
+        .flatten()
+        .and_then(|folder| safe_join(Path::new(&folder), to_relative).ok())
+        .is_some_and(|abs| abs.is_dir());
+    // ...but never for a FILE move whose destination happens to be a directory at landing.
+    let moving_a_directory = (destination_is_a_directory
+        && state.db.get_local_file(from_relative)?.is_none())
+        || state
+            .db
+            .list_known_folders()?
+            .iter()
+            .any(|folder| folder == from_relative);
 
     if moving_a_directory {
         let stranded = state.db.move_index_subtree(from_relative, to_relative)?;
@@ -1808,8 +1824,28 @@ pub(crate) fn apply_confirmed_move(
                 "moved on Dropbox but the index subtree did not travel whole"
             );
         }
+        // DBSYNC-111: the `.cloudsc` sidecars under the folder still name the OLD Dropbox
+        // path, which no longer exists. Point them at the new one. Local files only, no
+        // network; a failure is logged inside and is not fatal (the move has happened).
+        if let (Some(sync_folder), Ok(old_remote), Ok(new_remote)) = (
+            state.db.get_sync_folder().ok().flatten(),
+            crate::path_util::normalize_dropbox_path(from_relative),
+            crate::path_util::normalize_dropbox_path(to_relative),
+        ) {
+            if let Ok(new_abs) = safe_join(Path::new(&sync_folder), to_relative) {
+                let rewritten =
+                    crate::cloudsc::rewrite_sidecars_after_move(&new_abs, &old_remote, &new_remote);
+                if rewritten > 0 {
+                    tracing::info!(from = %from_relative, to = %to_relative, rewritten, "rewrote placeholder sidecars after a confirmed folder move");
+                }
+            }
+        }
     } else {
         state.db.move_index_row(from_relative, to_relative)?;
+    }
+    // DBSYNC-111: the move landed, so a refusal recorded when it once failed is stale.
+    if let Err(e) = state.db.clear_refused_moves_from(from_relative) {
+        tracing::warn!(error = %e, "could not clear a stale refused move");
     }
     // DBSYNC-114: a move INTO the excluded zone is the one thing that writes remote index rows
     // there while it is excluded; the exclusion pass drops them only once per filter, so tell

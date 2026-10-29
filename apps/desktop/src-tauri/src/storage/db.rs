@@ -1791,6 +1791,20 @@ impl Db {
         Ok(())
     }
 
+    /// A move out of `from_path` has landed: refusals recorded for it (a failed folder move
+    /// that "Retry failed jobs" later completed) are history.
+    pub fn clear_refused_moves_from(&self, from_path: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM refused_moves WHERE from_path = ?1",
+            params![from_path],
+        )?;
+        Ok(())
+    }
+
     pub fn list_refused_moves(&self) -> AppResult<HashSet<(String, String)>> {
         let conn = self
             .read

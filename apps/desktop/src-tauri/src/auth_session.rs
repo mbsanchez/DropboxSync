@@ -127,6 +127,10 @@ pub(crate) fn get_access_token(state: &AppState) -> AppResult<Zeroizing<String>>
         }
     }
 
+    // A test that gets here would read the real keychain and, with a token, call Dropbox.
+    if cfg!(test) {
+        panic!("tests must not reach get_access_token (keychain and network); inject a fake");
+    }
     let session = match state.secure_store.get_session() {
         Ok(s) => s,
         Err(_) => {
