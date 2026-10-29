@@ -169,7 +169,7 @@ fn delete_suppressed_by_dehydration(state: &AppState, rel: &str) -> bool {
 /// exact-or-separator-prefix check independently; this is the one shared helper
 /// both now call, so a future change to the boundary rule cannot drift between
 /// them by editing one copy and forgetting the other.
-fn path_covered_by(path: &str, prefix: &str) -> bool {
+pub(crate) fn path_covered_by(path: &str, prefix: &str) -> bool {
     path == prefix
         || (path.len() > prefix.len()
             && path.as_bytes()[prefix.len()] == b'/'
@@ -200,6 +200,17 @@ pub(crate) fn covered_by_active_job(path: &str, active: &HashSet<String>) -> boo
     active
         .iter()
         .any(|prefix| path_covered_by(&path, &canonical_cow(prefix)))
+}
+
+/// Is the folder `rel` busy: covered by an active job, OR named beneath it by one? A pending
+/// upload of `rel/new.txt` or a queued move into `rel` must stop a cleanup of `rel` (DBSYNC-111).
+/// Same prefix rule as [`covered_by_active_job`], asked in both directions.
+pub(crate) fn folder_busy_with_active_job(rel: &str, active: &HashSet<String>) -> bool {
+    let rel_c = canonical_cow(rel);
+    covered_by_active_job(rel, active)
+        || active
+            .iter()
+            .any(|a| path_covered_by(&canonical_cow(a), &rel_c))
 }
 
 fn canonical_cow(s: &str) -> std::borrow::Cow<'_, str> {
@@ -563,6 +574,20 @@ fn process_known_folder_deletion(
         state.db.remove_known_folder(rel)?;
         return Ok(0);
     }
+    // DBSYNC-111: a recursive `delete_v2` of a folder that a local sidecar still names takes
+    // the only copy of what that placeholder stands for (a renamed copy of the folder, or a
+    // mixed folder renamed twice before its move landed). The folder is untracked and Dropbox
+    // is left alone; its tracked files that really are gone are deleted one by one by the
+    // file-deletion pass. Single sink, so no folder-delete source can forget the rule.
+    if filter.sidecar_points_into(rel) {
+        tracing::warn!(
+            rel,
+            "a folder deleted locally is still named by a placeholder elsewhere: not sending a \
+             recursive remote delete; the folder stays on Dropbox"
+        );
+        state.db.remove_known_folder(rel)?;
+        return Ok(0);
+    }
     // Folders are never keyed in `remote_file_index`, so there is no rev to capture.
     state.db.enqueue_delete_job(rel, None)?;
     state.db.remove_known_folder(rel)?;
@@ -716,8 +741,27 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
     // Directories are correlated FIRST, and by path arithmetic rather than by content, so a
     // renamed folder is recognised before any of its contents is hashed. Hashing a thousand
     // children to discover they moved would cost what the re-upload being avoided costs.
-    let dir_moves =
+    let correlation =
         correlate_directory_renames(state, &known, &vanished, &present_dirs, &pending_targets)?;
+    let dir_moves = correlation.moves;
+    // DBSYNC-111: a vanished folder holding only placeholders (or nothing: once gone the two
+    // look alike) is never deleted by the watcher. Whether it was renamed is decided by the
+    // sidecars of the folder that appeared, which the scan can see in full; if nothing
+    // reappears the scan deletes it on Dropbox one pass later, as before. Computed BEFORE the
+    // `kept` folders are untracked below.
+    let held_for_scan: HashSet<String> = {
+        let known_folders = state.db.list_known_folders()?;
+        vanished
+            .iter()
+            .filter(|rel| known_folders.iter().any(|f| f == *rel))
+            .filter(|rel| is_placeholder_only_folder(&known, rel))
+            .cloned()
+            .collect()
+    };
+    // A sidecar points into these but they cannot be moved: untrack, never delete.
+    for old in &correlation.kept {
+        crate::cloudsc_ops::untrack_folders_subtree(state, old)?;
+    }
     for (old, new) in &dir_moves {
         if filter.scope(old) == PathScope::Ancestor {
             // Renaming a folder above an include moves its excluded siblings on Dropbox too.
@@ -837,7 +881,17 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             if state.db.get_local_file(rel)?.is_some() {
                 enqueued += process_local_file_deletion(state, &filter, &tracked_root, rel)?;
             }
-            state.db.upsert_known_folder(rel)?;
+            // A destination whose pair is postponed behind queued work stays unregistered, so
+            // the scan still sees it as new and can pair it once the work has drained.
+            // The same goes for a folder that holds nothing but placeholders (or nothing): it
+            // may be one half of a rename whose other half arrives in another batch, and a
+            // registered destination is one the scan can no longer tell from an old folder.
+            // The scan registers it.
+            if !correlation.postponed_destinations.contains(rel)
+                && !dir_holds_only_placeholders(absolute)
+            {
+                state.db.upsert_known_folder(rel)?;
+            }
         }
         let mut walker = WalkDir::new(absolute).into_iter();
         while let Some(entry) = walker.next() {
@@ -907,6 +961,7 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
             if moved_from.contains(rel.as_str())
                 || under_moved_dir(rel, &dir_moved_from)
                 || covered_by_active_job(rel, &pending_moves)
+                || held_for_scan.contains(rel)
             {
                 continue;
             }
@@ -966,6 +1021,9 @@ pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppRe
         if moved_from.contains(rel.as_str()) || under_moved_dir(rel, &dir_moved_from) {
             continue; // it did not vanish, it moved
         }
+        if held_for_scan.contains(rel) {
+            continue; // DBSYNC-111: left in `known_folders` for the scan to pair or delete
+        }
         enqueued += enqueue_targeted_deletions(
             state,
             &tracked_root,
@@ -998,9 +1056,9 @@ fn correlate_directory_renames(
     vanished: &[String],
     present_dirs: &[(String, PathBuf)],
     pending_targets: &HashSet<String>,
-) -> AppResult<Vec<(String, String)>> {
+) -> AppResult<DirCorrelation> {
     if vanished.is_empty() || present_dirs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DirCorrelation::default());
     }
     // DBSYNC-106: record which folders have ever held an indexed descendant, BEFORE the
     // correlator reads them and before pass three indexes this batch's files. A rename
@@ -1195,7 +1253,206 @@ fn correlate_directory_renames(
             break;
         }
     }
-    Ok(pairs)
+
+    // DBSYNC-111: folders that hold only `.cloudsc` placeholders have no tracked descendants
+    // and were stepped over above. Their evidence is the sidecars inside the folder that
+    // appeared. Outermost first, so `Old` is judged before `Old/Sub` and the inner folder
+    // travels with it instead of being paired on its own.
+    let mut placeholder_olds: Vec<&String> = vanished
+        .iter()
+        .filter(|old| known_folders.iter().any(|f| f == *old))
+        .filter(|old| is_placeholder_only_folder(known, old))
+        .collect();
+    placeholder_olds.sort_by_key(|old| old.matches('/').count());
+    let ctx = PairingContext {
+        state,
+        pending_targets,
+        refused: &refused,
+        folders_owning_content: &folders_owning_content,
+        rows: known,
+    };
+    let mut held: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut postponed_destinations: HashSet<String> = HashSet::new();
+    for old in placeholder_olds {
+        if held.iter().any(|h| path_covered_by(old, h)) {
+            continue;
+        }
+        match pair_placeholder_only_folder(
+            &ctx,
+            old,
+            present_dirs,
+            &claimed_new,
+            &crate::cloudsc::sidecar_evidence,
+        )? {
+            PlaceholderPairing::Pair(new) => {
+                if let Some((claimed, _)) = present_dirs.iter().find(|(n, _)| *n == new) {
+                    claimed_new.insert(claimed.as_str());
+                }
+                tracing::info!(from = %old, to = %new, "placeholder-only folder renamed: its sidecars all point into the old folder");
+                pairs.push((old.clone(), new));
+            }
+            PlaceholderPairing::Keep => kept.push(old.clone()),
+            PlaceholderPairing::Postpone(destination) => {
+                postponed_destinations.extend(destination);
+            }
+            // Nothing says it was renamed. The watcher still does not delete it: it cannot tell
+            // this from an empty folder, and the scan (which sees the whole disk) decides.
+            // An inner folder may still pair on its own, so it is not held.
+            PlaceholderPairing::NoEvidence => continue,
+        }
+        held.push(old.as_str());
+    }
+    Ok(DirCorrelation {
+        moves: pairs,
+        kept,
+        postponed_destinations,
+    })
+}
+
+/// What [`correlate_directory_renames`] decided.
+#[derive(Default)]
+struct DirCorrelation {
+    /// `(old, new)` folder pairs: one remote `move` each.
+    moves: Vec<(String, String)>,
+    /// Vanished placeholder-only folders a sidecar points into but that cannot be moved (the
+    /// sidecars disagree, the destination is refused or occupied, Dropbox refused the pair):
+    /// untracked, and NEVER deleted on Dropbox.
+    kept: Vec<String>,
+    /// Destinations of a pair postponed behind queued work: not registered in `known_folders`
+    /// yet, so the scan still sees them as new and can pair them once the work has drained.
+    postponed_destinations: HashSet<String>,
+}
+
+/// A known folder with no tracked file at or beneath it, other than `.cloudsc` placeholders
+/// (DBSYNC-111). After it has vanished from disk an empty folder looks the same, so callers
+/// treat both alike. Always false on Windows, which has no `.cloudsc` sidecars: there the
+/// existing behaviour is unchanged.
+fn is_placeholder_only_folder(known: &[FileIndexRow], folder: &str) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let prefix = format!("{folder}/");
+    !known.iter().any(|row| {
+        row.relative_path == folder
+            || (row.relative_path.starts_with(&prefix)
+                && !row.relative_path.ends_with(".cloudsc")
+                && !is_ignored_local_path(&row.relative_path))
+    })
+}
+
+/// A directory holding no real file, at any depth: only `.cloudsc` sidecars, ignored names and
+/// subfolders. Always false on Windows (no sidecars there; registration is unchanged).
+fn dir_holds_only_placeholders(dir: &Path) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    !WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.file_type().is_file()
+                && !e.file_name().to_string_lossy().ends_with(".cloudsc")
+                && !is_ignored_local_path(&e.file_name().to_string_lossy())
+        })
+}
+
+/// What the sidecars say about one vanished placeholder-only folder.
+enum PlaceholderPairing {
+    /// Every sidecar of this appeared folder points at the old one: move old to it.
+    Pair(String),
+    /// A sidecar points into the old folder but it cannot be moved: untrack, never delete.
+    Keep,
+    /// Queued work names either folder: neither move nor delete this pass. Carries the
+    /// destination, if one was found.
+    Postpone(Option<String>),
+    /// No sidecar points into the old folder.
+    NoEvidence,
+}
+
+/// Inputs shared by every pairing decision of one pass.
+struct PairingContext<'a> {
+    state: &'a AppState,
+    /// Every active job's paths (all job types, both ends).
+    pending_targets: &'a HashSet<String>,
+    refused: &'a HashSet<(String, String)>,
+    folders_owning_content: &'a [String],
+    /// Local index rows, for "does the destination own tracked files".
+    rows: &'a [FileIndexRow],
+}
+
+/// Decide what became of the vanished placeholder-only folder `old`, given the folders that
+/// appeared (`candidates`). One function for the watcher and the scan, so the refusals cannot
+/// drift apart (four review rounds found exactly that between the file and folder correlators).
+///
+/// **Once any sidecar points into `old`, `old` is never deleted on Dropbox.** Every outcome
+/// other than a move is `Keep` (untrack, leave Dropbox alone: the sidecars still hydrate from
+/// the old remote path) or a postponement.
+fn pair_placeholder_only_folder(
+    ctx: &PairingContext<'_>,
+    old: &str,
+    candidates: &[(String, PathBuf)],
+    claimed_new: &HashSet<&str>,
+    evidence: &dyn Fn(&Path, &str) -> crate::cloudsc::SidecarEvidence,
+) -> AppResult<PlaceholderPairing> {
+    // Dropbox already refused a move out of this folder. The pair is recorded, not the
+    // sidecars, so this is decided without looking at the destination. (A folder move Dropbox
+    // refuses is normally followed by delete-plus-upload; for placeholders the upload carries
+    // nothing, so that delete would be the loss.)
+    if ctx.refused.iter().any(|(from, _)| from == old) {
+        tracing::debug!(from = %old, "placeholder-only folder: Dropbox already refused its move; untracking, not deleting");
+        return Ok(PlaceholderPairing::Keep);
+    }
+    let old_remote = format!("/{old}");
+    let mut mismatch = false;
+    for (new, new_abs) in candidates {
+        if new == old
+            || path_covered_by(new, old)
+            || claimed_new.iter().any(|c| path_covered_by(new, c))
+        {
+            continue;
+        }
+        match evidence(new_abs, &old_remote) {
+            crate::cloudsc::SidecarEvidence::None => continue,
+            crate::cloudsc::SidecarEvidence::Mismatch => {
+                mismatch = true;
+                continue;
+            }
+            crate::cloudsc::SidecarEvidence::AllPointInto(_) => {}
+        }
+        // Queued work names either end: a move reorders the world underneath it.
+        if folder_busy_with_active_job(old, ctx.pending_targets)
+            || folder_busy_with_active_job(new, ctx.pending_targets)
+        {
+            tracing::debug!(from = %old, to = %new, "placeholder-only folder: queued work names it; postponed");
+            return Ok(PlaceholderPairing::Postpone(Some(new.clone())));
+        }
+        // The destination is a folder in its own right, or Dropbox already holds something
+        // there: moving would collide with it.
+        let new_prefix = format!("{new}/");
+        let owns_rows = ctx.rows.iter().any(|row| {
+            row.relative_path.starts_with(&new_prefix)
+                && !row.relative_path.ends_with(".cloudsc")
+                && !is_ignored_local_path(&row.relative_path)
+        });
+        if owns_rows || ctx.folders_owning_content.iter().any(|f| f == new) {
+            tracing::debug!(from = %old, to = %new, "placeholder-only folder: the destination is a folder in its own right; untracking, not deleting");
+            return Ok(PlaceholderPairing::Keep);
+        }
+        if !ctx.state.db.list_remote_files_under(new)?.is_empty() {
+            tracing::debug!(from = %old, to = %new, "placeholder-only folder: the destination already has remote rows; untracking, not deleting");
+            return Ok(PlaceholderPairing::Keep);
+        }
+        if ctx.refused.contains(&(old.to_string(), new.clone())) {
+            return Ok(PlaceholderPairing::Keep);
+        }
+        return Ok(PlaceholderPairing::Pair(new.clone()));
+    }
+    if mismatch {
+        tracing::debug!(from = %old, "placeholder-only folder: the sidecars of an appeared folder disagree; untracking, not deleting");
+        return Ok(PlaceholderPairing::Keep);
+    }
+    Ok(PlaceholderPairing::NoEvidence)
 }
 
 /// Pair paths that vanished with paths that appeared, when they are the same item under a
@@ -1582,6 +1839,11 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
         .db
         .get_sync_folder()?
         .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    // Same housekeeping as the watcher's pass: a refusal only matters while its source folder
+    // is still tracked (DBSYNC-99), and a scan with no watcher batch would never forget one.
+    if let Err(e) = state.db.prune_stale_refused_moves() {
+        tracing::warn!(error = %e, "could not prune stale refused moves");
+    }
     let known = state.db.list_local_files()?;
     // DBSYNC-31: indexed active-job query instead of scanning list_recent_jobs(200).
     let pending_targets: HashSet<String> = state.db.active_job_paths()?;
@@ -1670,6 +1932,16 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     // that is no longer present on disk must have been deleted locally, so its
     // remote counterpart needs to be deleted too (delete_v2 is recursive).
     let mut seen_dirs: HashSet<String> = HashSet::new();
+    // DBSYNC-111: read BEFORE the walk below. The walk registers every folder it sees, the
+    // rename destination included, so read afterwards this list could never say which
+    // folders just appeared and no vanished placeholder-only folder could be paired.
+    let known_folders_before: HashSet<String> = state
+        .db
+        .list_known_folders()?
+        .into_iter()
+        .map(|f| to_canonical_form(&f))
+        .collect();
+    let mut new_dirs: Vec<(String, PathBuf)> = Vec::new();
     let mut walker = WalkDir::new(&tracked_root).into_iter();
     while let Some(entry) = walker.next() {
         let entry = match entry {
@@ -1704,6 +1976,9 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
         }
 
         seen_dirs.insert(relative.clone());
+        if !known_folders_before.contains(&to_canonical_form(&relative)) {
+            new_dirs.push((relative.clone(), absolute.clone()));
+        }
         state.db.upsert_known_folder(&relative)?;
     }
 
@@ -1754,6 +2029,40 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
                     && !covered_by_active_job(rel, &pending)
             })
             .collect();
+
+        // DBSYNC-111: a vanished folder holding only placeholders is a rename when a folder
+        // that just appeared holds sidecars pointing at it. Paired, postponed and kept folders
+        // leave the deletions, and so are not counted by the breaker below.
+        enqueued_jobs += pair_vanished_placeholder_folders(
+            state,
+            &tracked_root,
+            &filter,
+            &known,
+            WalkedDirs {
+                seen: &seen_dirs,
+                new: &new_dirs,
+            },
+            &mut pending_targets,
+            &mut folder_deletions,
+        )?;
+
+        // DBSYNC-111: the same for a vanished MIXED folder (tracked files plus placeholders)
+        // that a placeholder elsewhere still names.
+        enqueued_jobs += pair_vanished_mixed_folders(
+            state,
+            &tracked_root,
+            &filter,
+            &known,
+            WalkedDirs {
+                seen: &seen_dirs,
+                new: &new_dirs,
+            },
+            &mut pending_targets,
+            ScanDeletions {
+                files: &mut file_deletions,
+                folders: &mut folder_deletions,
+            },
+        )?;
 
         // DBSYNC-114 F / H10 / C2: a vanished synced path whose content plausibly went into the
         // excluded zone is a `move` when it pairs exactly, and otherwise is NOT a deletion
@@ -1810,6 +2119,364 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     }
 
     Ok(enqueued_jobs)
+}
+
+/// The scan's half of DBSYNC-111: decide what became of each vanished folder that held only
+/// placeholders, before the breaker and before any `folder_deletions` entry is acted on.
+///
+/// `seen_dirs` are all the folders the walk saw; `new_dirs` the ones that were not in
+/// `known_folders` BEFORE it. A new folder is preferred as the destination, but a registered
+/// one is a candidate too: a rename done again before the first move landed leaves its final
+/// name registered by an earlier scan, and refusing it would lose the rename. Paired folders
+/// get a remote `move`; postponed, refused, disagreeing and still-pointed-at folders are
+/// removed from `folder_deletions` (with everything beneath them) so none of them reaches the
+/// recursive `delete_v2`. A folder nothing points into stays a deletion, as before.
+/// The folders a scan walk saw: all of them, and the ones not registered before the walk.
+#[derive(Clone, Copy)]
+struct WalkedDirs<'a> {
+    seen: &'a HashSet<String>,
+    new: &'a [(String, PathBuf)],
+}
+
+fn pair_vanished_placeholder_folders(
+    state: &AppState,
+    tracked_root: &Path,
+    filter: &PrefixFilter,
+    known: &[FileIndexRow],
+    walked: WalkedDirs<'_>,
+    pending_targets: &mut HashSet<String>,
+    folder_deletions: &mut Vec<String>,
+) -> AppResult<usize> {
+    let mut candidates: Vec<String> = folder_deletions
+        .iter()
+        .filter(|rel| is_placeholder_only_folder(known, rel))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    candidates.sort_by_key(|rel| rel.matches('/').count());
+    let refused = state.db.list_refused_moves()?;
+    let owning = state.db.list_known_folders_owning_content()?;
+    // Fresh, not the scan's snapshot: the file walk has just indexed whatever the destination
+    // holds, and a destination with tracked files is a folder in its own right.
+    let rows = state.db.list_local_files()?;
+    let active = pending_targets.clone();
+    let ctx = PairingContext {
+        state,
+        pending_targets: &active,
+        refused: &refused,
+        folders_owning_content: &owning,
+        rows: &rows,
+    };
+    // Every sidecar in the sync root, read once for all the candidates.
+    let WalkedDirs {
+        seen: seen_dirs,
+        new: new_dirs,
+    } = walked;
+    let Some(index) = filter.sidecar_index() else {
+        return Ok(0);
+    };
+    let mut enqueued = 0usize;
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut held: Vec<String> = Vec::new();
+    for old in &candidates {
+        if held.iter().any(|h| path_covered_by(old, h)) {
+            continue;
+        }
+        let claimed_refs: HashSet<&str> = claimed.iter().map(String::as_str).collect();
+        // Where a copy of this folder could be: the folders holding a sidecar that points into
+        // it, new ones first, outermost first.
+        let old_remote = format!("/{old}");
+        let mut places: Vec<(String, PathBuf)> = index
+            .dirs_holding_sidecars_into(&old_remote, tracked_root)
+            .into_iter()
+            .filter_map(|abs| key_from_disk(tracked_root, &abs).ok().map(|rel| (rel, abs)))
+            .filter(|(rel, _)| seen_dirs.contains(rel))
+            .collect();
+        places.sort_by_key(|(rel, _)| {
+            (
+                !new_dirs.iter().any(|(n, _)| n == rel),
+                rel.matches('/').count(),
+            )
+        });
+        let mut verdict =
+            pair_placeholder_only_folder(&ctx, old, &places, &claimed_refs, &|dir, remote| {
+                index.evidence(dir, remote)
+            })?;
+        if matches!(verdict, PlaceholderPairing::NoEvidence) && index.any_points_into(&old_remote) {
+            // No folder that just appeared claims it, but a sidecar somewhere still names it
+            // (a move that failed, a destination registered by an earlier pass): the bytes
+            // are Dropbox's only copy, so it is not deleted.
+            verdict = PlaceholderPairing::Keep;
+        }
+        match verdict {
+            PlaceholderPairing::Pair(new) => {
+                state.db.enqueue_job("move", Some(old), Some(&new))?;
+                pending_targets.insert(old.clone());
+                pending_targets.insert(new.clone());
+                enqueued += 1;
+                tracing::info!(from = %old, to = %new, "placeholder-only folder renamed: enqueued a move instead of a delete");
+                claimed.insert(new);
+            }
+            PlaceholderPairing::Keep => {
+                crate::cloudsc_ops::untrack_folders_subtree(state, old)?;
+                if state
+                    .db
+                    .first_time(&format!("placeholder-folder-kept:{old}"))
+                {
+                    tracing::warn!(rel = %old, "a placeholder-only folder vanished but a sidecar still points into it: untracked, NOT deleted on Dropbox");
+                }
+            }
+            PlaceholderPairing::Postpone(destination) => {
+                // Unregister the destination the walk just recorded, so the next scan still
+                // sees it as new.
+                // Only a destination that is new in this scan: a long-lived registered one
+                // (and its subtree) was not registered by this walk and stays as it is.
+                if let Some(destination) = destination {
+                    if new_dirs.iter().any(|(n, _)| *n == destination) {
+                        crate::cloudsc_ops::untrack_folders_subtree(state, &destination)?;
+                    }
+                }
+            }
+            PlaceholderPairing::NoEvidence => continue,
+        }
+        held.push(old.clone());
+    }
+    folder_deletions.retain(|rel| !held.iter().any(|h| path_covered_by(rel, h)));
+    Ok(enqueued)
+}
+
+/// The deletion candidates a scan has collected, for the passes that may take some back out.
+struct ScanDeletions<'a> {
+    files: &'a mut Vec<String>,
+    folders: &'a mut Vec<String>,
+}
+
+/// Active (queued, waiting or running) upload jobs, by path, for DBSYNC-111's mixed pairing.
+fn active_uploads(state: &AppState) -> AppResult<Vec<(i64, String, String)>> {
+    Ok(state
+        .db
+        .list_recent_jobs(2000)?
+        .into_iter()
+        .filter(|j| j.job_type == "upload")
+        .filter(|j| matches!(j.status.as_str(), "queued" | "retry_wait" | "running"))
+        .filter_map(|j| Some((j.id, j.status, j.target_path.or(j.source_path)?)))
+        .collect())
+}
+
+/// DBSYNC-111, the scan's half for a vanished MIXED folder: tracked files plus placeholders,
+/// renamed (twice, or by a scan that no watcher batch preceded). Pairs it with a folder that
+/// holds sidecars all pointing into it, in which EVERY tracked file reappears, and enqueues one
+/// folder `move`; the per-file deletes of its files are taken back out. Evidence that is only
+/// partly there is never guessed at: the folder is untracked and not deleted (its tracked files
+/// that really are gone still are, one by one) — the same net as the folder-delete sink.
+///
+/// The destination's own queued uploads and rows for those files are dropped first: they would
+/// otherwise reach Dropbox before the move and make the destination exist, and the move would
+/// be refused. After the move lands the moved rows decide: identical bytes need nothing, an
+/// edited file is an ordinary modified-file upload, never a conflicted copy.
+fn pair_vanished_mixed_folders(
+    state: &AppState,
+    tracked_root: &Path,
+    filter: &PrefixFilter,
+    known: &[FileIndexRow],
+    walked: WalkedDirs<'_>,
+    pending_targets: &mut HashSet<String>,
+    deletions: ScanDeletions<'_>,
+) -> AppResult<usize> {
+    if cfg!(windows) {
+        return Ok(0);
+    }
+    let Some(index) = filter.sidecar_index() else {
+        return Ok(0);
+    };
+    let mut candidates: Vec<String> = deletions
+        .folders
+        .iter()
+        .filter(|f| !is_placeholder_only_folder(known, f))
+        .filter(|f| index.any_points_into(&format!("/{f}")))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    candidates.sort_by_key(|rel| rel.matches('/').count());
+    let refused = state.db.list_refused_moves()?;
+    let rows = state.db.list_local_files()?;
+    let uploads = active_uploads(state)?;
+    let mut enqueued = 0usize;
+    let mut claimed: Vec<String> = Vec::new();
+    let mut held: Vec<String> = Vec::new();
+
+    for old in &candidates {
+        if held.iter().any(|h| path_covered_by(old, h)) {
+            continue;
+        }
+        let prefix = format!("{old}/");
+        let descendants: Vec<&FileIndexRow> = known
+            .iter()
+            .filter(|r| r.relative_path.starts_with(&prefix))
+            .filter(|r| {
+                !r.relative_path.ends_with(".cloudsc") && !is_ignored_local_path(&r.relative_path)
+            })
+            .collect();
+        if refused.iter().any(|(from, _)| from == old) {
+            crate::cloudsc_ops::untrack_folders_subtree(state, old)?;
+            held.push(old.clone());
+            continue;
+        }
+        if descendants.is_empty()
+            || descendants
+                .iter()
+                .any(|r| r.hash == crate::storage::db::Db::HASH_NEEDS_RESCAN)
+        {
+            continue; // the sink keeps the folder from a recursive delete
+        }
+        // DBSYNC-114 I2: a file beneath whose first upload has not landed may sit next to a
+        // Dropbox version that is not ours. A move would carry that version to the new name
+        // and drop the marker, so our bytes would never be sent (and a later retry would
+        // overwrite theirs unguarded). Not paired: the ordinary path uploads the destination's
+        // file as a new file with the guard armed, and the sink keeps the folder delete away.
+        if filter.unconfirmed_beneath(old) || state.db.has_unconfirmed_upload_under(old)? {
+            continue;
+        }
+        // Dropbox must hold exactly the bytes the rows describe (as the watcher's correlator
+        // requires), or the move would relocate somebody else's, or older, content.
+        let mut bytes_held = true;
+        for r in &descendants {
+            match state.db.get_remote_file(&r.relative_path)? {
+                Some(remote) if remote.content_hash == r.hash => {}
+                _ => {
+                    bytes_held = false;
+                    break;
+                }
+            }
+        }
+        if !bytes_held {
+            continue;
+        }
+        let old_remote = format!("/{old}");
+        let mut places: Vec<(String, PathBuf)> = index
+            .dirs_holding_sidecars_into(&old_remote, tracked_root)
+            .into_iter()
+            .filter_map(|abs| key_from_disk(tracked_root, &abs).ok().map(|rel| (rel, abs)))
+            .filter(|(rel, _)| walked.seen.contains(rel))
+            .collect();
+        places.sort_by_key(|(rel, _)| {
+            (
+                !walked.new.iter().any(|(n, _)| n == rel),
+                rel.matches('/').count(),
+            )
+        });
+        let mut ambiguous = false;
+        let mut verdict: Option<Result<(String, Vec<String>), ()>> = None; // Ok(pair) / Err = keep
+        let mut postponed = false;
+        for (new, new_abs) in &places {
+            if new == old
+                || path_covered_by(new, old)
+                || claimed.iter().any(|c| path_covered_by(new, c))
+            {
+                continue;
+            }
+            match index.evidence(new_abs, &old_remote) {
+                crate::cloudsc::SidecarEvidence::None => continue,
+                crate::cloudsc::SidecarEvidence::Mismatch => {
+                    ambiguous = true;
+                    continue;
+                }
+                crate::cloudsc::SidecarEvidence::AllPointInto(_) => {}
+            }
+            // Every tracked file must be there too, or this is not obviously the same folder.
+            let tails: Vec<&str> = descendants
+                .iter()
+                .map(|r| &r.relative_path[prefix.len()..])
+                .collect();
+            if tails
+                .iter()
+                .any(|t| !std::fs::symlink_metadata(new_abs.join(t)).is_ok_and(|m| m.is_file()))
+            {
+                ambiguous = true;
+                continue;
+            }
+            let new_prefix = format!("{new}/");
+            let dest_paths: Vec<String> =
+                tails.iter().map(|t| format!("{new_prefix}{t}")).collect();
+            // The destination may hold nothing else: no other tracked file, nothing on Dropbox.
+            let foreign_rows = rows.iter().any(|r| {
+                r.relative_path.starts_with(&new_prefix)
+                    && !r.relative_path.ends_with(".cloudsc")
+                    && !is_ignored_local_path(&r.relative_path)
+                    && !dest_paths.contains(&r.relative_path)
+            });
+            if foreign_rows || !state.db.list_remote_files_under(new)?.is_empty() {
+                verdict = Some(Err(()));
+                break;
+            }
+            // Queued uploads of the matched destination files are dropped when the pair goes
+            // ahead; one already running cannot be, so wait.
+            let running = uploads
+                .iter()
+                .any(|(_, status, path)| status == "running" && dest_paths.contains(path));
+            let busy_set: HashSet<String> = pending_targets
+                .iter()
+                .filter(|p| {
+                    !uploads
+                        .iter()
+                        .any(|(_, _, up)| up == *p && dest_paths.contains(up))
+                })
+                .cloned()
+                .collect();
+            if running
+                || folder_busy_with_active_job(old, &busy_set)
+                || folder_busy_with_active_job(new, &busy_set)
+            {
+                postponed = true;
+                break;
+            }
+            verdict = Some(Ok((new.clone(), dest_paths)));
+            break;
+        }
+        if postponed {
+            deletions.files.retain(|f| !path_covered_by(f, old));
+            held.push(old.clone());
+            continue;
+        }
+        match verdict {
+            Some(Ok((new, dest_paths))) => {
+                for (id, status, path) in &uploads {
+                    if status != "running" && dest_paths.contains(path) {
+                        state
+                            .db
+                            .mark_job_settled(*id, "superseded by a folder move")?;
+                    }
+                }
+                for dest in &dest_paths {
+                    state.db.remove_local_file(dest)?;
+                    state.db.clear_upload_unconfirmed(dest)?;
+                }
+                state.db.enqueue_job("move", Some(old), Some(&new))?;
+                pending_targets.insert(old.clone());
+                pending_targets.insert(new.clone());
+                enqueued += 1;
+                tracing::info!(from = %old, to = %new, "mixed folder renamed: enqueued a move instead of a delete");
+                claimed.push(new);
+                deletions.files.retain(|f| !path_covered_by(f, old));
+            }
+            Some(Err(())) => {
+                crate::cloudsc_ops::untrack_folders_subtree(state, old)?;
+            }
+            None if ambiguous => {
+                crate::cloudsc_ops::untrack_folders_subtree(state, old)?;
+            }
+            None => continue,
+        }
+        held.push(old.clone());
+    }
+    deletions
+        .folders
+        .retain(|rel| !held.iter().any(|h| path_covered_by(rel, h)));
+    Ok(enqueued)
 }
 
 /// What [`excluded_zone_move_fallback`] decided (DBSYNC-114 F / H10 / C2).
@@ -2528,6 +3195,44 @@ fn process_sync_queue_core(
     )
 }
 
+/// DBSYNC-111: a queued FOLDER move whose destination is no longer a directory on disk (the
+/// user renamed it again, or deleted it, before the move reached Dropbox) is settled here
+/// without a request. Landing it would move `from` to a name that no longer exists locally,
+/// after which the next scan reads the vanished destination as a deletion and sends a
+/// recursive `delete_v2` of the folder that now holds the user's content.
+///
+/// Resolved into ordinary state rather than failed or retried: the source stays tracked, so the
+/// next pass pairs it with wherever it went, or deletes it if it is truly gone. Only the
+/// destination row the scan registered while the move was queued is dropped. Returns whether the
+/// job was settled.
+fn settle_stale_folder_move(state: &AppState, from: &str, to: &str) -> bool {
+    let is_folder_move = state
+        .db
+        .list_known_folders()
+        .is_ok_and(|folders| folders.iter().any(|f| f == from));
+    if !is_folder_move {
+        return false;
+    }
+    let Ok(Some(root)) = state.db.get_sync_folder() else {
+        return false;
+    };
+    let Ok(destination) = crate::path_util::safe_join(Path::new(&root), to) else {
+        return false;
+    };
+    if destination.is_dir() {
+        return false;
+    }
+    if let Err(e) = crate::cloudsc_ops::untrack_folders_subtree(state, to) {
+        tracing::warn!(error = %e, "could not untrack the destination of a stale folder move");
+    }
+    tracing::info!(
+        from,
+        to,
+        "folder move settled without running: its destination no longer exists on disk; the source stays tracked for the next pass"
+    );
+    true
+}
+
 /// [`process_sync_queue_core`] with the `move` and `upload` arms' network calls taken as
 /// parameters too (DBSYNC-114 M1), so a test can drain a real `move` or `upload` job through
 /// the real dispatch and settlement without a token or a request. Production passes
@@ -2665,6 +3370,7 @@ fn process_sync_queue_with(
         // where the item was and `target_path` is where it is, and neither can stand in for
         // the other. Missing either is a programming error, not a transient failure.
         "move" => match (job.source_path.as_deref(), job.target_path.as_deref()) {
+            (Some(from), Some(to)) if settle_stale_folder_move(state, from, to) => Ok(()),
             (Some(from), Some(to)) => move_remote(from, to).map(|()| {
                 // `move_remote_file_internal` rewrites the index itself, and only once
                 // Dropbox has confirmed — so there is nothing to do here on success, and
@@ -2825,6 +3531,26 @@ fn apply_job_failure(
                 "sync job failed permanently"
             );
             state.db.mark_job_failed(job.id, attempt, Some(&msg))?;
+            // DBSYNC-111: a folder move that ended `failed` (quota, persistent 5xx, ...) is
+            // recorded like a refusal, so the correlators stop proposing the same pair on
+            // every scan (each proposal settled the destination's fresh uploads, and a
+            // local-only edit there never synced). "Retry failed jobs" re-queues the move
+            // itself; if it then lands, `apply_confirmed_move` rewrites the sidecars.
+            if job.job_type == "move" {
+                if let (Some(from), Some(to)) =
+                    (job.source_path.as_deref(), job.target_path.as_deref())
+                {
+                    let is_folder = state
+                        .db
+                        .list_known_folders()
+                        .is_ok_and(|folders| folders.iter().any(|f| f == from));
+                    if is_folder {
+                        if let Err(e) = state.db.record_refused_move(from, to) {
+                            tracing::warn!(error = %e, "could not record a failed folder move");
+                        }
+                    }
+                }
+            }
         }
         JobFailure::Retry => {
             let wait_secs = backoff_seconds(attempt);
@@ -13601,6 +14327,1216 @@ mod tests {
                 &job("delete", "Docs"),
                 &PrefixFilter::default()
             ));
+        }
+    }
+
+    /// DBSYNC-111 slice 2: a Finder rename of a folder that holds only `.cloudsc` placeholders
+    /// is a remote `move`, never a recursive delete. State is built through the pipeline: the
+    /// sidecar writer, a scan that registers the folders, then `fs::rename`.
+    #[cfg(not(windows))]
+    mod placeholder_folder_rename {
+        use super::*;
+        use crate::cloudsc::write_cloudsc_placeholder_file;
+        use crate::models::CloudscMeta;
+        use crate::sync_pipeline::process_sync_queue_with;
+        use std::path::Path;
+
+        fn sidecar(dir: &Path, name: &str, remote: &str) {
+            let meta = CloudscMeta {
+                version: 1,
+                tag: "file".to_string(),
+                remote_path_display: remote.to_string(),
+            };
+            write_cloudsc_placeholder_file(&dir.join(format!("{name}.cloudsc")), &meta).unwrap();
+        }
+
+        /// `Old/{a,b}` as sidecars, registered by a scan.
+        fn flat(state: &AppState) {
+            let old = sync_root(state).join("Old");
+            sidecar(&old, "a", "/Old/a");
+            sidecar(&old, "b", "/Old/b");
+            scan_local_changes_only(state).unwrap();
+            assert!(state
+                .db
+                .list_known_folders()
+                .unwrap()
+                .contains(&"Old".to_string()));
+        }
+
+        /// `Old/Sub/{c}`; `Old` holds only `Sub`.
+        fn nested(state: &AppState) {
+            sidecar(&sync_root(state).join("Old/Sub"), "c", "/Old/Sub/c");
+            scan_local_changes_only(state).unwrap();
+        }
+
+        fn rename(state: &AppState) {
+            let root = sync_root(state);
+            std::fs::rename(root.join("Old"), root.join("New")).unwrap();
+        }
+
+        fn only_one_move(state: &AppState) {
+            assert_eq!(
+                move_jobs(state),
+                vec![("Old".to_string(), "New".to_string())]
+            );
+            assert!(delete_jobs(state).is_empty(), "{:?}", delete_jobs(state));
+        }
+
+        fn nothing(state: &AppState) {
+            assert!(move_jobs(state).is_empty(), "{:?}", move_jobs(state));
+            assert!(delete_jobs(state).is_empty(), "{:?}", delete_jobs(state));
+        }
+
+        fn tracked(state: &AppState, f: &str) -> bool {
+            state
+                .db
+                .list_known_folders()
+                .unwrap()
+                .iter()
+                .any(|x| x == f)
+        }
+
+        fn watch(state: &AppState, paths: &[&str]) {
+            let p: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+            process_changed_paths(state, &p).unwrap();
+        }
+
+        #[test]
+        fn watcher_rename_is_one_move_and_no_delete() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            rename(&state);
+            watch(&state, &["Old", "New"]);
+            only_one_move(&state);
+            // The scan that follows (the move is still queued) adds nothing.
+            scan_local_changes_only(&state).unwrap();
+            only_one_move(&state);
+        }
+
+        #[test]
+        fn scan_rename_is_one_move_and_no_delete() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            only_one_move(&state);
+            scan_local_changes_only(&state).unwrap();
+            only_one_move(&state);
+        }
+
+        #[test]
+        fn nested_rename_moves_the_outer_folder_only() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                nested(&state);
+                // Rename the outer folder; the sidecars still name /Old/Sub/c.
+                let root = sync_root(&state);
+                std::fs::rename(root.join("Old"), root.join("New")).unwrap();
+                if via_watcher {
+                    watch(&state, &["Old", "Old/Sub", "New", "New/Sub"]);
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                only_one_move(&state);
+            }
+        }
+
+        #[test]
+        fn delete_without_reappearance_is_deleted_by_the_scan() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            std::fs::remove_dir_all(sync_root(&state).join("Old")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(delete_jobs(&state), vec!["Old".to_string()]);
+            assert!(move_jobs(&state).is_empty());
+        }
+
+        #[test]
+        fn watcher_defers_a_vanished_placeholder_only_folder_to_the_scan() {
+            // The batch carries only Old: no delete, and the row stays for the scan.
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            rename(&state);
+            watch(&state, &["Old"]);
+            nothing(&state);
+            assert!(tracked(&state, "Old"));
+            // The next scan pairs it with New.
+            scan_local_changes_only(&state).unwrap();
+            only_one_move(&state);
+        }
+
+        #[test]
+        fn watcher_deferral_ends_in_a_scan_delete_when_nothing_reappears() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            std::fs::remove_dir_all(sync_root(&state).join("Old")).unwrap();
+            watch(&state, &["Old"]);
+            nothing(&state);
+            assert!(tracked(&state, "Old"));
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(delete_jobs(&state), vec!["Old".to_string()]);
+        }
+
+        #[test]
+        fn an_empty_folder_is_deleted_one_scan_later_not_by_the_watcher() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            std::fs::create_dir_all(sync_root(&state).join("Empty")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            std::fs::remove_dir(sync_root(&state).join("Empty")).unwrap();
+            watch(&state, &["Empty"]);
+            nothing(&state);
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(delete_jobs(&state), vec!["Empty".to_string()]);
+        }
+
+        #[test]
+        fn a_folder_with_tracked_files_keeps_todays_watcher_path() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            std::fs::create_dir_all(root.join("Mixed")).unwrap();
+            std::fs::write(root.join("Mixed/f.txt"), b"hi").unwrap();
+            sidecar(&root.join("Mixed"), "g", "/Mixed/g");
+            let (hash, size, mtime) =
+                crate::path_util::hash_file(&root.join("Mixed/f.txt")).unwrap();
+            state.db.upsert_known_folder("Mixed").unwrap();
+            state
+                .db
+                .upsert_local_file("Mixed/f.txt", &hash, size, mtime)
+                .unwrap();
+            state
+                .db
+                .upsert_remote_file("Mixed/f.txt", &hash, "r1", mtime, Some("id:F"))
+                .unwrap();
+            std::fs::remove_dir_all(root.join("Mixed")).unwrap();
+            watch(&state, &["Mixed"]);
+            let mut d = delete_jobs(&state);
+            d.sort();
+            assert_eq!(d, vec!["Mixed".to_string(), "Mixed/f.txt".to_string()]);
+        }
+
+        #[test]
+        fn an_unrelated_new_folder_does_not_save_a_deleted_one() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            std::fs::remove_dir_all(root.join("Old")).unwrap();
+            sidecar(&root.join("Fresh"), "x", "/Other/x");
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(delete_jobs(&state), vec!["Old".to_string()]);
+            assert!(move_jobs(&state).is_empty());
+        }
+
+        #[test]
+        fn a_destination_with_tracked_files_is_a_folder_in_its_own_right() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            rename(&state);
+            let root = sync_root(&state);
+            std::fs::write(root.join("New/mine.txt"), b"mine").unwrap();
+            let (hash, size, mtime) =
+                crate::path_util::hash_file(&root.join("New/mine.txt")).unwrap();
+            state
+                .db
+                .upsert_local_file("New/mine.txt", &hash, size, mtime)
+                .unwrap();
+            watch(&state, &["Old", "New"]);
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(delete_jobs(&state).is_empty());
+            assert!(!tracked(&state, "Old"));
+        }
+
+        #[test]
+        fn a_copy_is_neither_moved_nor_deleted() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            std::fs::create_dir_all(root.join("Old copy")).unwrap();
+            for n in ["a", "b"] {
+                std::fs::copy(
+                    root.join(format!("Old/{n}.cloudsc")),
+                    root.join(format!("Old copy/{n}.cloudsc")),
+                )
+                .unwrap();
+            }
+            watch(&state, &["Old", "Old copy"]);
+            scan_local_changes_only(&state).unwrap();
+            nothing(&state);
+        }
+
+        #[test]
+        fn disagreeing_sidecars_untrack_and_never_delete() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                rename(&state);
+                sidecar(&sync_root(&state).join("New"), "b", "/Other/x");
+                if via_watcher {
+                    watch(&state, &["Old", "New"]);
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                nothing(&state);
+                assert!(!tracked(&state, "Old"));
+                scan_local_changes_only(&state).unwrap();
+                nothing(&state);
+            }
+        }
+
+        #[test]
+        fn an_occupied_destination_untracks_the_subtree_and_never_deletes() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                nested(&state);
+                let root = sync_root(&state);
+                std::fs::rename(root.join("Old"), root.join("New")).unwrap();
+                state
+                    .db
+                    .upsert_remote_file("New/z", "h", "r", 1, Some("id:Z"))
+                    .unwrap();
+                if via_watcher {
+                    watch(&state, &["Old", "Old/Sub", "New"]);
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                nothing(&state);
+                assert!(!tracked(&state, "Old") && !tracked(&state, "Old/Sub"));
+            }
+        }
+
+        #[test]
+        fn a_move_dropbox_refused_untracks_and_never_deletes() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                rename(&state);
+                scan_local_changes_only(&state).unwrap();
+                only_one_move(&state);
+                crate::dropbox_transfer::rederive_refused_move(&state, "Old", "New", true).unwrap();
+                let id = state
+                    .db
+                    .list_recent_jobs(50)
+                    .unwrap()
+                    .into_iter()
+                    .find(|j| j.job_type == "move")
+                    .unwrap()
+                    .id;
+                state.db.mark_job_completed(id).unwrap();
+                if via_watcher {
+                    watch(&state, &["Old", "New"]);
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+                assert_eq!(move_jobs(&state).len(), 1, "no second proposal");
+                assert!(!tracked(&state, "Old"));
+            }
+        }
+
+        #[test]
+        fn refusal_alone_blocks_the_delete_without_a_prior_pairing() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            crate::dropbox_transfer::rederive_refused_move(&state, "Old", "New", true).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(delete_jobs(&state).is_empty());
+        }
+
+        #[test]
+        fn queued_work_postpones_then_the_scan_pairs_once_it_drains() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                state
+                    .db
+                    .enqueue_job("upload", Some("Old/a"), Some("Old/a"))
+                    .unwrap();
+                rename(&state);
+                if via_watcher {
+                    watch(&state, &["Old", "New"]);
+                } else {
+                    scan_local_changes_only(&state).unwrap();
+                }
+                nothing(&state);
+                assert!(tracked(&state, "Old"), "left for the next pass");
+                assert!(!tracked(&state, "New"), "destination stays new");
+                let id = state.db.list_recent_jobs(50).unwrap()[0].id;
+                state.db.mark_job_completed(id).unwrap();
+                scan_local_changes_only(&state).unwrap();
+                only_one_move(&state);
+            }
+        }
+
+        /// The copy's sidecars still name `/Old`, so deleting `/Old` would break them: the
+        /// original's Dropbox folder is moved to the copy instead, never deleted.
+        #[test]
+        fn a_copy_then_the_original_deleted_moves_the_original_to_the_copy() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            std::fs::create_dir_all(root.join("Copy")).unwrap();
+            std::fs::copy(root.join("Old/a.cloudsc"), root.join("Copy/a.cloudsc")).unwrap();
+            scan_local_changes_only(&state).unwrap(); // Copy is registered
+            std::fs::remove_dir_all(root.join("Old")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Old".to_string(), "Copy".to_string())]
+            );
+            assert!(delete_jobs(&state).is_empty());
+        }
+
+        /// A sidecar nobody can pair (here: loose in the sync root) that still names the
+        /// vanished folder stops its deletion.
+        #[test]
+        fn a_sidecar_that_cannot_be_paired_still_stops_the_delete() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            sidecar(&root, "a", "/Old/a");
+            std::fs::remove_dir_all(root.join("Old")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            nothing(&state);
+            assert!(!tracked(&state, "Old"));
+        }
+
+        /// Two candidates: the registered long-standing copy and the new folder. The new one wins.
+        #[test]
+        fn a_new_destination_is_preferred_over_a_registered_copy() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            std::fs::create_dir_all(root.join("Aaa")).unwrap();
+            std::fs::copy(root.join("Old/a.cloudsc"), root.join("Aaa/a.cloudsc")).unwrap();
+            std::fs::copy(root.join("Old/b.cloudsc"), root.join("Aaa/b.cloudsc")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Old".to_string(), "New".to_string())]
+            );
+            assert!(delete_jobs(&state).is_empty());
+        }
+
+        #[test]
+        fn sidecars_are_rewritten_after_a_confirmed_move() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            sidecar(&root.join("Old/Sub"), "c", "/Old/Sub/c");
+            sidecar(&root.join("Old"), "a", "/Old/a");
+            sidecar(&root.join("Old"), "x", "/Other/x");
+            scan_local_changes_only(&state).unwrap();
+            rename(&state);
+            crate::dropbox_transfer::apply_confirmed_move(&state, "Old", "New").unwrap();
+            let read = |p: &str| {
+                crate::cloudsc::read_cloudsc_placeholder_file(&root.join(p))
+                    .unwrap()
+                    .remote_path_display
+            };
+            assert_eq!(read("New/a.cloudsc"), "/New/a");
+            assert_eq!(read("New/Sub/c.cloudsc"), "/New/Sub/c");
+            assert_eq!(read("New/x.cloudsc"), "/Other/x");
+        }
+
+        /// Drain every due `move` through the real dispatch with a fake Dropbox that lands the
+        /// move (the network-free index rewrite). Returns the moves that reached "Dropbox".
+        fn drain(state: &AppState) -> Vec<(String, String)> {
+            let landed = std::cell::RefCell::new(Vec::new());
+            for _ in 0..8 {
+                let more = process_sync_queue_with(
+                    state,
+                    |_| Ok(None),
+                    |from, to| {
+                        landed.borrow_mut().push((from.to_string(), to.to_string()));
+                        crate::dropbox_transfer::apply_confirmed_move(state, from, to)
+                    },
+                    // An upload is left queued (fails into retry_wait): these tests only drain moves.
+                    |rel, _| {
+                        Err(crate::error::AppError::Sync(format!(
+                            "test: upload of {rel} not run"
+                        )))
+                    },
+                )
+                .unwrap();
+                if !more {
+                    break;
+                }
+            }
+            landed.into_inner()
+        }
+
+        fn pass(state: &AppState, via_watcher: bool, paths: &[&str]) {
+            if via_watcher {
+                watch(state, paths);
+            } else {
+                scan_local_changes_only(state).unwrap();
+            }
+        }
+
+        fn queued_moves(state: &AppState) -> usize {
+            state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .filter(|j| j.job_type == "move" && j.status != "done")
+                .count()
+        }
+
+        #[test]
+        fn renaming_back_before_the_move_lands_deletes_nothing() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                let root = sync_root(&state);
+                rename(&state);
+                pass(&state, via_watcher, &["Old", "New"]);
+                assert_eq!(queued_moves(&state), 1);
+                std::fs::rename(root.join("New"), root.join("Old")).unwrap();
+                pass(&state, via_watcher, &["Old", "New"]);
+                let landed = drain(&state);
+                assert!(
+                    landed.is_empty(),
+                    "a stale move must not reach Dropbox: {landed:?}"
+                );
+                assert_eq!(queued_moves(&state), 0, "settled, not left retrying");
+                scan_local_changes_only(&state).unwrap();
+                scan_local_changes_only(&state).unwrap();
+                assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+                assert!(tracked(&state, "Old"));
+                assert!(!tracked(&state, "New"));
+                assert!(root.join("Old/a.cloudsc").exists());
+            }
+        }
+
+        #[test]
+        fn renaming_again_before_the_move_lands_ends_in_one_move_to_the_last_name() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                let root = sync_root(&state);
+                rename(&state);
+                pass(&state, via_watcher, &["Old", "New"]);
+                std::fs::rename(root.join("New"), root.join("Newer")).unwrap();
+                pass(&state, via_watcher, &["New", "Newer"]);
+                let landed = drain(&state);
+                assert!(
+                    landed.is_empty(),
+                    "the stale move must not land: {landed:?}"
+                );
+                scan_local_changes_only(&state).unwrap();
+                assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+                let landed = drain(&state);
+                assert_eq!(landed, vec![("Old".to_string(), "Newer".to_string())]);
+                scan_local_changes_only(&state).unwrap();
+                assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            }
+        }
+
+        #[test]
+        fn renamed_then_deleted_before_the_move_lands_deletes_only_the_original() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                let root = sync_root(&state);
+                rename(&state);
+                pass(&state, via_watcher, &["Old", "New"]);
+                std::fs::remove_dir_all(root.join("New")).unwrap();
+                pass(&state, via_watcher, &["New"]);
+                assert!(drain(&state).is_empty());
+                scan_local_changes_only(&state).unwrap();
+                assert_eq!(delete_jobs(&state), vec!["Old".to_string()]);
+            }
+        }
+
+        #[test]
+        fn batches_split_across_the_rename_still_pair() {
+            for new_first in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                flat(&state);
+                rename(&state);
+                if new_first {
+                    watch(&state, &["New"]);
+                    watch(&state, &["Old"]);
+                } else {
+                    watch(&state, &["Old"]);
+                    watch(&state, &["New"]);
+                }
+                nothing(&state);
+                assert!(
+                    !tracked(&state, "New"),
+                    "the watcher leaves a placeholder-only folder to the scan"
+                );
+                scan_local_changes_only(&state).unwrap();
+                only_one_move(&state);
+            }
+        }
+
+        #[test]
+        fn the_sidecar_walk_is_done_once_per_scan() {
+            // Two vanished folders, nothing points into either: the whole root is read once.
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            for n in ["E1", "E2", "E3"] {
+                std::fs::create_dir_all(root.join(n)).unwrap();
+            }
+            scan_local_changes_only(&state).unwrap();
+            for n in ["E1", "E2", "E3"] {
+                std::fs::remove_dir(root.join(n)).unwrap();
+            }
+            crate::cloudsc::SIDECAR_ROOT_WALKS.with(|c| c.set(0));
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(crate::cloudsc::SIDECAR_ROOT_WALKS.with(|c| c.get()), 1);
+            let mut d = delete_jobs(&state);
+            d.sort();
+            assert_eq!(d, vec!["E1", "E2", "E3"]);
+        }
+
+        // ---- Mixed folders (tracked files + placeholders), DBSYNC-111 ----
+
+        /// `Old/f.txt` (tracked and uploaded) beside the placeholder `Old/a` (cloud only).
+        fn mixed(state: &AppState) {
+            let root = sync_root(state);
+            std::fs::create_dir_all(root.join("Old")).unwrap();
+            std::fs::write(root.join("Old/f.txt"), b"hello").unwrap();
+            sidecar(&root.join("Old"), "a", "/Old/a");
+            let (hash, size, mtime) = crate::path_util::hash_file(&root.join("Old/f.txt")).unwrap();
+            state.db.upsert_known_folder("Old").unwrap();
+            state
+                .db
+                .upsert_local_file("Old/f.txt", &hash, size, mtime)
+                .unwrap();
+            state
+                .db
+                .upsert_remote_file("Old/f.txt", &hash, "r1", mtime, Some("id:F"))
+                .unwrap();
+            scan_local_changes_only(state).unwrap();
+            nothing(state);
+        }
+
+        fn recursive_old_delete(state: &AppState) -> bool {
+            delete_jobs(state).iter().any(|d| d == "Old")
+        }
+
+        /// Upload targets that are still going to run (a settled job is history).
+        fn live_uploads(state: &AppState) -> Vec<String> {
+            state
+                .db
+                .list_recent_jobs(500)
+                .unwrap()
+                .into_iter()
+                .filter(|j| j.job_type == "upload")
+                .filter(|j| matches!(j.status.as_str(), "queued" | "retry_wait" | "running"))
+                .filter_map(|j| j.target_path)
+                .collect()
+        }
+
+        /// After the pair: one move to `to`, nothing deleted, no upload left for the files that
+        /// travel; landing it keeps the placeholder pointing at the new name.
+        fn lands_as_one_move(state: &AppState, to: &str) {
+            assert_eq!(
+                move_jobs(state)
+                    .into_iter()
+                    .filter(|(_, t)| t == to)
+                    .collect::<Vec<_>>(),
+                vec![("Old".to_string(), to.to_string())]
+            );
+            assert!(delete_jobs(state).is_empty(), "{:?}", delete_jobs(state));
+            assert_eq!(
+                drain(state),
+                vec![("Old".to_string(), to.to_string())],
+                "the move reaches Dropbox"
+            );
+            let root = sync_root(state);
+            let meta = crate::cloudsc::read_cloudsc_placeholder_file(
+                &root.join(format!("{to}/a.cloudsc")),
+            )
+            .unwrap();
+            assert_eq!(meta.remote_path_display, format!("/{to}/a"));
+        }
+
+        fn no_conflicted_copy(state: &AppState) {
+            assert!(
+                !live_uploads(state).iter().any(|t| t.contains("conflicted")),
+                "{:?}",
+                live_uploads(state)
+            );
+        }
+
+        #[test]
+        fn mixed_folder_renamed_twice_before_the_move_lands_is_one_move_to_the_last_name() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            watch(&state, &["Old", "New"]);
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Old".to_string(), "New".to_string())]
+            );
+            std::fs::rename(root.join("New"), root.join("Newer")).unwrap();
+            watch(&state, &["New", "Newer"]);
+            assert!(drain(&state).is_empty(), "the stale move must not land");
+            scan_local_changes_only(&state).unwrap();
+            lands_as_one_move(&state, "Newer");
+            scan_local_changes_only(&state).unwrap();
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            assert!(
+                live_uploads(&state).is_empty(),
+                "{:?}",
+                live_uploads(&state)
+            );
+            no_conflicted_copy(&state);
+        }
+
+        #[test]
+        fn a_scan_only_rename_of_a_mixed_folder_is_one_move_then_one_more_for_a_second_rename() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(
+                move_jobs(&state),
+                vec![("Old".to_string(), "New".to_string())]
+            );
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            assert!(
+                live_uploads(&state).is_empty(),
+                "{:?}",
+                live_uploads(&state)
+            );
+            // Renamed again before it lands.
+            std::fs::rename(root.join("New"), root.join("Newer")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(drain(&state).is_empty());
+            scan_local_changes_only(&state).unwrap();
+            lands_as_one_move(&state, "Newer");
+            scan_local_changes_only(&state).unwrap();
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            no_conflicted_copy(&state);
+        }
+
+        #[test]
+        fn a_scan_only_single_rename_of_a_mixed_folder_lands_cleanly() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            lands_as_one_move(&state, "New");
+            scan_local_changes_only(&state).unwrap();
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            assert!(
+                live_uploads(&state).is_empty(),
+                "{:?}",
+                live_uploads(&state)
+            );
+        }
+
+        #[test]
+        fn an_edit_between_the_two_renames_is_uploaded_at_the_new_name_without_a_conflict() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            watch(&state, &["Old", "New"]);
+            std::fs::rename(root.join("New"), root.join("Newer")).unwrap();
+            std::fs::write(root.join("Newer/f.txt"), b"edited meanwhile").unwrap();
+            watch(&state, &["New", "Newer"]);
+            assert!(drain(&state).is_empty());
+            scan_local_changes_only(&state).unwrap();
+            lands_as_one_move(&state, "Newer");
+            // The moved row still holds the old bytes: the edit is an ordinary modified-file
+            // upload at the new name.
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(live_uploads(&state), vec!["Newer/f.txt".to_string()]);
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            no_conflicted_copy(&state);
+        }
+
+        #[test]
+        fn a_mixed_folder_missing_one_of_its_files_is_not_guessed_at() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            let g = root.join("Old/g.txt");
+            std::fs::write(&g, b"second").unwrap();
+            let (hash, size, mtime) = crate::path_util::hash_file(&g).unwrap();
+            state
+                .db
+                .upsert_local_file("Old/g.txt", &hash, size, mtime)
+                .unwrap();
+            state
+                .db
+                .upsert_remote_file("Old/g.txt", &hash, "r2", mtime, Some("id:G"))
+                .unwrap();
+            rename(&state);
+            std::fs::remove_file(root.join("New/g.txt")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+        }
+
+        #[test]
+        fn a_mixed_folder_whose_sidecars_disagree_is_not_guessed_at() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            sidecar(&root.join("Old"), "b", "/Old/b");
+            rename(&state);
+            sidecar(&root.join("New"), "b", "/Other/x");
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+        }
+
+        #[test]
+        fn a_mixed_folder_into_a_destination_dropbox_holds_is_not_moved() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            rename(&state);
+            state
+                .db
+                .upsert_remote_file("New/elsewhere.txt", "h", "r", 1, None)
+                .unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+        }
+
+        #[test]
+        fn a_mixed_folder_into_a_destination_with_other_tracked_files_is_not_moved() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            rename(&state);
+            let root = sync_root(&state);
+            std::fs::write(root.join("New/other.txt"), b"x").unwrap();
+            let (h, size, mtime) =
+                crate::path_util::hash_file(&root.join("New/other.txt")).unwrap();
+            state
+                .db
+                .upsert_local_file("New/other.txt", &h, size, mtime)
+                .unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+        }
+
+        #[test]
+        fn a_mixed_folders_queued_work_postpones_the_pair() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            rename(&state);
+            state
+                .db
+                .enqueue_job("upload", Some("Old/f.txt"), Some("Old/f.txt"))
+                .unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty());
+            assert!(
+                delete_jobs(&state).is_empty(),
+                "neither move nor delete this pass: {:?}",
+                delete_jobs(&state)
+            );
+        }
+
+        #[test]
+        fn a_mixed_folders_destination_with_queued_work_postpones_the_pair() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            rename(&state);
+            state
+                .db
+                .enqueue_job("upload", Some("New/z.txt"), Some("New/z.txt"))
+                .unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+        }
+
+        #[test]
+        fn a_mixed_folder_renamed_back_before_the_move_lands_deletes_nothing() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            watch(&state, &["Old", "New"]);
+            std::fs::rename(root.join("New"), root.join("Old")).unwrap();
+            watch(&state, &["Old", "New"]);
+            assert!(drain(&state).is_empty());
+            scan_local_changes_only(&state).unwrap();
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            assert!(tracked(&state, "Old"));
+        }
+
+        #[test]
+        fn a_single_rename_of_a_mixed_folder_is_still_one_move_and_the_sidecar_follows() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            watch(&state, &["Old", "New"]);
+            only_one_move(&state);
+            assert_eq!(drain(&state), vec![("Old".to_string(), "New".to_string())]);
+            scan_local_changes_only(&state).unwrap();
+            assert!(delete_jobs(&state).is_empty(), "{:?}", delete_jobs(&state));
+            let meta =
+                crate::cloudsc::read_cloudsc_placeholder_file(&root.join("New/a.cloudsc")).unwrap();
+            assert_eq!(meta.remote_path_display, "/New/a");
+        }
+
+        #[test]
+        fn a_genuinely_deleted_mixed_folder_is_still_deleted() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                mixed(&state);
+                std::fs::remove_dir_all(sync_root(&state).join("Old")).unwrap();
+                pass(&state, via_watcher, &["Old"]);
+                let mut d = delete_jobs(&state);
+                d.sort();
+                assert_eq!(d, vec!["Old".to_string(), "Old/f.txt".to_string()]);
+            }
+        }
+
+        #[test]
+        fn postponing_does_not_unregister_a_long_lived_destination() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            std::fs::create_dir_all(root.join("Copy/Deep")).unwrap();
+            std::fs::copy(root.join("Old/a.cloudsc"), root.join("Copy/a.cloudsc")).unwrap();
+            std::fs::write(root.join("Copy/Deep/real.txt"), b"x").unwrap();
+            scan_local_changes_only(&state).unwrap(); // registers Copy, queues the upload
+            assert!(live_uploads(&state).contains(&"Copy/Deep/real.txt".to_string()));
+            std::fs::remove_dir_all(root.join("Old")).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            nothing(&state);
+            assert!(tracked(&state, "Copy") && tracked(&state, "Copy/Deep"));
+            assert!(tracked(&state, "Old"), "left for the next pass");
+        }
+
+        // ---- Round 3 ----
+
+        /// `Old/a` (placeholder) and `Old/n.txt`, a new file whose first upload failed for good
+        /// while someone else put THEIR `n.txt` on Dropbox: built through the scan and the
+        /// sweep's remote-row writer.
+        fn mixed_with_a_never_landed_file(state: &AppState) {
+            let root = sync_root(state);
+            std::fs::create_dir_all(root.join("Old")).unwrap();
+            sidecar(&root.join("Old"), "a", "/Old/a");
+            std::fs::write(root.join("Old/n.txt"), b"ours").unwrap();
+            scan_local_changes_only(state).unwrap(); // row, marker and upload job for n.txt
+            assert!(state.db.is_upload_unconfirmed("Old/n.txt").unwrap());
+            let id = state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.job_type == "upload")
+                .unwrap()
+                .id;
+            state.db.mark_job_failed(id, 5, Some("boom")).unwrap();
+            // A sweep records the version somebody else uploaded.
+            state
+                .db
+                .upsert_remote_file("Old/n.txt", "theirs", "r9", 1, Some("id:T"))
+                .unwrap();
+        }
+
+        #[test]
+        fn a_folder_with_a_never_landed_file_is_not_moved_over_someone_elses_version() {
+            for via_watcher in [true, false] {
+                let tmp = tempdir().unwrap();
+                let state = build_state(tmp.path());
+                mixed_with_a_never_landed_file(&state);
+                rename(&state);
+                pass(&state, via_watcher, &["Old", "New"]);
+                assert!(drain(&state).is_empty(), "no move may reach Dropbox");
+                scan_local_changes_only(&state).unwrap();
+                assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+                assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+                // Their version stays where it is; ours is an ordinary new file, guard armed.
+                assert_eq!(
+                    state
+                        .db
+                        .get_remote_file("Old/n.txt")
+                        .unwrap()
+                        .unwrap()
+                        .content_hash,
+                    "theirs"
+                );
+                assert!(state.db.get_remote_file("New/n.txt").unwrap().is_none());
+                assert!(live_uploads(&state).contains(&"New/n.txt".to_string()));
+                assert!(state.db.is_upload_unconfirmed("New/n.txt").unwrap());
+            }
+        }
+
+        /// A pair whose move ends `failed` (quota, persistent 5xx) must not be proposed again
+        /// on every scan: each pass settled the destination's fresh upload and a local-only
+        /// edit never reached Dropbox.
+        #[test]
+        fn a_pair_whose_move_failed_for_good_is_not_re_paired_forever() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(move_jobs(&state).len(), 1);
+            // Its last attempt fails.
+            let id = state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.job_type == "move")
+                .unwrap()
+                .id;
+            state
+                .db
+                .mark_job_retry_wait(id, 4, "2000-01-01T00:00:00+00:00", Some("x"))
+                .unwrap();
+            process_sync_queue_with(
+                &state,
+                |_| Ok(None),
+                |_, _| {
+                    Err(crate::error::AppError::Dropbox {
+                        status: 507,
+                        message: "insufficient_quota".to_string(),
+                    })
+                },
+                |rel, _| panic!("unexpected upload of {rel}"),
+            )
+            .unwrap();
+            assert_eq!(
+                state
+                    .db
+                    .list_recent_jobs(50)
+                    .unwrap()
+                    .into_iter()
+                    .find(|j| j.id == id)
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+            // A local-only edit under the destination, then more scans.
+            std::fs::write(root.join("New/f.txt"), b"edited after the failure").unwrap();
+            scan_local_changes_only(&state).unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert_eq!(
+                move_jobs(&state).len(),
+                1,
+                "not proposed again: {:?}",
+                move_jobs(&state)
+            );
+            assert!(
+                live_uploads(&state).contains(&"New/f.txt".to_string()),
+                "the edit is not settled by a new pair: {:?}",
+                live_uploads(&state)
+            );
+            assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+        }
+
+        /// "Retry failed jobs" re-queues the failed move; if it then lands, the sidecars follow
+        /// even though the failure had untracked the source folder.
+        #[test]
+        fn a_retried_failed_folder_move_still_rewrites_the_sidecars_when_it_lands() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            let root = sync_root(&state);
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            // Old is no longer tracked (as after a failed pair that was set aside).
+            crate::cloudsc_ops::untrack_folders_subtree(&state, "Old").unwrap();
+            crate::dropbox_transfer::apply_confirmed_move(&state, "Old", "New").unwrap();
+            let meta =
+                crate::cloudsc::read_cloudsc_placeholder_file(&root.join("New/a.cloudsc")).unwrap();
+            assert_eq!(meta.remote_path_display, "/New/a");
+        }
+
+        /// A download queued under the old name travels with a landing folder move.
+        #[test]
+        fn a_queued_download_under_the_old_name_follows_a_landing_folder_move() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            state
+                .db
+                .enqueue_job("download", Some("Old/a"), Some("Old/a"))
+                .unwrap();
+            crate::dropbox_transfer::apply_confirmed_move(&state, "Old", "New").unwrap();
+            let jobs: Vec<_> = state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .filter(|j| j.job_type == "download")
+                .collect();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].target_path.as_deref(), Some("New/a"));
+            assert_eq!(jobs[0].source_path.as_deref(), Some("New/a"));
+        }
+
+        #[test]
+        fn a_marker_with_identical_bytes_on_dropbox_still_keeps_the_folder_out_of_a_pair() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed_with_a_never_landed_file(&state);
+            let ours = state.db.get_local_file("Old/n.txt").unwrap().unwrap().hash;
+            state
+                .db
+                .upsert_remote_file("Old/n.txt", &ours, "r9", 1, None)
+                .unwrap();
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+        }
+
+        #[test]
+        fn a_local_row_ahead_of_dropbox_keeps_the_folder_out_of_a_pair() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            mixed(&state);
+            let root = sync_root(&state);
+            // An edit whose upload then failed for good: the row is ahead of Dropbox, no marker.
+            std::fs::write(root.join("Old/f.txt"), b"edited, never uploaded").unwrap();
+            scan_local_changes_only(&state).unwrap();
+            let id = state
+                .db
+                .list_recent_jobs(50)
+                .unwrap()
+                .into_iter()
+                .find(|j| j.job_type == "upload")
+                .unwrap()
+                .id;
+            state.db.mark_job_failed(id, 5, Some("boom")).unwrap();
+            rename(&state);
+            scan_local_changes_only(&state).unwrap();
+            assert!(move_jobs(&state).is_empty(), "{:?}", move_jobs(&state));
+            assert!(!recursive_old_delete(&state), "{:?}", delete_jobs(&state));
+        }
+
+        // ---- Round 4 ----
+
+        /// The drain helpers inject only `move` and `upload`; a queued `delete` reaches the
+        /// real `delete_remote_file_internal`. In tests that must fail loudly before any
+        /// keychain read or request (the guard in `get_access_token` and `SecureStore`).
+        #[test]
+        #[should_panic(expected = "tests must not reach get_access_token")]
+        fn a_drain_with_a_queued_delete_fails_loudly_instead_of_reaching_the_keychain() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            state
+                .db
+                .enqueue_delete_job("Elsewhere/gone.txt", None)
+                .unwrap();
+            let _ = process_sync_queue_with(
+                &state,
+                |_| Ok(None),
+                |from, to| panic!("unexpected move {from} -> {to}"),
+                |rel, _| panic!("unexpected upload of {rel}"),
+            );
+        }
+
+        /// `apply_confirmed_move` of a FILE onto a path that is a directory at landing must stay
+        /// a file move: the directory fallback is for sources that are not file rows.
+        #[test]
+        fn a_file_move_landing_on_a_directory_stays_a_file_move() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            let root = sync_root(&state);
+            std::fs::create_dir_all(root.join("D")).unwrap();
+            state.db.upsert_local_file("a.txt", "h", 1, 1).unwrap();
+            state
+                .db
+                .upsert_remote_file("a.txt", "h", "r", 1, None)
+                .unwrap();
+            // A sidecar inside D that names a path under the SOURCE NAME as if it were a folder.
+            sidecar(&root.join("D"), "x", "/a.txt/x");
+            crate::dropbox_transfer::apply_confirmed_move(&state, "a.txt", "D").unwrap();
+            let meta =
+                crate::cloudsc::read_cloudsc_placeholder_file(&root.join("D/x.cloudsc")).unwrap();
+            assert_eq!(
+                meta.remote_path_display, "/a.txt/x",
+                "a file move rewrites no sidecars"
+            );
+            assert!(
+                state.db.get_local_file("D").unwrap().is_some(),
+                "the file row moved to D"
+            );
+            assert!(state.db.get_local_file("a.txt").unwrap().is_none());
+            assert!(state
+                .db
+                .list_local_files()
+                .unwrap()
+                .iter()
+                .all(|r| r.relative_path != "D/"));
+        }
+
+        /// A refusal recorded for a failed folder move that later lands via "Retry failed
+        /// jobs" must not outlive it, or a later NEW folder called `Old` is never paired.
+        #[test]
+        fn the_refusal_of_a_failed_move_goes_when_the_retry_lands() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            flat(&state);
+            rename(&state);
+            state.db.record_refused_move("Old", "New").unwrap();
+            crate::cloudsc_ops::untrack_folders_subtree(&state, "Old").unwrap();
+            crate::dropbox_transfer::apply_confirmed_move(&state, "Old", "New").unwrap();
+            assert!(state.db.list_refused_moves().unwrap().is_empty());
+        }
+
+        /// The scan prunes stale refusals like the watcher does.
+        #[test]
+        fn the_scan_prunes_stale_refusals() {
+            let tmp = tempdir().unwrap();
+            let state = build_state(tmp.path());
+            state.db.record_refused_move("Gone", "Else").unwrap();
+            scan_local_changes_only(&state).unwrap();
+            assert!(state.db.list_refused_moves().unwrap().is_empty());
         }
     }
 }

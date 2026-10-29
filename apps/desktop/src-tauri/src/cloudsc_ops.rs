@@ -87,16 +87,13 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
             let body = response
                 .text()
                 .unwrap_or_else(|_| "<unreadable body>".to_string());
-            // A local directory with no Dropbox counterpart (e.g. a local-only
-            // folder pending upload) is not an error for this indexer — it simply
-            // has nothing to placeholder. Don't spam the log or fail the sweep.
-            if body.contains("path/not_found") {
-                return Ok(0);
-            }
-            return Err(AppError::Dropbox {
-                status: status.as_u16(),
-                message: format!("list_folder for {remote_folder_path_display}: {body}"),
-            });
+            return handle_list_folder_failure(
+                state,
+                remote_folder_path_display,
+                local_dir,
+                status.as_u16(),
+                &body,
+            );
         }
         response
             .json()
@@ -157,6 +154,185 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
 
     emit_placeholder_changed(&names.created_names, &removed_names);
     Ok(created)
+}
+
+/// What the sweep does when `list_folder` answers non-2xx (DBSYNC-111). Network-free so it can
+/// be driven directly.
+///
+/// - Any body containing `path/not_found` returns `Ok(0)`: a local directory with no Dropbox
+///   counterpart (e.g. a local-only folder pending upload) has nothing to placeholder, and the
+///   sweep must neither fail nor spam the log.
+/// - On non-Windows, a REAL not-found (see [`is_list_folder_not_found`]) additionally removes
+///   the folder's now-orphaned `.cloudsc` placeholders; see [`prune_gone_folder_placeholders`].
+/// - Anything else is an error and removes nothing.
+fn handle_list_folder_failure(
+    state: &AppState,
+    remote_folder_path_display: &str,
+    local_dir: &Path,
+    status: u16,
+    body: &str,
+) -> AppResult<usize> {
+    if body.contains("path/not_found") {
+        // The real not-found body has never been captured; log it once per folder per run so
+        // the anchor can be checked against reality (DBSYNC-111 slice 3).
+        if state.db.first_time(&format!(
+            "list_folder_not_found:{remote_folder_path_display}"
+        )) {
+            tracing::info!(
+                folder = %remote_folder_path_display,
+                status,
+                body = %body,
+                "list_folder reported path/not_found"
+            );
+        }
+        #[cfg(not(windows))]
+        if is_list_folder_not_found(status, body) {
+            if let Err(e) =
+                prune_gone_folder_placeholders(state, remote_folder_path_display, local_dir)
+            {
+                tracing::warn!(
+                    folder = %remote_folder_path_display,
+                    error = %e,
+                    "could not remove placeholders of a folder Dropbox no longer has"
+                );
+            }
+        }
+        return Ok(0);
+    }
+    Err(AppError::Dropbox {
+        status,
+        message: format!("list_folder for {remote_folder_path_display}: {body}"),
+    })
+}
+
+/// True only for a genuine `list_folder` not-found: HTTP 409 AND the body's `error_summary`
+/// field starts with `path/not_found`. Anchored on the field, so the text appearing in some
+/// other field (e.g. `user_message`) or a different error (`path/malformed_path`,
+/// `path_lookup/not_found`) does not count.
+#[cfg(not(windows))]
+fn is_list_folder_not_found(status: u16, body: &str) -> bool {
+    status == 409 && body.contains("\"error_summary\":\"path/not_found")
+}
+
+/// The remote folder is confirmed gone: remove the `.cloudsc` placeholders that pointed into
+/// it, then the directories that leaves empty (DBSYNC-111). No Dropbox call, no job.
+///
+/// Three gates, all of which must pass for anything to be removed:
+/// 3. no active job covers the folder or names a path beneath it (a Finder rename or a first
+///    upload may be in flight; the index and disk disagree until it lands);
+/// 1. a sidecar is removed only if its metadata names a direct child of this remote folder
+///    (folded); a copied/renamed folder's sidecars point elsewhere and stay, and an unreadable
+///    sidecar stays;
+/// 2. a directory is removed only if a sidecar (or a nested directory) was removed from it and
+///    it is then empty (`.DS_Store` aside). Its `known_folders` subtree is untracked FIRST, then
+///    `fs::remove_dir` (never `remove_dir_all`) runs, deepest first. A folder left empty by a
+///    hydrated file going away is deliberately NOT cleaned.
+///
+/// The driver's WalkDir skips folders removed here when it later tries to read them
+/// (`filter_map(|e| e.ok())`).
+///
+/// Returns the removed placeholder names.
+#[cfg(not(windows))]
+fn prune_gone_folder_placeholders(
+    state: &AppState,
+    remote_folder_path_display: &str,
+    local_dir: &Path,
+) -> AppResult<Vec<String>> {
+    let sync_folder = state
+        .db
+        .get_sync_folder()?
+        .ok_or_else(|| AppError::Sync("sync folder not configured".to_string()))?;
+    let sync_folder = PathBuf::from(sync_folder);
+    let key = key_from_disk(&sync_folder, local_dir)?;
+    if key.is_empty() {
+        return Ok(Vec::new()); // never touch the sync root
+    }
+    // Gate 3, read once.
+    let active = state.db.active_job_paths()?;
+    if crate::sync_pipeline::folder_busy_with_active_job(&key, &active) {
+        return Ok(Vec::new());
+    }
+    let mut removed = Vec::new();
+    prune_gone_dir(
+        state,
+        &sync_folder,
+        local_dir,
+        remote_folder_path_display,
+        &mut removed,
+    );
+    emit_placeholder_changed(&[], &removed);
+    Ok(removed)
+}
+
+/// One directory of [`prune_gone_folder_placeholders`]. Returns true if the directory itself
+/// was removed.
+#[cfg(not(windows))]
+fn prune_gone_dir(
+    state: &AppState,
+    sync_folder: &Path,
+    dir: &Path,
+    remote_dir: &str,
+    removed: &mut Vec<String>,
+) -> bool {
+    let Ok(read) = fs::read_dir(dir) else {
+        return false;
+    };
+    let entries: Vec<_> = read.filter_map(Result::ok).collect();
+    let mut removed_here = false;
+    // Nested real directories first, so they are emptied (and gone) before their parent is judged.
+    for entry in &entries {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let sub_remote = format!("{}/{name}", remote_dir.trim_end_matches('/'));
+            if prune_gone_dir(state, sync_folder, &entry.path(), &sub_remote, removed) {
+                removed_here = true;
+            }
+        }
+    }
+    // Gate 1.
+    let folded_dir = fold(remote_dir);
+    for entry in &entries {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(target) = name.strip_suffix(".cloudsc") else {
+            continue;
+        };
+        let Ok(meta) = read_cloudsc_placeholder_file(&entry.path()) else {
+            continue; // unreadable: keep
+        };
+        let parent = meta
+            .remote_path_display
+            .rsplit_once('/')
+            .map_or("", |(p, _)| p);
+        if fold(parent) == folded_dir && fs::remove_file(entry.path()).is_ok() {
+            removed.push(target.to_string());
+            removed_here = true;
+        }
+    }
+    if !removed_here {
+        return false; // gate 2: nothing of ours was removed here, so this is not ours to remove
+    }
+    // Gate 2: empty (junk aside) after our removals.
+    let only_junk = fs::read_dir(dir).is_ok_and(|r| {
+        r.filter_map(Result::ok)
+            .all(|e| e.file_name() == ".DS_Store")
+    });
+    if !only_junk {
+        return false;
+    }
+    // Untrack BEFORE removing: if the directory went first, a scan in between would see a
+    // tracked folder vanish and send a recursive remote delete. (Comment-enforced; not
+    // mutation-testable, both orders end in the same state when the removal succeeds.)
+    if let Ok(rel) = key_from_disk(sync_folder, dir) {
+        if let Err(e) = untrack_folders_subtree(state, &rel) {
+            tracing::warn!(folder = %rel, error = %e, "could not untrack folder; keeping it");
+            return false;
+        }
+    }
+    remove_junk_only_dir_contents(dir);
+    fs::remove_dir(dir).is_ok()
 }
 
 /// Names tracked across the pages of one sweep (DBSYNC-103).
@@ -1360,7 +1536,7 @@ fn degrade_to_per_file(root: &Path, deleted: &[String]) -> AppResult<Vec<String>
 
 /// Remove every `known_folders` row for `folder_rel` and anything beneath it
 /// (`folder_rel/…`). Keys are `/`-canonical, so a lexical prefix match is exact.
-fn untrack_folders_subtree(state: &AppState, folder_rel: &str) -> AppResult<()> {
+pub(crate) fn untrack_folders_subtree(state: &AppState, folder_rel: &str) -> AppResult<()> {
     let prefix = format!("{folder_rel}/");
     for folder in state.db.list_known_folders()? {
         if folder == folder_rel || folder.starts_with(&prefix) {
@@ -2817,5 +2993,297 @@ mod tests {
 
         assert_eq!(created, 1);
         assert_eq!(removed, vec![NAME_NFD.to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // DBSYNC-111: a folder Dropbox no longer has loses its placeholders
+    // -----------------------------------------------------------------------
+
+    #[cfg(not(windows))]
+    mod gone_folder {
+        use super::*;
+
+        const NOT_FOUND: &str = r#"{"error":{".tag":"path","path":{".tag":"not_found"}},"error_summary":"path/not_found/"}"#;
+
+        fn sidecar(dir: &Path, name: &str, remote: &str) {
+            let meta = CloudscMeta {
+                version: 1,
+                tag: "file".to_string(),
+                remote_path_display: remote.to_string(),
+            };
+            write_cloudsc_placeholder_file(&dir.join(format!("{name}.cloudsc")), &meta).unwrap();
+        }
+
+        fn sweep(state: &AppState, remote: &str, local: &Path) -> AppResult<usize> {
+            handle_list_folder_failure(state, remote, local, 409, NOT_FOUND)
+        }
+
+        fn gone_with_two_sidecars(sync: &Path) -> PathBuf {
+            let gone = sync.join("Gone");
+            sidecar(&gone, "a.txt", "/Gone/a.txt");
+            sidecar(&gone, "b.txt", "/Gone/b.txt");
+            gone
+        }
+
+        #[test]
+        fn deleted_placeholder_only_folder_is_removed_with_its_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+            state.db.upsert_known_folder("Gone").unwrap();
+
+            assert_eq!(sweep(&state, "/Gone", &gone).unwrap(), 0);
+
+            assert!(!gone.exists(), "folder removed");
+            assert!(state.db.list_known_folders().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_real_file_keeps_its_folder() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+            fs::write(gone.join("c.txt"), b"mine").unwrap();
+            state.db.upsert_known_folder("Gone").unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(!gone.join("a.txt.cloudsc").exists());
+            assert!(!gone.join("b.txt.cloudsc").exists());
+            assert!(gone.join("c.txt").exists());
+            assert_eq!(state.db.list_known_folders().unwrap(), vec!["Gone"]);
+        }
+
+        /// DBSYNC-111, gate 3: while a folder move into `New` is queued, `New` is not-found on
+        /// Dropbox, and a sidecar whose target IS a direct child of `/New` (gate 1 would remove
+        /// it) must still be left alone.
+        #[test]
+        fn an_active_folder_move_into_the_folder_blocks_the_cleanup() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let new = sync.join("New");
+            sidecar(&new, "a", "/New/a");
+            state.db.upsert_known_folder("New").unwrap();
+            state
+                .db
+                .enqueue_job("move", Some("Old"), Some("New"))
+                .unwrap();
+            sweep(&state, "/New", &new).unwrap();
+            assert!(new.join("a.cloudsc").exists());
+            assert_eq!(state.db.list_known_folders().unwrap(), vec!["New"]);
+        }
+
+        /// DBSYNC-111, gate 1: a renamed folder's sidecars still name `/Old`, so the prune of
+        /// `/New` (not-found until the move lands) keeps them.
+        #[test]
+        fn a_renamed_folders_sidecars_survive_the_prune_before_the_move_lands() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let new = sync.join("New");
+            sidecar(&new, "a", "/Old/a");
+            state.db.upsert_known_folder("New").unwrap();
+            sweep(&state, "/New", &new).unwrap();
+            assert!(new.join("a.cloudsc").exists());
+        }
+
+        #[test]
+        fn sidecars_pointing_elsewhere_are_kept() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let copy = sync.join("Copy");
+            sidecar(&copy, "a.txt", "/Gone/a.txt");
+            state.db.upsert_known_folder("Copy").unwrap();
+
+            sweep(&state, "/Copy", &copy).unwrap();
+
+            assert!(copy.join("a.txt.cloudsc").exists());
+            assert_eq!(state.db.list_known_folders().unwrap(), vec!["Copy"]);
+        }
+
+        #[test]
+        fn a_pending_upload_under_the_folder_blocks_the_cleanup() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+            state.db.upsert_known_folder("Gone").unwrap();
+            state
+                .db
+                .enqueue_job("upload", None, Some("Gone/new.txt"))
+                .unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(gone.join("a.txt.cloudsc").exists());
+            assert!(gone.join("b.txt.cloudsc").exists());
+            assert_eq!(state.db.list_known_folders().unwrap(), vec!["Gone"]);
+        }
+
+        #[test]
+        fn a_queued_move_into_the_folder_blocks_the_cleanup() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+            state
+                .db
+                .enqueue_job("move", Some("Old"), Some("Gone"))
+                .unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(gone.join("a.txt.cloudsc").exists());
+        }
+
+        #[test]
+        fn a_job_covering_an_ancestor_blocks_the_cleanup() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let sub = sync.join("Parent").join("Gone");
+            sidecar(&sub, "a.txt", "/Parent/Gone/a.txt");
+            state
+                .db
+                .enqueue_job("move", Some("Old"), Some("Parent"))
+                .unwrap();
+
+            sweep(&state, "/Parent/Gone", &sub).unwrap();
+
+            assert!(sub.join("a.txt.cloudsc").exists());
+        }
+
+        #[test]
+        fn a_new_empty_local_folder_is_kept() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let fresh = sync.join("Fresh");
+            fs::create_dir_all(&fresh).unwrap();
+            state.db.upsert_known_folder("Fresh").unwrap();
+
+            sweep(&state, "/Fresh", &fresh).unwrap();
+
+            assert!(fresh.exists());
+            assert_eq!(state.db.list_known_folders().unwrap(), vec!["Fresh"]);
+        }
+
+        #[test]
+        fn nested_placeholder_only_folders_are_removed_contents_first() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = sync.join("Gone");
+            sidecar(&gone.join("Sub"), "y.txt", "/Gone/Sub/y.txt");
+            sidecar(&gone, "x", "/Gone/x");
+            state.db.upsert_known_folder("Gone").unwrap();
+            state.db.upsert_known_folder("Gone/Sub").unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(!gone.exists());
+            assert!(state.db.list_known_folders().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_nested_folder_that_is_not_empty_keeps_its_parent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = sync.join("Gone");
+            sidecar(&gone.join("Sub"), "y.txt", "/Gone/Sub/y.txt");
+            fs::write(gone.join("Sub").join("real.txt"), b"x").unwrap();
+            sidecar(&gone, "x", "/Gone/x");
+            state.db.upsert_known_folder("Gone").unwrap();
+            state.db.upsert_known_folder("Gone/Sub").unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(gone.join("Sub").join("real.txt").exists());
+            assert_eq!(
+                state.db.list_known_folders().unwrap(),
+                vec!["Gone", "Gone/Sub"]
+            );
+        }
+
+        #[test]
+        fn a_folder_left_with_only_ds_store_is_removed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+            fs::write(gone.join(".DS_Store"), b"junk").unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(!gone.exists());
+        }
+
+        #[test]
+        fn an_unreadable_sidecar_is_kept_with_its_folder() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+            fs::write(gone.join("junk.cloudsc"), b"\xff\x00 not a sidecar").unwrap();
+            state.db.upsert_known_folder("Gone").unwrap();
+
+            sweep(&state, "/Gone", &gone).unwrap();
+
+            assert!(gone.join("junk.cloudsc").exists());
+            assert!(!gone.join("a.txt.cloudsc").exists());
+            assert_eq!(state.db.list_known_folders().unwrap(), vec!["Gone"]);
+        }
+
+        #[test]
+        fn other_failures_remove_nothing_and_error() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sync = tmp.path().join("s");
+            let state = build_state(&sync);
+            let gone = gone_with_two_sidecars(&sync);
+
+            let err = handle_list_folder_failure(
+                &state,
+                "/Gone",
+                &gone,
+                409,
+                r#"{"error_summary":"path/malformed_path/"}"#,
+            );
+            assert!(err.is_err());
+            // Today's lenient match: a non-anchored path/not_found is Ok(0), nothing removed.
+            let lenient = handle_list_folder_failure(
+                &state,
+                "/Gone",
+                &gone,
+                500,
+                r#"{"error_summary":"x/","user_message":"path/not_found"}"#,
+            );
+            assert_eq!(lenient.unwrap(), 0);
+            assert!(gone.join("a.txt.cloudsc").exists());
+        }
+
+        #[test]
+        fn classifier() {
+            assert!(is_list_folder_not_found(409, NOT_FOUND));
+            assert!(!is_list_folder_not_found(
+                409,
+                r#"{"user_message":"path/not_found","error_summary":"other/"}"#
+            ));
+            assert!(!is_list_folder_not_found(
+                409,
+                r#"{"error_summary":"path/malformed_path/"}"#
+            ));
+            assert!(!is_list_folder_not_found(
+                409,
+                r#"{"error_summary":"path_lookup/not_found/.."}"#
+            ));
+            assert!(!is_list_folder_not_found(409, "path/not_found"));
+            assert!(!is_list_folder_not_found(500, NOT_FOUND));
+            assert!(!is_list_folder_not_found(429, NOT_FOUND));
+        }
     }
 }

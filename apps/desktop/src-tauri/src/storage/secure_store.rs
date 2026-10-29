@@ -4,6 +4,20 @@ use zeroize::Zeroizing;
 
 const SERVICE: &str = "dropbox-sync-desktop";
 
+/// The one place a keychain entry is opened. A unit test must never read or write the real
+/// keychain (the unsigned test binary triggers system prompts, and the data is the
+/// developer's), so under `cfg(test)` this panics instead of returning an entry.
+#[cfg(not(test))]
+fn keychain_entry(key: &str) -> Result<Entry, keyring::Error> {
+    Entry::new(SERVICE, key)
+}
+
+#[cfg(test)]
+fn keychain_entry(key: &str) -> Result<Entry, keyring::Error> {
+    let _ = SERVICE;
+    panic!("tests must not touch the keychain (tried to open entry {key:?}); inject a fake");
+}
+
 /// Legacy: entire session as one JSON string (exceeds Windows blob limit when combined).
 const LEGACY_SESSION_KEY: &str = "dropbox-token-session";
 
@@ -68,7 +82,7 @@ impl SecureStore {
 
     /// Legacy single-token entry used before `TokenSession` (see `auth_session` migration).
     pub fn get_token(&self) -> Result<String, keyring::Error> {
-        Entry::new(SERVICE, "dropbox-access-token")?.get_password()
+        keychain_entry("dropbox-access-token")?.get_password()
     }
 
     pub fn store_session(&self, session: &TokenSession) -> Result<(), keyring::Error> {
@@ -80,14 +94,14 @@ impl SecureStore {
             clear_chunked_key(SESSION_REFRESH)?;
         }
 
-        let expires_e = Entry::new(SERVICE, SESSION_EXPIRES)?;
+        let expires_e = keychain_entry(SESSION_EXPIRES)?;
         if let Some(ref exp) = session.expires_at {
             expires_e.set_password(exp)?;
         } else {
             let _ = expires_e.delete_credential();
         }
 
-        let _ = Entry::new(SERVICE, LEGACY_SESSION_KEY)?.delete_credential();
+        let _ = keychain_entry(LEGACY_SESSION_KEY)?.delete_credential();
 
         Ok(())
     }
@@ -98,7 +112,7 @@ impl SecureStore {
                 Ok(s) if !s.is_empty() => Some(s),
                 _ => None,
             };
-            let expires_at = match Entry::new(SERVICE, SESSION_EXPIRES)?.get_password() {
+            let expires_at = match keychain_entry(SESSION_EXPIRES)?.get_password() {
                 Ok(s) if !s.is_empty() => Some(s),
                 _ => None,
             };
@@ -109,7 +123,7 @@ impl SecureStore {
             });
         }
 
-        let legacy_e = Entry::new(SERVICE, LEGACY_SESSION_KEY)?;
+        let legacy_e = keychain_entry(LEGACY_SESSION_KEY)?;
         let json = legacy_e.get_password()?;
         let legacy: LegacyTokenSession =
             serde_json::from_str(&json).map_err(|_| keyring::Error::NoEntry)?;
@@ -188,7 +202,7 @@ fn chunk_part_key(base: &str, i: usize) -> String {
 /// success and surfacing any other keyring error. Used by the clear paths so a
 /// genuine failure isn't silently swallowed.
 fn delete_credential_if_present(key: &str) -> Result<(), keyring::Error> {
-    match Entry::new(SERVICE, key)?.delete_credential() {
+    match keychain_entry(key)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e),
     }
@@ -196,13 +210,13 @@ fn delete_credential_if_present(key: &str) -> Result<(), keyring::Error> {
 
 fn clear_overflow_parts(base: &str, start_idx: usize) {
     for i in start_idx..start_idx + 64 {
-        let _ = Entry::new(SERVICE, &chunk_part_key(base, i)).and_then(|e| e.delete_credential());
+        let _ = keychain_entry(&chunk_part_key(base, i)).and_then(|e| e.delete_credential());
     }
 }
 
 fn store_value_chunked(base: &str, value: &str) -> Result<(), keyring::Error> {
     let chunks = split_utf16_chunks(value);
-    let primary = Entry::new(SERVICE, base)?;
+    let primary = keychain_entry(base)?;
 
     if chunks.len() == 1 {
         primary.set_password(&chunks[0])?;
@@ -213,7 +227,7 @@ fn store_value_chunked(base: &str, value: &str) -> Result<(), keyring::Error> {
 
     primary.set_password(&format!("{CHUNK_MARKER}{}", chunks.len()))?;
     for (i, part) in chunks.iter().enumerate() {
-        Entry::new(SERVICE, &chunk_part_key(base, i))?.set_password(part)?;
+        keychain_entry(&chunk_part_key(base, i))?.set_password(part)?;
     }
     // Drop leftover parts if the new value uses fewer chunks than before.
     clear_overflow_parts(base, chunks.len());
@@ -221,12 +235,12 @@ fn store_value_chunked(base: &str, value: &str) -> Result<(), keyring::Error> {
 }
 
 fn load_value_chunked(base: &str) -> Result<String, keyring::Error> {
-    let primary = Entry::new(SERVICE, base)?.get_password()?;
+    let primary = keychain_entry(base)?.get_password()?;
     if let Some(rest) = primary.strip_prefix(CHUNK_MARKER) {
         let n: usize = rest.parse().map_err(|_| keyring::Error::NoEntry)?;
         let mut out = String::new();
         for i in 0..n {
-            let part = Entry::new(SERVICE, &chunk_part_key(base, i))?.get_password()?;
+            let part = keychain_entry(&chunk_part_key(base, i))?.get_password()?;
             out.push_str(&part);
         }
         return Ok(out);
@@ -290,5 +304,11 @@ mod chunking_tests {
     fn chunks_always_rejoin_to_the_original() {
         let secret = oversized_secret();
         assert_eq!(split_utf16_chunks(&secret).concat(), secret);
+    }
+
+    #[test]
+    #[should_panic(expected = "tests must not touch the keychain")]
+    fn a_test_cannot_open_a_keychain_entry() {
+        let _ = super::SecureStore::new().get_session();
     }
 }
