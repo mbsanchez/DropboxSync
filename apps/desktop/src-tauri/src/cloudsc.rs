@@ -251,6 +251,7 @@ pub(crate) fn rewrite_sidecars_after_move(
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only: how many whole-root sidecar walks this thread has done.
+    /// Test-only: how many `SidecarIndex::scan` walks (whole root or one subtree) this thread
+    /// has done.
     pub(crate) static SIDECAR_ROOT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

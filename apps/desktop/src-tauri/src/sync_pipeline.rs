@@ -1443,9 +1443,6 @@ fn pair_placeholder_only_folder(
             tracing::debug!(from = %old, to = %new, "placeholder-only folder: the destination already has remote rows; untracking, not deleting");
             return Ok(PlaceholderPairing::Keep);
         }
-        if ctx.refused.contains(&(old.to_string(), new.clone())) {
-            return Ok(PlaceholderPairing::Keep);
-        }
         return Ok(PlaceholderPairing::Pair(new.clone()));
     }
     if mismatch {
@@ -2121,16 +2118,6 @@ pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
     Ok(enqueued_jobs)
 }
 
-/// The scan's half of DBSYNC-111: decide what became of each vanished folder that held only
-/// placeholders, before the breaker and before any `folder_deletions` entry is acted on.
-///
-/// `seen_dirs` are all the folders the walk saw; `new_dirs` the ones that were not in
-/// `known_folders` BEFORE it. A new folder is preferred as the destination, but a registered
-/// one is a candidate too: a rename done again before the first move landed leaves its final
-/// name registered by an earlier scan, and refusing it would lose the rename. Paired folders
-/// get a remote `move`; postponed, refused, disagreeing and still-pointed-at folders are
-/// removed from `folder_deletions` (with everything beneath them) so none of them reaches the
-/// recursive `delete_v2`. A folder nothing points into stays a deletion, as before.
 /// The folders a scan walk saw: all of them, and the ones not registered before the walk.
 #[derive(Clone, Copy)]
 struct WalkedDirs<'a> {
@@ -2138,6 +2125,16 @@ struct WalkedDirs<'a> {
     new: &'a [(String, PathBuf)],
 }
 
+/// The scan's half of DBSYNC-111: decide what became of each vanished folder that held only
+/// placeholders, before the breaker and before any `folder_deletions` entry is acted on.
+///
+/// `walked.seen` are all the folders the walk saw; `walked.new` the ones that were not in
+/// `known_folders` BEFORE it. A new folder is preferred as the destination, but a registered
+/// one is a candidate too: a rename done again before the first move landed leaves its final
+/// name registered by an earlier scan, and refusing it would lose the rename. Paired folders
+/// get a remote `move`; postponed, refused, disagreeing and still-pointed-at folders are
+/// removed from `folder_deletions` (with everything beneath them) so none of them reaches the
+/// recursive `delete_v2`. A folder nothing points into stays a deletion, as before.
 fn pair_vanished_placeholder_folders(
     state: &AppState,
     tracked_root: &Path,
@@ -14900,7 +14897,7 @@ mod tests {
 
         #[test]
         fn the_sidecar_walk_is_done_once_per_scan() {
-            // Two vanished folders, nothing points into either: the whole root is read once.
+            // Three vanished folders, nothing points into any: the whole root is read once.
             let tmp = tempdir().unwrap();
             let state = build_state(tmp.path());
             let root = sync_root(&state);

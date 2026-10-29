@@ -218,15 +218,15 @@ fn is_list_folder_not_found(status: u16, body: &str) -> bool {
 /// it, then the directories that leaves empty (DBSYNC-111). No Dropbox call, no job.
 ///
 /// Three gates, all of which must pass for anything to be removed:
-/// 3. no active job covers the folder or names a path beneath it (a Finder rename or a first
-///    upload may be in flight; the index and disk disagree until it lands);
-/// 1. a sidecar is removed only if its metadata names a direct child of this remote folder
-///    (folded); a copied/renamed folder's sidecars point elsewhere and stay, and an unreadable
-///    sidecar stays;
-/// 2. a directory is removed only if a sidecar (or a nested directory) was removed from it and
-///    it is then empty (`.DS_Store` aside). Its `known_folders` subtree is untracked FIRST, then
-///    `fs::remove_dir` (never `remove_dir_all`) runs, deepest first. A folder left empty by a
-///    hydrated file going away is deliberately NOT cleaned.
+/// - Gate 3: no active job covers the folder or names a path beneath it (a Finder rename or a
+///   first upload may be in flight; the index and disk disagree until it lands);
+/// - Gate 1: a sidecar is removed only if its metadata names a direct child of this remote
+///   folder (folded); a copied/renamed folder's sidecars point elsewhere and stay, and an
+///   unreadable sidecar stays;
+/// - Gate 2: a directory is removed only if a sidecar (or a nested directory) was removed from
+///   it and it is then empty (`.DS_Store` aside). Its `known_folders` subtree is untracked
+///   FIRST, then `fs::remove_dir` (never `remove_dir_all`) runs, deepest first. A folder left
+///   empty by a hydrated file going away is deliberately NOT cleaned.
 ///
 /// The driver's WalkDir skips folders removed here when it later tries to read them
 /// (`filter_map(|e| e.ok())`).
@@ -325,11 +325,12 @@ fn prune_gone_dir(
     // Untrack BEFORE removing: if the directory went first, a scan in between would see a
     // tracked folder vanish and send a recursive remote delete. (Comment-enforced; not
     // mutation-testable, both orders end in the same state when the removal succeeds.)
-    if let Ok(rel) = key_from_disk(sync_folder, dir) {
-        if let Err(e) = untrack_folders_subtree(state, &rel) {
-            tracing::warn!(folder = %rel, error = %e, "could not untrack folder; keeping it");
-            return false;
-        }
+    let Ok(rel) = key_from_disk(sync_folder, dir) else {
+        return false;
+    };
+    if let Err(e) = untrack_folders_subtree(state, &rel) {
+        tracing::warn!(folder = %rel, error = %e, "could not untrack folder; keeping it");
+        return false;
     }
     remove_junk_only_dir_contents(dir);
     fs::remove_dir(dir).is_ok()
