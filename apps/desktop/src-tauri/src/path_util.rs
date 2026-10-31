@@ -498,6 +498,10 @@ pub(crate) struct PrefixFilter {
     /// Not part of the scope rules or of [`Self::signature`].
     /// Every marked path AND every ancestor folder of one, so a lookup is one hash probe.
     unconfirmed: std::collections::HashSet<String>,
+    /// The sync root and, read lazily at most once per pass, every sidecar under it
+    /// (DBSYNC-111). Set only by [`Self::load_for_deletion_pass`]; absent on a plain `load`.
+    sidecar_root: Option<PathBuf>,
+    sidecars: std::cell::OnceCell<crate::cloudsc::SidecarIndex>,
 }
 
 impl PrefixFilter {
@@ -513,6 +517,8 @@ impl PrefixFilter {
             include: fold_prefixes(include_prefixes),
             exclude: fold_prefixes(exclude_prefixes),
             unconfirmed: std::collections::HashSet::new(),
+            sidecar_root: None,
+            sidecars: std::cell::OnceCell::new(),
         }
     }
 
@@ -531,6 +537,7 @@ impl PrefixFilter {
     /// releases anything so [`Self::unconfirmed_beneath`] sees the markers as they stood.
     pub(crate) fn load_for_deletion_pass(db: &crate::storage::db::Db) -> AppResult<Self> {
         let mut filter = Self::load(db)?;
+        filter.sidecar_root = db.get_sync_folder()?.map(PathBuf::from);
         for path in db.list_unconfirmed_uploads()? {
             let mut end = path.len();
             filter.unconfirmed.insert(path.clone());
@@ -547,6 +554,29 @@ impl PrefixFilter {
     /// exact (binary) comparison like the table it mirrors. Always false for a plain `load`.
     pub(crate) fn unconfirmed_beneath(&self, prefix: &str) -> bool {
         self.unconfirmed.contains(prefix)
+    }
+
+    /// DBSYNC-111: does any `.cloudsc` sidecar anywhere under the sync root still name the
+    /// Dropbox folder `rel`? Such a folder is referenced by local content (a renamed copy of a
+    /// placeholder folder), so a recursive remote delete of it would leave those placeholders
+    /// dangling and destroy the only copy of what they stand for. The sidecars are read once
+    /// per pass, on first use. Always false without a deletion-pass filter and on Windows.
+    pub(crate) fn sidecar_points_into(&self, rel: &str) -> bool {
+        if cfg!(windows) {
+            return false;
+        }
+        self.sidecar_index()
+            .is_some_and(|index| index.any_points_into(&format!("/{rel}")))
+    }
+
+    /// The per-pass sidecar index behind [`Self::sidecar_points_into`], read on first use.
+    /// `None` without a deletion-pass filter.
+    pub(crate) fn sidecar_index(&self) -> Option<&crate::cloudsc::SidecarIndex> {
+        let root = self.sidecar_root.as_ref()?;
+        Some(
+            self.sidecars
+                .get_or_init(|| crate::cloudsc::SidecarIndex::scan(root)),
+        )
     }
 
     /// A stable string for the folded lists, to tell "the filter changed" from "it did not".
