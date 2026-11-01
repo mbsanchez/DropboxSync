@@ -25,7 +25,11 @@ export function runTests(files = listTests(), nodeArgs = []) {
     console.error("run-tests: no *.test.mjs files found");
     return 1;
   }
-  const r = spawnSync(process.execPath, ["--test", ...nodeArgs, ...files], { stdio: "inherit" });
+  // A run started from inside another `node --test` inherits NODE_TEST_CONTEXT, and on Node 20 that
+  // makes the child report to the parent and exit 0 even when a test fails. This runner owns its run.
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const r = spawnSync(process.execPath, ["--test", ...nodeArgs, ...files], { stdio: "inherit", env });
   if (r.error) {
     console.error(`run-tests: ${r.error.message}`);
     return 1;
