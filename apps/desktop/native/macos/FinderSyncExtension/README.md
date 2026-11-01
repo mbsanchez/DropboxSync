@@ -1,5 +1,9 @@
 # Finder Sync extension (macOS shell overlays)
 
+> A second appex, the File Provider extension, sits beside this one (DBSYNC-95): see
+> [`../FileProviderExtension/README.md`](../FileProviderExtension/README.md). This extension stops monitoring
+> on macOS at the File Provider cutover; until then nothing about it changes.
+
 The Tauri app writes **`overlay_state.json`** next to the SQLite database:
 
 - Path: `~/Library/Group Containers/<TEAM_ID>.com.dropboxsyncdesktop/Library/Application Support/DropboxSyncDesktop/overlay_state.json` (the App Group container, see the ADR below; `app.db` and the logs live in the same directory)
@@ -71,8 +75,8 @@ container redirection of Foundation's home APIs. It worked, but the exception is
 Store and it left the extension depending on a path outside its sandbox. A group id that starts with the
 signing team (`<TEAM_ID>.`) has needed no provisioning profile and no registration with Apple so far: Dropbox
 ships a notarized appex that way, and `codesign` shows the entitlement on both of our binaries with no profile.
-This is what has been observed, not a guarantee: notarization acceptance and the container materializing at
-runtime are not yet verified (DBSYNC-97 Slice 3, #229). The group is shared, not a copy: `db::app_data_dir()` resolves into
+Notarization accepted that combination and the container materialized at runtime with no profile and no
+permission dialog (DBSYNC-97 Slice 3, #229 / PR #230, QA on the maintainer's Mac). The group is shared, not a copy: `db::app_data_dir()` resolves into
 the container, and `getpwuid` and `realHomeDirectory` are gone.
 
 **The team ID is no longer kept in the tree; older commits contain it.** A team ID is not a secret: it is stamped
@@ -92,7 +96,7 @@ host does not trust that URL: `app_group::container_path()` first reads the proc
 `com.apple.security.application-groups` entitlement and returns `None` unless it contains the build's group. A host
 without the group (every ad-hoc or team-less `bundle:dev`) therefore never touches the container and fails at startup
 with an error naming `APPLE_TEAM_ID`, because it never falls back to a directory the extension cannot read. What a
-bare `tauri dev` run does is unverified until #229, as is the whole runtime behaviour; at startup the app logs
+bare `tauri dev` run does (a binary, no bundle) was not observed in #229; at startup the app logs
 which groups its signature carries and whether the expected one was found ("App Group entitlement check"). The extension has no such pre-check: an unentitled appex still gets a URL
 from `containerURL(forSecurityApplicationGroupIdentifier:)` and its first read is denied by the sandbox, which
 `reloadState()` logs. Export `APPLE_TEAM_ID` and `APPLE_SIGNING_IDENTITY` (see *Signing* below), or put

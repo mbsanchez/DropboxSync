@@ -626,6 +626,18 @@ impl Db {
         Ok(None)
     }
 
+    /// Removes one `app_config` key; a key that is not there is not an error. Used by the File
+    /// Provider breadcrumb (DBSYNC-95), whose absence means "no domain was registered".
+    #[cfg(target_os = "macos")]
+    pub fn delete_app_config(&self, key: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute("DELETE FROM app_config WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     // Selective sync (prefix-based). CSV of prefixes without leading '/' (e.g. "Fotos,Videos/2024").
     pub fn set_include_prefixes_csv(&self, csv: &str) -> AppResult<()> {
         self.set_app_config("include_prefixes_csv", csv)

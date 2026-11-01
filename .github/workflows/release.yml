@@ -186,6 +186,14 @@ jobs:
             echo "::error::no appex found under $APP/Contents/PlugIns"
             exit 1
           fi
+          # DBSYNC-95: the glob above would still pass if one of the two appexes silently went missing, so
+          # name both. A bundle without the File Provider appex must never reach notarization.
+          for REQUIRED in DropboxSyncFinderSync.appex DropboxSyncFileProvider.appex; do
+            if [ ! -d "$APP/Contents/PlugIns/$REQUIRED" ]; then
+              echo "::error::required appex $REQUIRED is missing from $APP/Contents/PlugIns"
+              exit 1
+            fi
+          done
           for APPEX in "${APPEXES[@]}"; do
             APPEX_PLIST="$GROUP_DIR/$(basename "$APPEX").plist"
             codesign -d --entitlements - --xml "$APPEX" > "$APPEX_PLIST"
@@ -275,6 +283,14 @@ jobs:
             echo "::error::no appex found under $APP/Contents/PlugIns"
             exit 1
           fi
+          # DBSYNC-95: the glob above would still pass if one of the two appexes silently went missing, so
+          # name both. A bundle without the File Provider appex must never be published.
+          for REQUIRED in DropboxSyncFinderSync.appex DropboxSyncFileProvider.appex; do
+            if [ ! -d "$APP/Contents/PlugIns/$REQUIRED" ]; then
+              echo "::error::required appex $REQUIRED is missing from $APP/Contents/PlugIns"
+              exit 1
+            fi
+          done
           # "${a[@]+"${a[@]}"}" — on the runner's Bash 3.2, iterating a possibly-empty array under
           # `set -u` is an unbound-variable error. The guard above exits first, so this is belt and
           # braces; build-appex.sh uses the same idiom for the same reason.

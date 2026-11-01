@@ -9,6 +9,8 @@ mod cloudsc_ops;
 mod commands;
 mod dropbox_transfer;
 mod error;
+#[cfg(target_os = "macos")]
+mod file_provider;
 mod finder_extension;
 mod flyout_geometry;
 mod fs_watcher;
@@ -433,6 +435,11 @@ pub fn run() {
                 }
 
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
+
+                // DBSYNC-95: the File Provider domain, behind the `FileProviderEnabled` defaults key.
+                // Off and never registered is a no-op, so this build behaves as before.
+                #[cfg(target_os = "macos")]
+                crate::file_provider::start(state.db.clone());
 
                 // DBSYNC-36: the ignore-glob predicate is backed by a process-wide
                 // static (`path_util::USER_IGNORE_GLOBS`), so the persisted CSV must be

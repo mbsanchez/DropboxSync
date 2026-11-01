@@ -5,6 +5,11 @@
 **Accepted** (2026-09-02, by the maintainer). Supersedes ADR-0002 **on the macOS placeholder
 path only**; ADR-0002's Windows CfAPI and hydration-on-demand decisions stand.
 
+**Amended 2026-11-01 (DBSYNC-95):** the process model, identity, enumeration, version and conflict
+mappings, and the rollout switch are recorded in
+[ADR-0004](0004-host-is-the-single-dropbox-client.md). The App Group and notarization are now proven
+(#229 / PR #230) for the host and the Finder Sync appex, and Finder Sync stops monitoring on macOS at the cutover.
+
 Written in English, unlike ADR-0001 and ADR-0002. The repository policy is English for
 commits and code comments; the two earlier ADRs predate that being applied consistently.
 Flagged rather than decided silently — say so if they should be Spanish instead.
@@ -85,14 +90,24 @@ registration or the hydration connection failed. Adoption removes the first. The
 remain, so the 121 production references do not go away. *(Re-derived by DBSYNC-96: 121 exactly,
 plus 44 in tests, 29 on Windows-specific paths and 89 generic placeholder references.)*
 
-**The App Group is implemented (DBSYNC-97) but not yet confirmed end to end.** Dropbox ships a **notarized** Developer ID File
+**The App Group is implemented and proven (DBSYNC-97, #229 / PR #230).** Dropbox ships a **notarized** Developer ID File
 Provider appex declaring an App Group with **no embedded provisioning profile**, and its group
 container exists on this machine; OneDrive's embeds profiles. Both ship. *Verified with `find`,
-`codesign`, `stapler validate` and `spctl`.* DBSYNC-97 now declares `<TEAM_ID>.com.dropboxsyncdesktop` on the host and the Finder Sync appex, with no
-profile, and `codesign` shows the entitlement on both binaries. Notarization acceptance and the group
-container materializing at runtime are still unverified (DBSYNC-97 Slice 3, #229), so Dropbox remains a
-shipping counter-example rather than a confirmation for us. Note that a successful `codesign` proves
-nothing here — it embeds any entitlement, including invented ones, without validating them.
+`codesign`, `stapler validate` and `spctl`.* DBSYNC-97 declares `<TEAM_ID>.com.dropboxsyncdesktop` on the host and the Finder Sync appex, with no
+profile. Note that a successful `codesign` proves nothing here — it embeds any entitlement, including
+invented ones, without validating them. The QA result on PR #230 (manual validation on the maintainer's
+Mac, macOS 26, a build signed with the maintainer's Developer ID) states what was then observed:
+
+- `notarytool` status `Accepted` with no issues, stapled; `spctl --assess` gives `accepted, source=Notarized
+  Developer ID`; `codesign --verify --deep --strict` passes. The App Group entitlement passed notarization
+  with no provisioning profile.
+- Host and appex both carry the group; `check-app-groups.mjs` on the real bundle printed `app-groups: OK`.
+- `containermanagerd` created the container on first launch, and the maintainer saw no permission dialog.
+- Badges rendered from the container, and a disproving check (renaming the container's `overlay_state.json`)
+  made them disappear.
+
+This covers the host and the Finder Sync appex only. It says nothing about a File Provider appex, a second
+appex in the bundle, or a File Provider domain; those are the first things DBSYNC-95 slice 1 has to prove.
 
 The literal team ID is no longer kept in this repository's tree; the build takes it from `APPLE_TEAM_ID`.
 Team ID: see `apps/desktop/native/macos/FinderSyncExtension/README.md` (App Group ADR).
@@ -136,8 +151,10 @@ per platform. This was weighed and accepted rather than discovered later: the wi
 precisely because `v0.1.0-rc1` is an unpublished draft and there are no users to migrate.
 
 **What this decision does not license.** No File Provider extension of ours has ever executed
-(see *Not verified*). The App Group itself is implemented in DBSYNC-97. The first implementation ticket carries the burden of proving the domain
-mounts and the App Group container materializes at runtime — not this ADR, and not the deleted spike.
+(see *Not verified*). The App Group is proven by DBSYNC-97 (#229). The first implementation ticket
+(DBSYNC-95 slice 1) carries the burden of proving the domain mounts and that notarization passes with two
+appexes — not this ADR, and not the deleted spike. The process model is in
+[ADR-0004](0004-host-is-the-single-dropbox-client.md).
 
 ## Sizing and recommendation (DBSYNC-96)
 
@@ -217,8 +234,10 @@ whole reason DBSYNC-79 was worth doing before the next one.
 package identity and Windows where sync-root registration or the hydration connection failed.
 The 121 production references stay; what changes is that macOS stops being one of its consumers.
 
-**Finder Sync stays**, on both platforms, unchanged. So does everything DBSYNC-72 and DBSYNC-76
-built.
+**Finder Sync stays until the cutover, then stops monitoring on macOS.** *(Amended 2026-11-01.)* File
+Provider shows sync state natively, so at the cutover slice the Finder Sync extension stops monitoring on
+macOS. Deleting the appex is a separate ticket, not part of DBSYNC-95. Until the cutover nothing changes:
+the work from DBSYNC-72 and DBSYNC-76 keeps running beside the switched-off File Provider path.
 
 **The folder relocation copies nothing.** The macOS sync root moves to the new domain and the
 content re-downloads from Dropbox; there is no migration code, no copy step and no data to keep
@@ -277,8 +296,8 @@ must be persisted either way.
 ### The extension has never run
 
 The spike was never registered as a domain: **no File Provider extension of ours has executed.**
-Untested are the domain mounting under `~/Library/CloudStorage/`, notarization of a build carrying
-the App Group entitlement (implemented in DBSYNC-97, unverified until #229), and the group container at
-runtime. Registration requires
+Untested are the domain mounting under `~/Library/CloudStorage/` and notarization of a bundle with two
+appexes. Notarization with the App Group entitlement and the group container at runtime were proven by
+#229 / PR #230 for the host and the Finder Sync appex. Registration requires
 `NSFileProviderManager.add(domain:)` from the host app — feasible, since `objc2` is already a
 dependency and `finder_extension.rs` uses `msg_send!`, but not written.

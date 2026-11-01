@@ -71,10 +71,11 @@ export function renderEntitlements(template, groupId) {
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
-/** The only two directories this script may write to; both are gitignored. */
+/** The only directories this script may write to; all are gitignored. */
 const OUTPUT_DIRS = [
   join("apps", "desktop", "src-tauri", ".generated"),
   join("apps", "desktop", "native", "macos", "FinderSyncExtension", "build"),
+  join("apps", "desktop", "native", "macos", "FileProviderExtension", "build"),
 ];
 
 /**
@@ -120,7 +121,7 @@ export function resolveOutput(path) {
 }
 
 /**
- * Output must land in one of the two gitignored directories above, resolved against the repository
+ * Output must land in one of the gitignored directories above, resolved against the repository
  * root, so a rendered team id can never be committed. A directory merely named `build` or
  * `.generated` somewhere else (a tracked `scripts/build/`, or a checkout under a parent called
  * `build`) does not qualify. Symlinks are resolved on both sides, so a symlinked directory inside an
@@ -145,7 +146,7 @@ function main() {
   }
   const target = resolveOutput(output);
   if (!isGeneratedPath(target)) {
-    console.error(`refusing to write ${output}: not inside the gitignored src-tauri/.generated/ or FinderSyncExtension/build/`);
+    console.error(`refusing to write ${output}: not inside the gitignored src-tauri/.generated/, FinderSyncExtension/build/ or FileProviderExtension/build/`);
     process.exit(2);
   }
   let decision;

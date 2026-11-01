@@ -210,8 +210,9 @@ struct OverlayState: Decodable {
     ///
     /// It does not reproduce on macOS 26 — the swift-foundation rewrite stopped converting
     /// dictionary keys — but `JSONDecoder` comes from the USER's Foundation, and
-    /// `minimumSystemVersion` is 12.0. Correct for the developer, silently wrong for a
-    /// subset of users on a subset of their files.
+    /// this appex's deployment target is 12.0 (the host's `minimumSystemVersion` is 13.0
+    /// since DBSYNC-95, but the appex is built for 12.0 on purpose). Correct for the
+    /// developer, silently wrong for a subset of users on a subset of their files.
     ///
     /// **These keys do more than avoid the strategy: they make it unreachable.** With the
     /// wire names spelled out, `.convertFromSnakeCase` rewrites `updated_at` to
