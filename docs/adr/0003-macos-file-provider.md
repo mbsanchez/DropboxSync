@@ -35,7 +35,7 @@ Sync work from DBSYNC-72 and DBSYNC-76 survives either outcome.
 
 **Our distribution model works.** Both reference providers are signed `Developer ID Application`
 with hardened runtime, not App Store. Our own spike appex built, signed as
-`Developer ID Application: Manuel Sanchez (XCAA3WMJM6)`, bundled into the app, and the release
+the maintainer's Developer ID Application identity, bundled into the app, and the release
 workflow's verification passed over it. *Verified by building the app from a clean state and
 listing `Contents/PlugIns/`.*
 
@@ -85,12 +85,19 @@ registration or the hydration connection failed. Adoption removes the first. The
 remain, so the 121 production references do not go away. *(Re-derived by DBSYNC-96: 121 exactly,
 plus 44 in tests, 29 on Windows-specific paths and 89 generic placeholder references.)*
 
-**The App Group is low-risk but unconfirmed.** Dropbox ships a **notarized** Developer ID File
+**The App Group is implemented (DBSYNC-97) but not yet confirmed end to end.** Dropbox ships a **notarized** Developer ID File
 Provider appex declaring an App Group with **no embedded provisioning profile**, and its group
 container exists on this machine; OneDrive's embeds profiles. Both ship. *Verified with `find`,
-`codesign`, `stapler validate` and `spctl`.* Our own build has not been notarized, so this is a
-shipping counter-example rather than a confirmation. Note that a successful `codesign` proves
+`codesign`, `stapler validate` and `spctl`.* DBSYNC-97 now declares `<TEAM_ID>.com.dropboxsyncdesktop` on the host and the Finder Sync appex, with no
+profile, and `codesign` shows the entitlement on both binaries. Notarization acceptance and the group
+container materializing at runtime are still unverified (DBSYNC-97 Slice 3, #229), so Dropbox remains a
+shipping counter-example rather than a confirmation for us. Note that a successful `codesign` proves
 nothing here — it embeds any entitlement, including invented ones, without validating them.
+
+The literal team ID is no longer kept in this repository's tree; older commits contain it and history is not
+rewritten. It is not a secret (it is stamped into every signed binary); removing it was the maintainer's choice, as
+hygiene and so that forks build with their own team. The
+build takes it from `APPLE_TEAM_ID`.
 
 **Timing.** The only tag, `v0.1.0-rc1`, is an unpublished draft. There are no users to migrate
 today, and there will be after the first real release.
@@ -105,7 +112,7 @@ overlay / placeholder ticket stream on macOS largely stops.
 **Costs:** the macOS sync root moves to `~/Library/CloudStorage/<Provider>` and **stops being
 user-chosen** — Windows keeps an arbitrary folder, so the product diverges per platform. A stable
 item identity must be introduced through the whole index. The macOS materialization path is
-rewritten rather than extended. The App Group migration DBSYNC-72 postponed becomes due.
+rewritten rather than extended. The App Group migration DBSYNC-72 postponed was implemented in DBSYNC-97.
 
 ## Decision
 
@@ -131,8 +138,8 @@ per platform. This was weighed and accepted rather than discovered later: the wi
 precisely because `v0.1.0-rc1` is an unpublished draft and there are no users to migrate.
 
 **What this decision does not license.** No File Provider extension of ours has ever executed
-(see *Not verified*). The first implementation ticket carries the burden of proving the domain
-mounts and the App Group is authorized at runtime — not this ADR, and not the deleted spike.
+(see *Not verified*). The App Group itself is implemented in DBSYNC-97. The first implementation ticket carries the burden of proving the domain
+mounts and the App Group container materializes at runtime — not this ADR, and not the deleted spike.
 
 ## Sizing and recommendation (DBSYNC-96)
 
@@ -222,7 +229,7 @@ bandwidth once, while a copy-and-verify path would be permanent code guarding a 
 It also exercises the first-run install path for real, which nothing else currently does.
 
 **Follow-up work**, in dependency order: stable item identity (blocking, and capable of sending
-this decision back for amendment); then the macOS provider arm, the App Group migration, and the
+this decision back for amendment); then the macOS provider arm, and the
 folder relocation with its onboarding consequences.
 
 ## Not verified
@@ -273,6 +280,7 @@ must be persisted either way.
 
 The spike was never registered as a domain: **no File Provider extension of ours has executed.**
 Untested are the domain mounting under `~/Library/CloudStorage/`, notarization of a build carrying
-the App Group entitlement, and the group container at runtime. Registration requires
+the App Group entitlement (implemented in DBSYNC-97, unverified until #229), and the group container at
+runtime. Registration requires
 `NSFileProviderManager.add(domain:)` from the host app — feasible, since `objc2` is already a
 dependency and `finder_extension.rs` uses `msg_send!`, but not written.

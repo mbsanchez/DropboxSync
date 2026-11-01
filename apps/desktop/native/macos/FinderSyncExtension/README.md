@@ -2,7 +2,7 @@
 
 The Tauri app writes **`overlay_state.json`** next to the SQLite database:
 
-- Path: `~/Library/Application Support/DropboxSyncDesktop/overlay_state.json`
+- Path: `~/Library/Group Containers/<TEAM_ID>.com.dropboxsyncdesktop/Library/Application Support/DropboxSyncDesktop/overlay_state.json` (the App Group container, see the ADR below; `app.db` and the logs live in the same directory)
 - Schema: see `src-tauri/src/overlay_state.rs` (`version`, `updated_at`, `sync_folder`, `paths` map with tiers `synced`, `out_of_sync`, `syncing`).
 
 This folder contains a **Finder Sync** implementation (`SyncExtension.swift`) that registers three badge images and assigns them per file using `requestBadgeIdentifier(for:)`.
@@ -43,16 +43,18 @@ output cannot be used to tell whether the toggle took effect. Confirm from the e
 `Logger` call at the top of `requestBadgeIdentifier(for:)`, opening the sync folder should produce a burst of
 queries within a second.
 
-## ADR: App Sandbox on, Hardened Runtime on, no App Group
+## ADR: App Sandbox on, Hardened Runtime on, shared App Group
 
-**Status:** Accepted — 2026-08-19 (DBSYNC-76). **Supersedes** the original "no App Sandbox" decision
-taken the same day under DBSYNC-72, which was wrong and is recorded at the bottom of this section.
+**Status:** Accepted — 2026-08-19 (DBSYNC-76), amended by DBSYNC-97. **Supersedes** the original "no App
+Sandbox" decision taken the same day under DBSYNC-72, which was wrong and is recorded at the bottom of this
+section. DBSYNC-76 also chose a read-only temporary exception over an App Group; DBSYNC-97 replaced that.
 
-**Decision.** The extension **is sandboxed**. `DropboxSyncFinderSync.entitlements` declares
-`com.apple.security.app-sandbox` together with a read-only temporary exception for
-`/Library/Application Support/DropboxSyncDesktop/`, so it still reads `overlay_state.json` from the
-host's own directory. Hardened Runtime stays on. No App Group is introduced and `db::app_data_dir()`
-is unchanged.
+**Decision.** The extension **is sandboxed** and Hardened Runtime stays on. The host and the extension both
+carry `com.apple.security.application-groups = [<TEAM_ID>.com.dropboxsyncdesktop]`. On macOS the host's whole
+data directory (`app.db`, logs, `overlay_state.json`) is
+`<group container>/Library/Application Support/DropboxSyncDesktop/`, where the group container is
+`~/Library/Group Containers/<TEAM_ID>.com.dropboxsyncdesktop/`. The extension reads `overlay_state.json` from
+there; the container is outside both sandboxes, so neither needs a temporary exception.
 
 **Context — why the earlier decision failed.** Without `com.apple.security.app-sandbox`, macOS silently
 refuses to register the extension: it never appears in System Settings → Extensions → Finder, `pluginkit`
@@ -62,21 +64,48 @@ lists no entry for it, and Finder never loads it. There is no error anywhere —
 target generates an entitlements file with the sandbox key. Adding the entitlement made registration work
 immediately.
 
-**Why no App Group.** Sandboxing normally forces the shared state file into
-`~/Library/Group Containers/<group-id>/`, which would mean rewriting `db::app_data_dir()`, migrating every
-existing user's state, registering the group with Apple, and shipping a provisioning profile. A read-only
-`com.apple.security.temporary-exception.files.home-relative-path.read-only` entitlement avoids all four —
-the same technique Dropbox uses for `~/.dropbox/`. The exception is read-only and scoped to one directory;
-the extension never writes.
+**Why an App Group, and why it is team-prefixed.** A sandboxed extension cannot read the host's real
+`~/Library/Application Support`. The first fix (DBSYNC-76) was a read-only
+`temporary-exception.files.home-relative-path.read-only` entitlement plus `getpwuid(getuid())` to bypass the
+container redirection of Foundation's home APIs. It worked, but the exception is not accepted on the Mac App
+Store and it left the extension depending on a path outside its sandbox. A group id that starts with the
+signing team (`<TEAM_ID>.`) has needed no provisioning profile and no registration with Apple so far: Dropbox
+ships a notarized appex that way, and `codesign` shows the entitlement on both of our binaries with no profile.
+This is what has been observed, not a guarantee: notarization acceptance and the container materializing at
+runtime are not yet verified (DBSYNC-97 Slice 3, #229). The group is shared, not a copy: `db::app_data_dir()` resolves into
+the container, and `getpwuid` and `realHomeDirectory` are gone.
 
-**The container trap.** Inside the sandbox, every Foundation home API — `homeDirectoryForCurrentUser`,
-`NSHomeDirectory()`, and `.userDomainMask` searches — is redirected to
-`~/Library/Containers/<bundle-id>/Data/`, whose `Library/Application Support` holds nothing but Apple's own
-symlinks. The temporary exception is relative to the **real** home, so `overlayStateURL()` must build the
-path from `getpwuid(getuid())`, which reads the passwd database and is not redirected. Resolving through
-`FileManager` yields a path that simply does not exist: `Data(contentsOf:)` fails, `state` stays `nil`,
-`directoryURLs` stays empty, and Finder never even asks for a badge — with no sandbox denial logged, because
-the protected path was never touched. `reloadState()` logs that failure for exactly this reason.
+**The team ID is no longer kept in the tree; older commits contain it.** A team ID is not a secret: it is stamped
+into every signed binary. The literal one was removed from this public repository as a maintainer's choice (hygiene,
+and so that forks build with their own team); history is not rewritten. The entitlements files in git hold the token `__APP_GROUP_ID__`;
+`scripts/render-entitlements.mjs` substitutes `<APPLE_TEAM_ID>.com.dropboxsyncdesktop` into gitignored copies at
+build time (the host's goes through `tauri-before-build.mjs`, the extension's through `build-appex.sh`). With no
+`APPLE_TEAM_ID`, or with `APPLE_SIGNING_IDENTITY` unset, empty or `-` (ad-hoc), the whole `application-groups` key is
+dropped rather than signed bare. The same renderer serves both, so the host and the appex always agree.
+
+**A working macOS build needs `APPLE_TEAM_ID` and a real `APPLE_SIGNING_IDENTITY`.** Only a build with both gets the
+group: the renderer drops the `application-groups` key when the identity is unset, empty or `-`, for the host and the
+appex alike (`tauri.conf.json` keeps `signingIdentity: "-"`, so an ad-hoc `dev:mac` or `bundle:dev` with only
+`APPLE_TEAM_ID` exported renders no group and warns). Foundation returns a container URL even for a
+group the process is not entitled to (and using it can raise the "access data from other apps" prompt), so the
+host does not trust that URL: `app_group::container_path()` first reads the process's own signed
+`com.apple.security.application-groups` entitlement and returns `None` unless it contains the build's group. A host
+without the group (every ad-hoc or team-less `bundle:dev`) therefore never touches the container and fails at startup
+with an error naming `APPLE_TEAM_ID`, because it never falls back to a directory the extension cannot read. What a
+bare `tauri dev` run does is unverified until #229, as is the whole runtime behaviour; at startup the app logs
+which groups its signature carries and whether the expected one was found ("App Group entitlement check"). The extension has no such pre-check: an unentitled appex still gets a URL
+from `containerURL(forSecurityApplicationGroupIdentifier:)` and its first read is denied by the sandbox, which
+`reloadState()` logs. Export `APPLE_TEAM_ID` and `APPLE_SIGNING_IDENTITY` (see *Signing* below), or put
+`APPLE_TEAM_ID` in the gitignored `apps/desktop/.env`. The release workflow refuses an invalid team before building,
+and, between build and notarization, runs `scripts/check-app-groups.mjs`: the host and every nested appex must
+carry exactly `<TeamIdentifier>.com.dropboxsyncdesktop`, and each appex `Info.plist` `DBSyncAppGroupID` must equal
+the group in its own entitlements.
+
+**The entitlements path is content-addressed.** `build-appex.sh` renders the entitlements and copies them to
+`build/entitlements-<first 16 hex of sha256>/DropboxSyncFinderSync.entitlements`. `xcodebuild` records the
+entitlements file's modification time and fails the next build with "Entitlements file ... was modified
+during the build" if the same path is rewritten (for example when the team changes). A new content yields a
+new path, and an unchanged one is never rewritten.
 
 **Entitlements are a property of the shipped artifact**, not of the sources, and the two can diverge:
 `xcodebuild` injects `com.apple.security.get-task-allow` unless told not to, which is why `build-appex.sh`
@@ -86,13 +115,9 @@ disables that injection on every path, signed or ad-hoc. Check the product, neve
 codesign -d --entitlements - build/DropboxSyncFinderSync.appex
 ```
 
-must print the sandbox key and the temporary exception, and **must not** print `get-task-allow` —
+must print the sandbox key and the application group, and **must not** print `get-task-allow` —
 notarization refuses that outright. If it appears, the appex was built by something other than that script
 (a plain `xcodebuild`, or Xcode.app) and must not be shipped.
-
-**Trade-off accepted.** The temporary-exception entitlement is not accepted on the Mac App Store. Submitting
-there would require reopening this decision and doing the App Group migration — but App Store distribution is
-not a goal; the app ships with Developer ID.
 
 ---
 

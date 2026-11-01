@@ -68,30 +68,40 @@ final class DropboxSyncFinderSync: FIFinderSync {
         }
     }
 
-    /// The real home directory, bypassing the sandbox container.
-    ///
-    /// This extension IS sandboxed — Finder refuses to register it otherwise (DBSYNC-76) — and
-    /// inside a sandbox every Foundation home API (`homeDirectoryForCurrentUser`, `NSHomeDirectory()`,
-    /// `.userDomainMask` searches) is redirected to `~/Library/Containers/<bundle-id>/Data/`. That
-    /// container's `Library/Application Support` holds only Apple's own symlinks (AddressBook,
-    /// SyncServices, iCloud), so resolving through it silently yields a path that never exists.
-    /// `getpwuid` reads the passwd database directly and is not redirected.
-    private func realHomeDirectory() -> URL {
-        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
-            return URL(fileURLWithPath: String(cString: dir), isDirectory: true)
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-    }
+    /// Same transition-logging discipline as [`lastLoadFailed`], for the App Group container lookup
+    /// (DBSYNC-97): `reloadState()` runs every 2s.
+    private var lastContainerFailed = false
 
-    /// Resolves the same path the Rust side writes in `db::app_data_dir()`:
-    /// `~/Library/Application Support/DropboxSyncDesktop/overlay_state.json`.
+    /// Resolves the file the Rust side writes in `db::app_data_dir()`:
+    /// `<App Group container>/Library/Application Support/DropboxSyncDesktop/overlay_state.json`.
     ///
-    /// Reading it from the sandbox is what
-    /// `com.apple.security.temporary-exception.files.home-relative-path.read-only` grants in
-    /// DropboxSyncFinderSync.entitlements — and that entitlement is relative to the REAL home,
-    /// which is why the path must be built from [`realHomeDirectory`].
-    private func overlayStateURL() -> URL {
-        realHomeDirectory()
+    /// The container is asked of the system, never built by hand. The group id is NOT a source
+    /// literal: it is team-prefixed, and the public tree no longer keeps a literal team id (older commits
+    /// contain it; not a secret, a maintainer's choice), so build-appex.sh substitutes it into the `DBSyncAppGroupID`
+    /// Info.plist key from `APPLE_TEAM_ID`. `nil` means a build without a team. An extension that is
+    /// NOT signed with the group does not get `nil`: on macOS Foundation still returns a URL of the
+    /// expected form, and the first read of it is then denied by the sandbox, which the read-failure
+    /// log below reports. Both are logged once per transition, because an unresolvable container looks
+    /// exactly like "no files tracked yet".
+    private func overlayStateURL() -> URL? {
+        let groupID = (Bundle.main.object(forInfoDictionaryKey: "DBSyncAppGroupID") as? String) ?? ""
+        let container = groupID.isEmpty
+            ? nil
+            : FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID)
+        guard let container = container else {
+            if !lastContainerFailed {
+                NSLog("DropboxSync FinderSync: no App Group container (group id '%@') — no badges will be "
+                    + "shown. The build needs APPLE_TEAM_ID and the application-groups entitlement.",
+                      groupID)
+                lastContainerFailed = true
+            }
+            return nil
+        }
+        if lastContainerFailed {
+            NSLog("DropboxSync FinderSync: App Group container '%@' resolved again.", groupID)
+            lastContainerFailed = false
+        }
+        return container
             .appendingPathComponent("Library/Application Support/DropboxSyncDesktop/overlay_state.json")
     }
 
@@ -141,19 +151,28 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// them would swallow one of the two messages.
     private var lastDecodeFailed = false
 
+    private func clearState() {
+        state = nil
+        // Must clear alongside `state`: leaving a stale stamp here would make the
+        // short-circuit in `reloadState` skip the diff when the file comes back with the same
+        // `updated_at`, and no badge would ever be pushed again.
+        lastUpdatedAt = nil
+    }
+
     private func reloadState() {
-        let url = overlayStateURL()
+        // No container: the lookup already logged why. Clear exactly like an unreadable file.
+        guard let url = overlayStateURL() else {
+            clearState()
+            return
+        }
         guard let data = try? Data(contentsOf: url) else {
             if !lastLoadFailed {
                 NSLog("DropboxSync FinderSync: cannot read %@ — no badges will be shown. "
-                    + "Check the sandbox entitlement covers this path.", url.path)
+                    + "Check the file exists in the App Group container; if it does, the extension may "
+                    + "not be signed with the App Group (sandbox denial), so check its signature.", url.path)
                 lastLoadFailed = true
             }
-            state = nil
-            // Must clear alongside `state`: leaving a stale stamp here would make the
-            // short-circuit below skip the diff when the file comes back with the same
-            // `updated_at`, and no badge would ever be pushed again.
-            lastUpdatedAt = nil
+            clearState()
             return
         }
         if lastLoadFailed {
@@ -185,8 +204,7 @@ final class DropboxSyncFinderSync: FIFinderSync {
                       logVerb(for: error), url.path, logSafeDescription(of: error))
                 lastDecodeFailed = true
             }
-            state = nil
-            lastUpdatedAt = nil
+            clearState()
             return
         }
         if lastDecodeFailed {

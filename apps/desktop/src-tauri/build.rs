@@ -5,5 +5,10 @@ fn main() {
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=framework=FinderSync");
 
+    // `app_group.rs` bakes the App Group id in with `option_env!("APPLE_TEAM_ID")` (DBSYNC-97). Cargo
+    // already tracks `option_env!` for the crate being compiled, so this line is belt and braces: it
+    // also re-runs this build script, and keeps the dependency visible in one place.
+    println!("cargo:rerun-if-env-changed=APPLE_TEAM_ID");
+
     tauri_build::build()
 }

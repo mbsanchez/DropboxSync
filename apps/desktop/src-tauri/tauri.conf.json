@@ -62,6 +62,7 @@
       "minimumSystemVersion": "12.0",
       "infoPlist": "Info.plist",
       "signingIdentity": "-",
+      "entitlements": ".generated/host.entitlements",
       "files": {
         "PlugIns/DropboxSyncFinderSync.appex": "../native/macos/FinderSyncExtension/build/DropboxSyncFinderSync.appex"
       }

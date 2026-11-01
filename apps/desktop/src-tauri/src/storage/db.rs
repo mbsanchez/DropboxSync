@@ -3198,13 +3198,16 @@ fn current_data_dir_os() -> DataDirOs {
 /// of env/FS access so every platform branch can be exercised in unit tests.
 ///
 /// - Windows: `%LOCALAPPDATA%\DropboxSyncDesktop`
-/// - macOS: `~/Library/Application Support/DropboxSyncDesktop`
+/// - macOS: `<App Group container>/Library/Application Support/DropboxSyncDesktop` (DBSYNC-97). The
+///   container base is injected; `None` is an error, never a fall back to `~/Library`, because the
+///   sandboxed Finder Sync extension could not read a database kept there.
 /// - Linux/other Unix: `$XDG_DATA_HOME/DropboxSyncDesktop`, else `~/.local/share/DropboxSyncDesktop`
 fn data_dir_for(
     os: DataDirOs,
     localappdata: Option<&str>,
     xdg_data_home: Option<&str>,
     home: Option<&str>,
+    group_container: Option<&str>,
 ) -> AppResult<PathBuf> {
     match os {
         DataDirOs::Windows => {
@@ -3214,10 +3217,14 @@ fn data_dir_for(
             Ok(PathBuf::from(base).join("DropboxSyncDesktop"))
         }
         DataDirOs::Macos => {
-            let home = home
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AppError::Io("HOME env var not found".into()))?;
-            Ok(PathBuf::from(home)
+            let container = group_container.filter(|s| !s.is_empty()).ok_or_else(|| {
+                AppError::Io(
+                    "the App Group container is unavailable: the app must be built with APPLE_TEAM_ID \
+                     and signed with the team-prefixed com.apple.security.application-groups entitlement"
+                        .into(),
+                )
+            })?;
+            Ok(PathBuf::from(container)
                 .join("Library")
                 .join("Application Support")
                 .join("DropboxSyncDesktop"))
@@ -3241,11 +3248,16 @@ fn resolve_app_data_dir() -> AppResult<PathBuf> {
     let localappdata = std::env::var("LOCALAPPDATA").ok();
     let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
     let home = std::env::var("HOME").ok();
+    #[cfg(target_os = "macos")]
+    let group_container = crate::app_group::container_path();
+    #[cfg(not(target_os = "macos"))]
+    let group_container: Option<String> = None;
     data_dir_for(
         current_data_dir_os(),
         localappdata.as_deref(),
         xdg_data_home.as_deref(),
         home.as_deref(),
+        group_container.as_deref(),
     )
 }
 
@@ -3288,6 +3300,7 @@ mod app_data_dir_tests {
             Some("C:\\Users\\u\\AppData\\Local"),
             None,
             None,
+            None,
         )
         .expect("windows path");
         assert_eq!(
@@ -3296,22 +3309,75 @@ mod app_data_dir_tests {
         );
     }
 
+    /// DBSYNC-97: on macOS the data dir lives inside the App Group container, so the sandboxed Finder
+    /// Sync extension can read `overlay_state.json` from the very directory the host writes it to. The
+    /// container base is injected; nothing here resolves the real one.
     #[test]
-    fn macos_uses_application_support_not_applications() {
-        let got = data_dir_for(DataDirOs::Macos, None, None, Some("/Users/u")).expect("macos path");
+    fn macos_uses_the_injected_group_container() {
+        let container = "/Users/u/Library/Group Containers/TEAM.com.dropboxsyncdesktop";
+        let got = data_dir_for(
+            DataDirOs::Macos,
+            None,
+            None,
+            Some("/Users/u"),
+            Some(container),
+        )
+        .expect("macos path");
         assert_eq!(
             got,
-            PathBuf::from("/Users/u")
+            PathBuf::from(container)
                 .join("Library")
                 .join("Application Support")
                 .join("DropboxSyncDesktop")
         );
     }
 
+    /// DBSYNC-97: a missing container is an error even when HOME is perfectly usable. Falling back to
+    /// `~/Library/Application Support` would put the database where the sandboxed extension cannot see
+    /// it, and the two sides would silently diverge (the DBSYNC-75 class of defect).
+    #[test]
+    fn macos_without_a_container_is_an_error_not_a_home_fallback() {
+        let err = data_dir_for(DataDirOs::Macos, None, None, Some("/Users/u"), None)
+            .expect_err("no container must not fall back to HOME");
+        let msg = err.to_string();
+        assert!(msg.contains("App Group"), "message names the cause: {msg}");
+        assert!(
+            msg.contains("APPLE_TEAM_ID"),
+            "message names the fix: {msg}"
+        );
+        assert!(
+            data_dir_for(DataDirOs::Macos, None, None, Some("/Users/u"), Some("")).is_err(),
+            "an empty container base is as good as none"
+        );
+    }
+
+    /// DBSYNC-97: the container is a macOS concept. Windows and Linux must ignore it entirely.
+    #[test]
+    fn other_platforms_ignore_the_group_container() {
+        let bogus = Some("/ignored");
+        assert_eq!(
+            data_dir_for(DataDirOs::Windows, Some("C:\\L"), None, None, bogus).unwrap(),
+            PathBuf::from("C:\\L").join("DropboxSyncDesktop")
+        );
+        assert_eq!(
+            data_dir_for(DataDirOs::Unix, None, None, Some("/home/u"), bogus).unwrap(),
+            PathBuf::from("/home/u")
+                .join(".local")
+                .join("share")
+                .join("DropboxSyncDesktop")
+        );
+    }
+
     #[test]
     fn linux_prefers_xdg_data_home() {
-        let got = data_dir_for(DataDirOs::Unix, None, Some("/custom/xdg"), Some("/home/u"))
-            .expect("linux xdg path");
+        let got = data_dir_for(
+            DataDirOs::Unix,
+            None,
+            Some("/custom/xdg"),
+            Some("/home/u"),
+            None,
+        )
+        .expect("linux xdg path");
         assert_eq!(got, PathBuf::from("/custom/xdg").join("DropboxSyncDesktop"));
     }
 
@@ -3323,20 +3389,20 @@ mod app_data_dir_tests {
             .join("share")
             .join("DropboxSyncDesktop");
         assert_eq!(
-            data_dir_for(DataDirOs::Unix, None, None, Some("/home/u")).unwrap(),
+            data_dir_for(DataDirOs::Unix, None, None, Some("/home/u"), None).unwrap(),
             expected
         );
         assert_eq!(
-            data_dir_for(DataDirOs::Unix, None, Some(""), Some("/home/u")).unwrap(),
+            data_dir_for(DataDirOs::Unix, None, Some(""), Some("/home/u"), None).unwrap(),
             expected
         );
     }
 
     #[test]
     fn missing_required_env_is_an_error() {
-        assert!(data_dir_for(DataDirOs::Windows, None, None, None).is_err());
-        assert!(data_dir_for(DataDirOs::Macos, None, None, None).is_err());
-        assert!(data_dir_for(DataDirOs::Unix, None, None, None).is_err());
+        assert!(data_dir_for(DataDirOs::Windows, None, None, None, None).is_err());
+        assert!(data_dir_for(DataDirOs::Macos, None, None, None, None).is_err());
+        assert!(data_dir_for(DataDirOs::Unix, None, None, None, None).is_err());
     }
 }
 
