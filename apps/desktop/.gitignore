@@ -26,6 +26,9 @@ dist-ssr
 # Finder Sync extension Xcode output (see npm run build:finder-sync)
 native/macos/FinderSyncExtension/build/
 
+# File Provider extension Xcode output (see npm run build:file-provider)
+native/macos/FileProviderExtension/build/
+
 # Local environment for Dropbox OAuth config
 .env
 

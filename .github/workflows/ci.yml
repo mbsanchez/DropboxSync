@@ -183,8 +183,8 @@ jobs:
         # earlier. Producing an installer belongs to the release workflow (GitHub #85);
         # a PR check only needs to prove the app links.
         #
-        # This step also builds the Swift appex: `beforeBuildCommand` runs
-        # `scripts/tauri-before-build.mjs`, which calls `build:finder-sync` on darwin.
+        # This step also builds the Swift appexes: `beforeBuildCommand` runs
+        # `scripts/tauri-before-build.mjs`, which calls `build:finder-sync` and `build:file-provider` on darwin.
         # That is why it must never be matrixed onto another OS.
         run: npm --workspace apps/desktop run bundle:dev
 

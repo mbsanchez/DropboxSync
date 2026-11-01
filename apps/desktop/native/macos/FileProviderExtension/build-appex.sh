@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Build DropboxSyncFileProvider.appex (File Provider extension). Requires full Xcode (not only CLT).
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Skipping File Provider appex build (macOS only)."
+  exit 0
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+PROJECT="DropboxSyncFileProvider.xcodeproj"
+SCHEME="DropboxSyncFileProvider"
+CONFIG="${CONFIGURATION:-Release}"
+DERIVED="${ROOT}/build/DerivedData"
+
+if ! command -v xcodebuild >/dev/null 2>&1; then
+  echo "xcodebuild not found. Install Xcode and run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
+  exit 1
+fi
+
+mkdir -p "$DERIVED"
+
+echo "Building ${SCHEME}.appex (${CONFIG})…"
+
+# Same team as the main app: set APPLE_TEAM_ID (also used by Tauri notarization) or DEVELOPMENT_TEAM.
+#
+# Supplying a team is NOT enough on its own. The project ships CODE_SIGN_STYLE=Automatic, and automatic
+# signing resolves the *development* certificate for a build action: with a team set and no "Mac Development"
+# certificate in the keychain, xcodebuild fails with
+#   error: No signing certificate "Mac Development" found
+# A Developer ID-only account (the distribution model for this app) never has that certificate. So whenever a
+# team is present we switch to manual signing and name the identity explicitly.
+# This signature is FINAL: Tauri does not re-sign it. `copy_custom_files_to_bundle()` (tauri-bundler 2.8.1,
+# bundle/macos/app.rs) places the appex from bundle.macOS.files into Contents/PlugIns/ without adding it to
+# the bundler's sign_paths, and the codesign invocation itself — which lives in tauri-macos-sign 2.3.3, not
+# in the bundler — carries no --deep. Whatever is wrong here reaches Apple unchanged.
+#
+# CODE_SIGN_INJECT_BASE_ENTITLEMENTS is set unconditionally, NOT only when signing for real: `xcodebuild
+# build` otherwise injects com.apple.security.get-task-allow, a debugger-attach entitlement that notarization
+# refuses and that defeats part of Hardened Runtime. Keeping it out of the ad-hoc path too means the appex
+# never carries it, whichever way it was built — otherwise exporting APPLE_SIGNING_IDENTITY without
+# APPLE_TEAM_ID would produce a Developer ID host wrapping an ad-hoc appex that still has it, and the
+# bundler's notarize_auth() accepts an ASC API key without APPLE_TEAM_ID, so that could be submitted.
+SIGN_ARGS=(CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO)
+
+# App Sandbox. Every File Provider extension on a reference Mac is sandboxed (Dropbox's replicated appex,
+# OneDrive's). There is deliberately NO network entitlement: the host app is the only Dropbox client (ADR-0004).
+# Passed here rather than through the environment: xcodebuild command-line settings win over env vars, so an
+# exported CODE_SIGN_ENTITLEMENTS was silently ignored.
+#
+# The committed file is a TEMPLATE (DBSYNC-97): it carries an App Group token, and the renderer substitutes the
+# team from APPLE_TEAM_ID into build/ (gitignored). Team ID: see FinderSyncExtension/README.md (App Group ADR).
+# With no team, or with an ad-hoc/unset APPLE_SIGNING_IDENTITY (the same rule the host uses, so the two agree),
+# it omits the group key and warns on stderr, so a build never gets a bare or wrong group. The group id is
+# captured from its stdout and handed to Info.plist as DBSyncAppGroupID, which is how the Swift side learns it.
+#
+# The rendered file lives in a directory named after its own content hash, never at a fixed path.
+# xcodebuild records the entitlements file's modification time, and fails the NEXT build with
+# "Entitlements file ... was modified during the build" if the same path changes (a different team, or
+# switching between a team and no team) until DerivedData is wiped. A content-addressed path is never
+# modified: new content gets a new path, identical content keeps the old one untouched.
+mkdir -p "${ROOT}/build"
+RENDERED="${ROOT}/build/entitlements.rendered"
+# Remove the previous output first: if the renderer silently did nothing, a stale file from an earlier
+# build (another team, or none) would otherwise be hashed and signed as if it were this build's.
+rm -f "$RENDERED"
+# A build that names both a team and a signing identity is meant to be a real one, so the renderer must
+# produce the group: --require-group makes it exit non-zero (and write nothing) otherwise. The renderer owns
+# the identity rule (unset, blank or "-" is ad-hoc); this script only decides whether to insist on it.
+RENDER_ARGS=()
+if [[ -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+  RENDER_ARGS+=(--require-group)
+fi
+APP_GROUP_ID="$(APPLE_TEAM_ID="${APPLE_TEAM_ID:-}" node "${ROOT}/../../../scripts/render-entitlements.mjs" \
+  "${RENDER_ARGS[@]+"${RENDER_ARGS[@]}"}" "${ROOT}/DropboxSyncFileProvider.entitlements" "$RENDERED")"
+if [[ ! -s "$RENDERED" ]]; then
+  echo "ERROR: render-entitlements.mjs produced no entitlements file; refusing to sign with stale or missing entitlements." >&2
+  exit 1
+fi
+ENTITLEMENTS_DIR="${ROOT}/build/entitlements-$(shasum -a 256 "$RENDERED" | cut -c1-16)"
+ENTITLEMENTS="${ENTITLEMENTS_DIR}/DropboxSyncFileProvider.entitlements"
+if [[ ! -f "$ENTITLEMENTS" ]]; then
+  mkdir -p "$ENTITLEMENTS_DIR"
+  # Copy to a temp name and rename: an interrupted `cp` straight to the final name would leave a
+  # truncated file that the `-f` test above then accepts on every later run.
+  cp "$RENDERED" "${ENTITLEMENTS}.tmp.$$"
+  mv "${ENTITLEMENTS}.tmp.$$" "$ENTITLEMENTS"
+fi
+SIGN_ARGS+=(CODE_SIGN_ENTITLEMENTS="$ENTITLEMENTS" DBSYNC_APP_GROUP_ID="$APP_GROUP_ID")
+
+TEAM="${APPLE_TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
+APPEX_IDENTITY="${APPEX_CODE_SIGN_IDENTITY:-Developer ID Application}"
+if [[ -n "$TEAM" ]]; then
+  SIGN_ARGS+=(
+    DEVELOPMENT_TEAM="$TEAM"
+    CODE_SIGN_STYLE=Manual
+    CODE_SIGN_IDENTITY="$APPEX_IDENTITY"
+    # Xcode signs build products with --timestamp=none; notarization requires a secure TSA timestamp on every
+    # nested bundle. Only meaningful with a real identity — an ad-hoc signature cannot be timestamped.
+    OTHER_CODE_SIGN_FLAGS="--timestamp"
+  )
+  echo "Signing appex as '${APPEX_IDENTITY}' for team ${TEAM} (hardened runtime, secure timestamp, no injected entitlements)."
+else
+  if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    echo "WARNING: APPLE_SIGNING_IDENTITY is set but APPLE_TEAM_ID is not." >&2
+    echo "         The host app will be signed for real while this appex stays ad-hoc, which cannot be" >&2
+    echo "         notarized. Export APPLE_TEAM_ID as well." >&2
+  fi
+  echo "No APPLE_TEAM_ID/DEVELOPMENT_TEAM set: ad-hoc signing (fine for development and CI, not notarizable)."
+fi
+
+# -scheme is required with -derivedDataPath on recent Xcode; keeps all output under native/.../build/.
+# With `set -u`, a plain "${SIGN_ARGS[@]}" can fail when the array is empty (macOS Bash 3.2).
+xcodebuild \
+  -project "$PROJECT" \
+  -scheme "$SCHEME" \
+  -configuration "$CONFIG" \
+  -derivedDataPath "$DERIVED" \
+  -destination "generic/platform=macOS" \
+  build \
+  CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-YES}" \
+  "${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"}"
+
+OUT="${DERIVED}/Build/Products/${CONFIG}/${SCHEME}.appex"
+echo "Built: $OUT"
+
+# Guard the coupling between FileProviderExtension.swift's @objc(...) name and the plist's principal class.
+# Nothing else catches a drift: removing the @objc attribute changes the emitted ObjC symbol to the
+# Swift-mangled form and the plist silently stops resolving, with no build error and no test failure.
+# Copied from the Finder Sync script (DBSYNC-95): scripts/appex-scripts.test.mjs keeps the signing flags aligned.
+if [[ -d "$OUT" ]]; then
+  DECLARED=$(/usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPrincipalClass" "$OUT/Contents/Info.plist" 2>/dev/null || true)
+  # Unlike the Finder Sync script this binary exports helper ObjC classes too (the item and enumerator), so the
+  # declared class must be among the exported ones rather than the first.
+  # `nm -U` lists DEFINED symbols only: plain `nm -a` also lists undefined imports, so an imported framework class
+  # such as NSObject would satisfy the check. No `-g`: the compiler emits the app's own ObjC classes as local
+  # symbols, which `nm -gU` leaves out, so it would reject the real principal class too.
+  EMITTED=$(nm -U "$OUT/Contents/MacOS/${SCHEME}" 2>/dev/null | sed -n 's/.*_OBJC_CLASS_\$_//p')
+  if [[ -z "$DECLARED" ]] || ! printf '%s\n' "$EMITTED" | grep -qxF "$DECLARED"; then
+    echo "ERROR: NSExtensionPrincipalClass '${DECLARED}' does not match the ObjC class the binary exports ('$(printf '%s' "$EMITTED" | tr '\n' ' ')')." >&2
+    echo "       NSClassFromString would return nil and the extension could never load. See DBSYNC-76 (same failure mode, Finder Sync)." >&2
+    exit 1
+  fi
+  echo "Principal class OK: ${DECLARED}"
+fi
+if [[ -d "$OUT" ]]; then
+  mkdir -p "${ROOT}/build"
+  rm -rf "${ROOT}/build/${SCHEME}.appex"
+  /usr/bin/ditto "$OUT" "${ROOT}/build/${SCHEME}.appex"
+  echo "Copied to: ${ROOT}/build/${SCHEME}.appex"
+fi
