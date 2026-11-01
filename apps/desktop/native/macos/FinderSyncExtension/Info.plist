@@ -20,6 +20,11 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!-- The App Group id, substituted by build-appex.sh from APPLE_TEAM_ID (empty without a team), so it
+	     cannot be a source literal (Team ID: see FinderSyncExtension/README.md, App Group ADR).
+	     SyncExtension.swift reads it from here. -->
+	<key>DBSyncAppGroupID</key>
+	<string>$(DBSYNC_APP_GROUP_ID)</string>
 	<!-- The extension host needs an AppKit run loop: SyncExtension.swift schedules a repeating
 	     Timer from init(), which never fires without one. Both Dropbox's garcon.appex and
 	     OneDrive's FinderSync.appex declare these two keys. -->

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TEMPLATE. scripts/render-entitlements.mjs writes the real file to src-tauri/.generated/ (gitignored),
+	     substituting the team id from APPLE_TEAM_ID (Team ID: see FinderSyncExtension/README.md, App Group ADR).
+	     Only the shared App Group lives here: the Finder Sync extension reads the same container, and the
+	     File Provider extension (DBSYNC-95) will reuse it. No provisioning profile is involved. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>__APP_GROUP_ID__</string>
+	</array>
+</dict>
+</plist>

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod app_group;
 mod auth;
 mod auth_session;
 #[cfg(windows)]
@@ -176,6 +178,8 @@ fn app_context() -> tauri::Context {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     logging::init_tracing();
+    #[cfg(all(target_os = "macos", not(test)))]
+    app_group::log_startup_entitlements();
 
     // STARTUP ORDER (DBSYNC-103 #186). `Db::new` also runs the NFC key migration (macOS) before
     // it returns, so no `Db` handle, and therefore no `AppState`, exists until every stored path
@@ -187,7 +191,12 @@ pub fn run() {
     // Any `Db::new` failure is also written to `startup-error.txt` next to the database
     // (synchronously, so it survives this panic). The error text names the file only when
     // that write succeeded, and otherwise carries the reason itself.
-    let db = Db::new().expect("failed to initialize sqlite db");
+    let db = Db::new().unwrap_or_else(|e| {
+        // A Finder or Dock launch has no terminal, and on macOS the usual cause (DBSYNC-97: no App
+        // Group container) leaves no log file either. Say it where a GUI launch can see it first.
+        logging::report_startup_failure(&format!("failed to initialize sqlite db: {e}"));
+        panic!("failed to initialize sqlite db: {e}");
+    });
     let mut sync_engine = SyncEngine::new();
     if let Ok(Some(folder)) = db.get_sync_folder() {
         sync_engine.set_tracked_path(folder);

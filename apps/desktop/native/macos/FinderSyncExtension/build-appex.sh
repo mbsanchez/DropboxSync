@@ -49,10 +49,46 @@ SIGN_ARGS=(CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO)
 # extension on a reference Mac is sandboxed (Dropbox's garcon.appex, OneDrive's FinderSync.appex, odrive).
 # Passed here rather than through the environment: xcodebuild command-line settings win over env vars, so an
 # exported CODE_SIGN_ENTITLEMENTS was silently ignored.
-ENTITLEMENTS="${ROOT}/DropboxSyncFinderSync.entitlements"
-if [[ -f "$ENTITLEMENTS" ]]; then
-  SIGN_ARGS+=(CODE_SIGN_ENTITLEMENTS="$ENTITLEMENTS")
+#
+# The committed file is a TEMPLATE (DBSYNC-97): it carries an App Group token, and the renderer substitutes the
+# team from APPLE_TEAM_ID into build/ (gitignored). Team ID: see FinderSyncExtension/README.md (App Group ADR).
+# With no team, or with an ad-hoc/unset APPLE_SIGNING_IDENTITY (the same rule the host uses, so the two agree),
+# it omits the group key and warns on stderr, so a build never gets a bare or wrong group. The group id is
+# captured from its stdout and handed to Info.plist as DBSyncAppGroupID, which is how the Swift side learns it.
+#
+# The rendered file lives in a directory named after its own content hash, never at a fixed path.
+# xcodebuild records the entitlements file's modification time, and fails the NEXT build with
+# "Entitlements file ... was modified during the build" if the same path changes (a different team, or
+# switching between a team and no team) until DerivedData is wiped. A content-addressed path is never
+# modified: new content gets a new path, identical content keeps the old one untouched.
+mkdir -p "${ROOT}/build"
+RENDERED="${ROOT}/build/entitlements.rendered"
+# Remove the previous output first: if the renderer silently did nothing, a stale file from an earlier
+# build (another team, or none) would otherwise be hashed and signed as if it were this build's.
+rm -f "$RENDERED"
+# A build that names both a team and a signing identity is meant to be a real one, so the renderer must
+# produce the group: --require-group makes it exit non-zero (and write nothing) otherwise. The renderer owns
+# the identity rule (unset, blank or "-" is ad-hoc); this script only decides whether to insist on it.
+RENDER_ARGS=()
+if [[ -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+  RENDER_ARGS+=(--require-group)
 fi
+APP_GROUP_ID="$(APPLE_TEAM_ID="${APPLE_TEAM_ID:-}" node "${ROOT}/../../../scripts/render-entitlements.mjs" \
+  "${RENDER_ARGS[@]+"${RENDER_ARGS[@]}"}" "${ROOT}/DropboxSyncFinderSync.entitlements" "$RENDERED")"
+if [[ ! -s "$RENDERED" ]]; then
+  echo "ERROR: render-entitlements.mjs produced no entitlements file; refusing to sign with stale or missing entitlements." >&2
+  exit 1
+fi
+ENTITLEMENTS_DIR="${ROOT}/build/entitlements-$(shasum -a 256 "$RENDERED" | cut -c1-16)"
+ENTITLEMENTS="${ENTITLEMENTS_DIR}/DropboxSyncFinderSync.entitlements"
+if [[ ! -f "$ENTITLEMENTS" ]]; then
+  mkdir -p "$ENTITLEMENTS_DIR"
+  # Copy to a temp name and rename: an interrupted `cp` straight to the final name would leave a
+  # truncated file that the `-f` test above then accepts on every later run.
+  cp "$RENDERED" "${ENTITLEMENTS}.tmp.$$"
+  mv "${ENTITLEMENTS}.tmp.$$" "$ENTITLEMENTS"
+fi
+SIGN_ARGS+=(CODE_SIGN_ENTITLEMENTS="$ENTITLEMENTS" DBSYNC_APP_GROUP_ID="$APP_GROUP_ID")
 
 TEAM="${APPLE_TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
 APPEX_IDENTITY="${APPEX_CODE_SIGN_IDENTITY:-Developer ID Application}"

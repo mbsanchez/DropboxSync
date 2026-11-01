@@ -16,18 +16,70 @@ fn env_filter() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
+/// A message safe to hand to a C string API: interior NULs would truncate or reject it.
+#[cfg(any(target_os = "macos", test))]
+fn without_nul(message: &str) -> String {
+    message.replace('\0', " ")
+}
+
+/// Writes a startup failure where a GUI launch can see it (DBSYNC-97). A Finder or Dock launch has
+/// no terminal and the file log may not exist yet, so on macOS the text also goes to the unified log
+/// via `NSLog` (Console.app, `log show --predicate 'process == "DropboxSyncDesktop"'`).
+pub(crate) fn report_startup_failure(message: &str) {
+    eprintln!("DropboxSync: {message}");
+    #[cfg(target_os = "macos")]
+    ns_log(&format!("DropboxSync: {message}"));
+}
+
+#[cfg(target_os = "macos")]
+fn ns_log(message: &str) {
+    use objc2::msg_send;
+    use objc2::rc::autoreleasepool;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use std::ffi::CString;
+
+    #[link(name = "Foundation", kind = "framework")]
+    extern "C" {
+        fn NSLog(format: *const AnyObject, ...);
+    }
+
+    let Ok(text) = CString::new(without_nul(message)) else {
+        return;
+    };
+    autoreleasepool(|_| {
+        // SAFETY: `stringWithUTF8String:` takes NUL-terminated C strings that outlive the calls, and
+        // `NSLog(@"%@", s)` is the documented way to log a string without it being parsed as a format.
+        unsafe {
+            let Some(ns_string) = AnyClass::get(c"NSString") else {
+                return;
+            };
+            let format: *mut AnyObject = msg_send![ns_string, stringWithUTF8String: c"%@".as_ptr()];
+            let body: *mut AnyObject = msg_send![ns_string, stringWithUTF8String: text.as_ptr()];
+            if !format.is_null() && !body.is_null() {
+                NSLog(format, body);
+            }
+        }
+    });
+}
+
 /// Initializes the global `tracing` subscriber. Must be called once, as the
 /// first thing in `run()`, before any other setup. Idempotent-safe: a second
 /// call (e.g. from tests) is a harmless no-op rather than a panic.
 pub(crate) fn init_tracing() {
     let dir = match crate::storage::db::app_data_dir() {
         Ok(dir) => dir,
-        Err(_) => {
-            // No app data dir available (e.g. unusual environment): fall back to a
-            // stderr-only subscriber rather than panicking.
+        Err(e) => {
+            // No app data dir available: fall back to a stderr-only subscriber rather than
+            // panicking here. The reason is NOT swallowed (DBSYNC-97): on macOS it is usually a
+            // missing App Group container, and `Db::new` fails with the same error right after.
+            // Reported once, through `report_startup_failure` (stderr plus the unified log): the
+            // fallback subscriber also writes to stderr, so a `tracing::error!` would print it twice.
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(env_filter())
                 .try_init();
+            report_startup_failure(&format!(
+                "no app data directory, file logging disabled: {e}"
+            ));
             return;
         }
     };
@@ -52,4 +104,17 @@ pub(crate) fn init_tracing() {
         .with(env_filter())
         .with(fmt_layer)
         .try_init();
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::without_nul;
+
+    /// `CString::new` rejects an interior NUL, which would silently drop the whole message.
+    #[test]
+    fn interior_nul_is_replaced_not_fatal() {
+        let cleaned = without_nul("a\0b");
+        assert_eq!(cleaned, "a b");
+        assert!(std::ffi::CString::new(cleaned).is_ok());
+    }
 }

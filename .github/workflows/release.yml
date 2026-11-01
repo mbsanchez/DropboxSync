@@ -74,7 +74,8 @@ jobs:
       # stamped into every signed binary and `codesign -dv` prints it for anyone who
       # downloads the app. Making it a secret cost real evidence: GitHub masked it in
       # the log, so the host-vs-appex comparison below printed `TeamIdentifier=***`
-      # twice and nobody could confirm by eye that the two matched.
+      # twice and nobody could confirm by eye that the two matched. Why the tree holds no literal
+      # team id: see apps/desktop/native/macos/FinderSyncExtension/README.md (App Group ADR).
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
 
     steps:
@@ -99,6 +100,19 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Require a valid team id before spending a build on it
+        # DBSYNC-97: without a team the build carries no App Group, and the app and its Finder
+        # extension would silently stop sharing state. Fail before building, not after notarizing.
+        # The value is trimmed and must be a 10-character Apple team id; the tools downstream trim
+        # it too, so a stray space would otherwise pass here and fail only at the entitlement check.
+        run: |
+          TEAM=$(printf '%s' "${APPLE_TEAM_ID:-}" | tr -d '[:space:]')
+          # The pattern lives in one place, render-entitlements.mjs (TEAM_ID_PATTERN), not here.
+          if ! node --input-type=module -e 'import { TEAM_ID_PATTERN } from "./apps/desktop/scripts/render-entitlements.mjs"; process.exit(TEAM_ID_PATTERN.test(process.argv[1]) ? 0 : 1)' "$TEAM"; then
+            echo "::error::APPLE_TEAM_ID must be a 10-character Apple team id (upper-case letters and digits); a release built without it ships with no App Group"
+            exit 1
+          fi
 
       - name: Create a temporary keychain and import the signing identity
         # A dedicated keychain, deleted unconditionally at the end of the job. The runner is
@@ -147,6 +161,63 @@ jobs:
       - name: Build and sign the app bundle
         # Signing only. Notarization is the next step, on purpose — see the header.
         run: npm --workspace apps/desktop run tauri -- build --bundles app,dmg
+
+      - name: Check the App Group entitlements before notarizing
+        # DBSYNC-97. Runs between build and notarize so a wrong group fails in seconds instead of
+        # after a 30-minute notarization. The host and every appex must carry exactly the group
+        # `<team>.com.dropboxsyncdesktop`, and each appex Info.plist `DBSyncAppGroupID` (what the
+        # extension reads at runtime) must equal the group in its own entitlements.
+        run: |
+          set -euo pipefail
+          APP=apps/desktop/src-tauri/target/release/bundle/macos/DropboxSyncDesktop.app
+          TEAM=$(printf '%s' "${APPLE_TEAM_ID:-}" | tr -d '[:space:]')
+          HOST_TEAM=$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          if [ "$HOST_TEAM" != "$TEAM" ]; then
+            echo "::error::signed team $HOST_TEAM != APPLE_TEAM_ID $TEAM"
+            exit 1
+          fi
+          GROUP_DIR=$(mktemp -d)
+          GROUP_PLISTS=("$GROUP_DIR/host.plist")
+          codesign -d --entitlements - --xml "$APP" > "$GROUP_DIR/host.plist"
+
+          shopt -s nullglob
+          APPEXES=("$APP"/Contents/PlugIns/*.appex)
+          if [ ${#APPEXES[@]} -eq 0 ]; then
+            echo "::error::no appex found under $APP/Contents/PlugIns"
+            exit 1
+          fi
+          for APPEX in "${APPEXES[@]}"; do
+            APPEX_PLIST="$GROUP_DIR/$(basename "$APPEX").plist"
+            codesign -d --entitlements - --xml "$APPEX" > "$APPEX_PLIST"
+            GROUP_PLISTS+=("$APPEX_PLIST")
+          done
+
+          # First, so its readable `::error::` lines always print: the plutil comparison below aborts the
+          # step when an appex has no `application-groups` key at all, which is exactly what this reports.
+          # Require the positive token, not just the exit code: a run that never reached the check
+          # (a wrong entry-point test once made the script a silent no-op) also exits 0.
+          CHECK_OUT=$(node apps/desktop/scripts/check-app-groups.mjs "$HOST_TEAM" "${GROUP_PLISTS[@]}")
+          printf '%s\n' "$CHECK_OUT"
+          if ! printf '%s\n' "$CHECK_OUT" | grep -qx 'app-groups: OK'; then
+            echo "::error::check-app-groups.mjs exited 0 but did not print 'app-groups: OK'; the check did not run"
+            exit 1
+          fi
+
+          for APPEX in "${APPEXES[@]}"; do
+            APPEX_PLIST="$GROUP_DIR/$(basename "$APPEX").plist"
+            if ! ENTITLED=$(plutil -extract 'com\.apple\.security\.application-groups.0' raw -o - "$APPEX_PLIST"); then
+              echo "::error::$(basename "$APPEX"): could not read the first application-groups entry from its entitlements"
+              exit 1
+            fi
+            if ! INFO=$(plutil -extract DBSyncAppGroupID raw -o - "$APPEX/Contents/Info.plist"); then
+              echo "::error::$(basename "$APPEX"): Info.plist has no readable DBSyncAppGroupID"
+              exit 1
+            fi
+            if [ "$ENTITLED" != "$INFO" ]; then
+              echo "::error::$(basename "$APPEX") Info.plist DBSyncAppGroupID '$INFO' != entitlement '$ENTITLED'"
+              exit 1
+            fi
+          done
 
       - name: Notarize and staple
         env:

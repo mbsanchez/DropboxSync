@@ -214,6 +214,14 @@ jobs:
         # not later mistaken for a defect.
         run: npm --workspace apps/desktop run build
 
+      - name: Build-script tests
+        # DBSYNC-97: the entitlement renderer and the release App Group check are plain Node and
+        # guard what ships. They have their own tests (`scripts/*.test.mjs`) and nothing else in CI
+        # runs them. `scripts/run-tests.mjs` lists the files itself and passes explicit paths to
+        # `node --test`: this job pins Node 20, which does not expand globs (Node does that only from
+        # version 21), and neither does `cmd.exe` on a Windows developer machine.
+        run: npm --workspace apps/desktop run test:scripts
+
   # Windows artefacts: the app links, and the Explorer shell extension type-checks
   # (DBSYNC-38, GitHub #122).
   windows-app:

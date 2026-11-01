@@ -9,14 +9,13 @@
 	<true/>
 	<key>com.apple.security.files.user-selected.read-only</key>
 	<true/>
-	<!-- The sandbox puts the extension in its own container, so it can no longer reach the host's
-	     Application Support directory where overlay_state.json lives. This temporary exception grants
-	     read-only access to exactly that directory and nothing else. Dropbox does the same for
-	     ~/.dropbox/. The alternative — an App Group shared container — needs an identifier registered
-	     with Apple and a provisioning profile, and would move the state file for every existing user. -->
-	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<!-- TEMPLATE. scripts/render-entitlements.mjs renders it to build/ (gitignored), substituting the team id
+	     from APPLE_TEAM_ID (Team ID: see FinderSyncExtension/README.md, App Group ADR). The App Group is
+	     how this sandboxed extension reaches the host's data directory (overlay_state.json): the container lives outside both
+	     sandboxes and needs no temporary exception. Team-prefixed, so it needs no provisioning profile. -->
+	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>/Library/Application Support/DropboxSyncDesktop/</string>
+		<string>__APP_GROUP_ID__</string>
 	</array>
 </dict>
 </plist>

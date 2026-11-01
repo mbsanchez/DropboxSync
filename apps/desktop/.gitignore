@@ -28,3 +28,6 @@ native/macos/FinderSyncExtension/build/
 
 # Local environment for Dropbox OAuth config
 .env
+
+# Rendered entitlements (carry the team id; see scripts/render-entitlements.mjs)
+src-tauri/.generated/
