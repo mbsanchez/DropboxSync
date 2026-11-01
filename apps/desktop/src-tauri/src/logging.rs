@@ -72,13 +72,14 @@ pub(crate) fn init_tracing() {
             // No app data dir available: fall back to a stderr-only subscriber rather than
             // panicking here. The reason is NOT swallowed (DBSYNC-97): on macOS it is usually a
             // missing App Group container, and `Db::new` fails with the same error right after.
+            // Reported once, through `report_startup_failure` (stderr plus the unified log): the
+            // fallback subscriber also writes to stderr, so a `tracing::error!` would print it twice.
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(env_filter())
                 .try_init();
             report_startup_failure(&format!(
                 "no app data directory, file logging disabled: {e}"
             ));
-            tracing::error!(error = %e, "no app data directory, file logging disabled");
             return;
         }
     };

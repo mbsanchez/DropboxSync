@@ -11,7 +11,8 @@
  */
 import { readFileSync } from "node:fs";
 
-import { GROUP_SUFFIX, isEntryPoint } from "./render-entitlements.mjs";
+import { isEntryPoint } from "./entry-point.mjs";
+import { GROUP_SUFFIX, TEAM_ID_PATTERN } from "./render-entitlements.mjs";
 
 const KEY = "com.apple.security.application-groups";
 
@@ -29,7 +30,7 @@ export function readGroups(xml) {
 /** Problems found across `{ name, xml }` bundles (host first). Empty means the check passed. */
 export function checkAppGroups(team, bundles) {
   const problems = [];
-  if (!/^[A-Z0-9]{10}$/.test(team ?? "")) {
+  if (!TEAM_ID_PATTERN.test(team ?? "")) {
     return [`team "${team ?? ""}" is not a 10-character team id`];
   }
   const expected = `${team}.${GROUP_SUFFIX}`;

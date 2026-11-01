@@ -59,6 +59,7 @@ function runViaSymlink(team, host, ...appexes) {
   mkdirSync(real);
   copyFileSync(script, join(real, "check-app-groups.mjs"));
   copyFileSync(join(dirname(script), "render-entitlements.mjs"), join(real, "render-entitlements.mjs"));
+  copyFileSync(join(dirname(script), "entry-point.mjs"), join(real, "entry-point.mjs"));
   const link = join(dir, "link");
   symlinkSync(real, link);
   const files = [host, ...appexes].map((xml, i) => {

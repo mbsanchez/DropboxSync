@@ -135,7 +135,7 @@ The Rust backend writes:
 - macOS: `~/Library/Group Containers/<TEAM_ID>.com.dropboxsyncdesktop/Library/Application Support/DropboxSyncDesktop/overlay_state.json` (the App Group container, DBSYNC-97; `app.db` and the logs live beside it)
 - Windows: `%LOCALAPPDATA%\\DropboxSyncDesktop\\overlay_state.json`
 
-A working macOS build needs `APPLE_TEAM_ID` (it names the App Group) and the signing identity (`APPLE_SIGNING_IDENTITY`). Put `APPLE_TEAM_ID` in `apps/desktop/.env` (gitignored; see `.env.example`) or export it. Without it, or in an unsigned or ad-hoc build (`tauri dev`, `bundle:dev` without an identity) whose entitlements lack the group, the app fails at startup because it cannot resolve its data directory (it checks its own signature first and never touches the container). A team ID is not a secret; the literal one is no longer kept in the tree (older commits contain it), so forks build with their own.
+A working macOS build needs `APPLE_TEAM_ID` (it names the App Group) and the signing identity (`APPLE_SIGNING_IDENTITY`). Put `APPLE_TEAM_ID` in `apps/desktop/.env` (gitignored; see `.env.example`) or export it. Without it, or in an unsigned or ad-hoc build (`tauri dev`, `bundle:dev` without an identity) whose entitlements lack the group, the app fails at startup because it cannot resolve its data directory (it checks its own signature first and never touches the container). Team ID: see `native/macos/FinderSyncExtension/README.md` (App Group ADR).
 
 Schema summary:
 

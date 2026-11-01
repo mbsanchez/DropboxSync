@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<!-- TEMPLATE. scripts/render-entitlements.mjs writes the real file to src-tauri/.generated/ (gitignored),
-	     substituting the team id from APPLE_TEAM_ID. Not a secret, but the repository never holds a literal one.
+	     substituting the team id from APPLE_TEAM_ID (Team ID: see FinderSyncExtension/README.md, App Group ADR).
 	     Only the shared App Group lives here: the Finder Sync extension reads the same container, and the
 	     File Provider extension (DBSYNC-95) will reuse it. No provisioning profile is involved. -->
 	<key>com.apple.security.application-groups</key>

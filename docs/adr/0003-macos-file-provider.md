@@ -94,10 +94,8 @@ container materializing at runtime are still unverified (DBSYNC-97 Slice 3, #229
 shipping counter-example rather than a confirmation for us. Note that a successful `codesign` proves
 nothing here — it embeds any entitlement, including invented ones, without validating them.
 
-The literal team ID is no longer kept in this repository's tree; older commits contain it and history is not
-rewritten. It is not a secret (it is stamped into every signed binary); removing it was the maintainer's choice, as
-hygiene and so that forks build with their own team. The
-build takes it from `APPLE_TEAM_ID`.
+The literal team ID is no longer kept in this repository's tree; the build takes it from `APPLE_TEAM_ID`.
+Team ID: see `apps/desktop/native/macos/FinderSyncExtension/README.md` (App Group ADR).
 
 **Timing.** The only tag, `v0.1.0-rc1`, is an unpublished draft. There are no users to migrate
 today, and there will be after the first real release.

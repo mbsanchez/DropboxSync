@@ -74,9 +74,8 @@ jobs:
       # stamped into every signed binary and `codesign -dv` prints it for anyone who
       # downloads the app. Making it a secret cost real evidence: GitHub masked it in
       # the log, so the host-vs-appex comparison below printed `TeamIdentifier=***`
-      # twice and nobody could confirm by eye that the two matched. The tree no longer keeps a
-      # literal team id (older commits contain it; maintainer's choice, DBSYNC-97: hygiene, and so
-      # that forks build with their own team), which is why it arrives here as a variable.
+      # twice and nobody could confirm by eye that the two matched. Why the tree holds no literal
+      # team id: see apps/desktop/native/macos/FinderSyncExtension/README.md (App Group ADR).
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
 
     steps:
@@ -109,7 +108,8 @@ jobs:
         # it too, so a stray space would otherwise pass here and fail only at the entitlement check.
         run: |
           TEAM=$(printf '%s' "${APPLE_TEAM_ID:-}" | tr -d '[:space:]')
-          if ! printf '%s' "$TEAM" | grep -Eq '^[A-Z0-9]{10}$'; then
+          # The pattern lives in one place, render-entitlements.mjs (TEAM_ID_PATTERN), not here.
+          if ! node --input-type=module -e 'import { TEAM_ID_PATTERN } from "./apps/desktop/scripts/render-entitlements.mjs"; process.exit(TEAM_ID_PATTERN.test(process.argv[1]) ? 0 : 1)' "$TEAM"; then
             echo "::error::APPLE_TEAM_ID must be a 10-character Apple team id (upper-case letters and digits); a release built without it ships with no App Group"
             exit 1
           fi
@@ -186,18 +186,14 @@ jobs:
             echo "::error::no appex found under $APP/Contents/PlugIns"
             exit 1
           fi
-          for APPEX in "${APPEXES[@]+"${APPEXES[@]}"}"; do
+          for APPEX in "${APPEXES[@]}"; do
             APPEX_PLIST="$GROUP_DIR/$(basename "$APPEX").plist"
             codesign -d --entitlements - --xml "$APPEX" > "$APPEX_PLIST"
             GROUP_PLISTS+=("$APPEX_PLIST")
-            ENTITLED=$(plutil -extract 'com\.apple\.security\.application-groups.0' raw -o - "$APPEX_PLIST")
-            INFO=$(plutil -extract DBSyncAppGroupID raw -o - "$APPEX/Contents/Info.plist")
-            if [ "$ENTITLED" != "$INFO" ]; then
-              echo "::error::$(basename "$APPEX") Info.plist DBSyncAppGroupID '$INFO' != entitlement '$ENTITLED'"
-              exit 1
-            fi
           done
 
+          # First, so its readable `::error::` lines always print: the plutil comparison below aborts the
+          # step when an appex has no `application-groups` key at all, which is exactly what this reports.
           # Require the positive token, not just the exit code: a run that never reached the check
           # (a wrong entry-point test once made the script a silent no-op) also exits 0.
           CHECK_OUT=$(node apps/desktop/scripts/check-app-groups.mjs "$HOST_TEAM" "${GROUP_PLISTS[@]}")
@@ -206,6 +202,22 @@ jobs:
             echo "::error::check-app-groups.mjs exited 0 but did not print 'app-groups: OK'; the check did not run"
             exit 1
           fi
+
+          for APPEX in "${APPEXES[@]}"; do
+            APPEX_PLIST="$GROUP_DIR/$(basename "$APPEX").plist"
+            if ! ENTITLED=$(plutil -extract 'com\.apple\.security\.application-groups.0' raw -o - "$APPEX_PLIST"); then
+              echo "::error::$(basename "$APPEX"): could not read the first application-groups entry from its entitlements"
+              exit 1
+            fi
+            if ! INFO=$(plutil -extract DBSyncAppGroupID raw -o - "$APPEX/Contents/Info.plist"); then
+              echo "::error::$(basename "$APPEX"): Info.plist has no readable DBSyncAppGroupID"
+              exit 1
+            fi
+            if [ "$ENTITLED" != "$INFO" ]; then
+              echo "::error::$(basename "$APPEX") Info.plist DBSyncAppGroupID '$INFO' != entitlement '$ENTITLED'"
+              exit 1
+            fi
+          done
 
       - name: Notarize and staple
         env:

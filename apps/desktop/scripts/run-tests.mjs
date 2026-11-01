@@ -6,9 +6,11 @@
  * The exit code of `node --test` is propagated; no test files at all is a failure, never a silent pass.
  */
 import { spawnSync } from "node:child_process";
-import { readdirSync, realpathSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { isEntryPoint } from "./entry-point.mjs";
 
 const dir = dirname(fileURLToPath(import.meta.url));
 
@@ -37,7 +39,6 @@ export function runTests(files = listTests(), nodeArgs = []) {
   return r.status ?? 1;
 }
 
-// Real paths on both sides: through a symlinked path a plain comparison is false and nothing would run.
-if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+if (isEntryPoint(import.meta.url)) {
   process.exit(runTests());
 }

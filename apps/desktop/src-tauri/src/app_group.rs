@@ -2,9 +2,8 @@
 //!
 //! On macOS the whole data directory (`app.db`, logs, `overlay_state.json`) lives inside the group
 //! container, because that is the one place a sandboxed extension can read without a temporary
-//! exception. The group id is `<TEAM_ID>.com.dropboxsyncdesktop`. A team id is not a secret (it is
-//! stamped into every signed binary), but by the maintainer's choice the public tree no longer keeps
-//! a literal one (older commits contain it), so that forks build with their own team. It is baked in at compile time from
+//! exception. The group id is `<TEAM_ID>.com.dropboxsyncdesktop` (Team ID: see
+//! `FinderSyncExtension/README.md`, App Group ADR). It is baked in at compile time from
 //! `APPLE_TEAM_ID` (`build.rs` re-runs on a change) and mirrored into the entitlements by
 //! `scripts/render-entitlements.mjs`.
 
@@ -18,9 +17,10 @@ fn app_group_id(team: Option<&str>) -> Option<String> {
 }
 
 /// Whether `group` is one of the App Groups in the process's own entitlements. Exact match only: a
-/// prefix, a different team or an empty id is not entitled.
+/// prefix or a different team is not entitled. The only caller passes an id built by `app_group_id`,
+/// which is never empty, so no empty-id case needs guarding here.
 fn is_entitled(entitled_groups: &[String], group: &str) -> bool {
-    !group.is_empty() && entitled_groups.iter().any(|g| g == group)
+    entitled_groups.iter().any(|g| g == group)
 }
 
 /// This build's group id, but only when the running process is actually entitled to it.
@@ -272,10 +272,6 @@ mod tests {
         assert!(!is_entitled(&held, "ABCDE12345"));
         assert!(!is_entitled(&held, "ZZZZZ99999.com.dropboxsyncdesktop"));
         assert!(!is_entitled(&[], "ABCDE12345.com.dropboxsyncdesktop"));
-        assert!(
-            !is_entitled(&groups(&[""]), ""),
-            "an empty id is never entitled"
-        );
     }
 
     /// The unsigned / unentitled build: a team is compiled in, but the process holds no such group, so

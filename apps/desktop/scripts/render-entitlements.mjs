@@ -2,22 +2,26 @@
  * Renders a macOS entitlements template into a gitignored file (DBSYNC-97).
  *
  * The App Group id is `<TEAM_ID>.com.dropboxsyncdesktop`. The team id comes only from the
- * `APPLE_TEAM_ID` environment variable. A team id is not a secret (every signed binary carries it), but
- * by the maintainer's choice this public repository never holds a literal one, so forks build with
- * their own team (older commits do contain the maintainer's; history is not rewritten). A template
- * holds the `__APP_GROUP_ID__` token; this script substitutes it, or drops the whole
+ * `APPLE_TEAM_ID` environment variable (why it is never a literal: FinderSyncExtension/README.md,
+ * App Group ADR). A template holds the `__APP_GROUP_ID__` token; this script substitutes it, or drops the whole
  * `application-groups` key when there is no team, so a build can never sign a bare or wrong group.
  *
- *   node render-entitlements.mjs <template> <output>
+ *   node render-entitlements.mjs [--require-group] <template> <output>
  *
  * stdout: the group id, or nothing when there is no team (callers capture it). stderr: warnings.
+ * `--require-group` turns the "no group" outcomes (no team, ad-hoc identity) into exit 1 with no output
+ * file, for a caller that is about to sign with a real identity and must never sign without the group.
  */
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isEntryPoint } from "./entry-point.mjs";
+
 export const GROUP_TOKEN = "__APP_GROUP_ID__";
 export const GROUP_SUFFIX = "com.dropboxsyncdesktop";
+/** The one definition of a valid Apple team id; `check-app-groups.mjs` and `release.yml` use this too. */
+export const TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/;
 
 const GROUP_KEY_BLOCK =
   /[ \t]*<key>com\.apple\.security\.application-groups<\/key>\s*<array>\s*<string>__APP_GROUP_ID__<\/string>\s*<\/array>[ \t]*\n?/;
@@ -26,7 +30,7 @@ const GROUP_KEY_BLOCK =
 export function appGroupId(team) {
   const t = (team ?? "").trim();
   if (t === "") return null;
-  if (!/^[A-Z0-9]{10}$/.test(t)) {
+  if (!TEAM_ID_PATTERN.test(t)) {
     throw new Error(`APPLE_TEAM_ID is not a valid Apple team id (10 upper-case letters or digits)`);
   }
   return `${t}.${GROUP_SUFFIX}`;
@@ -131,24 +135,12 @@ export function isGeneratedPath(path, root = REPO_ROOT) {
   return OUTPUT_DIRS.some((dir) => target.startsWith(join(realRoot, dir) + sep));
 }
 
-/**
- * Whether the module `importMetaUrl` is the script being run. Compares real paths on both sides: through
- * a symlinked path (`/tmp` and `/var` are symlinks on macOS) a plain string comparison is false, `main()`
- * would silently not run and the process would exit 0 having done nothing.
- */
-export function isEntryPoint(importMetaUrl, argv1 = process.argv[1]) {
-  if (!argv1) return false;
-  try {
-    return realpathSync(argv1) === realpathSync(fileURLToPath(importMetaUrl));
-  } catch {
-    return false;
-  }
-}
-
 function main() {
-  const [template, output] = process.argv.slice(2);
-  if (!template || !output) {
-    console.error("usage: render-entitlements.mjs <template> <output>");
+  const args = process.argv.slice(2);
+  const requireGroup = args.includes("--require-group");
+  const [template, output, ...extra] = args.filter((a) => a !== "--require-group");
+  if (!template || !output || extra.length > 0) {
+    console.error("usage: render-entitlements.mjs [--require-group] <template> <output>");
     process.exit(2);
   }
   const target = resolveOutput(output);
@@ -164,6 +156,10 @@ function main() {
     process.exit(1);
   }
   const { groupId, reason } = decision;
+  if (requireGroup && groupId === null) {
+    console.error(`ERROR: --require-group: no App Group can be rendered (${reason === "no-team" ? "APPLE_TEAM_ID is not set" : "APPLE_SIGNING_IDENTITY is unset, empty or '-'"}); refusing to continue.`);
+    process.exit(1);
+  }
   if (reason === "no-team") {
     console.error("WARNING: APPLE_TEAM_ID is not set. Rendering entitlements WITHOUT an App Group.");
     console.error("         The app cannot open its data directory and will fail at startup; the Finder");

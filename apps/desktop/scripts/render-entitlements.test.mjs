@@ -12,13 +12,13 @@ import {
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import {
+  TEAM_ID_PATTERN,
   appGroupId,
   decideAppGroup,
-  isEntryPoint,
   isGeneratedPath,
   isRealSigningIdentity,
   renderEntitlements,
@@ -126,18 +126,6 @@ test("the group is decided by team AND a real identity", () => {
   assert.throws(() => decideAppGroup({ APPLE_TEAM_ID: "bad", APPLE_SIGNING_IDENTITY: IDENTITY }), /not a valid/);
 });
 
-test("isEntryPoint is true for the module itself, also through a symlink, and false for another script", () => {
-  const dir = mkdtempSync(join(tmpdir(), "entry-"));
-  const link = join(dir, "link");
-  symlinkSync(here, link);
-  const url = pathToFileURL(script).href;
-  assert.equal(isEntryPoint(url, script), true);
-  assert.equal(isEntryPoint(url, join(link, "render-entitlements.mjs")), true);
-  assert.equal(isEntryPoint(url, join(here, "check-app-groups.mjs")), false);
-  assert.equal(isEntryPoint(url, undefined), false);
-  assert.equal(isEntryPoint(url, join(dir, "missing.mjs")), false);
-});
-
 /**
  * Runs the real CLI from a throwaway copy of the repository layout, so the script resolves its
  * whitelist against the temp root and nothing is ever written into the working tree.
@@ -147,13 +135,14 @@ test("isEntryPoint is true for the module itself, also through a symlink, and fa
  * goes through an explicit extra symlink to the root. `setup(root)` may plant files before the run.
  */
 function runCli(team, rel = "apps/desktop/src-tauri/.generated/out.entitlements", opts = {}) {
-  const { identity = "identity" in opts ? undefined : IDENTITY, via = "plain", setup } = opts;
+  const { identity = "identity" in opts ? undefined : IDENTITY, via = "plain", setup, flags = [] } = opts;
   const made = mkdtempSync(join(tmpdir(), "render-ent-"));
   const realRoot = realpathSync(made);
   const root = via === "real" ? realRoot : made;
   const scriptsDir = join(realRoot, "apps", "desktop", "scripts");
   mkdirSync(scriptsDir, { recursive: true });
   copyFileSync(script, join(scriptsDir, "render-entitlements.mjs"));
+  copyFileSync(join(here, "entry-point.mjs"), join(scriptsDir, "entry-point.mjs"));
   writeFileSync(join(realRoot, "t.plist"), TEMPLATE);
   if (setup) setup(realRoot);
   let seen = root;
@@ -168,7 +157,7 @@ function runCli(team, rel = "apps/desktop/src-tauri/.generated/out.entitlements"
   delete env.APPLE_SIGNING_IDENTITY;
   if (team !== undefined) env.APPLE_TEAM_ID = team;
   if (identity !== undefined) env.APPLE_SIGNING_IDENTITY = identity;
-  const r = spawnSync("node", [copy, join(seen, "t.plist"), target], { env, encoding: "utf8" });
+  const r = spawnSync("node", [copy, ...flags, join(seen, "t.plist"), target], { env, encoding: "utf8" });
   return { ...r, target, realRoot };
 }
 
@@ -278,4 +267,42 @@ test("isGeneratedPath matches when the repository root is spelled through a syml
   assert.equal(isGeneratedPath(file, link), true);
   assert.equal(isGeneratedPath(file, real), true);
   assert.equal(isGeneratedPath(join(link, "apps", "desktop", "elsewhere", "x"), link), false);
+});
+
+test("TEAM_ID_PATTERN accepts exactly ten upper-case letters or digits", () => {
+  assert.equal(TEAM_ID_PATTERN.test(TEAM), true);
+  for (const bad of ["", "abcde12345", "ABCDE1234", "ABCDE123456", " ABCDE12345", "ABCDE12345\n", "ABCDE-2345"]) {
+    assert.equal(TEAM_ID_PATTERN.test(bad), false, JSON.stringify(bad));
+  }
+});
+
+test("CLI --require-group renders and prints the id when a group is possible", () => {
+  const r = runCli(TEAM, undefined, { flags: ["--require-group"] });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), `${TEAM}.com.dropboxsyncdesktop`);
+  assert.ok(existsSync(r.target));
+});
+
+test("CLI --require-group fails, and writes nothing, when there is no team", () => {
+  const r = runCli(undefined, undefined, { flags: ["--require-group"] });
+  assert.equal(r.status, 1, r.stderr);
+  assert.equal(r.stdout.trim(), "");
+  assert.match(r.stderr, /--require-group.*APPLE_TEAM_ID/);
+  assert.equal(existsSync(r.target), false);
+});
+
+test("CLI --require-group fails, and writes nothing, for an unset, empty or ad-hoc identity", () => {
+  for (const identity of [undefined, "", "-"]) {
+    const r = runCli(TEAM, undefined, { identity, flags: ["--require-group"] });
+    assert.equal(r.status, 1, `identity ${JSON.stringify(identity)}: ${r.stderr}`);
+    assert.match(r.stderr, /--require-group.*APPLE_SIGNING_IDENTITY/);
+    assert.equal(existsSync(r.target), false);
+  }
+});
+
+test("CLI --require-group still rejects a malformed team, and a stray extra argument", () => {
+  assert.equal(runCli("bad", undefined, { flags: ["--require-group"] }).status, 1);
+  const r = runCli(TEAM, undefined, { flags: ["--bogus"] });
+  assert.equal(r.status, 2, "an unknown flag is read as the template and the extra argument is refused");
+  assert.match(r.stderr, /usage/);
 });

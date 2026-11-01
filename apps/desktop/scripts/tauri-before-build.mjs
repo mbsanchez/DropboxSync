@@ -21,8 +21,8 @@ function run(cmd, args) {
 
 run("npm", ["run", "build"]);
 if (process.platform === "darwin") {
-  // Rendered here, not committed: the App Group id carries the team id, which this repository no longer
-  // keeps in the tree (older commits contain it; not a secret, and forks build with their own team).
+  // Rendered here, not committed: the App Group id carries the team id (Team ID: see
+  // FinderSyncExtension/README.md, App Group ADR).
   // The renderer renders the group only when APPLE_TEAM_ID is set AND APPLE_SIGNING_IDENTITY is a real
   // identity (not unset, empty or "-"), and warns loudly otherwise. `tauri.conf.json` keeps
   // `signingIdentity: "-"`, so without that rule an ad-hoc `dev:mac`/`bundle:dev` with APPLE_TEAM_ID

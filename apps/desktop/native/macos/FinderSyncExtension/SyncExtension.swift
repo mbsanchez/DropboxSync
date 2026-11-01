@@ -76,9 +76,8 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// `<App Group container>/Library/Application Support/DropboxSyncDesktop/overlay_state.json`.
     ///
     /// The container is asked of the system, never built by hand. The group id is NOT a source
-    /// literal: it is team-prefixed, and the public tree no longer keeps a literal team id (older commits
-    /// contain it; not a secret, a maintainer's choice), so build-appex.sh substitutes it into the `DBSyncAppGroupID`
-    /// Info.plist key from `APPLE_TEAM_ID`. `nil` means a build without a team. An extension that is
+    /// literal: it is team-prefixed (Team ID: see FinderSyncExtension/README.md, App Group ADR), so
+    /// build-appex.sh substitutes it into the `DBSyncAppGroupID` Info.plist key from `APPLE_TEAM_ID`. `nil` means a build without a team. An extension that is
     /// NOT signed with the group does not get `nil`: on macOS Foundation still returns a URL of the
     /// expected form, and the first read of it is then denied by the sandbox, which the read-failure
     /// log below reports. Both are logged once per transition, because an unresolvable container looks
