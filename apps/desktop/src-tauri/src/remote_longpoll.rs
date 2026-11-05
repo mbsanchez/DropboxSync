@@ -38,6 +38,13 @@ pub(crate) fn start_longpoll(state: &AppState) {
     std::thread::spawn(move || longpoll_loop(&st));
 }
 
+/// Whether the remote loop has anything to keep in sync: a sync folder, or (macOS, DBSYNC-95) the
+/// File Provider projection.
+#[cfg(target_os = "macos")]
+fn remote_loop_has_work(sync_folder_set: bool, projection_active: bool) -> bool {
+    sync_folder_set || projection_active
+}
+
 /// Exponential error backoff: 0 → 5s → 10s → … capped at 60s.
 fn next_backoff(prev: u64) -> u64 {
     if prev == 0 {
@@ -59,6 +66,10 @@ fn longpoll_loop(state: &AppState) {
             .flatten()
             .map(|f| !f.trim().is_empty())
             .unwrap_or(false);
+        // DBSYNC-95: with the File Provider projection on, macOS keeps no sync folder (ADR-0004), so the
+        // loop must run without one.
+        #[cfg(target_os = "macos")]
+        let folder_ok = remote_loop_has_work(folder_ok, state.db.projection_active());
         if !folder_ok || crate::auth_session::get_access_token(state).is_err() {
             std::thread::sleep(Duration::from_secs(IDLE_SLEEP_SECS));
             continue;
@@ -128,16 +139,7 @@ fn longpoll_loop(state: &AppState) {
 /// Return the current delta cursor, seeding a fresh snapshot if none exists.
 /// Returns `Ok(None)` when it had to seed this round (caller loops again).
 fn ensure_cursor(state: &AppState) -> AppResult<Option<String>> {
-    match state
-        .db
-        .get_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY)?
-    {
-        Some(c) if !c.is_empty() => Ok(Some(c)),
-        _ => {
-            crate::remote_index::seed_remote_delta_cursor(state)?;
-            Ok(None)
-        }
-    }
+    crate::remote_index::cursor_or_seed(state, crate::remote_index::seed_remote_delta_cursor)
 }
 
 fn do_longpoll(state: &AppState, cursor: &str) -> AppResult<DropboxLongpollResponse> {
@@ -232,10 +234,23 @@ fn apply_and_drain(state: &AppState) -> DrainOutcome {
     // this same sync_running gate, AFTER the drain (so delta-driven deletes drain
     // before discovery). The DBSYNC-66 grace window is armed inside the sweep, so
     // restore churn still can't be read as a user delete.
-    match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state) {
-        Ok(n) if n > 0 => tracing::info!(count = n, "indexed new remote placeholder(s) (longpoll)"),
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed (longpoll)"),
+    //
+    // DBSYNC-95: skipped without a sync folder (the loop now also runs for the projection alone),
+    // where the sweep would only log "sync folder not configured" on every change.
+    #[cfg(target_os = "macos")]
+    let has_sync_folder = state.db.get_sync_folder().ok().flatten().is_some();
+    // Other platforms always have one here (the ready check requires it): unchanged.
+    #[cfg(not(target_os = "macos"))]
+    let has_sync_folder = true;
+    if has_sync_folder {
+        match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state)
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "indexed new remote placeholder(s) (longpoll)")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed (longpoll)"),
+        }
     }
     state.sync_running.store(false, Ordering::Release);
     crate::auth_session::refresh_tray_tooltip(state);
@@ -250,6 +265,29 @@ fn apply_and_drain(state: &AppState) -> DrainOutcome {
 mod tests {
     use super::{next_backoff, MAX_BACKOFF_SECS, MIN_BACKOFF_SECS};
     use crate::models::DropboxLongpollResponse;
+
+    /// DBSYNC-95: the loop runs for a sync folder OR for the projection, and idles for neither.
+    ///
+    /// Proof this test can fail: turning the `||` of `remote_loop_has_work` into `&&` fails the
+    /// projection-only row; dropping the folder operand fails the folder-only row.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_remote_loop_runs_for_a_sync_folder_or_for_the_projection() {
+        use super::remote_loop_has_work;
+        assert!(
+            remote_loop_has_work(true, false),
+            "sync folder only (today)"
+        );
+        assert!(
+            remote_loop_has_work(false, true),
+            "projection only (macOS, no folder)"
+        );
+        assert!(remote_loop_has_work(true, true));
+        assert!(
+            !remote_loop_has_work(false, false),
+            "neither: idle, as today"
+        );
+    }
 
     #[test]
     fn backoff_grows_and_caps() {

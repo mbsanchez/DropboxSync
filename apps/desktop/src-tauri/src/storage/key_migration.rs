@@ -1075,6 +1075,19 @@ mod tests {
             ("unconfirmed_uploads", "marked_at"),
             // A content hash, not a path.
             ("unconfirmed_uploads", "sent_hash"),
+            // DBSYNC-95: the File Provider projection (macOS). It never meets the local index or the
+            // NFC re-key, and the classification stays "not a local path key", but not because it
+            // needs no canonicalisation: `fp_item.path_lower` is a REMOTE path compared with other
+            // remote paths (a `deleted` entry's against the one an upsert stored), the case
+            // `path_util::fold` exists for, so the projection writes it already folded (NFC, then
+            // lowercase) and queries it folded. The rest are strings from Dropbox kept as sent
+            // (`name` is a display name; the hash and the rev are opaque).
+            ("fp_identity", "dropbox_id"),
+            ("fp_identity", "created_at"),
+            ("fp_item", "path_lower"),
+            ("fp_item", "name"),
+            ("fp_item", "content_hash"),
+            ("fp_item", "rev"),
         ];
         let (_p, conn) = legacy_db();
         let tables = col_strings(

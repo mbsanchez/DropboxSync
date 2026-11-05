@@ -18,6 +18,16 @@
 //! without which `AnyClass::get` silently returns `None`. Nothing in this module's tests reaches the
 //! framework or the real user defaults: the defaults read is `None` under `cfg(test)`, and the decision
 //! and the sequencing are written against the `DomainOps` and `Breadcrumb` traits that tests replace.
+//!
+//! ## The projection (DBSYNC-95 slice 2a)
+//!
+//! The same switch also decides whether the host feeds the projection of the remote tree that the
+//! extension reads (`storage/db/projection.rs`). `start` records it on the `Db`
+//! (`Db::projection_active`), clears the projection when it is off and holds something, and, when it is
+//! on and the projection is unpopulated, leaves the stored cursor alone (`usable_delta_cursor` treats it
+//! as absent, so the loop seeds, and a failed seed falls back to it). After a commit the sync thread calls [`signal_working_set`], which
+//! only hands a unit to a worker thread: the worker resolves the domain and asks the system to
+//! re-enumerate the working set, and the sync thread never waits for it.
 
 use std::sync::Arc;
 
@@ -198,10 +208,59 @@ pub(crate) fn reconcile(switch_on: bool, crumb: &impl Breadcrumb, ops: &impl Dom
     }
 }
 
+/// What the startup decision did to the projection, for the log and for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchEffect {
+    /// Nothing was written.
+    Untouched,
+    /// The switch is off and the projection held rows or was populated: it was emptied.
+    Cleared,
+    /// The switch is on and the projection is not populated. Nothing was written: the stored delta
+    /// cursor stays, and `usable_delta_cursor` treats it as absent beside an unpopulated projection,
+    /// so the next loop iteration seeds, and a failed seed falls back to the stored cursor.
+    SeedPending,
+}
+
+/// The projection half of the startup decision. Off: clear the projection, but only when it holds
+/// something, found by a read, so a switch that was never on never opens a write transaction. On: write
+/// nothing; an unpopulated projection is reported, and seeded by the loop (see [`SwitchEffect::SeedPending`]).
+pub(crate) fn apply_switch(db: &Db, switch_on: bool) -> Result<SwitchEffect, String> {
+    if !switch_on {
+        if !db.projection_holds_anything().map_err(|e| e.to_string())? {
+            return Ok(SwitchEffect::Untouched);
+        }
+        let commit = db.project_clear().map_err(|e| e.to_string())?;
+        return Ok(if commit.rows > 0 {
+            SwitchEffect::Cleared
+        } else {
+            SwitchEffect::Untouched
+        });
+    }
+    let state = db.projection_state().map_err(|e| e.to_string())?;
+    Ok(if state.populated {
+        SwitchEffect::Untouched
+    } else {
+        SwitchEffect::SeedPending
+    })
+}
+
 /// Startup entry point, called from `lib.rs` `setup` once the database exists. The switch is read here,
-/// once; the File Provider calls run on their own thread so a slow `fileproviderd` never delays startup.
+/// once, and recorded on the `Db` before this returns (the remote loop starts after it, so it never
+/// sees a stale value); the File Provider calls run on their own thread so a slow `fileproviderd`
+/// never delays startup.
 pub(crate) fn start(db: Arc<Db>) {
     let switch_on = read_switch();
+    db.set_projection_enabled(switch_on);
+    match apply_switch(&db, switch_on) {
+        Ok(effect) => tracing::info!(
+            switch_on,
+            ?effect,
+            "File Provider projection startup decision"
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "File Provider: could not apply the switch to the projection")
+        }
+    }
     let spawned = std::thread::Builder::new()
         .name("file-provider-domain".into())
         .spawn(move || {
@@ -210,9 +269,111 @@ pub(crate) fn start(db: Arc<Db>) {
             objc2::rc::autoreleasepool(|_| {
                 reconcile(switch_on, &*db, &system::SystemDomain);
             });
+            // The projection may have been populated by an earlier run: tell the system once, so a
+            // domain mounted after the last commit enumerates it.
+            if switch_on && db.projection_state().is_ok_and(|s| s.populated) {
+                signal_working_set();
+            }
         });
     if let Err(e) = spawned {
         tracing::error!(error = %e, "File Provider: could not start the domain thread");
+    }
+}
+
+/// Collapses a burst of signal requests into one pending signal. `request` says whether the caller
+/// has to wake the worker (nobody else has); the worker calls `begin` BEFORE it signals, so a request
+/// that arrives while it is signalling is not lost: it sets the flag again and wakes the worker once
+/// more.
+pub(crate) struct SignalGate {
+    pending: std::sync::atomic::AtomicBool,
+}
+
+impl SignalGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pending: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn request(&self) -> bool {
+        !self.pending.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn begin(&self) {
+        self.pending
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The one gate in front of the signal worker. Only the real worker uses it; a test builds its own.
+#[cfg(not(test))]
+static SIGNAL_GATE: SignalGate = SignalGate::new();
+
+/// What a signal outcome means for the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalReport {
+    /// Same as last time: say nothing.
+    Quiet,
+    /// It started failing, or fails for a different reason: log it once.
+    Failing,
+    /// It works again after failing: log it once.
+    Recovered,
+}
+
+/// Turns the stream of signal outcomes into log transitions. With the switch on and no domain
+/// registered every delta fails the same way, and a WARN per delta would bury the log; the Swift
+/// extension follows the same discipline (log on a transition, not on every repeat).
+pub(crate) struct SignalOutcomeLog {
+    /// `None`: nothing yet or the last one worked. `Some(reason)`: failing with that reason.
+    failing: std::sync::Mutex<Option<String>>,
+}
+
+impl SignalOutcomeLog {
+    pub(crate) const fn new() -> Self {
+        Self {
+            failing: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn note(&self, outcome: &Result<(), String>) -> SignalReport {
+        let mut failing = self
+            .failing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (outcome, failing.as_ref()) {
+            (Ok(()), None) => SignalReport::Quiet,
+            (Ok(()), Some(_)) => {
+                *failing = None;
+                SignalReport::Recovered
+            }
+            (Err(e), Some(last)) if last == e => SignalReport::Quiet,
+            (Err(e), _) => {
+                *failing = Some(e.clone());
+                SignalReport::Failing
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+static SIGNAL_OUTCOMES: SignalOutcomeLog = SignalOutcomeLog::new();
+
+/// Asks the system to re-enumerate the working set, which makes it call `enumerateChanges`. Fire and
+/// forget: it returns at once, whatever `fileproviderd` is doing, and a burst of calls is one signal.
+pub(crate) fn signal_working_set() {
+    system::request_signal();
+}
+
+/// How many working-set signals this test thread has asked for.
+#[cfg(test)]
+pub(crate) fn signals_requested_on_this_thread() -> usize {
+    system::requested()
+}
+
+/// [`signal_working_set`], but only when the projection is being fed.
+pub(crate) fn signal_if_active(db: &Db) {
+    if db.projection_active() {
+        signal_working_set();
     }
 }
 
@@ -451,6 +612,148 @@ mod system {
             .map_err(|_| "timed out waiting for getDomains".to_string())?
     }
 
+    extern "C" {
+        /// `NSFileProviderWorkingSetContainerItemIdentifier` (NSFileProviderItem.h:51). Read from the
+        /// framework rather than spelled out, so a changed string value cannot silently stop the signal.
+        static NSFileProviderWorkingSetContainerItemIdentifier: *const AnyObject;
+    }
+
+    /// Reports the outcome of the signal chain once, from whichever handler finishes it.
+    fn finish(
+        tx: &std::sync::Mutex<Option<mpsc::Sender<Result<(), String>>>>,
+        result: Result<(), String>,
+    ) {
+        if let Ok(mut guard) = tx.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(result);
+            }
+        }
+    }
+
+    /// `getDomains`, then `+managerForDomain:`, then
+    /// `-signalEnumeratorForContainerItemIdentifier:completionHandler:` on the working set (the only
+    /// container a replicated extension signals). Selectors checked against the SDK's
+    /// `NSFileProviderManager.h` lines 67, 100 and 242. The manager is used inside the `getDomains`
+    /// handler, so no Objective-C object crosses a thread; only the outcome does.
+    fn signal_working_set_blocking() -> Result<(), String> {
+        let cls = manager_class()?;
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let outer_tx = tx.clone();
+        let block = RcBlock::new(move |domains: *mut AnyObject, err: *mut AnyObject| {
+            autoreleasepool(|_| {
+                if !err.is_null() {
+                    return finish(&outer_tx, Err(describe_error(err)));
+                }
+                if domains.is_null() {
+                    return finish(&outer_tx, Err("getDomains returned no list".to_string()));
+                }
+                let mut target: *mut AnyObject = std::ptr::null_mut();
+                // SAFETY: `domains` is a live NSArray of NSFileProviderDomain for the duration of this
+                // block; `count`, `objectAtIndex:` and `identifier` are documented API.
+                unsafe {
+                    let count: usize = msg_send![domains, count];
+                    for i in 0..count {
+                        let d: *mut AnyObject = msg_send![domains, objectAtIndex: i];
+                        let id: *mut AnyObject = msg_send![d, identifier];
+                        if to_rust_string(id).as_deref() == Some(DOMAIN_ID) {
+                            target = d;
+                            break;
+                        }
+                    }
+                }
+                if target.is_null() {
+                    return finish(&outer_tx, Err("the domain is not registered".to_string()));
+                }
+                // SAFETY: `+managerForDomain:` takes an NSFileProviderDomain and returns an autoreleased
+                // manager (nil only for a domain it cannot serve), live until this pool drains.
+                let manager: *mut AnyObject = unsafe { msg_send![cls, managerForDomain: target] };
+                if manager.is_null() {
+                    return finish(&outer_tx, Err("managerForDomain returned nil".to_string()));
+                }
+                let inner_tx = outer_tx.clone();
+                let done = RcBlock::new(move |err: *mut AnyObject| {
+                    let result = if err.is_null() {
+                        Ok(())
+                    } else {
+                        Err(describe_error(err))
+                    };
+                    finish(&inner_tx, result);
+                });
+                // SAFETY: an instance method taking an NSString identifier and a `void (^)(NSError *)`
+                // block (Manager.h:100). The identifier is a framework constant, valid for the process
+                // lifetime; the block is copied by the framework until it runs.
+                unsafe {
+                    let working_set: *const AnyObject =
+                        NSFileProviderWorkingSetContainerItemIdentifier;
+                    let _: () = msg_send![
+                        manager,
+                        signalEnumeratorForContainerItemIdentifier: working_set,
+                        completionHandler: &*done
+                    ];
+                }
+            });
+        });
+        // SAFETY: class method with one block argument `void (^)(NSArray *, NSError *)` (Manager.h:244).
+        unsafe {
+            let _: () = msg_send![cls, getDomainsWithCompletionHandler: &*block];
+        }
+        rx.recv_timeout(CALL_TIMEOUT)
+            .map_err(|_| "timed out waiting for the working set signal".to_string())?
+    }
+
+    /// The worker's queue: one unit per wake-up, created with the first request.
+    static SIGNAL_WORKER: std::sync::OnceLock<Option<mpsc::Sender<()>>> =
+        std::sync::OnceLock::new();
+    static SIGNALS_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Hands a unit to the signal worker and returns. Never blocks and never calls the framework on
+    /// the caller's thread.
+    pub(super) fn request_signal() {
+        if !super::SIGNAL_GATE.request() {
+            return;
+        }
+        let worker = SIGNAL_WORKER.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<()>();
+            let spawned = std::thread::Builder::new()
+                .name("file-provider-signal".into())
+                .spawn(move || {
+                    for () in rx {
+                        // Before signalling: a request that lands while the call is in flight must
+                        // wake this loop again.
+                        super::SIGNAL_GATE.begin();
+                        let outcome = autoreleasepool(|_| signal_working_set_blocking());
+                        if outcome.is_ok() {
+                            SIGNALS_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // One line per transition: a missing domain would otherwise warn on every delta.
+                        match (super::SIGNAL_OUTCOMES.note(&outcome), outcome) {
+                            (super::SignalReport::Failing, Err(e)) => tracing::warn!(
+                                error = %e,
+                                "File Provider: signalling the working set failed (logged once until it changes)"
+                            ),
+                            (super::SignalReport::Recovered, _) => tracing::info!(
+                                signals_sent = SIGNALS_SENT.load(std::sync::atomic::Ordering::Relaxed),
+                                "File Provider: working set signalled again"
+                            ),
+                            _ => {}
+                        }
+                    }
+                });
+            match spawned {
+                Ok(_) => Some(tx),
+                Err(e) => {
+                    tracing::error!(error = %e, "File Provider: could not start the signal worker");
+                    None
+                }
+            }
+        });
+        let delivered = worker.as_ref().is_some_and(|tx| tx.send(()).is_ok());
+        if !delivered {
+            super::SIGNAL_GATE.begin();
+        }
+    }
+
     impl DomainOps for SystemDomain {
         fn add(&self) -> Result<(), String> {
             let domain = new_domain()?;
@@ -473,6 +776,21 @@ mod system {
 mod system {
     //! Inert stand-ins: no unit test may reach FileProvider or the user defaults.
     use super::{DomainOps, RemovalMode};
+
+    thread_local! {
+        /// How many signals the code under test asked for on this thread. Thread-local so parallel
+        /// tests cannot see each other's requests.
+        static REQUESTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Records the request instead of reaching the framework.
+    pub(super) fn request_signal() {
+        REQUESTED.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn requested() -> usize {
+        REQUESTED.with(std::cell::Cell::get)
+    }
 
     pub(super) struct SystemDomain;
 
@@ -724,5 +1042,108 @@ mod tests {
         assert_eq!(reconcile(false, &db, &ops), Outcome::Removed);
         assert_eq!(reconcile(false, &db, &ops), Outcome::Untouched);
         assert_eq!(*ops.calls.borrow(), ["add", "remove"]);
+    }
+
+    // ── DBSYNC-95 slice 2a: the switch and the projection, the signal ───────────────────────────
+
+    fn real_db() -> (tempfile::TempDir, Db) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Db::new_at(&tmp.path().join("app.db")).expect("db");
+        (tmp, db)
+    }
+
+    /// A burst of requests wakes the worker once; a request after the worker has begun wakes it again,
+    /// so a change committed while a signal is in flight is never swallowed.
+    ///
+    /// Proof this test can fail: making `request` always return `true` fails the burst assertion;
+    /// never clearing the flag in `begin` fails the last one.
+    #[test]
+    fn a_burst_of_signal_requests_wakes_the_worker_once() {
+        let gate = SignalGate::new();
+        assert!(gate.request(), "the first request wakes the worker");
+        for _ in 0..100 {
+            assert!(!gate.request(), "the rest are coalesced");
+        }
+        gate.begin();
+        assert!(
+            gate.request(),
+            "a request after the worker began wakes it again"
+        );
+    }
+
+    /// The signal outcome is logged on a transition only: the same failure repeated is quiet, a new
+    /// reason or a recovery is reported once.
+    ///
+    /// Proof this test can fail: returning `Failing` for a repeated identical error (dropping the
+    /// `last == e` arm) fails the second assertion; never clearing `failing` on success fails the
+    /// recovery and the next-failure assertions.
+    #[test]
+    fn a_signal_failure_is_logged_once_per_transition() {
+        let log = SignalOutcomeLog::new();
+        let no_domain = Err("the domain is not registered".to_string());
+        assert_eq!(log.note(&Ok(())), SignalReport::Quiet);
+        assert_eq!(log.note(&no_domain), SignalReport::Failing, "first failure");
+        for _ in 0..50 {
+            assert_eq!(log.note(&no_domain), SignalReport::Quiet, "the repeat");
+        }
+        assert_eq!(
+            log.note(&Err("timed out".to_string())),
+            SignalReport::Failing,
+            "a different reason is news"
+        );
+        assert_eq!(log.note(&Ok(())), SignalReport::Recovered);
+        assert_eq!(log.note(&Ok(())), SignalReport::Quiet);
+        assert_eq!(
+            log.note(&no_domain),
+            SignalReport::Failing,
+            "failing again after a recovery is a new transition"
+        );
+    }
+
+    /// Switch off with a populated projection clears it; with nothing in it, writes nothing at all.
+    ///
+    /// Proof this test can fail: skipping `project_clear` in the off branch of `apply_switch` leaves
+    /// the rows; making `clear_with` unconditional moves `seq` on an empty projection.
+    #[test]
+    fn switching_off_clears_a_populated_projection_and_writes_nothing_to_an_empty_one() {
+        let (_tmp, db) = real_db();
+        db.set_projection_enabled(true);
+        db.project_snapshot(&[]).expect("populate");
+        assert!(db.projection_state().unwrap().populated);
+
+        assert_eq!(apply_switch(&db, false), Ok(SwitchEffect::Cleared));
+        assert!(!db.projection_state().unwrap().populated);
+
+        let after_clear = db.projection_state().unwrap();
+        assert_eq!(apply_switch(&db, false), Ok(SwitchEffect::Untouched));
+        assert_eq!(db.projection_state().unwrap(), after_clear, "no write");
+    }
+
+    /// Switch on with an unpopulated projection writes nothing, and above all keeps the stored cursor:
+    /// wiping it would defeat the failing-seed fallback on a boot with no network.
+    ///
+    /// Proof this test can fail: restoring the `set_app_config(.., "")` wipe empties the cursor.
+    #[test]
+    fn switching_on_with_an_unpopulated_projection_keeps_the_cursor() {
+        use crate::remote_index::REMOTE_DELTA_CURSOR_KEY as CURSOR;
+        let (_tmp, db) = real_db();
+        db.set_app_config(CURSOR, "old-cursor").unwrap();
+        let before = db.projection_state().unwrap();
+
+        assert_eq!(apply_switch(&db, true), Ok(SwitchEffect::SeedPending));
+        assert_eq!(
+            db.get_app_config(CURSOR).unwrap().as_deref(),
+            Some("old-cursor")
+        );
+        assert_eq!(db.projection_state().unwrap(), before, "no write");
+
+        db.set_projection_enabled(true);
+        db.project_snapshot(&[]).expect("populate");
+        db.set_app_config(CURSOR, "live-cursor").unwrap();
+        assert_eq!(apply_switch(&db, true), Ok(SwitchEffect::Untouched));
+        assert_eq!(
+            db.get_app_config(CURSOR).unwrap().as_deref(),
+            Some("live-cursor")
+        );
     }
 }

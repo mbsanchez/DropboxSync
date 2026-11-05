@@ -47,6 +47,18 @@ pub fn set_selective_sync_filters(
 ) -> Result<(), String> {
     state.db.set_include_prefixes_csv(&include_csv)?;
     state.db.set_exclude_prefixes_csv(&exclude_csv)?;
+    // DBSYNC-95: the File Provider domain hides what selective sync excludes, so the stored flag is
+    // re-evaluated now, in one transaction, without a snapshot. A no-op with the switch off. A failure
+    // is logged, not returned: the filters themselves are saved, and the flags catch up at the next
+    // Save or snapshot.
+    #[cfg(target_os = "macos")]
+    match state.db.project_reapply_filter() {
+        Ok(commit) if commit.rows > 0 => crate::file_provider::signal_working_set(),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "File Provider: could not reapply the selective sync filter")
+        }
+    }
     // DBSYNC-114: apply the change now instead of at the next scheduled tick. Only with a
     // sync folder (there is nothing to apply without one), through the same single-flight
     // gate as the manual sync, so it never races a cycle in flight; if one IS running, the
@@ -150,6 +162,9 @@ pub fn set_sync_folder(state: tauri::State<AppState>, folder: String) -> Result<
     state.db.set_sync_folder(&folder)?;
     if prev != folder {
         state.db.reset_sync_state()?;
+        // DBSYNC-95: the reset emptied the projection and expired its anchors; tell the system.
+        #[cfg(target_os = "macos")]
+        crate::file_provider::signal_if_active(&state.db);
     }
     {
         let mut engine = state
@@ -196,6 +211,9 @@ pub fn disconnect_dropbox(state: tauri::State<AppState>) -> Result<(), String> {
     }
 
     state.db.reset_sync_state()?;
+    // DBSYNC-95: the reset emptied the projection and expired its anchors; tell the system.
+    #[cfg(target_os = "macos")]
+    crate::file_provider::signal_if_active(&state.db);
     state.db.clear_sync_folder()?;
 
     {
@@ -830,5 +848,55 @@ mod tests {
             got,
             serde_json::json!({"includeCsv": "A", "excludeCsv": "B"})
         );
+    }
+
+    /// DBSYNC-95: saving the filter re-evaluates the File Provider projection's hidden flag, through
+    /// the real command; with the switch off the same save writes nothing to it.
+    ///
+    /// Proof this test can fail: removing the `project_reapply_filter` call from
+    /// `set_selective_sync_filters` leaves the folder live.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn saving_the_filter_flips_the_projections_hidden_flag_only_when_the_switch_is_on() {
+        use crate::storage::db::projection::{ProjectedEntry, STATE_HIDDEN, STATE_LIVE};
+        let folder = |path: &str, id: &str| {
+            ProjectedEntry::from_entry(&crate::models::DropboxEntry {
+                tag: "folder".into(),
+                path_display: Some(path.into()),
+                path_lower: Some(path.to_lowercase()),
+                content_hash: None,
+                rev: None,
+                server_modified: None,
+                size: None,
+                id: Some(id.into()),
+            })
+            .expect("folder")
+        };
+        let save = |app: &tauri::App<tauri::test::MockRuntime>| {
+            invoke(
+                app,
+                "set_selective_sync_filters",
+                serde_json::json!({"includeCsv": "", "excludeCsv": "Docs"}),
+            )
+            .expect("save")
+        };
+
+        let (app, db, _dir) = mock_app();
+        db.set_projection_enabled(true);
+        db.project_snapshot(&[folder("/Docs", "id:d"), folder("/Photos", "id:p")])
+            .expect("snapshot");
+        save(&app);
+        assert_eq!(
+            db.projection_states_by_path(),
+            vec![
+                ("/docs".into(), STATE_HIDDEN),
+                ("/photos".into(), STATE_LIVE)
+            ]
+        );
+
+        let (off_app, off_db, _off_dir) = mock_app();
+        let before = off_db.projection_state().expect("state");
+        save(&off_app);
+        assert_eq!(off_db.projection_state().expect("state"), before);
     }
 }

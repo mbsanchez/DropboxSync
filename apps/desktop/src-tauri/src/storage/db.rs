@@ -6,6 +6,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// The File Provider projection of the remote tree (DBSYNC-95 slice 2a). macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) mod projection;
+
 /// What Dropbox reported for an upload that landed (see `Db::confirm_upload_landed`).
 pub struct LandedUpload<'a> {
     pub content_hash: &'a str,
@@ -117,6 +121,15 @@ pub struct Db {
     /// Keys of "log this once per condition" lines already written by this process
     /// (DBSYNC-114: the exclusion pass must not repeat the same kept-file WARN every tick).
     logged_once: Mutex<HashSet<String>>,
+    /// Whether the File Provider projection is being fed: the `FileProviderEnabled` switch, set once at
+    /// startup by `file_provider::start` (DBSYNC-95). Off by default, and per instance rather than a
+    /// process global so a test that turns it on cannot leak into a parallel one. The one reader is
+    /// [`Db::projection_active`].
+    #[cfg(target_os = "macos")]
+    projection_enabled: std::sync::atomic::AtomicBool,
+    /// In-memory health of the projection feed: consecutive failures and the reseed backoff.
+    #[cfg(target_os = "macos")]
+    projection_health: Mutex<projection::ProjectionHealth>,
 }
 
 /// Debug-only contract check: every index key reaching the storage layer is already
@@ -288,6 +301,10 @@ impl Db {
                 _ => PathBuf::from("."),
             },
             logged_once: Mutex::new(HashSet::new()),
+            #[cfg(target_os = "macos")]
+            projection_enabled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            projection_health: Mutex::new(projection::ProjectionHealth::default()),
         })
     }
 
@@ -388,6 +405,11 @@ impl Db {
         tx.execute("DELETE FROM unconfirmed_uploads", [])?;
         tx.execute("DELETE FROM sync_conflicts", [])?;
         tx.execute("DELETE FROM known_folders", [])?;
+        // DBSYNC-95: the File Provider projection mirrors the remote tree of the account that was
+        // just left, so it goes with the cursor below, and its anchors expire. A no-op when it holds
+        // nothing, which is always the case with the switch off.
+        #[cfg(target_os = "macos")]
+        projection::clear_in(&tx)?;
         // Drop the cursor-delta cursor so remote change detection re-seeds
         // against the new folder (DBSYNC-30); other app_config keys are kept.
         tx.execute(
@@ -3135,6 +3157,11 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
         ",
         [],
     )?;
+
+    // DBSYNC-95: the File Provider projection tables. Additive and macOS only, so Windows and Linux
+    // databases gain nothing.
+    #[cfg(target_os = "macos")]
+    projection::migrate(conn)?;
 
     // Only ONE active job per (job_type, target_path); DONE/failed history is exempt
     // (partial index), so `enqueue_job`'s ON CONFLICT collapses re-enqueues of the same

@@ -66,6 +66,43 @@ The host reads it once at startup, so quit and relaunch the app after changing i
 
 The breadcrumb is the `app_config` row `file_provider_domain_registered`.
 
+## The projection (slice 2a, host side only)
+
+With the switch on, the host also maintains `fp_identity`, `fp_item` and `fp_state` in `app.db` (the group
+container). The extension does not read them yet (slice 2b); `Tests/projection-schema.sql` is the DDL it will
+read, kept identical to the host's by a Rust test. After each commit the host asks the system to
+re-enumerate the working set. With the switch off nothing is written, and turning it off empties the tables.
+
+How it is fed: the entries of each Dropbox delta are applied one at a time, in Dropbox's order, in one write
+transaction, and each item changes only through its own entry (no inference about a renamed folder's
+descendants; a snapshot places rows by id, sweeps what was not listed, then resolves parents again). The rules
+come from Dropbox's classic `/delta` contract, are not in the current v2 docs we could read, and were checked
+only against the shapes captured in #234. For the extension: a folder at state ORPHAN is not a parent, so a
+live or hidden row never has an orphan parent, and an orphan (`parent_item = -1`) is never listed. Details in
+the module docs of `src-tauri/src/storage/db/projection.rs` and in ADR-0004.
+
+**Open for 2b:** rename a folder of about 200 files on dropbox.com and capture whether every descendant is
+re-listed.
+
+What feeding it costs (it is not free, and "no extra call" would be wrong):
+
+- **A full listing when the switch goes on.** An unpopulated projection makes the stored delta cursor count as
+  absent (it is not wiped), so the next loop iteration takes a snapshot (a recursive `list_folder` of the whole
+  account); if that listing fails, the stored cursor is used and the reseed is retried later. The same happens after a Dropbox
+  cursor reset, after logout or a new sync folder, and after the projection gives up on a failing delta
+  (a listing at most every 30 minutes while it keeps failing, 1 minute at first, doubling).
+- **The breaker-gated reconcile on machines that have a sync folder.** The snapshot goes through the same
+  seed as always, so a machine with a sync folder also runs the local-index reconcile (and its mass-delete
+  breaker) at that point. A machine without one skips it.
+- **The remote long-poll loop runs without a sync folder.** On macOS with the switch on, the loop that
+  waits for Dropbox changes runs for the projection alone, where it used to idle until a folder was set.
+  Each wake-up applies the delta to the projection (one write transaction) and nothing else.
+- **Storage:** one row per file and folder of the account, plus up to 50 000 tombstones.
+
+To inspect it without launching anything, open a COPY of `app.db` read-only:
+`sqlite3 'file:app-copy.db?mode=ro' 'select state, count(*) from fp_item group by state; select * from fp_state;'`.
+The host logs counts only (`File Provider projection committed`, `working set signalled`), never names.
+
 ## Live checks (with the maintainer)
 
 1. **Strip quarantine after copying the app.** `ditto` keeps the quarantine attribute, and a quarantined app
