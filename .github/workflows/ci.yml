@@ -177,6 +177,11 @@ jobs:
         # by construction, and the only automated coverage the extension has.
         run: apps/desktop/native/macos/FinderSyncExtension/Tests/run-badge-diff-tests.sh
 
+      - name: File Provider projection checks
+        # Compiles the real ProjectionModel.swift and ProjectionStore.swift and runs them against a
+        # temporary WAL database built from the schema fixture, including readers against a writer.
+        run: apps/desktop/native/macos/FileProviderExtension/Tests/run-projection-tests.sh
+
       - name: Build macOS app bundle
         # `bundle:dev` (--bundles app), not `tauri build`. The full build also produces a
         # DMG, a stage that has never executed in CI even once because every run died

@@ -30,6 +30,7 @@
 //! re-enumerate the working set, and the sync thread never waits for it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::storage::db::Db;
 
@@ -309,6 +310,82 @@ impl SignalGate {
 #[cfg(not(test))]
 static SIGNAL_GATE: SignalGate = SignalGate::new();
 
+/// How long the signal waits after a delta removed something. Dropbox can deliver a folder rename in
+/// two invocations, every delete in the first (`has_more=false`, nothing announces the second) and every
+/// re-add in the next one. Measured live: 2.9 s for a folder of 204 entries (#234), and DBSYNC-102
+/// recorded 3.45 s and 3.43 s for the same split on a share and an un-share. Ten seconds is about three
+/// times that; what it costs is a remote delete reaching Finder ten seconds late.
+pub(crate) const SIGNAL_REMOVAL_GRACE: Duration = Duration::from_secs(10);
+
+/// The longest a run of removals can hold the signal, so that a steady stream of deletes cannot keep
+/// the system from ever hearing about them.
+pub(crate) const SIGNAL_REMOVAL_MAX_HOLD: Duration = Duration::from_secs(60);
+
+/// When the worker may signal after a removal. This narrows the window, it does not close it: the
+/// system may still enumerate during the hold for a reason of its own, and it then sees the rows the
+/// first half removed. Only the signal is held, never the projection.
+pub(crate) struct SignalHold {
+    /// The first removal of the run and the end of the hold; `None` when nothing is held.
+    window: std::sync::Mutex<Option<(Instant, Instant)>>,
+}
+
+impl SignalHold {
+    pub(crate) const fn new() -> Self {
+        Self {
+            window: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(Instant, Instant)>> {
+        self.window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Starts the hold, or moves its end later, never past [`SIGNAL_REMOVAL_MAX_HOLD`] from its start.
+    pub(crate) fn extend(&self, now: Instant) {
+        let mut window = self.lock();
+        let first = window.map_or(now, |(first, _)| first);
+        let until = (now + SIGNAL_REMOVAL_GRACE).min(first + SIGNAL_REMOVAL_MAX_HOLD);
+        *window = Some((first, until));
+    }
+
+    /// What is left of the hold. Zero ends it, so the next removal starts a new run.
+    pub(crate) fn remaining(&self, now: Instant) -> Duration {
+        let mut window = self.lock();
+        match *window {
+            Some((_, until)) if until > now => until - now,
+            _ => {
+                *window = None;
+                Duration::ZERO
+            }
+        }
+    }
+}
+
+/// The worker's wait before it signals. It re-opens the gate before each look at the hold, so a request
+/// that lands during the wait wakes the worker once more instead of being lost, and a hold that begins
+/// after the last look is seen by that wake-up.
+pub(crate) fn wait_out_hold(
+    gate: &SignalGate,
+    hold: &SignalHold,
+    now: impl Fn() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) {
+    loop {
+        gate.begin();
+        let wait = hold.remaining(now());
+        if wait.is_zero() {
+            return;
+        }
+        sleep(wait);
+    }
+}
+
+/// The one hold in front of the signal worker. Only the real worker uses it; a test builds its own.
+#[cfg(not(test))]
+static SIGNAL_HOLD: SignalHold = SignalHold::new();
+
 /// What a signal outcome means for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalReport {
@@ -364,6 +441,21 @@ pub(crate) fn signal_working_set() {
     system::request_signal();
 }
 
+/// [`signal_working_set`] after a delta commit, holding the signal when the delta removed something,
+/// because the second half of a rename may be one invocation away (see [`SIGNAL_REMOVAL_GRACE`]).
+pub(crate) fn signal_after_delta(removed_something: bool) {
+    if removed_something {
+        system::hold_signal();
+    }
+    system::request_signal();
+}
+
+/// How many working-set signals this test thread has asked to hold.
+#[cfg(test)]
+pub(crate) fn signal_holds_on_this_thread() -> usize {
+    system::holds()
+}
+
 /// How many working-set signals this test thread has asked for.
 #[cfg(test)]
 pub(crate) fn signals_requested_on_this_thread() -> usize {
@@ -394,7 +486,7 @@ mod system {
     //! The only unsafe code: `msg_send!` calls to `NSUserDefaults` and `NSFileProviderManager`.
     use std::ffi::CString;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use block2::RcBlock;
     use objc2::msg_send;
@@ -707,6 +799,11 @@ mod system {
         std::sync::OnceLock::new();
     static SIGNALS_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// Holds the next signal for the removal grace.
+    pub(super) fn hold_signal() {
+        super::SIGNAL_HOLD.extend(Instant::now());
+    }
+
     /// Hands a unit to the signal worker and returns. Never blocks and never calls the framework on
     /// the caller's thread.
     pub(super) fn request_signal() {
@@ -719,9 +816,14 @@ mod system {
                 .name("file-provider-signal".into())
                 .spawn(move || {
                     for () in rx {
-                        // Before signalling: a request that lands while the call is in flight must
-                        // wake this loop again.
-                        super::SIGNAL_GATE.begin();
+                        // Opens the gate before signalling: a request that lands while the call is
+                        // in flight must wake this loop again.
+                        super::wait_out_hold(
+                            &super::SIGNAL_GATE,
+                            &super::SIGNAL_HOLD,
+                            Instant::now,
+                            std::thread::sleep,
+                        );
                         let outcome = autoreleasepool(|_| signal_working_set_blocking());
                         if outcome.is_ok() {
                             SIGNALS_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -781,9 +883,18 @@ mod system {
         /// How many signals the code under test asked for on this thread. Thread-local so parallel
         /// tests cannot see each other's requests.
         static REQUESTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static HOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Records the request instead of reaching the framework.
+    pub(super) fn hold_signal() {
+        HOLDS.with(|h| h.set(h.get() + 1));
+    }
+
+    pub(super) fn holds() -> usize {
+        HOLDS.with(std::cell::Cell::get)
+    }
+
     pub(super) fn request_signal() {
         REQUESTED.with(|c| c.set(c.get() + 1));
     }
@@ -1145,5 +1256,78 @@ mod tests {
             db.get_app_config(CURSOR).unwrap().as_deref(),
             Some("live-cursor")
         );
+    }
+
+    /// Proof this test can fail: removing the `first + SIGNAL_REMOVAL_MAX_HOLD` bound fails the last
+    /// assertion, and returning zero from `remaining` fails the first.
+    #[test]
+    fn a_removal_holds_the_signal_and_a_run_of_them_cannot_hold_it_for_ever() {
+        let hold = SignalHold::new();
+        let start = Instant::now();
+        assert_eq!(hold.remaining(start), Duration::ZERO);
+
+        hold.extend(start);
+        assert_eq!(hold.remaining(start), SIGNAL_REMOVAL_GRACE);
+
+        let later = start + Duration::from_secs(5);
+        hold.extend(later);
+        assert_eq!(hold.remaining(later), SIGNAL_REMOVAL_GRACE);
+
+        let mut now = later;
+        while now < start + SIGNAL_REMOVAL_MAX_HOLD * 2 {
+            hold.extend(now);
+            now += Duration::from_secs(5);
+        }
+        assert_eq!(
+            hold.remaining(start + SIGNAL_REMOVAL_MAX_HOLD),
+            Duration::ZERO
+        );
+    }
+
+    /// Proof this test can fail: moving the `remaining` that ends the hold off this path keeps a stale
+    /// window, so the second run starts late and the last assertion fails.
+    #[test]
+    fn a_hold_that_ran_out_does_not_shorten_the_next_one() {
+        let hold = SignalHold::new();
+        let start = Instant::now();
+        hold.extend(start);
+        let expired = start + SIGNAL_REMOVAL_MAX_HOLD;
+        assert_eq!(hold.remaining(expired), Duration::ZERO);
+
+        hold.extend(expired);
+        assert_eq!(hold.remaining(expired), SIGNAL_REMOVAL_GRACE);
+    }
+
+    /// The worker sleeps out the whole hold, including one that grows during the wait, and a request
+    /// made during the wait is not swallowed by a gate left closed.
+    ///
+    /// Proof this test can fail: dropping the loop in `wait_out_hold` signals after the first sleep and
+    /// fails the sleep count; moving `gate.begin()` after the loop fails the gate check.
+    #[test]
+    fn the_worker_waits_out_a_hold_that_grows_while_it_sleeps() {
+        let gate = SignalGate::new();
+        let hold = SignalHold::new();
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        assert!(gate.request());
+        hold.extend(start);
+
+        let mut sleeps = 0;
+        wait_out_hold(
+            &gate,
+            &hold,
+            || clock.get(),
+            |wait| {
+                sleeps += 1;
+                clock.set(clock.get() + wait);
+                if sleeps == 1 {
+                    assert!(gate.request(), "the gate is open during the wait");
+                    hold.extend(clock.get());
+                }
+            },
+        );
+
+        assert_eq!(sleeps, 2);
+        assert_eq!(clock.get(), start + SIGNAL_REMOVAL_GRACE * 2);
     }
 }

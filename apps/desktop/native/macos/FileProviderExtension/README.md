@@ -66,12 +66,29 @@ The host reads it once at startup, so quit and relaunch the app after changing i
 
 The breadcrumb is the `app_config` row `file_provider_domain_registered`.
 
-## The projection (slice 2a, host side only)
+## The projection
 
-With the switch on, the host also maintains `fp_identity`, `fp_item` and `fp_state` in `app.db` (the group
-container). The extension does not read them yet (slice 2b); `Tests/projection-schema.sql` is the DDL it will
-read, kept identical to the host's by a Rust test. After each commit the host asks the system to
-re-enumerate the working set. With the switch off nothing is written, and turning it off empties the tables.
+With the switch on, the host maintains `fp_identity`, `fp_item` and `fp_state` in `app.db` (the group
+container). The extension reads them through `ProjectionStore.swift`, one read-only open and one read
+transaction per call, and writes nothing; `ProjectionModel.swift` holds the decisions (ids, anchors, pages,
+change batches) and imports Foundation only. `Tests/projection-schema.sql` is the DDL, kept identical to the
+host's by a Rust test; `Tests/run-projection-tests.sh` runs the model and the store against it, in CI too.
+
+After each commit the host asks the system to re-enumerate the working set. A delta that removed something
+holds that signal for 10 s (60 s at most for a run of them), because Dropbox can deliver a folder rename as
+all its deletes and, about 3 s later, all its re-adds (ADR-0004, *A rename split in two*). With the switch off
+nothing is written, and turning it off empties the tables.
+
+A failed read is logged by class and told to the system in one of two ways (`ReadFailure.answer`). SQLite busy
+or failing an I/O is a transient error, which the system retries. Anything only the host can cure (a missing
+or damaged file, unpopulated, newer schema, no container) is `serverUnreachable`, which shows an error and
+backs off until the next signal. `currentSyncAnchor` answers `nil` for any failed read. `noSuchItem` is kept for an identifier with no live row,
+because the system takes it to mean the item was deleted and tries to delete it from disk; a live file asked
+for as a container lists itself.
+
+Files show in Finder and cannot be opened yet (slice 3). Nothing reaches Dropbox from the domain (slice 4):
+subfolders refuse changes, but the domain root is writable, so a file created there stays local while
+`createItem` refuses it.
 
 How it is fed: the entries of each Dropbox delta are applied one at a time, in Dropbox's order, in one write
 transaction, and each item changes only through its own entry (no inference about a renamed folder's
@@ -80,9 +97,6 @@ come from Dropbox's classic `/delta` contract, are not in the current v2 docs we
 only against the shapes captured in #234. For the extension: a folder at state ORPHAN is not a parent, so a
 live or hidden row never has an orphan parent, and an orphan (`parent_item = -1`) is never listed. Details in
 the module docs of `src-tauri/src/storage/db/projection.rs` and in ADR-0004.
-
-**Open for 2b:** rename a folder of about 200 files on dropbox.com and capture whether every descendant is
-re-listed.
 
 What feeding it costs (it is not free, and "no extra call" would be wrong):
 
@@ -99,7 +113,8 @@ What feeding it costs (it is not free, and "no extra call" would be wrong):
   Each wake-up applies the delta to the projection (one write transaction) and nothing else.
 - **Storage:** one row per file and folder of the account, plus up to 50 000 tombstones.
 
-To inspect it without launching anything, open a COPY of `app.db` read-only:
+To inspect it without launching anything, copy `app.db` and `app.db-wal` together and open the copy read-only
+(the rows may be in the `-wal`, and a read-only open fails without it):
 `sqlite3 'file:app-copy.db?mode=ro' 'select state, count(*) from fp_item group by state; select * from fp_state;'`.
 The host logs counts only (`File Provider projection committed`, `working set signalled`), never names.
 
@@ -109,13 +124,13 @@ The host logs counts only (`File Provider projection committed`, `working set si
    runs translocated from a randomised read-only path, where the extension is not found:
    `xattr -dr com.apple.quarantine /Applications/DropboxSyncDesktop.app`.
 2. Switch on and relaunch (above).
-3. The domain mounts: `ls ~/Library/CloudStorage/` shows a `DropboxSync...` folder containing
-   `File Provider tracer`.
+3. The domain mounts: `ls ~/Library/CloudStorage/` shows a `DropboxSync...` folder containing the Dropbox
+   root.
 4. The extension is registered: `pluginkit -m -p com.apple.fileprovider-nonui -v` lists
    `com.mobsanchez.dropboxsyncdesktop.fileprovider`.
 5. The enumerator is called. Use `/usr/bin/log`, not the shell builtin:
    `/usr/bin/log stream --predicate 'subsystem == "com.mobsanchez.dropboxsyncdesktop.fileprovider"'`
-   shows `init`, `enumerator(for:)` and `enumerateItems`.
+   shows `init`, `enumerator(for:)` and `enumerateItems rows=<n>`.
 6. No permission dialog appears at any point.
 7. Finder Sync badges still work outside the domain.
 
@@ -145,10 +160,3 @@ usage is unverified here), or from System Settings, then relaunch.
 exists. If re-adding fails after a removal, look for a leftover `DropboxSync...` folder under
 `~/Library/CloudStorage/` (quit the app, and move it aside rather than deleting it) and relaunch. That
 sequence is unverified; the first live run decides whether it is needed.
-
-## Known limits of the tracer
-
-- Not verified on a live system: the domain mounting, `NSFileProviderManager` calls through `objc2` and
-  `block2` (a failure there is a crash, not a compile error), and notarization with two appexes.
-- The host removes a domain it finds by identifier using a fresh `NSFileProviderDomain` object with the same
-  identifier; that this matches is assumed from the header, not observed.

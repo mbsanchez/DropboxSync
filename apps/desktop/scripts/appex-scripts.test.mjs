@@ -88,6 +88,6 @@ test("the File Provider target builds with the hardened runtime in every configu
 test("the File Provider extension refuses containers it does not serve", () => {
   const swift = readFileSync(join(macos, "FileProviderExtension", "FileProviderExtension.swift"), "utf8");
   assert.match(swift, /case \.trashContainer:\s*(\/\/[^\n]*\s*)*throw CocoaError\(\.featureUnsupported\)/);
-  assert.match(swift, /default:\s*throw NSFileProviderError\(\.noSuchItem\)/);
+  assert.match(swift, /guard let itemId = ItemIdCodec\.decode\(containerItemIdentifier\.rawValue\) else \{\s*throw noSuchItem\(containerItemIdentifier\)/);
   assert.doesNotMatch(swift, /fetchContents[\s\S]*?completionHandler\(nil, nil, NSFileProviderError\(\.cannotSynchronize\)\)/);
 });

@@ -203,6 +203,38 @@ pub(crate) fn startup_error_path(db_path: &std::path::Path) -> std::path::PathBu
     db_path.with_file_name("startup-error.txt")
 }
 
+/// Keeps `app.db-wal` and `app.db-shm` when the last connection closes (DBSYNC-95).
+///
+/// SQLite deletes both on a clean close, and the File Provider extension cannot read without the
+/// `-wal`: its read-only open goes through Apple's SQLite, which then fails every prepare with
+/// `SQLITE_CANTOPEN`.
+/// An ordinary quit leaves them by not closing at all; this covers whatever does close. The write
+/// connection is the only one that needs it: the read-only one leaves both files whenever it closes.
+#[cfg(target_os = "macos")]
+fn keep_wal_files(conn: &Connection) -> AppResult<()> {
+    use rusqlite::ffi;
+    let mut on: std::ffi::c_int = 1;
+    // SAFETY: `handle` is valid while `conn` is borrowed, the name is a NUL-terminated literal, and
+    // this opcode reads and writes one `c_int` through the pointer, which outlives the call.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            std::ptr::from_mut(&mut on).cast(),
+        )
+    };
+    if rc != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), None).into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keep_wal_files(_conn: &Connection) -> AppResult<()> {
+    Ok(())
+}
+
 /// Writes `msg` with a timestamp to `file`, synchronously. Best effort: the caller decides
 /// what to say when this fails, and failing to write the diagnostic must not mask the error
 /// being reported.
@@ -249,6 +281,7 @@ impl Db {
 
     fn open_and_migrate(path: &std::path::Path) -> AppResult<Self> {
         let mut write = Connection::open(path)?;
+        keep_wal_files(&write)?;
         // DBSYNC-103 (L5): `Db::new` runs the schema migrate and the NFC re-key BEFORE
         // `tauri_plugin_single_instance` can hand a second launch off to the first (the
         // plugin is registered on the builder, after `Db::new`; reordering it is out of scope
@@ -4955,6 +4988,50 @@ mod tests {
         let want = crate::storage::db::DB_BUSY_TIMEOUT.as_millis() as i64;
         assert_eq!(ms(&db.write), want, "write connection");
         assert_eq!(ms(&db.read), want, "read connection");
+    }
+
+    /// The File Provider extension cannot read `app.db` once these two are gone, whichever connection
+    /// closes last (`keep_wal_files`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_wal_files_outlive_the_last_connection() {
+        for read_closes_last in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.db");
+            let Db {
+                write, mut read, ..
+            } = Db::new_at(&path).unwrap();
+            // A connection that never read is not in the WAL, and its close would prove nothing.
+            let _: i64 = read
+                .get_mut()
+                .unwrap()
+                .query_row("SELECT count(*) FROM fp_state", [], |r| r.get(0))
+                .unwrap();
+            if read_closes_last {
+                drop(write);
+                drop(read);
+            } else {
+                drop(read);
+                drop(write);
+            }
+            for sidecar in ["app.db-wal", "app.db-shm"] {
+                assert!(
+                    dir.path().join(sidecar).exists(),
+                    "{sidecar} is gone, read_closes_last={read_closes_last}"
+                );
+            }
+            // What the extension's read goes through: Apple's SQLite, not the bundled one.
+            let read_back = std::process::Command::new("/usr/bin/sqlite3")
+                .arg(format!("file:{}?mode=ro", path.display()))
+                .arg("SELECT count(*) FROM fp_state")
+                .output()
+                .unwrap();
+            assert!(
+                read_back.status.success(),
+                "read_closes_last={read_closes_last}: {}",
+                String::from_utf8_lossy(&read_back.stderr)
+            );
+        }
     }
 
     /// Retry must not fail because a `failed` row has an active twin (the partial unique index

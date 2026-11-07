@@ -8,10 +8,14 @@
 
 /* Begin PBXBuildFile section */
 		DBFP00000000000000000021 /* FileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBFP00000000000000000001 /* FileProviderExtension.swift */; };
+		DBFP00000000000000000022 /* ProjectionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBFP00000000000000000002 /* ProjectionModel.swift */; };
+		DBFP00000000000000000023 /* ProjectionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBFP00000000000000000003 /* ProjectionStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		DBFP00000000000000000001 /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
+		DBFP00000000000000000002 /* ProjectionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectionModel.swift; sourceTree = "<group>"; };
+		DBFP00000000000000000003 /* ProjectionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectionStore.swift; sourceTree = "<group>"; };
 		DBFP00000000000000000005 /* DropboxSyncFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = DropboxSyncFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		DBFP00000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -39,6 +43,8 @@
 			isa = PBXGroup;
 			children = (
 				DBFP00000000000000000001 /* FileProviderExtension.swift */,
+				DBFP00000000000000000002 /* ProjectionModel.swift */,
+				DBFP00000000000000000003 /* ProjectionStore.swift */,
 				DBFP00000000000000000006 /* Info.plist */,
 			);
 			name = FileProviderExtension;
@@ -121,6 +127,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				DBFP00000000000000000021 /* FileProviderExtension.swift in Sources */,
+				DBFP00000000000000000022 /* ProjectionModel.swift in Sources */,
+				DBFP00000000000000000023 /* ProjectionStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

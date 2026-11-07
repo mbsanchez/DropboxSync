@@ -1610,7 +1610,7 @@ pub(crate) fn run_remote_delta(
         // Gives up after a few failures in a row (clearing the projection) so it never pins the cursor.
         let commit = state.db.project_delta_or_give_up(&all_entries)?;
         if commit.rows > 0 {
-            crate::file_provider::signal_working_set();
+            crate::file_provider::signal_after_delta(commit.vanished > 0);
         }
     }
 

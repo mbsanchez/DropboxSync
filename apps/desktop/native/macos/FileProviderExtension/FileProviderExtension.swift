@@ -3,20 +3,22 @@ import Foundation
 import os
 import UniformTypeIdentifiers
 
-/// The tracer File Provider extension (DBSYNC-95 slice 1, ADR-0004).
+/// The File Provider extension (DBSYNC-95, ADR-0004).
 ///
-/// It proves the extension loads, the domain mounts and the enumerator is called. It serves ONE static
-/// folder item; nothing is read from the host, and every write or download answers with an error. Later
-/// slices replace the static item with a read-only projection of the host's index.
+/// It lists the host's projection of the Dropbox tree and changes nothing: it has no network and no token,
+/// it only reads `app.db`, and every write answers with an error. Downloads arrive in slice 3, writes in
+/// slice 4.
 ///
 /// `@objc(DropboxSyncFileProvider)` makes the runtime class name the bare literal that Info.plist names in
 /// `NSExtensionPrincipalClass`. `build-appex.sh` checks the two agree.
 @objc(DropboxSyncFileProvider)
 final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension {
     private let domain: NSFileProviderDomain
+    private let store: ProjectionStore?
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
+        self.store = Self.openStore()
         super.init()
         fpLog.info("init domain=\(domain.identifier.rawValue, privacy: .public)")
     }
@@ -30,14 +32,23 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        fpLog.info("item(for:) \(identifier.rawValue, privacy: .public)")
         switch identifier {
         case .rootContainer:
-            completionHandler(TracerItem.root, nil)
-        case TracerItem.folder.itemIdentifier:
-            completionHandler(TracerItem.folder, nil)
+            completionHandler(RootItem(), nil)
         default:
-            completionHandler(nil, NSFileProviderError(.noSuchItem))
+            guard let itemId = ItemIdCodec.decode(identifier.rawValue) else {
+                completionHandler(nil, noSuchItem(identifier))
+                return Progress(totalUnitCount: 1)
+            }
+            do {
+                if let row = try requireStore(store).item(itemId) {
+                    completionHandler(ProjectionItem(row: row), nil)
+                } else {
+                    completionHandler(nil, noSuchItem(identifier))
+                }
+            } catch {
+                completionHandler(nil, readError(error, during: "item"))
+            }
         }
         return Progress(totalUnitCount: 1)
     }
@@ -51,12 +62,16 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         case .trashContainer:
             // The header's instruction for an extension that does not support trashing items.
             throw CocoaError(.featureUnsupported)
-        case .rootContainer, .workingSet, TracerItem.folder.itemIdentifier:
-            break
+        case .workingSet:
+            return ProjectionEnumerator(store: store, scope: .workingSet)
+        case .rootContainer:
+            return ProjectionEnumerator(store: store, scope: .folder(projectionRootItem))
         default:
-            throw NSFileProviderError(.noSuchItem)
+            guard let itemId = ItemIdCodec.decode(containerItemIdentifier.rawValue) else {
+                throw noSuchItem(containerItemIdentifier)
+            }
+            return ProjectionEnumerator(store: store, scope: .folder(itemId))
         }
-        return TracerEnumerator(container: containerItemIdentifier)
     }
 
     func fetchContents(
@@ -65,11 +80,21 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         request: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        fpLog.info("fetchContents: no such item")
-        // The tracer serves folders only, so no item has contents to fetch. `noSuchItem` is one of the codes
-        // the header lists for this method (with NSFileReadNoPermissionError, notAuthenticated and
-        // serverUnreachable); `cannotSynchronize` is not. Slice 3 keeps `noSuchItem` for an unknown identifier.
-        completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
+        // Downloads arrive in slice 3. An unknown identifier stays `noSuchItem`; a known file answers
+        // `serverUnreachable`, so nothing reads as a missing file. The system shows an error and backs off
+        // until signalled, which is what a stub should get.
+        fpLog.info("fetchContents refused")
+        guard let itemId = ItemIdCodec.decode(itemIdentifier.rawValue) else {
+            completionHandler(nil, nil, noSuchItem(itemIdentifier))
+            return Progress(totalUnitCount: 1)
+        }
+        do {
+            let known = try requireStore(store).item(itemId) != nil
+            completionHandler(
+                nil, nil, known ? NSFileProviderError(.serverUnreachable) : noSuchItem(itemIdentifier))
+        } catch {
+            completionHandler(nil, nil, readError(error, during: "fetchContents"))
+        }
         return Progress(totalUnitCount: 1)
     }
 
@@ -113,31 +138,53 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
     }
 }
 
-/// Shared logger. Only static, non-user strings are logged public; identifiers here are our own constants.
+extension DropboxSyncFileProvider {
+    /// The store in the App Group container, or `nil` without a group: a build without a team, which
+    /// then fails every read with `ReadFailure.noContainer` and logs why.
+    private static func openStore() -> ProjectionStore? {
+        let groupID = (Bundle.main.object(forInfoDictionaryKey: "DBSyncAppGroupID") as? String) ?? ""
+        guard !groupID.isEmpty,
+              let container = FileManager.default.containerURL(
+                  forSecurityApplicationGroupIdentifier: groupID) else {
+            fpLog.error("no App Group container")
+            return nil
+        }
+        return ProjectionStore(databasePath: ProjectionStore.path(inContainer: container))
+    }
+}
+
+/// The store, or the failure that says why there is none.
+func requireStore(_ store: ProjectionStore?) throws -> ProjectionStore {
+    guard let store = store else { throw ReadFailure.noContainer }
+    return store
+}
+
+/// What the system gets for a failed read (`ReadFailure.answer`). Logged by class only: no name or path
+/// reaches the log.
+func readError(_ error: Error, during operation: StaticString) -> Error {
+    fpLog.error("read failed during \(operation.description, privacy: .public): \(String(describing: error), privacy: .public)")
+    switch (error as? ReadFailure)?.answer ?? .retry(code: 0) {
+    case .waitForSignal:
+        return NSFileProviderError(.serverUnreachable)
+    case .retry(let code):
+        return ReadAnswer.transientError(code: code)
+    }
+}
+
+/// The header's form of `noSuchItem`. The system takes it to mean the item was deleted and attempts to
+/// delete it from disk, so it answers only for an identifier with no live row.
+func noSuchItem(_ identifier: NSFileProviderItemIdentifier) -> Error {
+    NSError.fileProviderErrorForNonExistentItem(withIdentifier: identifier)
+}
+
+/// Shared logger. Identifiers (`i<n>`) and counts are logged public; a name or a path never is.
 let fpLog = Logger(subsystem: "com.mobsanchez.dropboxsyncdesktop.fileprovider", category: "extension")
 
-/// The tracer's items: the domain root and one static folder under it.
-final class TracerItem: NSObject, NSFileProviderItem {
-    static let root = TracerItem(id: .rootContainer, parent: .rootContainer, name: "Dropbox Sync", isRoot: true)
-    static let folder = TracerItem(
-        id: NSFileProviderItemIdentifier("tracer-item"), parent: .rootContainer, name: "File Provider tracer",
-        isRoot: false)
-
-    private let id: NSFileProviderItemIdentifier
-    private let parent: NSFileProviderItemIdentifier
-    private let name: String
-    private let isRoot: Bool
-
-    private init(id: NSFileProviderItemIdentifier, parent: NSFileProviderItemIdentifier, name: String, isRoot: Bool) {
-        self.id = id
-        self.parent = parent
-        self.name = name
-        self.isRoot = isRoot
-    }
-
-    var itemIdentifier: NSFileProviderItemIdentifier { id }
-    var parentItemIdentifier: NSFileProviderItemIdentifier { parent }
-    var filename: String { name }
+/// The domain root. It is not a row of the projection.
+final class RootItem: NSObject, NSFileProviderItem {
+    var itemIdentifier: NSFileProviderItemIdentifier { .rootContainer }
+    var parentItemIdentifier: NSFileProviderItemIdentifier { .rootContainer }
+    var filename: String { "Dropbox Sync" }
     var contentType: UTType { .folder }
     var capabilities: NSFileProviderItemCapabilities { [.allowsReading, .allowsContentEnumerating] }
     var itemVersion: NSFileProviderItemVersion {
@@ -145,34 +192,131 @@ final class TracerItem: NSObject, NSFileProviderItem {
     }
 }
 
-/// Enumerates the static item under the root; every other container, and the working set, is empty.
-final class TracerEnumerator: NSObject, NSFileProviderEnumerator {
-    /// The fixed anchor the tracer reports: nothing ever changes.
-    private static let anchor = NSFileProviderSyncAnchor(Data("1".utf8))
+/// One row of the projection.
+final class ProjectionItem: NSObject, NSFileProviderItem {
+    private let row: ProjectionRow
 
-    private let container: NSFileProviderItemIdentifier
+    init(row: ProjectionRow) {
+        self.row = row
+        super.init()
+    }
 
-    init(container: NSFileProviderItemIdentifier) {
-        self.container = container
+    var itemIdentifier: NSFileProviderItemIdentifier {
+        NSFileProviderItemIdentifier(ItemIdCodec.encode(row.itemId))
+    }
+
+    var parentItemIdentifier: NSFileProviderItemIdentifier {
+        row.parentItem == projectionRootItem
+            ? .rootContainer
+            : NSFileProviderItemIdentifier(ItemIdCodec.encode(row.parentItem))
+    }
+
+    var filename: String { row.name }
+
+    var contentType: UTType {
+        if row.isFolder { return .folder }
+        let suffix = (row.name as NSString).pathExtension
+        return UTType(filenameExtension: suffix) ?? .data
+    }
+
+    var capabilities: NSFileProviderItemCapabilities {
+        row.isFolder ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading]
+    }
+
+    var documentSize: NSNumber? { row.isFolder ? nil : NSNumber(value: row.sizeBytes) }
+
+    var contentModificationDate: Date? {
+        row.modifiedTs > 0 ? Date(timeIntervalSince1970: TimeInterval(row.modifiedTs)) : nil
+    }
+
+    var itemVersion: NSFileProviderItemVersion {
+        NSFileProviderItemVersion(contentVersion: row.contentVersion, metadataVersion: row.metaVersion)
+    }
+}
+
+/// Lists a folder or the working set from the projection, one page per call.
+///
+/// The changes are the whole domain's whichever enumerator is asked: a replicated extension only signals
+/// the working set, and an item's identifier means the same thing everywhere.
+final class ProjectionEnumerator: NSObject, NSFileProviderEnumerator {
+    enum Scope {
+        case workingSet
+        case folder(Int64)
+    }
+
+    private let store: ProjectionStore?
+    private let scope: Scope
+
+    init(store: ProjectionStore?, scope: Scope) {
+        self.store = store
+        self.scope = scope
         super.init()
     }
 
     func invalidate() {}
 
     func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
-        fpLog.info("enumerateItems \(self.container.rawValue, privacy: .public)")
-        if container == .rootContainer {
-            observer.didEnumerate([TracerItem.folder])
+        let after = PageCodec.afterItem(page.rawValue)
+        // One row more than a batch: it tells a last full page from one with a next.
+        let limit = projectionBatchSize + 1
+        do {
+            let store = try requireStore(self.store)
+            let rows: [ProjectionRow]
+            switch scope {
+            case .workingSet:
+                rows = try store.liveItems(afterItem: after, limit: limit)
+            case .folder(let parent):
+                guard let children = try store.children(of: parent, afterItem: after, limit: limit) else {
+                    observer.finishEnumeratingWithError(
+                        noSuchItem(NSFileProviderItemIdentifier(ItemIdCodec.encode(parent))))
+                    return
+                }
+                rows = children
+            }
+            let (served, next) = PageCodec.next(rows: rows, batch: projectionBatchSize)
+            fpLog.info("enumerateItems rows=\(served.count, privacy: .public)")
+            observer.didEnumerate(served.map(ProjectionItem.init(row:)))
+            observer.finishEnumerating(upTo: next.map(NSFileProviderPage.init(_:)))
+        } catch {
+            observer.finishEnumeratingWithError(readError(error, during: "enumerateItems"))
         }
-        observer.finishEnumerating(upTo: nil)
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
-        fpLog.info("enumerateChanges \(self.container.rawValue, privacy: .public)")
-        observer.finishEnumeratingChanges(upTo: Self.anchor, moreComing: false)
+        do {
+            let store = try requireStore(self.store)
+            let from = ProjectionAnchor(encoded: anchor.rawValue)
+            guard let read = try store.changes(from: from, limit: projectionBatchSize + 1) else {
+                fpLog.info("enumerateChanges: anchor expired")
+                observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
+                return
+            }
+            let plan = ChangePlan.make(rows: read.rows, batch: projectionBatchSize, head: read.head)
+            fpLog.info("enumerateChanges updated=\(plan.updated.count, privacy: .public) deleted=\(plan.deletedItemIds.count, privacy: .public)")
+            if !plan.updated.isEmpty {
+                observer.didUpdate(plan.updated.map(ProjectionItem.init(row:)))
+            }
+            if !plan.deletedItemIds.isEmpty {
+                observer.didDeleteItems(withIdentifiers: plan.deletedItemIds.map {
+                    NSFileProviderItemIdentifier(ItemIdCodec.encode($0))
+                })
+            }
+            observer.finishEnumeratingChanges(
+                upTo: NSFileProviderSyncAnchor(plan.upTo.encoded), moreComing: plan.moreComing)
+        } catch {
+            observer.finishEnumeratingWithError(readError(error, during: "enumerateChanges"))
+        }
     }
 
+    /// `nil` for any failed read, on a healthy projection too. The header allows it and does not say what
+    /// the system does with it.
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        completionHandler(Self.anchor)
+        do {
+            let head = try requireStore(store).head()
+            completionHandler(NSFileProviderSyncAnchor(ProjectionAnchor(head: head).encoded))
+        } catch {
+            _ = readError(error, during: "currentSyncAnchor")
+            completionHandler(nil)
+        }
     }
 }

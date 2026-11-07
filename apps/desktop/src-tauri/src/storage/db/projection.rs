@@ -20,14 +20,16 @@
 //! NOT in the current v2 documentation we could read (the "detecting changes" page does not state it).
 //! It was checked against the live capture of #234 (2a.0), and only for the shapes captured: a nested
 //! create, a folder rename, a file move, an empty folder delete and the delete of a folder with
-//! content. What a large rename lists is not known yet; see "Open question for 2b".
+//! content, and later against the rename of a folder of 204 entries (#234, 2026-11-06).
 //!
 //! What the capture showed:
 //!
 //! 1. A `deleted` entry carries a path and nothing else, so a delete is resolved through the item's
 //!    CURRENT `path_lower`, never through an id. Upserts are keyed by `dropbox_id`.
-//! 2. A folder rename arrives as one batch: deletes of the old paths first, then the folder at its new
-//!    path with the SAME id, then its children with their same ids.
+//! 2. A folder rename arrives as deletes of the old paths, then the folder at its new path with the
+//!    SAME id, then every descendant with its same id. Nothing promises one batch: a small rename came
+//!    in one invocation, the rename of 204 entries came in two (every delete, `has_more=false`, and 2.9 s
+//!    later every re-add). DBSYNC-102 had already measured the same split on a share and an un-share.
 //! 3. A move changes `rev` while the content stays. The content version is therefore derived from
 //!    `content_hash` alone.
 //! 4. A folder delete lists its children's deletes, but nothing proves that holds for a large or deep
@@ -81,11 +83,12 @@
 //! left at a stale path under a folder that a later entry tombstones. It changes only through its own
 //! entry, like every row.)
 //!
-//! ### Open question for 2b (live check)
+//! ### A rename split across two invocations
 //!
-//! Rename a folder of about 200 files on dropbox.com and capture whether every descendant is
-//! re-listed. If it is not, the unlisted descendants stay where they are (deleted, or live under their
-//! old paths); this module does not guess. The capture decides whether anything must change.
+//! Both halves are ordinary batches. The first tombstones the rows and the second finds each id and
+//! restores it in place, so identities survive the gap. Between them the projection says those rows are
+//! deleted, and it is right to: nothing in the first half announces the second. What is held back is
+//! the signal, not the data ([`ProjectionCommit::vanished`], `file_provider::SIGNAL_REMOVAL_GRACE`).
 //!
 //! ## The snapshot
 //!
@@ -333,6 +336,8 @@ struct Stamper {
     stamped: usize,
     /// How many rows this writer turned into tombstones (the cap check runs only when it is not 0).
     tombstoned: usize,
+    /// How many rows were listed before this writer and are not at the end of it.
+    vanished: usize,
 }
 
 impl Stamper {
@@ -342,6 +347,7 @@ impl Stamper {
             seq,
             stamped: 0,
             tombstoned: 0,
+            vanished: 0,
         })
     }
 
@@ -362,10 +368,13 @@ impl Stamper {
 
 /// What a writer committed. `rows` counts the sequence values it took (a snapshot or a clear also
 /// takes one for the expiry), so `rows == 0` means nothing changed and nobody has to be told.
+/// `vanished` counts the rows that were live before the batch and are not after it; only a delta acts
+/// on it, because only a delta can be the first half of a rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProjectionCommit {
     pub rows: usize,
     pub seq: i64,
+    pub vanished: usize,
 }
 
 /// The anchor ingredients, as stored.
@@ -968,6 +977,9 @@ impl<'a> Sequence<'a> {
             // New bytes make a local copy stale; anything else leaves the flag alone.
             let downloaded = before.downloaded && before.content_hash == now.content_hash;
             stamp.execute(params![item_id, self.st.stamp(), downloaded])?;
+            if before.state == STATE_LIVE && now.state != STATE_LIVE {
+                self.st.vanished += 1;
+            }
         }
         Ok(())
     }
@@ -1053,6 +1065,7 @@ pub(super) fn clear_in(conn: &Connection) -> rusqlite::Result<ProjectionCommit> 
     Ok(ProjectionCommit {
         rows: st.stamped,
         seq: st.seq,
+        vanished: st.vanished,
     })
 }
 
@@ -1127,6 +1140,7 @@ impl Db {
         let commit = ProjectionCommit {
             rows: st.stamped,
             seq: st.seq,
+            vanished: st.vanished,
         };
         if commit.rows > 0 {
             // Counts only: a path or a name would put user data in a log.
@@ -1151,7 +1165,11 @@ impl Db {
         entries: &[ProjectedEntry],
     ) -> AppResult<ProjectionCommit> {
         if !self.projection_active() {
-            return Ok(ProjectionCommit { rows: 0, seq: 0 });
+            return Ok(ProjectionCommit {
+                rows: 0,
+                seq: 0,
+                vanished: 0,
+            });
         }
         let (_, commit) = self.write_projection("snapshot", |conn, st| {
             // Read inside the transaction: a Save cannot commit between the read and the writes.
@@ -1192,7 +1210,11 @@ impl Db {
     /// The delta writer: one invocation's raw entries, folders included. Writes nothing unless the
     /// switch is on and the projection is populated.
     pub(crate) fn project_delta(&self, entries: &[DropboxEntry]) -> AppResult<ProjectionCommit> {
-        let none = ProjectionCommit { rows: 0, seq: 0 };
+        let none = ProjectionCommit {
+            rows: 0,
+            seq: 0,
+            vanished: 0,
+        };
         if !self.projection_active() {
             return Ok(none);
         }
@@ -1298,7 +1320,11 @@ impl Db {
     /// longer matches, in one transaction and without a snapshot. Called when the filter is saved.
     pub(crate) fn project_reapply_filter(&self) -> AppResult<ProjectionCommit> {
         if !self.projection_active() {
-            return Ok(ProjectionCommit { rows: 0, seq: 0 });
+            return Ok(ProjectionCommit {
+                rows: 0,
+                seq: 0,
+                vanished: 0,
+            });
         }
         let (_, commit) = self.write_projection("filter", |conn, st| {
             if !populated(conn)? {
@@ -1337,7 +1363,11 @@ impl Db {
         downloaded: bool,
     ) -> AppResult<ProjectionCommit> {
         if !self.projection_active() {
-            return Ok(ProjectionCommit { rows: 0, seq: 0 });
+            return Ok(ProjectionCommit {
+                rows: 0,
+                seq: 0,
+                vanished: 0,
+            });
         }
         let (_, commit) = self.write_projection("downloaded", |conn, st| {
             if !populated(conn)? {
@@ -2106,6 +2136,64 @@ mod tests {
             crate::file_provider::signals_requested_on_this_thread(),
             signals,
             "a replay that changed nothing must not signal"
+        );
+    }
+
+    /// The rename of a folder of 204 entries as it was captured live (#234, 2026-11-06): every delete
+    /// in one invocation, then every re-add in the next. Every identity survives the gap, and only the
+    /// first half holds the signal back.
+    ///
+    /// Proof this test can fail: removing `self.st.vanished += 1` fails the hold check; passing `true`
+    /// to `signal_after_delta` unconditionally fails the check on the second half.
+    #[test]
+    fn a_rename_split_across_two_invocations_keeps_every_id_and_holds_the_signal_once() {
+        let w = world(true, true);
+        run(&w, vec![dir("/FP", FCAP), file("/FP/b.txt", B, "rev-aaa1")]);
+        let before: Vec<i64> = all_rows(w.db()).iter().map(|r| r.item_id).collect();
+        let holds = crate::file_provider::signal_holds_on_this_thread();
+
+        run(&w, vec![gone("/FP/b.txt"), gone("/FP")]);
+        assert_eq!(
+            crate::file_provider::signal_holds_on_this_thread(),
+            holds + 1,
+            "the deletes may be half a rename"
+        );
+        assert!(all_rows(w.db()).iter().all(|r| r.state == STATE_DELETED));
+
+        run(&w, vec![dir("/FQ", FCAP), file("/FQ/b.txt", B, "rev-bbb2")]);
+        assert_eq!(
+            crate::file_provider::signal_holds_on_this_thread(),
+            holds + 1,
+            "the re-adds removed nothing"
+        );
+        let after = all_rows(w.db());
+        assert_eq!(
+            after.iter().map(|r| r.item_id).collect::<Vec<_>>(),
+            before,
+            "no identity was minted"
+        );
+        assert!(after.iter().all(|r| r.state == STATE_LIVE));
+    }
+
+    /// A rename inside one invocation removes nothing by the end of the batch, so nothing is held.
+    ///
+    /// Proof this test can fail: counting `vanished` at each tombstone instead of in `finish` makes it
+    /// non-zero here.
+    #[test]
+    fn a_rename_inside_one_invocation_holds_nothing() {
+        let w = world(true, true);
+        for e in [inv1(), inv2(), inv3()] {
+            run(&w, e);
+        }
+        let holds = crate::file_provider::signal_holds_on_this_thread();
+        let signals = crate::file_provider::signals_requested_on_this_thread();
+
+        run(&w, inv4());
+
+        assert_eq!(crate::file_provider::signal_holds_on_this_thread(), holds);
+        assert_eq!(
+            crate::file_provider::signals_requested_on_this_thread(),
+            signals + 1
         );
     }
 

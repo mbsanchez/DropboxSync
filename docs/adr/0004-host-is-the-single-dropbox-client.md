@@ -124,22 +124,42 @@ lives on `feature/DBSYNC-95-file-provider-extension`.
 
 Slice 2 designs the projection around the raw `list_folder/continue` entries, logged by the app's own
 `remote delta: raw entry` line while the maintainer made the changes on dropbox.com. Four facts follow, and
-each one changed the design:
+each one changed the design. Fact 2 was corrected by a second capture on 2026-11-06:
 
 1. **A `deleted` entry carries a path and nothing else.** No id, no rev. A delete is therefore resolved
    through the item's *current* path (the projection keeps a `path_lower` index); only upserts are keyed by
    `dropbox_id`.
-2. **A folder rename arrives as one batch, deletes first.** The old child path and the old folder path are
-   deleted, then the folder is re-added at its new path with the **same id**, then the child with its same
-   id. Applied entry by entry in that order (see *Contract model* below), this is a move: the re-add finds
-   the tombstone of the same id and updates it in place, so both ids survive and both rows end live.
+2. **A folder rename arrives deletes first, and not always in one batch.** The old child path and the old
+   folder path are deleted, then the folder is re-added at its new path with the **same id**, then every
+   descendant with its same id. Applied entry by entry in that order (see *Contract model* below), this is
+   a move: the re-add finds the tombstone of the same id and updates it in place, so the ids survive and the
+   rows end live. A two-entry rename came in one invocation. A folder of 204 entries came in two: 204 deletes
+   with `has_more=false`, then, 2.9 s later, 204 re-adds. DBSYNC-102 had already measured the same split on a
+   share and an un-share (3.45 s and 3.43 s). See *A rename split in two* below.
 3. **A move changes the file's `rev` while its content stays the same.** Confirmed on the wire, so the
    content version is derived from `content_hash` only (see *Versions*).
 4. **Deleting a folder with content lists the child deletes explicitly**; an empty folder is one entry.
    Whether that holds for a large or deep tree is *not* observed, so a delete also tombstones everything
-   beneath its path prefix as a fallback. Whether a renamed folder's descendants are all re-listed is not
-   observed either, and the projection does not guess: it follows the contract literally (see below) and the
-   question goes to a live check in slice 2b.
+   beneath its path prefix as a fallback. A renamed folder's descendants **are** all re-listed: the 204-entry
+   rename listed every file and subfolder, two levels deep.
+
+### A rename split in two
+
+Between the two invocations the projection correctly says the rows are deleted: `has_more=false` means
+nothing announces the second half. Publishing that gap would make Finder drop the folder and bring it back,
+and from slice 3 on it could cost downloaded content or a pending change.
+
+So the host holds the **signal**, not the data. A delta that leaves a previously live row non-live delays the
+working-set signal by 10 s, moved later by each further such delta and never past 60 s from the first. A
+delta that removes nothing does not shorten a hold in progress, and a rename inside one batch holds nothing.
+Ten seconds is about three times the longest gap measured; the price is that a real remote delete reaches
+Finder ten seconds late.
+
+This narrows the window and does not close it: the data is already gone from the projection during the hold,
+so an enumeration the system starts itself, `item(for:)` or `fetchContents` all read the gap. Slices 3 and 4
+must assume an item can be reported deleted and return with the same identifier seconds later. The answer in
+that gap matters: `noSuchItem` tells the system the item was deleted and to attempt deleting it from disk, so
+once items have content (slice 3) a rename in progress must not answer it for a row that may come back.
 
 ### The projection (slice 2a)
 
