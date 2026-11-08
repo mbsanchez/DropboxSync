@@ -58,6 +58,10 @@ const STARTUP_RESOLVE_REPEAT: Duration = Duration::from_secs(5);
 struct Request {
     version: u32,
     item_id: i64,
+    /// The system says Finder asked (`NSFileProviderRequest.isFileViewerRequest`): a person opened the
+    /// file, as opposed to Spotlight or Quick Look reading it.
+    #[serde(default)]
+    viewer: bool,
 }
 
 /// What the queue held under one id.
@@ -395,6 +399,72 @@ fn lift_throttling_later() {
     }
 }
 
+/// What a person who opened a file Dropbox will not hand out gets instead: the file on dropbox.com, where a
+/// Paper document opens in its editor. The system shows nothing for the refusal itself.
+fn open_in_browser(db: &Db, item_id: i64) {
+    let url = match db.projection_web_location(item_id) {
+        Ok(Some((path_lower, name))) => web_preview_url(&path_lower, &name),
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "File Provider exchange: cannot read the row to open");
+            return;
+        }
+    };
+    let Some(url) = url else { return };
+    // The URL holds the path, so it goes to `open` and never to the log.
+    match std::process::Command::new("/usr/bin/open")
+        .arg(url.as_str())
+        .spawn()
+    {
+        Ok(_) => tracing::info!(item_id, "File Provider exchange: opened on dropbox.com"),
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "File Provider exchange: cannot open the browser")
+        }
+    }
+}
+
+/// `https://www.dropbox.com/preview/<parent>/<name>`, encoded segment by segment. Checked live: it opens a
+/// Paper document, by way of a redirect to its own link (#235). Dropbox's web paths ignore case, so the
+/// lowercase parent from the projection reaches the same folder; the name keeps its case.
+fn web_preview_url(path_lower: &str, name: &str) -> Option<reqwest::Url> {
+    let mut url = reqwest::Url::parse("https://www.dropbox.com/preview").ok()?;
+    let parent = path_lower.rsplit_once('/').map_or("", |(parent, _)| parent);
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.extend(parent.split('/').filter(|s| !s.is_empty()));
+        segments.push(name);
+    }
+    Some(url)
+}
+
+/// One browser tab per file per [`BROWSER_REPEAT`], whatever the system's retries ask for.
+struct BrowserOpens {
+    last: Mutex<Option<(i64, Instant)>>,
+}
+
+/// Longer than the system takes to ask twice for one double click.
+const BROWSER_REPEAT: Duration = Duration::from_secs(10);
+
+impl BrowserOpens {
+    const fn new() -> Self {
+        Self {
+            last: Mutex::new(None),
+        }
+    }
+
+    fn allow(&self, item_id: i64, now: Instant) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let repeat =
+            last.is_some_and(|(id, at)| id == item_id && now.duration_since(at) < BROWSER_REPEAT);
+        if !repeat {
+            *last = Some((item_id, now));
+        }
+        !repeat
+    }
+}
+
+static BROWSER_OPENS: BrowserOpens = BrowserOpens::new();
+
 /// Publishes `Retry` unless the request was answered, however the worker ends: a waiter whose host holds
 /// the lock has no other way to hear about a panic.
 struct AnswerGuard<'a> {
@@ -448,6 +518,12 @@ fn handle(state: &AppState, exchange: &Exchange, id: &str, request: &Request) {
     );
     if matches!(outcome, Outcome::Offline | Outcome::Auth) {
         lift_throttling_later();
+    }
+    if outcome == Outcome::Refused
+        && request.viewer
+        && BROWSER_OPENS.allow(request.item_id, Instant::now())
+    {
+        open_in_browser(&state.db, request.item_id);
     }
     guard.answer(&outcome);
 }
@@ -670,6 +746,7 @@ mod tests {
             Request {
                 version: EXCHANGE_VERSION,
                 item_id: self.item_id(),
+                viewer: false,
             }
         }
     }
@@ -775,6 +852,7 @@ mod tests {
         let request = Request {
             version: EXCHANGE_VERSION,
             item_id: 987_654,
+            viewer: false,
         };
 
         assert_eq!(
@@ -839,7 +917,8 @@ mod tests {
                 ID.to_string(),
                 Pending::Serve(Request {
                     version: 1,
-                    item_id: 7
+                    item_id: 7,
+                    viewer: false,
                 })
             )]
         );
@@ -1060,6 +1139,64 @@ mod tests {
 
         drop(lock);
         assert!(probe.try_lock_shared().is_ok());
+    }
+
+    /// The shape `Exchange.swift` writes for a double click.
+    #[test]
+    fn a_request_says_whether_a_person_opened_the_file() {
+        let w = world(b"hello");
+        write_request(
+            &w,
+            &format!("{ID}.json"),
+            r#"{"version":1,"item_id":7,"viewer":true}"#,
+        );
+
+        let taken = w.exchange.take_pending().unwrap();
+
+        assert_eq!(
+            taken,
+            vec![(
+                ID.to_string(),
+                Pending::Serve(Request {
+                    version: 1,
+                    item_id: 7,
+                    viewer: true,
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn the_web_url_is_the_preview_of_the_path() {
+        let url = web_preview_url("/documentos de paper/🎉 intro.paper", "🎉 Intro.paper").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://www.dropbox.com/preview/documentos%20de%20paper/%F0%9F%8E%89%20Intro.paper"
+        );
+
+        // The URL that opened the document live.
+        let root = web_preview_url("/sin título.paper", "Sin título.paper").unwrap();
+        assert_eq!(
+            root.as_str(),
+            "https://www.dropbox.com/preview/Sin%20t%C3%ADtulo.paper"
+        );
+
+        let tricky = web_preview_url("/a?b/c#d.paper", "c#d.paper").unwrap();
+        assert_eq!(
+            tricky.as_str(),
+            "https://www.dropbox.com/preview/a%3Fb/c%23d.paper"
+        );
+    }
+
+    #[test]
+    fn one_double_click_opens_one_tab() {
+        let opens = BrowserOpens::new();
+        let now = Instant::now();
+
+        assert!(opens.allow(1, now));
+        assert!(!opens.allow(1, now + Duration::from_secs(1)));
+        assert!(opens.allow(2, now + Duration::from_secs(2)));
+        assert!(opens.allow(1, now + BROWSER_REPEAT + Duration::from_secs(3)));
     }
 
     #[test]

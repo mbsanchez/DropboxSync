@@ -1389,6 +1389,24 @@ impl Db {
         Ok(target)
     }
 
+    /// Where a live file sits, for its dropbox.com page: `(path_lower, name)`.
+    pub(crate) fn projection_web_location(
+        &self,
+        item_id: i64,
+    ) -> AppResult<Option<(String, String)>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let location = conn
+            .prepare_cached(
+                "SELECT path_lower, name FROM fp_item WHERE item_id = ?1 AND state = 0",
+            )?
+            .query_row([item_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(location)
+    }
+
     /// Test hook: the id of the row at `path_lower`.
     #[cfg(test)]
     pub(crate) fn projection_item_id(&self, path_lower: &str) -> Option<i64> {

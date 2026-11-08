@@ -111,7 +111,9 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             return progress
         }
         let store = self.store
-        exchange.fetch(itemId: itemId, isCancelled: { progress.isCancelled }) { outcome in
+        exchange.fetch(
+            itemId: itemId, viewer: request.isFileViewerRequest, isCancelled: { progress.isCancelled }
+        ) { outcome in
             fpLog.info("fetchContents \(itemId, privacy: .public): \(outcome.logLabel, privacy: .public)")
             switch outcome {
             case .staged(let url, let contentVersion):
@@ -134,7 +136,8 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             case .auth:
                 completionHandler(nil, nil, NSFileProviderError(.notAuthenticated))
             case .refused:
-                // The header's answer for content the user cannot have: shown, not retried.
+                // The header's answer for content the user cannot have: not retried. The system shows
+                // nothing for it, so the host opens the file on dropbox.com for a Finder request.
                 completionHandler(nil, nil, CocoaError(.fileReadNoPermission))
             case .retry:
                 completionHandler(nil, nil, ReadAnswer.transientError(code: 0))

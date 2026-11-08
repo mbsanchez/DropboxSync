@@ -113,14 +113,21 @@ final class ExchangeClient {
 
     /// Queues a request and calls `done` once, on a background queue. A host that is down answers now,
     /// before anything is queued, and one that dies during the wait answers within a poll.
-    func fetch(itemId: Int64, isCancelled: @escaping () -> Bool, done: @escaping (ExchangeOutcome) -> Void) {
+    /// `viewer`: Finder asked, so a person is opening the file. The host opens a file Dropbox will not hand
+    /// out on dropbox.com for that person, and for nobody else.
+    func fetch(
+        itemId: Int64,
+        viewer: Bool = false,
+        isCancelled: @escaping () -> Bool,
+        done: @escaping (ExchangeOutcome) -> Void
+    ) {
         let id = UUID().uuidString
         DispatchQueue.global(qos: .userInitiated).async {
             guard hostIsRunning(lockPath: self.paths.lock) else {
                 done(.hostDown)
                 return
             }
-            guard self.enqueue(id: id, itemId: itemId) else {
+            guard self.enqueue(id: id, itemId: itemId, viewer: viewer) else {
                 done(.retry)
                 return
             }
@@ -129,8 +136,8 @@ final class ExchangeClient {
         }
     }
 
-    private func enqueue(id: String, itemId: Int64) -> Bool {
-        let body = Data("{\"version\":1,\"item_id\":\(itemId)}".utf8)
+    private func enqueue(id: String, itemId: Int64, viewer: Bool) -> Bool {
+        let body = Data("{\"version\":1,\"item_id\":\(itemId),\"viewer\":\(viewer)}".utf8)
         do {
             try body.write(to: paths.requestTemp(id))
             try FileManager.default.moveItem(at: paths.requestTemp(id), to: paths.request(id))

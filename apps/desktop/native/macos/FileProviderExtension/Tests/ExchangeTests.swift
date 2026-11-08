@@ -206,7 +206,16 @@ extension ProjectionTests {
     })
     _ = finish { client().fetch(itemId: 7, isCancelled: { false }, done: $0) }
     shape.lock()
-    expect(sent == #"{"version":1,"item_id":7}"#, "the request is what the host's test parses")
+    expect(sent == #"{"version":1,"item_id":7,"viewer":false}"#, "the request is what the host parses")
+    shape.unlock()
+    answerNextRequest(with: #"{"version":1,"outcome":"retry"}"#, inspect: { body in
+        shape.lock()
+        sent = body
+        shape.unlock()
+    })
+    _ = finish { client().fetch(itemId: 7, viewer: true, isCancelled: { false }, done: $0) }
+    shape.lock()
+    expect(sent == #"{"version":1,"item_id":7,"viewer":true}"#, "a double click is what the host's test parses")
     shape.unlock()
 
     // The handover.

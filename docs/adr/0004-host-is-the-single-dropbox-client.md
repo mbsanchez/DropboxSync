@@ -306,6 +306,9 @@ and hands the file over; a row that moved on meanwhile answers a transient error
   a file Dropbox will not hand out (`unsupported_file`, which a Paper document gets) is
   `NSFileReadNoPermissionError`, and anything else is a transient error. Dropbox's "not found" is transient
   too: a real delete reaches the system through the change feed.
+- **A file Dropbox will not hand out** is refused without a message from the system, so when Finder asked
+  (`isFileViewerRequest`) the host opens its page on dropbox.com instead, at most once per file per 10 s.
+  Spotlight and Quick Look get the refusal and nothing else.
 - **`noSuchItem`** answers only an identifier with no row. A row that is not live answers a transient error, in
   `item(for:)`, `fetchContents` and folder enumeration, because it may come back (*A rename split in two*). The
   system should stop asking about a real delete once the feed has told it.
@@ -356,9 +359,10 @@ stays unset, and the gating is explicit rather than implied by the unset value. 
   and it worked after relaunching.
 - **A file whose transfer takes longer than the download's 300 s timeout** fails as a transient error, and
   keeps failing on every retry. The bound is inherited from the existing download path.
-- **A Paper document** is listed by the feed like any file, with a size and a `content_hash`, and its download
-  answers 409. That much was observed live (#235); the `unsupported_file` summary is Dropbox's documented one,
-  read back from the log after the fix.
+- **Measured for Paper documents (#235):** the feed lists one like any file, with a size and a
+  `content_hash`; its download answers `409 unsupported_file/`; the system shows nothing for the refusal; and
+  `https://www.dropbox.com/preview/<path>` opens the document, with the parent folder in lower case, by
+  redirecting to its link. A `/home?preview=` URL does not: it lands on the home page.
 - **The login item** (`SMAppService`) registers in this app. Starting at a real login has not been observed.
 - **Deep or large folder deletes and renames** (fact 4 above): the prefix fallback exists because the
   listing of every descendant is unproven. The contract text itself comes from the classic `/delta` rules and
