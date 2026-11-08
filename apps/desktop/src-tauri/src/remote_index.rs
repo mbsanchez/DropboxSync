@@ -1032,6 +1032,8 @@ pub(crate) fn finish_seed(
                 if commit.rows > 0 {
                     crate::file_provider::signal_working_set();
                 }
+                // A read during the seed answered `serverUnreachable`, and only this lifts it.
+                crate::file_provider::signal_errors_resolved_soon();
             }
             Err(e) => {
                 tracing::error!(

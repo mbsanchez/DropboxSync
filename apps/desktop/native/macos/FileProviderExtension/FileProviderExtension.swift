@@ -6,8 +6,8 @@ import UniformTypeIdentifiers
 /// The File Provider extension (DBSYNC-95, ADR-0004).
 ///
 /// It lists the host's projection of the Dropbox tree and changes nothing: it has no network and no token,
-/// it only reads `app.db`, and every write answers with an error. Downloads arrive in slice 3, writes in
-/// slice 4.
+/// it only reads `app.db`, and every write answers with an error (slice 4). A download is asked of the host
+/// through the exchange in the container (`Exchange.swift`).
 ///
 /// `@objc(DropboxSyncFileProvider)` makes the runtime class name the bare literal that Info.plist names in
 /// `NSExtensionPrincipalClass`. `build-appex.sh` checks the two agree.
@@ -15,10 +15,13 @@ import UniformTypeIdentifiers
 final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension {
     private let domain: NSFileProviderDomain
     private let store: ProjectionStore?
+    private let exchange: ExchangeClient?
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
-        self.store = Self.openStore()
+        let (store, exchange) = Self.openContainer()
+        self.store = store
+        self.exchange = exchange
         super.init()
         fpLog.info("init domain=\(domain.identifier.rawValue, privacy: .public)")
     }
@@ -41,9 +44,12 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
                 return Progress(totalUnitCount: 1)
             }
             do {
-                if let row = try requireStore(store).item(itemId) {
+                switch try requireStore(store).presence(itemId) {
+                case .live(let row):
                     completionHandler(ProjectionItem(row: row), nil)
-                } else {
+                case .notLive:
+                    completionHandler(nil, ReadAnswer.transientError(code: 0))
+                case .unknown:
                     completionHandler(nil, noSuchItem(identifier))
                 }
             } catch {
@@ -80,22 +86,63 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         request: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        // Downloads arrive in slice 3. An unknown identifier stays `noSuchItem`; a known file answers
-        // `serverUnreachable`, so nothing reads as a missing file. The system shows an error and backs off
-        // until signalled, which is what a stub should get.
-        fpLog.info("fetchContents refused")
+        let progress = Progress(totalUnitCount: 1)
         guard let itemId = ItemIdCodec.decode(itemIdentifier.rawValue) else {
             completionHandler(nil, nil, noSuchItem(itemIdentifier))
-            return Progress(totalUnitCount: 1)
+            return progress
         }
         do {
-            let known = try requireStore(store).item(itemId) != nil
-            completionHandler(
-                nil, nil, known ? NSFileProviderError(.serverUnreachable) : noSuchItem(itemIdentifier))
+            switch try requireStore(store).presence(itemId) {
+            case .unknown:
+                completionHandler(nil, nil, noSuchItem(itemIdentifier))
+                return progress
+            case .notLive:
+                completionHandler(nil, nil, ReadAnswer.transientError(code: 0))
+                return progress
+            case .live:
+                break
+            }
         } catch {
             completionHandler(nil, nil, readError(error, during: "fetchContents"))
+            return progress
         }
-        return Progress(totalUnitCount: 1)
+        guard let exchange = exchange else {
+            completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        let store = self.store
+        exchange.fetch(itemId: itemId, isCancelled: { progress.isCancelled }) { outcome in
+            fpLog.info("fetchContents \(itemId, privacy: .public): \(outcome.logLabel, privacy: .public)")
+            switch outcome {
+            case .staged(let url, let contentVersion):
+                do {
+                    let current = try requireStore(store).presence(itemId)
+                    guard let row = rowToHandOver(stagedVersion: contentVersion, presence: current) else {
+                        // The row moved on during the download. The system asks again for the new version.
+                        try? FileManager.default.removeItem(at: url)
+                        completionHandler(nil, nil, ReadAnswer.transientError(code: 0))
+                        return
+                    }
+                    progress.completedUnitCount = 1
+                    completionHandler(url, ProjectionItem(row: row), nil)
+                } catch {
+                    try? FileManager.default.removeItem(at: url)
+                    completionHandler(nil, nil, readError(error, during: "fetchContents"))
+                }
+            case .hostDown, .offline:
+                completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+            case .auth:
+                completionHandler(nil, nil, NSFileProviderError(.notAuthenticated))
+            case .refused:
+                // The header's answer for content the user cannot have: shown, not retried.
+                completionHandler(nil, nil, CocoaError(.fileReadNoPermission))
+            case .retry:
+                completionHandler(nil, nil, ReadAnswer.transientError(code: 0))
+            case .cancelled:
+                completionHandler(nil, nil, CocoaError(.userCancelled))
+            }
+        }
+        return progress
     }
 
     func createItem(
@@ -139,17 +186,22 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
 }
 
 extension DropboxSyncFileProvider {
-    /// The store in the App Group container, or `nil` without a group: a build without a team, which
-    /// then fails every read with `ReadFailure.noContainer` and logs why.
-    private static func openStore() -> ProjectionStore? {
+    /// The store and the exchange in the App Group container, or `nil` without a group: a build without a
+    /// team, which then fails every read with `ReadFailure.noContainer` and logs why.
+    private static func openContainer() -> (ProjectionStore?, ExchangeClient?) {
         let groupID = (Bundle.main.object(forInfoDictionaryKey: "DBSyncAppGroupID") as? String) ?? ""
         guard !groupID.isEmpty,
               let container = FileManager.default.containerURL(
                   forSecurityApplicationGroupIdentifier: groupID) else {
             fpLog.error("no App Group container")
-            return nil
+            return (nil, nil)
         }
-        return ProjectionStore(databasePath: ProjectionStore.path(inContainer: container))
+        let exchange = ExchangePaths(
+            dataDirectory: ProjectionStore.dataDirectory(inContainer: container))
+        return (
+            ProjectionStore(databasePath: ProjectionStore.path(inContainer: container)),
+            ExchangeClient(paths: exchange, notification: groupID + exchangeNotificationSuffix)
+        )
     }
 }
 
@@ -267,8 +319,11 @@ final class ProjectionEnumerator: NSObject, NSFileProviderEnumerator {
                 rows = try store.liveItems(afterItem: after, limit: limit)
             case .folder(let parent):
                 guard let children = try store.children(of: parent, afterItem: after, limit: limit) else {
+                    let known = try store.presence(parent) != .unknown
                     observer.finishEnumeratingWithError(
-                        noSuchItem(NSFileProviderItemIdentifier(ItemIdCodec.encode(parent))))
+                        known
+                            ? ReadAnswer.transientError(code: 0)
+                            : noSuchItem(NSFileProviderItemIdentifier(ItemIdCodec.encode(parent))))
                     return
                 }
                 rows = children

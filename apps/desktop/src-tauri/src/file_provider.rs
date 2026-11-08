@@ -281,6 +281,36 @@ pub(crate) fn start(db: Arc<Db>) {
     }
 }
 
+/// Tells the system that `serverUnreachable` and `notAuthenticated` may have passed, which cancels its
+/// throttling of every item that got one. Blocks on the framework, so the caller is not the sync thread;
+/// a caller that is uses [`signal_errors_resolved_soon`].
+pub(crate) fn signal_errors_resolved() {
+    if let Err(e) = system::signal_errors_resolved() {
+        tracing::warn!(error = %e, "File Provider: could not signal that errors resolved");
+    }
+}
+
+/// [`signal_errors_resolved`] on its own thread, for the sync thread: a projection that just became
+/// populated cures what `notPopulated` answered with `serverUnreachable`, and a working-set signal does
+/// not lift that throttling.
+pub(crate) fn signal_errors_resolved_soon() {
+    #[cfg(test)]
+    system::note_errors_resolved();
+    #[cfg(not(test))]
+    if let Err(e) = std::thread::Builder::new()
+        .name("file-provider-resolve-seed".into())
+        .spawn(signal_errors_resolved)
+    {
+        tracing::error!(error = %e, "File Provider: could not signal that errors resolved");
+    }
+}
+
+/// How many times this test thread asked for that lift.
+#[cfg(test)]
+pub(crate) fn errors_resolved_on_this_thread() -> usize {
+    system::errors_resolved()
+}
+
 /// Collapses a burst of signal requests into one pending signal. `request` says whether the caller
 /// has to wake the worker (nobody else has); the worker calls `begin` BEFORE it signals, so a request
 /// that arrives while it is signalling is not lost: it sets the flag again and wakes the worker once
@@ -708,6 +738,8 @@ mod system {
         /// `NSFileProviderWorkingSetContainerItemIdentifier` (NSFileProviderItem.h:51). Read from the
         /// framework rather than spelled out, so a changed string value cannot silently stop the signal.
         static NSFileProviderWorkingSetContainerItemIdentifier: *const AnyObject;
+        /// `NSFileProviderErrorDomain` (NSFileProviderError.h).
+        static NSFileProviderErrorDomain: *const AnyObject;
     }
 
     /// Reports the outcome of the signal chain once, from whichever handler finishes it.
@@ -728,6 +760,62 @@ mod system {
     /// `NSFileProviderManager.h` lines 67, 100 and 242. The manager is used inside the `getDomains`
     /// handler, so no Objective-C object crosses a thread; only the outcome does.
     fn signal_working_set_blocking() -> Result<(), String> {
+        on_domain_manager(|manager, done| {
+            // SAFETY: an instance method taking an NSString identifier and a `void (^)(NSError *)`
+            // block (Manager.h:100). The identifier is a framework constant, valid for the process
+            // lifetime; the block is copied by the framework until it runs.
+            unsafe {
+                let working_set: *const AnyObject = NSFileProviderWorkingSetContainerItemIdentifier;
+                let _: () = msg_send![
+                    manager,
+                    signalEnumeratorForContainerItemIdentifier: working_set,
+                    completionHandler: done
+                ];
+            }
+        })
+    }
+
+    /// `-signalErrorResolved:completionHandler:` (Manager.h:258) for the two errors a request can answer
+    /// with that the system throttles until signalled.
+    pub(super) fn signal_errors_resolved() -> Result<(), String> {
+        let error_class = AnyClass::get(c"NSError").ok_or("NSError is not available")?;
+        for code in [SERVER_UNREACHABLE, NOT_AUTHENTICATED] {
+            autoreleasepool(|_| {
+                on_domain_manager(move |manager, done| {
+                    // SAFETY: `errorWithDomain:code:userInfo:` is documented NSError API and nil is a
+                    // valid `userInfo`. The domain is a framework constant, valid for the process
+                    // lifetime, and the error is autoreleased into the pool around this call.
+                    // `signalErrorResolved:completionHandler:` takes an NSError and a block the
+                    // framework copies until it runs.
+                    unsafe {
+                        let domain: *const AnyObject = NSFileProviderErrorDomain;
+                        let no_info: *const AnyObject = std::ptr::null();
+                        let error: *mut AnyObject = msg_send![
+                            error_class,
+                            errorWithDomain: domain,
+                            code: code,
+                            userInfo: no_info
+                        ];
+                        let _: () =
+                            msg_send![manager, signalErrorResolved: error, completionHandler: done];
+                    }
+                })
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `NSFileProviderError.h`.
+    const NOT_AUTHENTICATED: isize = -1000;
+    const SERVER_UNREACHABLE: isize = -1004;
+
+    /// Resolves our domain's manager and runs `call` on it, then waits for the block `call` passed on.
+    /// `getDomains`, then `+managerForDomain:`; the manager is used inside the `getDomains` handler, so
+    /// no Objective-C object crosses a thread, only the outcome does. Selectors checked against the
+    /// SDK's `NSFileProviderManager.h` lines 67 and 244.
+    fn on_domain_manager(
+        call: impl Fn(*mut AnyObject, &block2::Block<dyn Fn(*mut AnyObject)>) + 'static,
+    ) -> Result<(), String> {
         let cls = manager_class()?;
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
@@ -772,18 +860,7 @@ mod system {
                     };
                     finish(&inner_tx, result);
                 });
-                // SAFETY: an instance method taking an NSString identifier and a `void (^)(NSError *)`
-                // block (Manager.h:100). The identifier is a framework constant, valid for the process
-                // lifetime; the block is copied by the framework until it runs.
-                unsafe {
-                    let working_set: *const AnyObject =
-                        NSFileProviderWorkingSetContainerItemIdentifier;
-                    let _: () = msg_send![
-                        manager,
-                        signalEnumeratorForContainerItemIdentifier: working_set,
-                        completionHandler: &*done
-                    ];
-                }
+                call(manager, &done);
             });
         });
         // SAFETY: class method with one block argument `void (^)(NSArray *, NSError *)` (Manager.h:244).
@@ -791,7 +868,7 @@ mod system {
             let _: () = msg_send![cls, getDomainsWithCompletionHandler: &*block];
         }
         rx.recv_timeout(CALL_TIMEOUT)
-            .map_err(|_| "timed out waiting for the working set signal".to_string())?
+            .map_err(|_| "timed out waiting for the File Provider manager".to_string())?
     }
 
     /// The worker's queue: one unit per wake-up, created with the first request.
@@ -884,6 +961,7 @@ mod system {
         /// tests cannot see each other's requests.
         static REQUESTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static HOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static ERRORS_RESOLVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Records the request instead of reaching the framework.
@@ -901,6 +979,18 @@ mod system {
 
     pub(super) fn requested() -> usize {
         REQUESTED.with(std::cell::Cell::get)
+    }
+
+    pub(super) fn signal_errors_resolved() -> Result<(), String> {
+        Ok(())
+    }
+
+    pub(super) fn note_errors_resolved() {
+        ERRORS_RESOLVED.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn errors_resolved() -> usize {
+        ERRORS_RESOLVED.with(std::cell::Cell::get)
     }
 
     pub(super) struct SystemDomain;

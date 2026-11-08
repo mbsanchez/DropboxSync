@@ -117,6 +117,7 @@ struct ProjectionTests {
         plans()
         readAnswers()
         storeChecks()
+        exchangeChecks()
         if failures == 0 {
             print("Projection: all checks passed")
             exit(0)

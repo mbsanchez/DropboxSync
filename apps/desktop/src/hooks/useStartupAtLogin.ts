@@ -2,9 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * Start-at-login toggle (DBSYNC-36 S4), backed by the Windows StartupTask API
- * (`commands::get_startup_at_login` / `set_startup_at_login`). The backend rejects
- * on non-Windows platforms and on unpackaged dev builds that lack package identity —
+ * Start-at-login toggle (DBSYNC-36 S4), backed by the Windows StartupTask API or
+ * macOS `SMAppService` (`commands::get_startup_at_login` / `set_startup_at_login`). The
+ * backend rejects elsewhere and on unpackaged Windows dev builds that lack package identity —
  * that's an expected condition, not an error, so we quietly flip `supported` to
  * false (only a debug pushLog line) instead of surfacing it to the user. Callers
  * should hide the toggle entirely when `supported` is false.

@@ -151,9 +151,41 @@ pub(crate) fn download_to_path(
     fetch_and_write_file(&state.http_client, &token, path_display, target)
 }
 
+/// Downloads exactly revision `rev` into `target`, for the File Provider exchange (DBSYNC-95). Like
+/// [`download_to_path`] it touches neither the index nor the sync root. `shown_path` is what the
+/// progress events and errors name.
+#[cfg(target_os = "macos")]
+pub(crate) fn download_revision_to_path(
+    state: &AppState,
+    rev: &str,
+    shown_path: &str,
+    target: &Path,
+) -> AppResult<()> {
+    let token = get_access_token(state)?;
+    fetch_revision_or_path(
+        &state.http_client,
+        &token,
+        &format!("rev:{rev}"),
+        shown_path,
+        target,
+    )
+}
+
 fn fetch_and_write_file(
     client: &Client,
     token: &str,
+    path_display: &str,
+    target: &Path,
+) -> AppResult<()> {
+    fetch_revision_or_path(client, token, path_display, path_display, target)
+}
+
+/// `source` is what Dropbox is asked for, a path or `rev:<rev>`; `path_display` is what the progress
+/// events and errors name.
+fn fetch_revision_or_path(
+    client: &Client,
+    token: &str,
+    source: &str,
     path_display: &str,
     target: &Path,
 ) -> AppResult<()> {
@@ -184,7 +216,7 @@ fn fetch_and_write_file(
         .bearer_auth(token)
         .header(
             "Dropbox-API-Arg",
-            serde_json::json!({ "path": path_display }).to_string(),
+            serde_json::json!({ "path": source }).to_string(),
         )
         .timeout(Duration::from_secs(300))
         .send()

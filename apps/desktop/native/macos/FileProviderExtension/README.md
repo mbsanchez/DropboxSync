@@ -4,17 +4,18 @@
 `com.apple.fileprovider-nonui`) written in Swift. It ships in every macOS build next to the Finder Sync appex
 and does nothing until the host app registers a File Provider domain.
 
-**Slice 1 is a tracer.** The enumerator serves one static folder, `File Provider tracer`; create, modify,
-delete and download answer with `cannotSynchronize`. It exists to prove that the extension loads, the domain
-mounts under `~/Library/CloudStorage`, and notarization passes with two appexes. The process model (the host
-is the only Dropbox client; the extension has no network and no keychain access) is
+It lists the host's projection of the Dropbox tree and downloads a file when it is opened. Create, modify and
+delete answer with `cannotSynchronize` until slice 4. The process model (the host is the only Dropbox client;
+the extension has no network and no keychain access) is
 [ADR-0004](../../../../docs/adr/0004-host-is-the-single-dropbox-client.md).
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `FileProviderExtension.swift` | The extension, the static item and the enumerator. Logs with `os.Logger`. |
+| `FileProviderExtension.swift` | The extension, its items and the enumerator. Logs with `os.Logger`. |
+| `ProjectionModel.swift`, `ProjectionStore.swift` | The read-only projection in `app.db`. |
+| `Exchange.swift` | Asks the host for a file. |
 | `Info.plist` | Extension point, bare ObjC principal class, `NSExtensionFileProviderSupportsEnumeration`, `DBSyncAppGroupID`. Deliberately no `NSExtensionFileProviderDocumentGroup`. |
 | `DropboxSyncFileProvider.entitlements` | Template: sandbox plus `__APP_GROUP_ID__`. No network entitlement. |
 | `build-appex.sh` | Builds and signs the appex. Copied from the Finder Sync script. |
@@ -82,11 +83,11 @@ nothing is written, and turning it off empties the tables.
 A failed read is logged by class and told to the system in one of two ways (`ReadFailure.answer`). SQLite busy
 or failing an I/O is a transient error, which the system retries. Anything only the host can cure (a missing
 or damaged file, unpopulated, newer schema, no container) is `serverUnreachable`, which shows an error and
-backs off until the next signal. `currentSyncAnchor` answers `nil` for any failed read. `noSuchItem` is kept for an identifier with no live row,
+backs off until the next signal. `currentSyncAnchor` answers `nil` for any failed read. `noSuchItem` is kept for an identifier with no row at all,
 because the system takes it to mean the item was deleted and tries to delete it from disk; a live file asked
 for as a container lists itself.
 
-Files show in Finder and cannot be opened yet (slice 3). Nothing reaches Dropbox from the domain (slice 4):
+Opening a file downloads it (see *Download on open*). Nothing else reaches Dropbox from the domain (slice 4):
 subfolders refuse changes, but the domain root is writable, so a file created there stays local while
 `createItem` refuses it.
 
@@ -117,6 +118,20 @@ To inspect it without launching anything, copy `app.db` and `app.db-wal` togethe
 (the rows may be in the `-wal`, and a read-only open fails without it):
 `sqlite3 'file:app-copy.db?mode=ro' 'select state, count(*) from fp_item group by state; select * from fp_state;'`.
 The host logs counts only (`File Provider projection committed`, `working set signalled`), never names.
+
+## Download on open
+
+`fetchContents` asks the host through `fp-exchange/` beside `app.db`; `Exchange.swift` is this side and
+`src-tauri/src/file_provider_exchange.rs` documents the protocol. To see one request:
+
+```bash
+/usr/bin/log show --last 5m --info --debug --predicate 'subsystem == "com.mobsanchez.dropboxsyncdesktop.fileprovider" AND eventMessage CONTAINS "fetchContents"'
+```
+
+Each line ends in the class of the outcome: `staged`, `hostDown`, `offline`, `auth`, `refused`, `retry` or `cancelled`. An
+empty `requests/`, `staging/` and `results/` is the resting state; a download that was cancelled clears when it
+finishes. The host's side logs under
+`dropbox_sync_desktop_lib::file_provider_exchange`, and `=debug` shows each notification it receives.
 
 ## Live checks (with the maintainer)
 

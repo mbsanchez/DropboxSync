@@ -96,6 +96,10 @@ extension ProjectionTests {
             check("paging", try store.children(of: projectionRootItem, afterItem: 1, limit: 10)?.map(\.itemId) == [6])
             check("the limit binds children", try store.children(of: projectionRootItem, afterItem: 0, limit: 1)?.map(\.itemId) == [1])
             check("a live file lists itself", try store.children(of: 2, afterItem: 0, limit: 10)?.map(\.itemId) == [2])
+            check("a live row is live", { if case .live(let r) = try? store.presence(2) { return r.itemId == 2 } else { return false } }())
+            check("a tombstone may come back", try store.presence(3) == .notLive)
+            check("a hidden row may come back", try store.presence(4) == .notLive)
+            check("no row is unknown", try store.presence(999) == .unknown)
             check("a deleted file is gone", try store.children(of: 3, afterItem: 0, limit: 10) == nil)
             check("a hidden file is gone", try store.children(of: 4, afterItem: 0, limit: 10) == nil)
             check("a deleted folder is gone", try store.children(of: 7, afterItem: 0, limit: 10) == nil)
@@ -103,9 +107,6 @@ extension ProjectionTests {
             check("working set is live rows", try store.liveItems(afterItem: 0, limit: 10).map(\.itemId) == [1, 2, 6])
             check("working set pages", try store.liveItems(afterItem: 1, limit: 10).map(\.itemId) == [2, 6])
             check("the limit binds the working set", try store.liveItems(afterItem: 0, limit: 1).map(\.itemId) == [1])
-            check("a live item", try store.item(2)?.name == "a.txt")
-            check("a tombstone is not an item", try store.item(3) == nil)
-            check("a hidden row is not an item", try store.item(4) == nil)
             let changes = try store.changes(from: ProjectionAnchor(generation: 7, seq: 11), limit: 10)
             check("changes in sequence order, every state", changes?.rows.map(\.itemId) == [3, 4, 5, 6, 7])
             check("the head comes with them", changes?.head.seq == 30)
@@ -130,7 +131,7 @@ extension ProjectionTests {
     private static func refusals(_ writer: OpaquePointer?, _ store: ProjectionStore) {
         let reads: [(String, () throws -> Void)] = [
             ("head", { _ = try store.head() }),
-            ("item", { _ = try store.item(1) }),
+            ("presence", { _ = try store.presence(1) }),
             ("children", { _ = try store.children(of: projectionRootItem, afterItem: 0, limit: 10) }),
             ("working set", { _ = try store.liveItems(afterItem: 0, limit: 10) }),
             ("changes", { _ = try store.changes(from: ProjectionAnchor(generation: 7, seq: 11), limit: 10) }),

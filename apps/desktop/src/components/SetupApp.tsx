@@ -306,7 +306,7 @@ function SetupApp() {
             <>
               <h3>Start at login</h3>
               <p style={{ fontSize: "0.85rem", color: "#64748b", marginTop: -4, marginBottom: 8 }}>
-                Start DropboxSync automatically when you sign in to Windows.
+                Start DropboxSync automatically when you sign in.
               </p>
               <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <input

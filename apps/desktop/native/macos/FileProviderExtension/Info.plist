@@ -31,6 +31,9 @@
 	<dict>
 		<!-- Deliberately NO NSExtensionFileProviderDocumentGroup: the installed Dropbox replicated
 		     appex omits it, and the group is reached through the entitlement instead. -->
+		<!-- At most this many fetchContents at once per domain: each is one download by the host. -->
+		<key>NSExtensionFileProviderDownloadPipelineDepth</key>
+		<integer>4</integer>
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
 		<true/>
 		<key>NSExtensionPointIdentifier</key>

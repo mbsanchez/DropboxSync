@@ -18,11 +18,14 @@ struct ProjectionStore {
     /// How long a read waits for the host. The host's own writers wait 10 s.
     private static let busyTimeoutMillis: Int32 = 5000
 
-    /// The database inside the App Group container: the same relative path as the host's data dir.
+    /// The host's data dir inside the App Group container.
+    static func dataDirectory(inContainer container: URL) -> URL {
+        container.appendingPathComponent("Library/Application Support/DropboxSyncDesktop")
+    }
+
+    /// The database inside the App Group container.
     static func path(inContainer container: URL) -> String {
-        container
-            .appendingPathComponent("Library/Application Support/DropboxSyncDesktop/app.db")
-            .path
+        dataDirectory(inContainer: container).appendingPathComponent("app.db").path
     }
 
     private static let rowColumns =
@@ -35,22 +38,22 @@ struct ProjectionStore {
         try read { db in try Self.readyHead(db) }
     }
 
-    /// The live row with this id. `nil`: there is none, in a populated projection.
-    func item(_ itemId: Int64) throws -> ProjectionRow? {
+    /// Whether there is a row with this id, and whether it is live.
+    func presence(_ itemId: Int64) throws -> ItemPresence {
         try read { db in
             _ = try Self.readyHead(db)
-            return try Self.rows(
-                db,
-                "SELECT \(Self.rowColumns) FROM fp_item WHERE item_id = ?1 AND state = 0",
-                [itemId]
+            let row = try Self.rows(
+                db, "SELECT \(Self.rowColumns) FROM fp_item WHERE item_id = ?1", [itemId]
             ).first
+            guard let row = row else { return .unknown }
+            return row.state == ProjectionItemState.live ? .live(row) : .notLive
         }
     }
 
     /// What enumerating `parent` lists: its live children after `afterItem`, at most `limit`, in
     /// `item_id` order. A live file lists itself, because the system also opens an enumerator on a single
-    /// document to follow it. `nil`: there is no live row, which tells the system the item is gone. The
-    /// domain root always exists.
+    /// document to follow it. `nil`: there is no live row, and `presence` says what to answer. The domain
+    /// root always exists.
     func children(of parent: Int64, afterItem: Int64, limit: Int) throws -> [ProjectionRow]? {
         try read { db in
             _ = try Self.readyHead(db)

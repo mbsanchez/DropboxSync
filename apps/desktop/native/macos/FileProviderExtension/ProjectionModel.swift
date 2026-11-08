@@ -34,6 +34,15 @@ struct ProjectionRow: Equatable {
     var changedSeq: Int64
 }
 
+/// Whether the projection knows an item. A row that is not live may come back with the same identifier
+/// (ADR-0004, *A rename split in two*), so it is not the same answer as an identifier with no row:
+/// only the second is `noSuchItem`, which tells the system to delete the item from disk.
+enum ItemPresence: Equatable {
+    case live(ProjectionRow)
+    case notLive
+    case unknown
+}
+
 /// The `fp_state` row.
 struct ProjectionHead: Equatable {
     var schemaVersion: Int64
@@ -56,8 +65,8 @@ enum ReadFailure: Error, Equatable {
     ///
     /// SQLite being busy or failing an I/O can pass by itself, so the system retries it. Everything else
     /// needs the host, and retrying would only repeat the answer: a missing or damaged file, or a
-    /// projection not ready. The host signals when it starts with a populated projection and when it
-    /// finishes populating one. `noContainer` and `schemaTooNew` end with a new build, not with a retry.
+    /// projection not ready. The host lifts that throttling when it starts and when it finishes
+    /// populating a projection. `noContainer` and `schemaTooNew` end with a new build, not with a retry.
     var answer: ReadAnswer {
         switch self {
         case .open(let code), .query(let code):

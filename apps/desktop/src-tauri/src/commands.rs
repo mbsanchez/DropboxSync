@@ -729,10 +729,16 @@ pub fn get_startup_at_login() -> Result<bool, String> {
     crate::windows_startup::get_startup_enabled()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn get_startup_at_login(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    crate::login_item::is_enabled(state.db.projection_active())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 #[tauri::command]
 pub fn get_startup_at_login() -> Result<bool, String> {
-    Err("startup-at-login is only supported on Windows".into())
+    Err("startup-at-login is only supported on Windows and macOS".into())
 }
 
 /// DBSYNC-36 S4: enable/disable starting at login. Returns the resulting
@@ -744,10 +750,19 @@ pub fn set_startup_at_login(enabled: bool) -> Result<bool, String> {
     crate::windows_startup::set_startup_enabled(enabled)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn set_startup_at_login(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    crate::login_item::set_enabled(state.db.projection_active(), enabled)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 #[tauri::command]
 pub fn set_startup_at_login(_enabled: bool) -> Result<bool, String> {
-    Err("startup-at-login is only supported on Windows".into())
+    Err("startup-at-login is only supported on Windows and macOS".into())
 }
 
 // Not on Windows: the `tauri` `test` feature is a non-Windows dev-dependency (see Cargo.toml).

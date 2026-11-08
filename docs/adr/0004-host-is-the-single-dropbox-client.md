@@ -29,11 +29,17 @@ change.
 **The extension has no network entitlement and no keychain access.** It works through four things only:
 
 1. **A read-only projection** of the index, read from `app.db` in the App Group container.
-2. **A request queue**: a table in the same database where the extension records what the system asked of it
-   (fetch, create, modify, delete). The host executes the requests.
+2. **A request queue**: files in the container, under `fp-exchange/requests/`, where the extension records what
+   the system asked of it. The host executes the requests. (Amended 2026-11-07, slice 3: this was a table in
+   `app.db`. That would have made the extension a second SQLite writer, against the read-only connection the
+   rest of this ADR relies on, and files need no schema and wait on no write lock.)
 3. **Staging**: file contents move between the two processes through a directory in the container.
-4. **A Darwin notification** that wakes the host when a request is queued. The host also polls the queue on
-   startup, so a notification posted while it was not running is not lost.
+4. **A Darwin notification** that wakes the host when a request is queued. The host also scans the queue every
+   2 s and at startup, so a lost notification, or one posted while it was starting, delays a request and
+   does not lose it.
+5. **A lock**: the host holds an exclusive `flock` on `fp-exchange/host.lock` for its whole life. The kernel
+   drops it when the process dies, however it dies, so the extension tells a host that is down from one that
+   is slow, without a heartbeat and without hanging.
 
 **Rejected alternatives**
 
@@ -46,7 +52,7 @@ change.
 - **XPC between the extension and the host.** It gives a typed channel, but it needs a registered service
   name, a connection lifecycle to manage on both sides, and a host that must be running for every call,
   including plain metadata reads. The database already gives the extension cheap, offline reads and the
-  request table already gives durable writes. XPC would add a protocol to version and no capability the queue
+  request files already give durable writes. XPC would add a protocol to version and no capability the queue
   lacks. Rejected as unneeded. It can be revisited if the queue's latency proves to be a problem.
 
 ### Identity
@@ -82,8 +88,10 @@ change.
 
 ### When the host is not running
 
-A request that needs the host fails with a **retryable File Provider error**, and the system retries it. To keep
-that case rare, the host opens at login on macOS through an **`SMAppService` login item**. `SMAppService` and
+A request that needs the host fails at once with `serverUnreachable`: the extension finds the host's lock free,
+before it queues anything and at every poll while it waits. The system shows an error and backs off until
+signalled, so the host calls `signalErrorResolved:` when it starts, when a projection finishes populating, and
+30 s after the last answer that Dropbox is unreachable or the session needs the user. To keep that case rare, the host opens at login on macOS through an **`SMAppService` login item**. `SMAppService` and
 `contentPolicy` (behind *Make Available Offline*) both need macOS 13, which is why the minimum system version
 rises to 13.0. The target stays arm64 only.
 
@@ -286,6 +294,28 @@ separate cursor for the projection.
 The extension (slice 2b) only reads these tables, through a read-only connection, and the host tells the
 system to re-enumerate the working set after each commit with a fire-and-forget signal.
 
+### Download on open (slice 3)
+
+`fetchContents` checks the row and the lock, renames a request into `fp-exchange/requests/`, posts the
+notification and polls. The host takes the request, reads the row, downloads `rev:<rev>` into
+`fp-exchange/staging/`, checks the bytes against the row's `content_hash` and renames a result into
+`fp-exchange/results/`. The extension then compares the result's `content_version` with the row as it stands
+and hands the file over; a row that moved on meanwhile answers a transient error, and the system asks again.
+
+- **Answers:** Dropbox unreachable is `serverUnreachable`, a session that needs the user is `notAuthenticated`,
+  a file Dropbox will not hand out (`unsupported_file`, which a Paper document gets) is
+  `NSFileReadNoPermissionError`, and anything else is a transient error. Dropbox's "not found" is transient
+  too: a real delete reaches the system through the change feed.
+- **`noSuchItem`** answers only an identifier with no row. A row that is not live answers a transient error, in
+  `item(for:)`, `fetchContents` and folder enumeration, because it may come back (*A rename split in two*). The
+  system should stop asking about a real delete once the feed has told it.
+- **`NSFileProviderItem.isDownloaded`** is ignored by a replicated extension, so `fp_item.downloaded` stays
+  unset here.
+- **Cleanup:** the system clones and unlinks what it is handed. A fetch abandoned after the host took it
+  leaves a marker, and the host drops the bytes when the download ends: the download itself is not aborted.
+  The host sweeps exchange files older than an hour, which a crash leaves behind, and removes the directory
+  at startup with the switch off.
+
 ### What stays and what is gated at the cutover
 
 Gated off on macOS, kept for Windows: the filesystem watcher, the local scan and the rename heuristics, the
@@ -299,8 +329,10 @@ stays unset, and the gating is explicit rather than implied by the unset value. 
 - One Dropbox client means one set of retry, conflict and mass-delete rules, and one writer of the index. The
   cost is that the extension is only as available as the host: the login item and the retryable error exist
   for that.
-- The extension is small and offline: it can be reviewed as "reads a database, writes a request row, copies
+- The extension is small and offline: it can be reviewed as "reads a database, writes a request file, copies
   files in the container". It cannot leak a token because it never has one.
+- Requests hold an item id and results a version and a class, so no name or path sits in the exchange. The
+  file names are random, and only the staged bytes are user content.
 - The database schema becomes an interface between two processes, so migrations are additive and the extension
   reads through a read-only connection. WAL and `-shm` under the sandbox need checking when the read path is
   built (slice 2).
@@ -319,10 +351,15 @@ stays unset, and the gating is explicit rather than implied by the unset value. 
   against the SDK headers and has not run live; a wrong selector is a crash, not a compile error.
 - **Whether a sandboxed extension can read the host's SQLite file under WAL** through the group container.
   Slice 2b checks it, with the host running and with it quit.
-- **Latency of the queue plus Darwin notification** against what the system tolerates for `fetchContents`.
-- **Whether the system restarts the host's requests correctly** after the retryable error when the host starts
-  late.
-- **The login item** (`SMAppService`) has not been tried in this app.
+- **Measured by slice 3 (#235), signed but not notarized:** the Darwin notification and the `flock` both cross
+  the sandbox; a 379 KB file opened through the queue in under 2 s; with the app quit an open failed in 0.56 s,
+  and it worked after relaunching.
+- **A file whose transfer takes longer than the download's 300 s timeout** fails as a transient error, and
+  keeps failing on every retry. The bound is inherited from the existing download path.
+- **A Paper document** is listed by the feed like any file, with a size and a `content_hash`, and its download
+  answers 409. That much was observed live (#235); the `unsupported_file` summary is Dropbox's documented one,
+  read back from the log after the fix.
+- **The login item** (`SMAppService`) registers in this app. Starting at a real login has not been observed.
 - **Deep or large folder deletes and renames** (fact 4 above): the prefix fallback exists because the
   listing of every descendant is unproven. The contract text itself comes from the classic `/delta` rules and
   was only checked against the shapes captured in #234.

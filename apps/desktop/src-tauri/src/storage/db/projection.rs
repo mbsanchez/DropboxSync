@@ -252,6 +252,15 @@ pub(crate) fn meta_version(name: &str, parent_item: i64, rev: &str) -> Vec<u8> {
 
 // ── entries ─────────────────────────────────────────────────────────────────────────────────────
 
+/// What the host needs to download a live file.
+pub(crate) struct ProjectionDownloadTarget {
+    pub(crate) rev: String,
+    pub(crate) content_hash: String,
+    /// The `content_version` column: what the extension compares the row with after the download.
+    pub(crate) content_version: Vec<u8>,
+    pub(crate) path_lower: String,
+}
+
 /// One file or folder as the projection stores it, taken from a raw Dropbox entry. Compact on
 /// purpose: a snapshot holds one per item of the account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1354,8 +1363,49 @@ impl Db {
         Ok(commit)
     }
 
-    /// Records whether the local copy of a file matches the version the projection holds. Written by
-    /// the download path (slice 3); nothing calls it yet.
+    /// What the host needs to download `item_id`. `None`: it is not a live file.
+    pub(crate) fn projection_download_target(
+        &self,
+        item_id: i64,
+    ) -> AppResult<Option<ProjectionDownloadTarget>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let target = conn
+            .prepare_cached(
+                "SELECT rev, content_hash, content_version, path_lower FROM fp_item
+                 WHERE item_id = ?1 AND state = 0 AND is_folder = 0",
+            )?
+            .query_row([item_id], |r| {
+                Ok(ProjectionDownloadTarget {
+                    rev: r.get(0)?,
+                    content_hash: r.get(1)?,
+                    content_version: r.get(2)?,
+                    path_lower: r.get(3)?,
+                })
+            })
+            .optional()?;
+        Ok(target)
+    }
+
+    /// Test hook: the id of the row at `path_lower`.
+    #[cfg(test)]
+    pub(crate) fn projection_item_id(&self, path_lower: &str) -> Option<i64> {
+        let conn = self.read.lock().unwrap();
+        let id = conn
+            .query_row(
+                "SELECT item_id FROM fp_item WHERE path_lower = ?1",
+                [path_lower],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        id
+    }
+
+    /// Records whether the local copy of a file matches the version the projection holds. Nothing calls
+    /// it yet: a replicated extension's `isDownloaded` is ignored, so this waits for offline (#237).
     #[allow(dead_code)]
     pub(crate) fn set_projection_downloaded(
         &self,
@@ -2476,6 +2526,23 @@ mod tests {
 
         assert_eq!(count(db, "fp_item"), 0);
         assert_eq!(db.projection_state().unwrap(), before);
+    }
+
+    /// `notPopulated` answers `serverUnreachable`, which only `signalErrorResolved:` lifts: the working-set
+    /// signal the seed also sends does not.
+    ///
+    /// Proof this test can fail: removing the call from `finish_seed`.
+    #[test]
+    fn a_landed_snapshot_lifts_what_the_empty_projection_answered() {
+        let w = world(true, false);
+        let before = crate::file_provider::errors_resolved_on_this_thread();
+
+        seed(&w, inv1()).unwrap();
+
+        assert_eq!(
+            crate::file_provider::errors_resolved_on_this_thread(),
+            before + 1
+        );
     }
 
     /// The switch is read once at startup, but the file outlives a run: a projection populated earlier

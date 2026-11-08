@@ -10,6 +10,6 @@ cd "$(dirname "$0")/.."
 OUT=$(mktemp -d)/projection-tests
 trap 'rm -rf "$(dirname "$OUT")"' EXIT
 
-xcrun swiftc -suppress-warnings -o "$OUT" ProjectionModel.swift ProjectionStore.swift \
-  Tests/ProjectionModelTests.swift Tests/ProjectionStoreTests.swift
+xcrun swiftc -suppress-warnings -o "$OUT" ProjectionModel.swift ProjectionStore.swift Exchange.swift \
+  Tests/ProjectionModelTests.swift Tests/ProjectionStoreTests.swift Tests/ExchangeTests.swift
 "$OUT" Tests/projection-schema.sql
