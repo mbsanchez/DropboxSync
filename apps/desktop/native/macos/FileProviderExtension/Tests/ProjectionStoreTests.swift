@@ -35,6 +35,7 @@ extension ProjectionTests {
             + insertSql(id: 6, parent: 0, name: "file.txt", folder: 0, state: 0, seq: 15)
             + insertSql(id: 7, parent: 1, name: "gone folder", folder: 1, state: 2, seq: 16)
         check("rows", exec(db, rows) == SQLITE_OK)
+        check("pin", exec(db, "INSERT INTO fp_pin(item_id) VALUES (1), (2)") == SQLITE_OK)
         return db
     }
 
@@ -56,7 +57,9 @@ extension ProjectionTests {
         writesAreRefused(store)
         refusals(writer, store)
         concurrency(writer, store)
+        withoutPinTable(writer, store)
         sqlite3_close(writer)
+        inheritance(dir: dir, schema: schema)
         afterTheHostClosed(store, path: path)
 
         let missing = ProjectionStore(databasePath: dir.appendingPathComponent("none.db").path)
@@ -105,6 +108,9 @@ extension ProjectionTests {
             check("a deleted folder is gone", try store.children(of: 7, afterItem: 0, limit: 10) == nil)
             check("an unknown id is gone", try store.children(of: 99, afterItem: 0, limit: 10) == nil)
             check("working set is live rows", try store.liveItems(afterItem: 0, limit: 10).map(\.itemId) == [1, 2, 6])
+            let live = try store.liveItems(afterItem: 0, limit: 10)
+            check("fp_pin is read as the row's pin", live.map(\.pinned) == [true, true, false])
+            check("under a pinned folder is inherited", live.map(\.inherited) == [false, true, false])
             check("working set pages", try store.liveItems(afterItem: 1, limit: 10).map(\.itemId) == [2, 6])
             check("the limit binds the working set", try store.liveItems(afterItem: 0, limit: 1).map(\.itemId) == [1])
             let changes = try store.changes(from: ProjectionAnchor(generation: 7, seq: 11), limit: 10)
@@ -118,6 +124,40 @@ extension ProjectionTests {
         } catch {
             check("reads threw \(error)", false)
         }
+    }
+
+    /// A pin reaches every depth under its folder, through the memo, and stops at the root and at an
+    /// orphan (found in review: the fixture only had depth 1).
+    private static func inheritance(dir: URL, schema: String) {
+        var db: OpaquePointer?
+        let path = dir.appendingPathComponent("inherit.db").path
+        check("create inherit", sqlite3_open(path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        check("schema inherit", exec(db, schema) == SQLITE_OK)
+        let rows = "INSERT INTO fp_state(id, schema_version, generation, seq, min_valid_seq, populated) "
+            + "VALUES (1, 1, 7, 30, 5, 1);"
+            + insertSql(id: 1, parent: 0, name: "top", folder: 1, state: 0, seq: 10)
+            + insertSql(id: 2, parent: 1, name: "mid", folder: 1, state: 0, seq: 11)
+            + insertSql(id: 3, parent: 2, name: "deep.txt", folder: 0, state: 0, seq: 12)
+            + insertSql(id: 4, parent: 2, name: "deep2.txt", folder: 0, state: 0, seq: 13)
+            + insertSql(id: 5, parent: 0, name: "other.txt", folder: 0, state: 0, seq: 14)
+            + insertSql(id: 6, parent: -1, name: "orphan.txt", folder: 0, state: 3, seq: 15)
+            + "INSERT INTO fp_pin(item_id) VALUES (1);"
+        check("rows inherit", exec(db, rows) == SQLITE_OK)
+        let store = ProjectionStore(databasePath: path)
+        let live = (try? store.liveItems(afterItem: 0, limit: 10)) ?? []
+        check("inherited at every depth", live.map(\.inherited) == [false, true, true, true, false])
+        let changes = try? store.changes(from: ProjectionAnchor(generation: 7, seq: 14), limit: 10)
+        check("an orphan inherits nothing", changes?.rows.map(\.inherited) == [false])
+    }
+
+    /// A new extension can run before the host that creates `fp_pin` (found in review): it still reads.
+    private static func withoutPinTable(_ writer: OpaquePointer?, _ store: ProjectionStore) {
+        check("drop fp_pin", exec(writer, "DROP TABLE fp_pin") == SQLITE_OK)
+        // The concurrency check added rows from 1001 on.
+        let live = try? store.liveItems(afterItem: 0, limit: 3)
+        check("reads work without fp_pin", live?.map(\.itemId) == [1, 2, 6])
+        check("and nothing is pinned", live?.allSatisfy { !$0.pinned && !$0.inherited } == true)
     }
 
     /// Writes are refused by the handle itself, not by the store being careful.

@@ -32,6 +32,10 @@ struct ProjectionRow: Equatable {
     var metaVersion: Data
     var state: Int64
     var changedSeq: Int64
+    /// Pinned by *Make Available Offline* (#237): `fp_pin` holds the item.
+    var pinned: Bool = false
+    /// A folder above it is pinned: it is kept offline through that folder.
+    var inherited: Bool = false
 }
 
 /// Whether the projection knows an item. A row that is not live may come back with the same identifier
@@ -142,11 +146,16 @@ enum ItemIdCodec {
 /// expires into a rescan, and it is part of every metadata version, so that rescan replaces each item
 /// instead of keeping the cached one. Slice 3 served read-only items under format 1, and Finder went on
 /// refusing to delete them after slice 4 allowed it. Format 3 adds trashing.
+///
+/// A pin changes what the system caches too (the content policy and `userInfo`), so a pinned item carries
+/// a `p.` in its version, and one under a pinned folder an `i.`. Other items keep the format-3 version they
+/// had: their policy is the default and the actions read a missing key as not pinned, so no rescan is
+/// needed.
 enum ItemFormat {
     static let current = 3
 
-    static func metadataVersion(_ rowVersion: Data) -> Data {
-        Data("f\(current).".utf8) + rowVersion
+    static func metadataVersion(_ rowVersion: Data, pinned: Bool = false, inherited: Bool = false) -> Data {
+        Data("f\(current).\(pinned ? "p." : "")\(inherited ? "i." : "")".utf8) + rowVersion
     }
 }
 

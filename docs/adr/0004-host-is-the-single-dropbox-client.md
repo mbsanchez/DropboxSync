@@ -397,6 +397,61 @@ there. Nothing is queued on the host: a failure answers the system, which retrie
   that moves out of a folder deleted in the same batch; this one can make the system rename one of two items
   that swap a path in one batch, which loses nothing.
 
+### Offline (slice 5)
+
+- **No system pin.** A third-party domain gets no *Keep Downloaded* of its own: the item fields the system can
+  change do not include the content policy (`NSFileProviderItemFields`), and the Dropbox client offers *Make
+  Available Offline* and *Make Online-Only* as its own actions (`NSExtensionFileProviderActions` in its appex).
+  This domain does the same, named *DropboxSync: …* because Finder lists a provider's actions loose, with
+  the app's icon and no submenu.
+- **The pin is the host's.** The extension stays a reader: each item is one `pin` or `unpin` exchange
+  request, and the host writes `fp_pin` and signals. A pinned item reports
+  `contentPolicy = .downloadEagerlyAndKeepDownloaded`, which a folder passes to what is under it. When a pin
+  changes, the item and every live row under it take a sequence value, because what is under a pinned
+  folder reports that too: `userInfo.inherited`, an `i.` in its metadata version, and neither action, since
+  it is offline through the folder and the system would refuse to evict it. A folder moved into or out of a
+  pinned folder has the live rows under it stamped by the write that moves it (delta or snapshot); a move
+  that stays on the same side stamps only the folder. A multiple
+  selection reaches the action whole, so items under a pinned folder are skipped there as well. A pinned
+  item carries a `p.`.
+  Other items keep their format-3 version and need no rescan. Unpinning a folder takes every pin under it,
+  so it can be evicted whole.
+- **Where pins go.** A pin goes with its row when the row goes: a snapshot that drops the item, or a pruned
+  tombstone. A clear keeps them: identities survive it, and the clears that are not the user's (the switch
+  turned back on, a failed snapshot or a failing delta recovering) are followed by a reseed of the same
+  items, whose sweep then drops the pins of those that did not come back. `reset_sync_state` drops every
+  pin: leaving the account, and changing the sync folder, which runs it too. An extension that runs before the host has created `fp_pin` (a new
+  bundle, an old host still running) reads everything as unpinned.
+- **Pinning downloads by reading.** Measured on battery (26 %, unplugged): the system took the pinned item
+  and logged `scheduling background download <reason:content policy>`, and `requestDownloadForItem` logged
+  the same with `reason:direct request`; `dasd` then held `com.apple.fileproviderd.background-download`
+  under its *Battery Level Policy*, so the files stayed in the cloud. A plain read of the same file
+  downloaded it in 2 s. So a pin carries the domain's visible folder (`getUserVisibleURL`), and the host
+  reads one byte of every live file at or under the item there. One queue serves every pin, with two
+  readers, so these reads alone leave half of the extension's four download slots for a file the user
+  opens (on power the system also downloads pinned items itself, which this does not bound); a read whose
+  pin is gone by its turn (Make Online-Only came first) is skipped. The readers are threads of their own:
+  a read blocks until `fetchContents` is served through the exchange, which runs each request on its own
+  thread. The host reads only in a real directory (not a symlink) directly under `~/Library/CloudStorage`,
+  whatever the request says; without one the pin still takes and the files download when the system's
+  scheduler allows.
+- **Later content is read too.** After each delta commit the host reads the pinned files that commit
+  stamped (a new revision, a file added or moved under a pinned folder), through the same queue, at the
+  domain folder the last pin named (kept in `app_config`, checked again before use). Without a pin that
+  named a folder, nothing is read and the system's policy downloads them when its scheduler allows.
+  Measured on battery (16 %): a new 175 MB revision of a pinned, downloaded file was read 5 s after its
+  delta and downloaded in full. A file added under the pinned folder failed `NotFound` 0.1 ms after the
+  commit, before the system had created it, so a read of a file a delta brought waits for it, ten times a
+  second apart; a pin's own reads do not wait.
+- **Unpinning evicts.** *Make Online-Only* unpins and calls `evictItem`, asked again for up to 5 s while the
+  system still holds the pinned policy (`nonEvictable`). It is offered on anything pinned or downloaded, and
+  on folders, that is not under a pinned folder, so it also replaces *Remove Download*.
+- **The system's Download Now and Remove Download are hidden** (`NSExtensionFileProviderAllowsContextualMenuDownloadEntry`,
+  `NSExtensionFileProviderAllowsUserControlledEviction`): next to the two actions they read as the same
+  thing. Opening a file still downloads it, and the extension's own eviction is unaffected.
+- **What is downloaded is the system's.** A replicated extension's `isDownloaded` is ignored and Finder shows
+  the system's own state, so the host records only the pin; `fp_item.downloaded` stays unused.
+
 ### What stays and what is gated at the cutover
 
 Gated off on macOS, kept for Windows: the filesystem watcher, the local scan and the rename heuristics, the

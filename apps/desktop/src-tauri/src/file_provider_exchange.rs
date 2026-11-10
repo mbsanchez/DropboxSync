@@ -85,6 +85,10 @@ struct Request {
     new_name: Option<String>,
     #[serde(default)]
     content: bool,
+    /// A pin: the domain's folder as the user sees it, from `getUserVisibleURL`, where the host reads the
+    /// pinned files so that they download now.
+    #[serde(default)]
+    root: String,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
@@ -95,6 +99,9 @@ enum Op {
     Create,
     Modify,
     Delete,
+    /// *Make Available Offline* and *Make Online-Only* on `item_id` (#237).
+    Pin,
+    Unpin,
 }
 
 /// What the queue held under one id.
@@ -141,6 +148,8 @@ enum Outcome {
     /// The folder a create or a move names was deleted on Dropbox: `noSuchItem` for that folder, which
     /// the system re-creates (createItem error cases). The item itself is fine.
     GoneParent,
+    /// A pin or an unpin took: the system reads the item again.
+    Done,
 }
 
 impl Outcome {
@@ -159,6 +168,7 @@ impl Outcome {
             Outcome::DeletionRejected => "deletion_rejected",
             Outcome::Gone => "gone",
             Outcome::GoneParent => "gone_parent",
+            Outcome::Done => "done",
         }
     }
 }
@@ -503,6 +513,193 @@ fn outcome_for_write(written: crate::file_provider_writes::WriteOutcome) -> Outc
     }
 }
 
+/// Pins or unpins an item. Not live is `noSuchItem`, unless the removal may be half a rename.
+fn pin(db: &Db, item_id: i64, pinned: bool) -> Outcome {
+    match db.set_projection_pinned(item_id, pinned) {
+        Ok(true) => Outcome::Done,
+        Ok(false) if crate::file_provider::removal_held() => Outcome::Retry,
+        Ok(false) => Outcome::Gone,
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "File Provider exchange: cannot record the pin");
+            Outcome::Retry
+        }
+    }
+}
+
+/// How many pinned files are read at once, across every pin: half the extension's download pipeline
+/// (`NSExtensionFileProviderDownloadPipelineDepth` is 4), so these reads alone leave room for a file the
+/// user opens. On power the system also downloads pinned items by itself, which this does not bound.
+const PIN_READERS: usize = 2;
+
+/// The domain's folder, if `root` is one: a real directory (not a symlink) directly under
+/// `~/Library/CloudStorage`. The host reads only there, whatever the request says.
+fn domain_root(root: &str, home: &Path) -> Option<PathBuf> {
+    let path = Path::new(root);
+    let storage = home.join("Library/CloudStorage");
+    let plain = path.components().all(|c| {
+        matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))
+    });
+    let real_dir = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir());
+    (path.is_absolute() && plain && path.parent() == Some(storage.as_path()) && real_dir)
+        .then(|| path.to_path_buf())
+}
+
+/// One pinned file to read, and the pin it was queued for.
+struct PinRead {
+    pin: i64,
+    path: PathBuf,
+    /// The file came with a delta: the system may not have created it on disk yet.
+    fresh: bool,
+}
+
+/// The files waiting to be read, for every pin, and how many readers are working on them.
+struct PinReads {
+    queue: std::collections::VecDeque<PinRead>,
+    readers: usize,
+}
+
+static PIN_READS: Mutex<PinReads> = Mutex::new(PinReads {
+    queue: std::collections::VecDeque::new(),
+    readers: 0,
+});
+
+/// Takes the next file to read, skipping those whose pin is gone (Make Online-Only came first: reading
+/// them would download what the user just made online-only). `None`: nothing left, and this reader
+/// stops.
+fn next_pin_read(
+    reads: &Mutex<PinReads>,
+    still_pinned: &dyn Fn(i64) -> bool,
+) -> Option<(PathBuf, bool)> {
+    loop {
+        let mut st = reads.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(next) = st.queue.pop_front() else {
+            st.readers = st.readers.saturating_sub(1);
+            return None;
+        };
+        drop(st);
+        if still_pinned(next.pin) {
+            return Some((next.path, next.fresh));
+        }
+    }
+}
+
+/// Reads one byte of each file a pin covers, so that the system downloads them now. Measured: the content
+/// policy and `requestDownloadForItem` only schedule a background download, which the activity scheduler
+/// holds while the Mac is on battery, so a pinned file stayed in the cloud; a read is an ordinary on-demand
+/// download. A read blocks until `fetchContents` is served through this exchange, whose requests each run
+/// on a thread of their own, so the readers are threads of their own too.
+fn download_pinned(state: &AppState, item_id: i64, root: &str) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(root) = domain_root(root, &home) else {
+        tracing::warn!(item_id, "File Provider pin: no usable domain folder, nothing read");
+        return;
+    };
+    // Kept for what a later delta brings under a pin, when no request names the folder.
+    if let Err(e) = state.db.set_app_config(VISIBLE_ROOT_KEY, &root.to_string_lossy()) {
+        tracing::warn!(error = %e, "File Provider pin: cannot keep the domain folder");
+    }
+    let files = match state.db.projection_live_files_under(item_id) {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "File Provider pin: cannot list the files");
+            return;
+        }
+    };
+    tracing::info!(item_id, files = files.len(), "File Provider pin: reading the pinned files");
+    queue_pin_reads(state, &root, files.into_iter().map(|rel| (item_id, rel)).collect(), false);
+}
+
+/// Where the last pin said the domain's folder is (`app_config`).
+const VISIBLE_ROOT_KEY: &str = "fp_visible_root";
+
+/// After a delta commit: reads the pinned files it changed, a new revision or a file added under a pinned
+/// folder, which the content policy alone would leave in the cloud while on battery. Nothing without a pin,
+/// or without a domain folder a pin has named.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn download_pinned_changes(state: &AppState, seq: i64, rows: usize) {
+    let files = match state.db.projection_pinned_files_stamped(seq, rows) {
+        Ok(files) if !files.is_empty() => files,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "File Provider pin: cannot list the changed pinned files");
+            return;
+        }
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let stored = state.db.get_app_config(VISIBLE_ROOT_KEY).ok().flatten().unwrap_or_default();
+    let Some(root) = domain_root(&stored, &home) else {
+        tracing::warn!(files = files.len(), "File Provider pin: no known domain folder, changes not read");
+        return;
+    };
+    tracing::info!(files = files.len(), "File Provider pin: reading changed pinned files");
+    queue_pin_reads(state, &root, files, true);
+}
+
+/// Queues reads of `(pin, path under root)` and starts readers up to [`PIN_READERS`].
+fn queue_pin_reads(state: &AppState, root: &Path, files: Vec<(i64, String)>, fresh: bool) {
+    let start = {
+        let mut st = PIN_READS.lock().unwrap_or_else(|e| e.into_inner());
+        st.queue.extend(files.into_iter().map(|(pin, rel)| PinRead {
+            pin,
+            path: root.join(rel),
+            fresh,
+        }));
+        let start = PIN_READERS.saturating_sub(st.readers);
+        st.readers += start;
+        start
+    };
+    for _ in 0..start {
+        let db = state.db.clone();
+        let spawned = std::thread::Builder::new()
+            .name("file-provider-pin".into())
+            .spawn(move || {
+                // A read that cannot be checked is made: a byte too many costs nothing, a skipped one
+                // leaves the file to the battery-gated scheduler.
+                let still_pinned = |pin: i64| {
+                    db.projection_pinned(pin).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "File Provider pin: cannot check the pin, reading");
+                        true
+                    })
+                };
+                while let Some((path, fresh)) = next_pin_read(&PIN_READS, &still_pinned) {
+                    let attempts = if fresh { PLACEHOLDER_ATTEMPTS } else { 1 };
+                    let read = || read_one_byte(&path, attempts, &|| std::thread::sleep(PLACEHOLDER_WAIT));
+                    // A panic here would leave the reader counted and the queue without one.
+                    if std::panic::catch_unwind(read).is_err() {
+                        tracing::error!("File Provider pin: a read panicked");
+                    }
+                }
+            });
+        if spawned.is_err() {
+            let mut st = PIN_READS.lock().unwrap_or_else(|e| e.into_inner());
+            st.readers = st.readers.saturating_sub(1);
+        }
+    }
+}
+
+/// Opens a file and reads a byte. Failures are logged by error class: the path is the user's.
+///
+/// A file a delta just brought may not be on disk yet: the host reads as soon as the delta commits, and the
+/// system creates the item only once it has enumerated the change (measured: `NotFound` 0.1 ms after the
+/// commit). Such a read waits for it, `attempts` times.
+fn read_one_byte(path: &Path, attempts: u32, wait: &dyn Fn()) {
+    for attempt in 1..=attempts {
+        let read = File::open(path).and_then(|mut f| f.read(&mut [0_u8; 1]));
+        match read {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < attempts => wait(),
+            Err(e) => {
+                tracing::warn!(kind = ?e.kind(), "File Provider pin: a pinned file could not be read");
+                return;
+            }
+        }
+    }
+}
+
+/// How long a read of a file a delta brought waits for the system to create it: 10 × 1 s.
+const PLACEHOLDER_ATTEMPTS: u32 = 10;
+const PLACEHOLDER_WAIT: Duration = Duration::from_secs(1);
+
 /// What a person who opened a file Dropbox will not hand out gets instead: the file on dropbox.com, where a
 /// Paper document opens in its editor. The system shows nothing for the refusal itself.
 fn open_in_browser(db: &Db, item_id: i64) {
@@ -670,6 +867,16 @@ fn handle(state: &AppState, exchange: &Exchange, id: &str, request: &Request) {
                 request.item_id,
                 &request.base_version,
             ))
+        }
+        Op::Pin | Op::Unpin => {
+            let outcome = pin(&state.db, request.item_id, request.op == Op::Pin);
+            if outcome == Outcome::Done {
+                crate::file_provider::signal_working_set();
+                if request.op == Op::Pin {
+                    download_pinned(state, request.item_id, &request.root);
+                }
+            }
+            outcome
         }
     };
     tracing::info!(
@@ -1463,6 +1670,126 @@ mod tests {
             .unwrap();
             assert_eq!(body, expected);
         }
+    }
+
+    /// Proof this test can fail: a request the extension writes as `pin` that does not parse is dropped,
+    /// and Make Available Offline does nothing.
+    #[test]
+    fn a_pin_and_an_unpin_parse_and_answer_done() {
+        for (body, op) in [
+            (r#"{"item_id":5,"op":"pin","version":1}"#, Op::Pin),
+            (r#"{"item_id":5,"op":"unpin","version":1}"#, Op::Unpin),
+        ] {
+            let request: Request = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                request,
+                Request {
+                    version: 1,
+                    op,
+                    item_id: 5,
+                    ..Request::default()
+                }
+            );
+        }
+        let body = serde_json::to_string(&ResultFile {
+            version: 1,
+            outcome: &Outcome::Done,
+        })
+        .unwrap();
+        assert_eq!(body, r#"{"version":1,"outcome":"done"}"#);
+    }
+
+    /// Proof this test can fail: answering `done` for an item that is gone leaves the system waiting for
+    /// a change that never comes; answering `gone` for a live one makes it delete the item.
+    #[test]
+    fn a_pin_of_a_live_item_is_done_and_of_any_other_gone() {
+        let w = world(b"hello");
+
+        assert_eq!(pin(&w.db, w.item_id(), true), Outcome::Done);
+        assert!(w.db.projection_pinned(w.item_id()).unwrap());
+        assert_eq!(pin(&w.db, w.item_id(), false), Outcome::Done);
+        assert!(!w.db.projection_pinned(w.item_id()).unwrap());
+        assert_eq!(pin(&w.db, 9_999, true), Outcome::Gone);
+    }
+
+    /// Proof this test can fail: accepting any directory lets a request point the host's reads anywhere.
+    #[test]
+    fn the_host_reads_only_under_the_domain_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let storage = home.path().join("Library/CloudStorage");
+        let domain = storage.join("DropboxSyncDesktop-Test");
+        fs::create_dir_all(domain.join("deeper")).unwrap();
+        let text = |p: &Path| p.to_str().unwrap().to_string();
+
+        assert_eq!(domain_root(&text(&domain), home.path()), Some(domain.clone()));
+        assert_eq!(domain_root(&text(&domain.join("deeper")), home.path()), None, "not the domain itself");
+        assert_eq!(domain_root(&text(&storage), home.path()), None);
+        assert_eq!(domain_root(&text(home.path()), home.path()), None);
+        assert_eq!(domain_root(&format!("{}/x/../DropboxSyncDesktop-Test", text(&storage)), home.path()), None);
+        assert_eq!(domain_root(&text(&storage.join("missing")), home.path()), None);
+        // Lexically directly under CloudStorage, and Library itself on disk.
+        assert_eq!(domain_root(&format!("{}/..", text(&storage)), home.path()), None, "a trailing ..");
+        let elsewhere = home.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, storage.join("Link")).unwrap();
+        assert_eq!(domain_root(&text(&storage.join("Link")), home.path()), None, "a symlink");
+        assert_eq!(domain_root("", home.path()), None);
+        let pin: Request =
+            serde_json::from_str(r#"{"item_id":5,"op":"pin","root":"/r","version":1}"#).unwrap();
+        assert_eq!(pin.root, "/r");
+    }
+
+    /// Found in review: the readers of a large pinned folder went on after Make Online-Only and downloaded
+    /// what the user had just made online-only.
+    ///
+    /// Proof this test can fail: reading whatever is queued without asking whether its pin is still there.
+    #[test]
+    fn a_read_whose_pin_is_gone_is_skipped() {
+        let reads = Mutex::new(PinReads {
+            queue: [(1, "a"), (2, "b"), (1, "c")]
+                .into_iter()
+                .map(|(pin, p)| PinRead {
+                    pin,
+                    path: PathBuf::from(p),
+                    fresh: false,
+                })
+                .collect(),
+            readers: 1,
+        });
+        let still_pinned = |pin: i64| pin == 1;
+
+        let mut read = Vec::new();
+        while let Some((path, _)) = next_pin_read(&reads, &still_pinned) {
+            read.push(path);
+        }
+
+        assert_eq!(read, vec![PathBuf::from("a"), PathBuf::from("c")]);
+        assert_eq!(reads.lock().unwrap().readers, 0, "the reader left");
+    }
+
+    /// Measured live: the read of a file a delta added ran before the system had created it, failed
+    /// `NotFound`, and the file stayed in the cloud. Such a read waits for it; a pin's own read does not.
+    ///
+    /// Proof this test can fail: a single attempt, or not stopping at the first success.
+    #[test]
+    fn a_read_of_a_new_file_waits_for_it_to_appear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let waits = Cell::new(0);
+        let wait = || {
+            waits.set(waits.get() + 1);
+            if waits.get() == 3 {
+                fs::write(&path, b"x").unwrap();
+            }
+        };
+
+        read_one_byte(&path, PLACEHOLDER_ATTEMPTS, &wait);
+        assert_eq!(waits.get(), 3, "read on the attempt after it appeared");
+
+        let missing = dir.path().join("missing.txt");
+        let waits_once = Cell::new(0);
+        read_one_byte(&missing, 1, &|| waits_once.set(waits_once.get() + 1));
+        assert_eq!(waits_once.get(), 0, "a pin's read does not wait");
     }
 
     #[test]

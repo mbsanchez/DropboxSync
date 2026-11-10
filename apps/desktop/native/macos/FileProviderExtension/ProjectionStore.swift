@@ -183,17 +183,66 @@ struct ProjectionStore {
     }
 
     private static func rows(_ db: OpaquePointer, _ sql: String, _ values: [Int64]) throws -> [ProjectionRow] {
+        let out = try ids(db, sql, values, read: row)
+        return try withPins(db, out)
+    }
+
+    private static func ids<T>(
+        _ db: OpaquePointer, _ sql: String, _ values: [Int64], read: (OpaquePointer) -> T
+    ) throws -> [T] {
         let statement = try prepare(db, sql)
         defer { sqlite3_finalize(statement) }
         for (index, value) in values.enumerated() {
             sqlite3_bind_int64(statement, Int32(index + 1), value)
         }
-        var out: [ProjectionRow] = []
+        var out: [T] = []
         while true {
             let step = sqlite3_step(statement)
             if step == SQLITE_DONE { return out }
             guard step == SQLITE_ROW else { throw ReadFailure.query(step) }
-            out.append(row(statement))
+            out.append(read(statement))
+        }
+    }
+
+    /// Marks the rows pinned themselves, and those under a pinned folder (#237). Without `fp_pin` (a new
+    /// extension before the host that creates it has run) nothing is pinned, and every read still works.
+    private static func withPins(_ db: OpaquePointer, _ rows: [ProjectionRow]) throws -> [ProjectionRow] {
+        let hasTable = try ids(
+            db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fp_pin'", [], read: { _ in true }
+        ).first ?? false
+        guard hasTable else { return rows }
+        let pinned = Set(try ids(db, "SELECT item_id FROM fp_pin", [], read: { sqlite3_column_int64($0, 0) }))
+        guard !pinned.isEmpty else { return rows }
+        var underPin: [Int64: Bool] = [projectionRootItem: false]
+        func isUnderPin(_ folder: Int64) throws -> Bool {
+            var chain: [Int64] = []
+            var at = folder
+            var answer = false
+            while true {
+                if let known = underPin[at] {
+                    answer = known
+                    break
+                }
+                if pinned.contains(at) {
+                    answer = true
+                    break
+                }
+                chain.append(at)
+                guard chain.count < 4096,
+                      let parent = try ids(
+                          db, "SELECT parent_item FROM fp_item WHERE item_id = ?1", [at],
+                          read: { sqlite3_column_int64($0, 0) }
+                      ).first else { break }
+                at = parent
+            }
+            for id in chain { underPin[id] = answer }
+            return answer
+        }
+        return try rows.map { row in
+            var marked = row
+            marked.pinned = pinned.contains(row.itemId)
+            marked.inherited = try isUnderPin(row.parentItem)
+            return marked
         }
     }
 

@@ -149,7 +149,7 @@ const NO_PARENT: i64 = -1;
 /// Bumped only by a change the extension has to refuse to read past.
 const SCHEMA_VERSION: i64 = 1;
 
-/// The three tables and their indexes. `Tests/projection-schema.sql` in the File Provider extension
+/// The tables and their indexes. `Tests/projection-schema.sql` in the File Provider extension
 /// is the copy the extension's tests build their database from; a test below fails when the two
 /// differ, so neither can move alone.
 const SCHEMA_SQL: &str = "
@@ -180,6 +180,9 @@ CREATE INDEX IF NOT EXISTS idx_fp_item_parent ON fp_item(parent_item, state);
 CREATE INDEX IF NOT EXISTS idx_fp_item_seq ON fp_item(changed_seq);
 CREATE INDEX IF NOT EXISTS idx_fp_item_path ON fp_item(path_lower);
 CREATE INDEX IF NOT EXISTS idx_fp_item_orphan ON fp_item(path_lower) WHERE state = 3;
+CREATE TABLE IF NOT EXISTS fp_pin (
+    item_id INTEGER PRIMARY KEY REFERENCES fp_identity(item_id)
+);
 CREATE TABLE IF NOT EXISTS fp_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version INTEGER NOT NULL,
@@ -1005,7 +1008,10 @@ impl<'a> Sequence<'a> {
     /// Stamps every pre-existing touched row whose final state differs from its state before the
     /// batch, once. A row that ends where it began (a replayed batch, a delete followed by an identical
     /// re-add) takes no value. Two tombstones are the same state whatever else the batch wrote into them.
-    fn finish(self) -> rusqlite::Result<()> {
+    fn finish(mut self) -> rusqlite::Result<()> {
+        let mut moved_folders = Vec::new();
+        // Rows created by the batch were stamped when inserted.
+        let mut stamped: HashSet<i64> = self.created.clone();
         let mut stamp = self.conn.prepare_cached(
             "UPDATE fp_item SET changed_seq = ?2, downloaded = ?3 WHERE item_id = ?1",
         )?;
@@ -1025,12 +1031,86 @@ impl<'a> Sequence<'a> {
             // New bytes make a local copy stale; anything else leaves the flag alone.
             let downloaded = before.downloaded && before.content_hash == now.content_hash;
             stamp.execute(params![item_id, self.st.stamp(), downloaded])?;
+            stamped.insert(*item_id);
             if before.state == STATE_LIVE && now.state != STATE_LIVE {
                 self.st.vanished += 1;
+            }
+            if now.is_folder && now.state == STATE_LIVE && before.parent_item != now.parent_item {
+                moved_folders.push((*item_id, before.parent_item, now.parent_item));
+            }
+        }
+        self.restamp_under_moved_folders(&moved_folders, stamped)
+    }
+
+    /// What is under a folder that moved into or out of a pinned folder now inherits the pin, or no longer
+    /// (#237), which the extension reports on each item (`userInfo.inherited`), so the live rows under it
+    /// are read again. A move that keeps the folder on the same side, the common case, stamps nothing
+    /// more, and neither does a row this batch already stamped.
+    fn restamp_under_moved_folders(
+        &mut self,
+        moved: &[(i64, i64, i64)],
+        mut done: HashSet<i64>,
+    ) -> rusqlite::Result<()> {
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let pinned: HashSet<i64> = {
+            let mut stmt = self.conn.prepare_cached("SELECT item_id FROM fp_pin")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if pinned.is_empty() {
+            return Ok(());
+        }
+        for (folder, old_parent, new_parent) in moved {
+            if under_pin(self.conn, &pinned, *old_parent)? == under_pin(self.conn, &pinned, *new_parent)? {
+                continue;
+            }
+            let under: Vec<i64> = {
+                let mut stmt = self.conn.prepare_cached(
+                    "WITH RECURSIVE tree(id) AS (
+                         SELECT item_id FROM fp_item WHERE parent_item = ?1 AND state = 0
+                         UNION
+                         SELECT i.item_id FROM fp_item i JOIN tree ON i.parent_item = tree.id
+                         WHERE i.state = 0
+                     )
+                     SELECT id FROM tree ORDER BY id",
+                )?;
+                let rows = stmt.query_map([*folder], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for id in under {
+                if done.insert(id) {
+                    self.conn
+                        .prepare_cached("UPDATE fp_item SET changed_seq = ?2 WHERE item_id = ?1")?
+                        .execute(params![id, self.st.stamp()])?;
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Whether `folder` or a folder above it is pinned. The root and an orphan's `-1` are not.
+fn under_pin(conn: &Connection, pinned: &HashSet<i64>, folder: i64) -> rusqlite::Result<bool> {
+    let mut at = folder;
+    for _ in 0..4096 {
+        if pinned.contains(&at) {
+            return Ok(true);
+        }
+        if at == ROOT_ITEM || at == NO_PARENT {
+            return Ok(false);
+        }
+        let parent: Option<i64> = conn
+            .prepare_cached("SELECT parent_item FROM fp_item WHERE item_id = ?1")?
+            .query_row([at], |r| r.get(0))
+            .optional()?;
+        match parent {
+            Some(parent) => at = parent,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 /// Whether writing `new` over `old` would change nothing at all.
@@ -1089,6 +1169,15 @@ fn expire_anchors(conn: &Connection, st: &mut Stamper, populated: bool) -> rusql
     Ok(())
 }
 
+/// A pin lives as long as its row: one left behind would pin whatever row came back under the id.
+fn drop_orphan_pins(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM fp_pin WHERE item_id NOT IN (SELECT item_id FROM fp_item)",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Empties the projection and marks it unpopulated, if it holds anything. Identities stay. A no-op
 /// (no stamp, no write) on a projection that is already empty and unpopulated.
 fn clear_with(conn: &Connection, st: &mut Stamper) -> rusqlite::Result<bool> {
@@ -1101,6 +1190,9 @@ fn clear_with(conn: &Connection, st: &mut Stamper) -> rusqlite::Result<bool> {
     if !populated && !has_rows {
         return Ok(false);
     }
+    // Pins stay: identities survive a clear, so the reseed that follows (the switch turned back on, a
+    // failed snapshot or delta recovering) brings back the same items, and the snapshot's sweep drops
+    // the pins of those that did not come back. Leaving the account drops them (`clear_in`).
     conn.execute("DELETE FROM fp_item", [])?;
     expire_anchors(conn, st, false)?;
     Ok(true)
@@ -1110,6 +1202,8 @@ fn clear_with(conn: &Connection, st: &mut Stamper) -> rusqlite::Result<bool> {
 pub(super) fn clear_in(conn: &Connection) -> rusqlite::Result<ProjectionCommit> {
     let mut st = Stamper::load(conn)?;
     clear_with(conn, &mut st)?;
+    // The account was left: its pins were choices about its files.
+    conn.execute("DELETE FROM fp_pin", [])?;
     st.save(conn)?;
     Ok(ProjectionCommit {
         rows: st.stamped,
@@ -1248,6 +1342,7 @@ impl Db {
                 conn.prepare_cached("DELETE FROM fp_item WHERE item_id = ?1")?
                     .execute([id])?;
             }
+            drop_orphan_pins(conn)?;
             run.reresolve_all()?;
             run.heal_orphans()?;
             run.finish()?;
@@ -1672,8 +1767,169 @@ impl Db {
         .unwrap()
     }
 
+    /// Pins or unpins a live item: *Make Available Offline* and *Make Online-Only* (#237). A pinned
+    /// item is listed with the content policy that keeps it downloaded, and what is under a pinned folder
+    /// is listed as inheriting it. Unpinning takes every pin under the item with it, so a folder made
+    /// online-only can be evicted whole. When anything changed, the item and every live row under it take
+    /// a new sequence value, so the system reads them again with what they now inherit. `false`: no live
+    /// row, and nothing changed.
+    pub(crate) fn set_projection_pinned(&self, item_id: i64, pinned: bool) -> AppResult<bool> {
+        let (live, _) = self.write_projection("pin", |conn, st| {
+            let state: Option<i64> = conn
+                .prepare_cached("SELECT state FROM fp_item WHERE item_id = ?1")?
+                .query_row([item_id], |r| r.get(0))
+                .optional()?;
+            if state != Some(STATE_LIVE) {
+                return Ok(false);
+            }
+            // The item and every row under it, whatever their state.
+            let subtree: Vec<(i64, i64)> = {
+                let mut stmt = conn.prepare_cached(
+                    "WITH RECURSIVE tree(id) AS (
+                         SELECT ?1
+                         UNION
+                         SELECT i.item_id FROM fp_item i JOIN tree ON i.parent_item = tree.id
+                     )
+                     SELECT i.item_id, i.state FROM fp_item i JOIN tree ON i.item_id = tree.id
+                     ORDER BY i.item_id",
+                )?;
+                let rows = stmt.query_map([item_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let changed = if pinned {
+                conn.prepare_cached("INSERT OR IGNORE INTO fp_pin(item_id) VALUES (?1)")?
+                    .execute([item_id])?
+            } else {
+                let mut removed = 0;
+                for (id, _) in &subtree {
+                    removed += conn
+                        .prepare_cached("DELETE FROM fp_pin WHERE item_id = ?1")?
+                        .execute([id])?;
+                }
+                removed
+            };
+            if changed > 0 {
+                for (id, row_state) in &subtree {
+                    if *row_state == STATE_LIVE {
+                        conn.prepare_cached("UPDATE fp_item SET changed_seq = ?2 WHERE item_id = ?1")?
+                            .execute(params![id, st.stamp()])?;
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(live)
+    }
+
+    /// The live files a commit stamped that are pinned, themselves or through a folder above them, each
+    /// with the pin that covers it and its path relative to the domain root: what a delta brought that a
+    /// pin has to download now (#237), a new revision or a file added under a pinned folder. `seq` and
+    /// `rows` are the commit's: its values are the `rows` up to `seq`, taken in one transaction.
+    pub(crate) fn projection_pinned_files_stamped(
+        &self,
+        seq: i64,
+        rows: usize,
+    ) -> AppResult<Vec<(i64, String)>> {
+        let conn = self.read_conn()?;
+        let pinned: HashSet<i64> = {
+            let mut stmt = conn.prepare_cached("SELECT item_id FROM fp_pin")?;
+            let ids = stmt.query_map([], |r| r.get(0))?;
+            ids.collect::<rusqlite::Result<_>>()?
+        };
+        if pinned.is_empty() || rows == 0 {
+            return Ok(Vec::new());
+        }
+        let first = seq - i64::try_from(rows).unwrap_or(i64::MAX) + 1;
+        let stamped: Vec<(i64, i64, String)> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT item_id, parent_item, name FROM fp_item
+                 WHERE changed_seq BETWEEN ?1 AND ?2 AND state = 0 AND is_folder = 0
+                 ORDER BY item_id",
+            )?;
+            let found = stmt.query_map(params![first, seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            found.collect::<rusqlite::Result<_>>()?
+        };
+        let mut out = Vec::new();
+        for (item_id, parent, name) in stamped {
+            // Up to the root: the nearest pin, and the names on the way, which must all be live.
+            let mut names = vec![name];
+            let mut owner = pinned.contains(&item_id).then_some(item_id);
+            let mut at = parent;
+            let mut reachable = true;
+            while at != ROOT_ITEM {
+                let row: Option<(i64, String, i64)> = conn
+                    .prepare_cached("SELECT parent_item, name, state FROM fp_item WHERE item_id = ?1")?
+                    .query_row([at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                match row {
+                    Some((up, folder, STATE_LIVE)) if names.len() < 4096 => {
+                        if owner.is_none() && pinned.contains(&at) {
+                            owner = Some(at);
+                        }
+                        names.push(folder);
+                        at = up;
+                    }
+                    _ => {
+                        reachable = false;
+                        break;
+                    }
+                }
+            }
+            if let (true, Some(owner)) = (reachable, owner) {
+                names.reverse();
+                out.push((owner, names.join("/")));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The live files at or under a live item, as paths relative to the domain root built from the rows'
+    /// names, which keep Dropbox's case: what pinning the item has to download (#237). Empty when the
+    /// item, or a folder above it, is not live.
+    pub(crate) fn projection_live_files_under(&self, item_id: i64) -> AppResult<Vec<String>> {
+        let conn = self.read_conn()?;
+        let mut names = Vec::new();
+        let mut at = item_id;
+        while at != ROOT_ITEM {
+            let row: Option<(i64, String, i64)> = conn
+                .prepare_cached("SELECT parent_item, name, state FROM fp_item WHERE item_id = ?1")?
+                .query_row([at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            match row {
+                Some((parent, name, STATE_LIVE)) if names.len() < 4096 => {
+                    names.push(name);
+                    at = parent;
+                }
+                _ => return Ok(Vec::new()),
+            }
+        }
+        names.reverse();
+        let mut stmt = conn.prepare_cached(
+            "WITH RECURSIVE tree(id, rel, folder) AS (
+                 SELECT item_id, ?2, is_folder FROM fp_item WHERE item_id = ?1 AND state = 0
+                 UNION ALL
+                 SELECT i.item_id, tree.rel || '/' || i.name, i.is_folder
+                 FROM fp_item i JOIN tree ON i.parent_item = tree.id
+                 WHERE tree.folder = 1 AND i.state = 0
+             )
+             SELECT rel FROM tree WHERE folder = 0 ORDER BY rel",
+        )?;
+        let rows = stmt.query_map(params![item_id, names.join("/")], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether an item is pinned itself (not through a folder above it).
+    pub(crate) fn projection_pinned(&self, item_id: i64) -> AppResult<bool> {
+        let conn = self.read_conn()?;
+        let pinned = conn
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM fp_pin WHERE item_id = ?1)")?
+            .query_row([item_id], |r| r.get(0))?;
+        Ok(pinned)
+    }
+
     /// Records whether the local copy of a file matches the version the projection holds. Nothing calls
-    /// it yet: a replicated extension's `isDownloaded` is ignored, so this waits for offline (#237).
+    /// it: a replicated extension's `isDownloaded` is ignored, and the system keeps what is downloaded
+    /// itself, which is what Finder shows (#237).
     #[allow(dead_code)]
     pub(crate) fn set_projection_downloaded(
         &self,
@@ -1808,6 +2064,7 @@ fn prune_tombstones(conn: &Connection, cap: usize) -> rusqlite::Result<usize> {
         "DELETE FROM fp_item WHERE state = 2 AND changed_seq <= ?1",
         [bound],
     )?;
+    drop_orphan_pins(conn)?;
     conn.execute(
         "UPDATE fp_state SET min_valid_seq = MAX(min_valid_seq, ?1) WHERE id = 1",
         [bound],
@@ -1902,6 +2159,7 @@ mod tests {
     const SUB: &str = "id:t00000000000FCAPSUB002";
     const B: &str = "id:t00000000000FCAPFILE03";
     const HASH_B: &str = "5f1c0d3a9b7e2c44a1d8e6f03b9a7c5d2e4f6a8b0c1d3e5f7a9b1c3d5e7f9a0b";
+    const HASH_B_OTHER: &str = "6f1c0d3a9b7e2c44a1d8e6f03b9a7c5d2e4f6a8b0c1d3e5f7a9b1c3d5e7f9a0b";
 
     struct World {
         state: AppState,
@@ -3156,8 +3414,8 @@ mod tests {
             normalized_schema(&from_host),
         );
         assert!(
-            host_schema.len() == 8,
-            "sanity: three tables and five indexes, got {host_schema:?}"
+            host_schema.len() == 9,
+            "sanity: four tables and five indexes, got {host_schema:?}"
         );
         assert_eq!(fixture_schema, host_schema);
 
@@ -5352,5 +5610,291 @@ mod tests {
         seed(&w, again).unwrap();
         let reseed = started.elapsed();
         eprintln!("MEASURE snapshot of 50000 items: first {first:?}, unchanged reseed {reseed:?}");
+    }
+
+    // ── pins (#237) ─────────────────────────────────────────────────────────────────────────────
+
+    const PIN_A: &str = "id:t00000000000PINFILE01";
+    const PIN_B: &str = "id:t00000000000PINFILE02";
+
+    fn pinned_world() -> (World, i64) {
+        let w = world(true, true);
+        run(&w, vec![file("/a.txt", PIN_A, "r1")]);
+        let id = w.db().projection_item_id("/a.txt").unwrap();
+        (w, id)
+    }
+
+    fn row_seq(db: &Db, item_id: i64) -> i64 {
+        all_rows(db).into_iter().find(|r| r.item_id == item_id).unwrap().seq
+    }
+
+    /// A pin that changes takes one sequence value, on the item's own row, so the system reads that item
+    /// again; the same pin twice takes none.
+    ///
+    /// Proof this test can fail: not stamping the row leaves the system with the old content policy;
+    /// stamping without a change moves the sequence for nothing.
+    #[test]
+    fn a_pin_moves_its_item_in_the_change_sequence_once() {
+        let (w, id) = pinned_world();
+        let db = w.db();
+        let s0 = seq(db);
+
+        assert!(db.set_projection_pinned(id, true).unwrap());
+        assert!(db.projection_pinned(id).unwrap());
+        assert_eq!(seq(db), s0 + 1);
+        assert_eq!(row_seq(db, id), s0 + 1, "the item's row carries the change");
+        assert!(db.set_projection_pinned(id, true).unwrap());
+        assert_eq!(seq(db), s0 + 1, "the same pin again is not a change");
+
+        assert!(db.set_projection_pinned(id, false).unwrap());
+        assert!(!db.projection_pinned(id).unwrap());
+        assert_eq!(row_seq(db, id), s0 + 2);
+    }
+
+    /// Only a live row can be pinned.
+    ///
+    /// Proof this test can fail: dropping the state check pins a deleted item.
+    #[test]
+    fn a_deleted_item_cannot_be_pinned() {
+        let (w, id) = pinned_world();
+        run(&w, vec![gone("/a.txt")]);
+
+        assert!(!w.db().set_projection_pinned(id, true).unwrap());
+        assert!(!w.db().projection_pinned(id).unwrap());
+        assert_eq!(w.db().set_projection_pinned(9_999, true).unwrap(), false);
+    }
+
+    /// A pin goes with its row: a snapshot that no longer lists the item drops it, so the item coming back
+    /// under the same id is not pinned by a choice made for the old one.
+    ///
+    /// Proof this test can fail: dropping the sweep's cleanup leaves the pin on the returning item.
+    #[test]
+    fn a_pin_goes_with_its_row() {
+        let (w, id) = pinned_world();
+        let db = w.db();
+        db.set_projection_pinned(id, true).unwrap();
+        seed(&w, vec![file("/b.txt", PIN_B, "r1")]).unwrap();
+        run(&w, vec![file("/a.txt", PIN_A, "r2")]);
+        assert_eq!(db.projection_item_id("/a.txt"), Some(id), "the same identity came back");
+        assert!(!db.projection_pinned(id).unwrap(), "after a snapshot without it");
+
+    }
+
+    /// Found in review: a recovery clear (a failed snapshot, the delta failing) dropped every pin, and the
+    /// reseed brought the same files back unpinned. A clear keeps them; leaving the account drops them.
+    ///
+    /// Proof this test can fail: dropping pins in the clear loses the first; keeping them on reset keeps
+    /// the second.
+    #[test]
+    fn a_clear_keeps_pins_and_leaving_the_account_drops_them() {
+        let (w, id) = pinned_world();
+        let db = w.db();
+        db.set_projection_pinned(id, true).unwrap();
+
+        db.project_clear().unwrap();
+        seed(&w, vec![file("/a.txt", PIN_A, "r3")]).unwrap();
+        assert_eq!(db.projection_item_id("/a.txt"), Some(id));
+        assert!(db.projection_pinned(id).unwrap(), "after a clear and the reseed");
+
+        db.reset_sync_state().unwrap();
+        assert!(!db.projection_pinned(id).unwrap(), "after leaving the account");
+    }
+
+    /// Found in review: what is under a pinned folder kept its old version, so the system never learned
+    /// it now inherits the pin; and unpinning a folder left pins under it that stopped its eviction.
+    ///
+    /// Proof this test can fail: stamping only the item, or deleting only its own pin.
+    #[test]
+    fn a_pin_reaches_what_is_under_the_folder() {
+        let w = world(true, true);
+        run(
+            &w,
+            vec![
+                dir("/Top", "id:t00000000000PINDIR021"),
+                file("/Top/a.txt", "id:t00000000000PINFILE21", "r1"),
+                file("/Top/b.txt", "id:t00000000000PINFILE22", "r1"),
+            ],
+        );
+        let db = w.db();
+        let (top, a, b) = (
+            db.projection_item_id("/top").unwrap(),
+            db.projection_item_id("/top/a.txt").unwrap(),
+            db.projection_item_id("/top/b.txt").unwrap(),
+        );
+        db.set_projection_pinned(b, true).unwrap();
+        let before = seq(db);
+
+        db.set_projection_pinned(top, true).unwrap();
+        assert!(row_seq(db, a) > before && row_seq(db, b) > before, "the children are read again");
+
+        db.set_projection_pinned(top, false).unwrap();
+        assert!(!db.projection_pinned(top).unwrap());
+        assert!(!db.projection_pinned(b).unwrap(), "a pin under it goes too");
+    }
+
+    /// Proof this test can fail: dropping the cleanup after pruning leaves the pin on the returning item.
+    #[test]
+    fn a_pin_goes_with_its_pruned_tombstone() {
+        let (w, id) = pinned_world();
+        let db = w.db();
+        db.set_projection_pinned(id, true).unwrap();
+        TOMBSTONE_CAP_OVERRIDE.with(|c| c.set(Some(0)));
+        run(&w, vec![gone("/a.txt")]);
+        TOMBSTONE_CAP_OVERRIDE.with(|c| c.set(None));
+        assert_eq!(db.projection_row_state(id).unwrap(), None, "the tombstone was pruned");
+
+        run(&w, vec![file("/a.txt", PIN_A, "r2")]);
+
+        assert_eq!(db.projection_item_id("/a.txt"), Some(id));
+        assert!(!db.projection_pinned(id).unwrap());
+    }
+
+    /// Proof this test can fail: dropping the recursion misses the nested file; dropping a state check
+    /// lists a deleted one; building the path from `path_lower` loses the case Finder shows.
+    #[test]
+    fn the_files_under_an_item_are_its_live_files_at_any_depth_with_their_case() {
+        let w = world(true, true);
+        run(
+            &w,
+            vec![
+                dir("/Top", "id:t00000000000PINDIR001"),
+                dir("/Top/Sub", "id:t00000000000PINDIR002"),
+                file("/Top/Sub/Deep.txt", "id:t00000000000PINFILE11", "r1"),
+                file("/Top/a.txt", "id:t00000000000PINFILE12", "r1"),
+                file("/Top/gone.txt", "id:t00000000000PINFILE13", "r1"),
+            ],
+        );
+        run(&w, vec![gone("/Top/gone.txt")]);
+        let db = w.db();
+        let top = db.projection_item_id("/top").unwrap();
+        let deep = db.projection_item_id("/top/sub/deep.txt").unwrap();
+
+        assert_eq!(
+            db.projection_live_files_under(top).unwrap(),
+            vec!["Top/Sub/Deep.txt".to_string(), "Top/a.txt".to_string()]
+        );
+        assert_eq!(db.projection_live_files_under(deep).unwrap(), vec!["Top/Sub/Deep.txt".to_string()]);
+        let gone_id = db.projection_item_id("/top/gone.txt").unwrap();
+        assert!(db.projection_live_files_under(gone_id).unwrap().is_empty());
+    }
+
+    /// Found in the second review: a folder moved into a pinned folder kept its files' old versions, so the
+    /// system never learned they now inherit the pin (and the reverse when moved out). With no pin at all,
+    /// nothing extra is stamped.
+    ///
+    /// Proof this test can fail: stamping only the moved folder leaves its file where it was.
+    #[test]
+    fn what_is_under_a_folder_moved_into_a_pinned_folder_is_read_again() {
+        for pin in [true, false] {
+            let w = world(true, true);
+            run(
+                &w,
+                vec![
+                    dir("/Top", "id:t00000000000PINDIR031"),
+                    dir("/Other", "id:t00000000000PINDIR032"),
+                    file("/Other/x.txt", "id:t00000000000PINFILE31", "r1"),
+                ],
+            );
+            let db = w.db();
+            let top = db.projection_item_id("/top").unwrap();
+            let x = db.projection_item_id("/other/x.txt").unwrap();
+            if pin {
+                db.set_projection_pinned(top, true).unwrap();
+            }
+            let before = row_seq(db, x);
+
+            run(
+                &w,
+                vec![
+                    gone("/Other/x.txt"),
+                    gone("/Other"),
+                    dir("/Top/Other", "id:t00000000000PINDIR032"),
+                    file("/Top/Other/x.txt", "id:t00000000000PINFILE31", "r1"),
+                ],
+            );
+
+            assert_eq!(row_seq(db, x) > before, pin, "pinned: {pin}");
+
+            // And out again, by the folder alone, as a move made in Finder reaches the projection. (A
+            // folder-only delta re-resolves the rows under it by itself, so this checks the pinned case.)
+            if pin {
+                let before = row_seq(db, x);
+                run(&w, vec![gone("/Top/Other"), dir("/Other", "id:t00000000000PINDIR032")]);
+                assert!(row_seq(db, x) > before, "moved out");
+            }
+        }
+    }
+
+    /// Found in the third review: with any pin at all, every folder move stamped its whole subtree. A move
+    /// that stays outside every pinned folder stamps only the folder.
+    ///
+    /// Proof this test can fail: dropping the comparison of the old and new side stamps the child.
+    #[test]
+    fn a_move_away_from_any_pinned_folder_stamps_only_the_folder() {
+        let w = world(true, true);
+        run(
+            &w,
+            vec![
+                dir("/Pinned", "id:t00000000000PINDIR041"),
+                dir("/A", "id:t00000000000PINDIR042"),
+                dir("/B", "id:t00000000000PINDIR043"),
+                file("/A/y.txt", "id:t00000000000PINFILE41", "r1"),
+            ],
+        );
+        let db = w.db();
+        db.set_projection_pinned(db.projection_item_id("/pinned").unwrap(), true).unwrap();
+        let y = db.projection_item_id("/a/y.txt").unwrap();
+        let before = row_seq(db, y);
+
+        run(
+            &w,
+            vec![
+                gone("/A/y.txt"),
+                gone("/A"),
+                dir("/B/A", "id:t00000000000PINDIR042"),
+                file("/B/A/y.txt", "id:t00000000000PINFILE41", "r1"),
+            ],
+        );
+
+        assert_eq!(row_seq(db, y), before);
+    }
+
+    /// Found when covering battery: a new revision of a pinned file, or a file added under a pinned folder,
+    /// waited for power. The delta's commit names them, with the pin that covers each.
+    ///
+    /// Proof this test can fail: a range off by one misses the first value; not walking up misses the
+    /// file under the folder; listing unpinned rows reads what nobody pinned.
+    #[test]
+    fn a_delta_names_the_pinned_files_it_changed() {
+        let w = world(true, true);
+        run(
+            &w,
+            vec![
+                dir("/Top", "id:t00000000000PINDIR051"),
+                file("/Top/a.txt", "id:t00000000000PINFILE51", "r1"),
+                file("/free.txt", "id:t00000000000PINFILE52", "r1"),
+            ],
+        );
+        let db = w.db();
+        let top = db.projection_item_id("/top").unwrap();
+        db.set_projection_pinned(top, true).unwrap();
+        let before = seq(db);
+
+        run(
+            &w,
+            vec![
+                file_with("/Top/a.txt", "id:t00000000000PINFILE51", "r2", HASH_B_OTHER),
+                file("/Top/new.txt", "id:t00000000000PINFILE53", "r1"),
+                file_with("/free.txt", "id:t00000000000PINFILE52", "r2", HASH_B_OTHER),
+            ],
+        );
+        let after = seq(db);
+        let rows = usize::try_from(after - before).unwrap();
+
+        assert_eq!(
+            db.projection_pinned_files_stamped(after, rows).unwrap(),
+            vec![(top, "Top/a.txt".to_string()), (top, "Top/new.txt".to_string())]
+        );
+        assert!(db.projection_pinned_files_stamped(after, 0).unwrap().is_empty());
     }
 }

@@ -57,6 +57,10 @@ struct ProjectionTests {
         check("metadata version carries the format",
               ItemFormat.metadataVersion(Data([3, 4])) == Data("f3.".utf8) + Data([3, 4]))
         check("older format versions differ", ItemFormat.metadataVersion(Data([3, 4])) != Data([3, 4]))
+        check("a pinned item carries its pin in its version",
+              ItemFormat.metadataVersion(Data([3, 4]), pinned: true) == Data("f3.p.".utf8) + Data([3, 4]))
+        check("an item under a pinned folder carries that in its version",
+              ItemFormat.metadataVersion(Data([3, 4]), inherited: true) == Data("f3.i.".utf8) + Data([3, 4]))
     }
 
     static func reimports() {

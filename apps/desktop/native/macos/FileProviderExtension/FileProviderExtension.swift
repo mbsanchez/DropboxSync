@@ -139,7 +139,7 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
                 // The header's answer for content the user cannot have: not retried. The system shows
                 // nothing for it, so the host opens the file on dropbox.com for a Finder request.
                 completionHandler(nil, nil, CocoaError(.fileReadNoPermission))
-            case .retry, .written, .collision, .conflict, .deleted, .deletionRejected, .gone, .goneParent:
+            case .retry, .written, .collision, .conflict, .deleted, .deletionRejected, .gone, .goneParent, .done:
                 completionHandler(nil, nil, ReadAnswer.transientError(code: 0))
             case .cancelled:
                 completionHandler(nil, nil, CocoaError(.userCancelled))
@@ -244,7 +244,7 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             case .refused:
                 // Selective sync would hide it: it would reach Dropbox and never show here.
                 completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
-            case .staged, .retry, .conflict, .deleted, .deletionRejected:
+            case .staged, .retry, .conflict, .deleted, .deletionRejected, .done:
                 completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
             }
         }
@@ -340,7 +340,7 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             case .refused:
                 // Selective sync would hide it where it was moved.
                 completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
-            case .staged, .retry, .deleted, .deletionRejected:
+            case .staged, .retry, .deleted, .deletionRejected, .done:
                 completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
             }
         }
@@ -394,11 +394,126 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
                 completionHandler(NSFileProviderError(.notAuthenticated))
             case .cancelled:
                 completionHandler(CocoaError(.userCancelled))
-            case .staged, .refused, .retry, .written, .conflict, .collision:
+            case .staged, .refused, .retry, .written, .conflict, .collision, .done:
                 completionHandler(ReadAnswer.transientError(code: 0))
             }
         }
         return progress
+    }
+}
+
+/// *Make Available Offline* and *Make Online-Only* (#237). The system has no pin of its own for a
+/// third-party domain, so these are the extension's actions, as the Dropbox client's are: the host records
+/// the pin, the item comes back with a content policy that keeps it downloaded, and an unpinned item is
+/// evicted. The policy only schedules a background download, which waits while the Mac is on battery
+/// (measured), so a pin names the domain's folder and the host reads the pinned files there, which
+/// downloads them now. Make Online-Only also evicts what is downloaded and not pinned:
+/// Info.plist hides the system's Download Now and Remove Download, which read as the same two actions.
+extension DropboxSyncFileProvider: NSFileProviderCustomAction {
+    func performAction(
+        identifier actionIdentifier: NSFileProviderExtensionActionIdentifier,
+        onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
+        completionHandler: @escaping (Error?) -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+        guard let pinned = OfflineAction.pins(actionIdentifier.rawValue) else {
+            completionHandler(CocoaError(.featureUnsupported))
+            return progress
+        }
+        guard let exchange = exchange else {
+            completionHandler(NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        let manager = NSFileProviderManager(for: domain)
+        let items = itemIdentifiers.compactMap { identifier in
+            ItemIdCodec.decode(identifier.rawValue).map { (identifier, $0) }
+        }
+        var failure: Error?
+        var root = ""
+        func next(_ index: Int) {
+            guard index < items.count else {
+                completionHandler(progress.isCancelled ? CocoaError(.userCancelled) : failure)
+                return
+            }
+            let (identifier, itemId) = items[index]
+            // A multiple selection reaches here whole, even the items the action is not offered on. One
+            // under a pinned folder is offline through it: skipped, as its menu would (found in review:
+            // unpinning it did nothing, and its eviction failed the whole action).
+            if case .live(let row)? = try? requireStore(store).presence(itemId), row.inherited {
+                fpLog.info("\(pinned ? "pin" : "unpin", privacy: .public) \(itemId, privacy: .public): under a pinned folder, skipped")
+                progress.completedUnitCount += 1
+                next(index + 1)
+                return
+            }
+            exchange.pin(itemId: itemId, pinned: pinned, root: root, isCancelled: { progress.isCancelled }) { outcome in
+                fpLog.info("\(pinned ? "pin" : "unpin", privacy: .public) \(itemId, privacy: .public): \(outcome.logLabel, privacy: .public)")
+                switch outcome {
+                case .done:
+                    progress.completedUnitCount += 1
+                    if pinned {
+                        next(index + 1)
+                    } else {
+                        Self.evict(identifier, manager: manager, attempt: 0) { error in
+                            if let error = error, failure == nil { failure = error }
+                            next(index + 1)
+                        }
+                    }
+                case .gone:
+                    // Deleted on Dropbox meanwhile: nothing left to pin.
+                    progress.completedUnitCount += 1
+                    next(index + 1)
+                case .hostDown, .offline:
+                    failure = failure ?? NSFileProviderError(.serverUnreachable)
+                    next(index + 1)
+                case .cancelled:
+                    completionHandler(CocoaError(.userCancelled))
+                default:
+                    failure = failure ?? ReadAnswer.transientError(code: 0)
+                    next(index + 1)
+                }
+            }
+        }
+        guard pinned, let manager = manager else {
+            next(0)
+            return progress
+        }
+        manager.getUserVisibleURL(for: .rootContainer) { url, error in
+            if let error = error {
+                fpLog.error("no visible root: \(String(describing: error), privacy: .public)")
+            }
+            root = url?.path ?? ""
+            next(0)
+        }
+        return progress
+    }
+
+    /// Evicts an item the host just unpinned. The system may not have read the item's new policy yet, and
+    /// refuses to evict while it still holds the pinned one: asked again for a few seconds.
+    private static func evict(
+        _ identifier: NSFileProviderItemIdentifier,
+        manager: NSFileProviderManager?,
+        attempt: Int,
+        done: @escaping (Error?) -> Void
+    ) {
+        guard let manager = manager else {
+            done(nil)
+            return
+        }
+        manager.evictItem(identifier: identifier) { error in
+            let code = (error as NSError?).flatMap { $0.domain == NSFileProviderErrorDomain ? $0.code : nil }
+            let notYet = code == NSFileProviderError.Code.nonEvictable.rawValue
+                || code == NSFileProviderError.Code.nonEvictableChildren.rawValue
+            if notYet && attempt < 10 {
+                DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(500)) {
+                    evict(identifier, manager: manager, attempt: attempt + 1, done: done)
+                }
+                return
+            }
+            if let error = error {
+                fpLog.error("evict \(identifier.rawValue, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
+            done(error)
+        }
     }
 }
 
@@ -511,8 +626,20 @@ final class ProjectionItem: NSObject, NSFileProviderItem {
 
     var itemVersion: NSFileProviderItemVersion {
         NSFileProviderItemVersion(
-            contentVersion: row.contentVersion, metadataVersion: ItemFormat.metadataVersion(row.metaVersion))
+            contentVersion: row.contentVersion,
+            metadataVersion: ItemFormat.metadataVersion(
+                row.metaVersion, pinned: row.pinned, inherited: row.inherited))
     }
+
+    /// A pinned item is downloaded and kept downloaded, and a pinned folder passes that on to what is
+    /// under it, whose own policy is inherited (#237).
+    var contentPolicy: NSFileProviderContentPolicy {
+        row.pinned ? .downloadEagerlyAndKeepDownloaded : .inherited
+    }
+
+    /// What the Finder actions in Info.plist test: which of them to offer. An item under a pinned folder is
+    /// offered neither: it is offline through the folder, and the system would refuse to evict it.
+    var userInfo: [AnyHashable: Any]? { ["pinned": row.pinned, "inherited": row.inherited] }
 }
 
 /// Lists a folder or the working set from the projection, one page per call.

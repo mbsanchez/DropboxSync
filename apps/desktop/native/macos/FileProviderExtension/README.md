@@ -150,6 +150,20 @@ by error class, never by name.
 **A build that changes what an item reports** (its capabilities, above all) bumps `ItemFormat.current` in
 `ProjectionModel.swift`. Without it the system keeps what it cached for every item it already knows.
 
+## Offline (slice 5)
+
+Two actions in `Info.plist`, **DropboxSync: Make Available Offline** and **DropboxSync: Make Online-Only**,
+reach `performAction` (`NSFileProviderCustomAction`). Each item is one `pin` or `unpin` request; the host
+records it in `fp_pin` and moves the row and what is under it in the change sequence, so the item comes back with
+`contentPolicy = .downloadEagerlyAndKeepDownloaded` and a `p.` in its metadata version; what is under a
+pinned folder comes back with `userInfo.inherited` and an `i.`, and is offered neither action. A pin also
+names the domain's visible folder, and the host reads one byte of every live file at or under the item
+there (two readers shared by every pin), which downloads it now: the policy alone only schedules a background
+download, held while on battery. After each delta the host also reads the pinned files it changed. Unpinning
+evicts. The system's Download Now and Remove Download are hidden. Rules and measurements are in ADR-0004,
+*Offline (slice 5)*. The extension logs `pin <id>: <outcome>` and `unpin <id>: <outcome>`; the host logs
+`File Provider pin: reading the pinned files` with the count.
+
 ## Live checks (with the maintainer)
 
 1. **Strip quarantine after copying the app.** `ditto` keeps the quarantine attribute, and a quarantined app

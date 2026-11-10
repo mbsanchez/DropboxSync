@@ -1613,6 +1613,7 @@ pub(crate) fn run_remote_delta(
         let commit = state.db.project_delta_or_give_up(&all_entries)?;
         if commit.rows > 0 {
             crate::file_provider::signal_after_delta(commit.vanished > 0);
+            crate::file_provider_exchange::download_pinned_changes(state, commit.seq, commit.rows);
         }
     }
 

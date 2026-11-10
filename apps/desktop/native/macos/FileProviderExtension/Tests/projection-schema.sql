@@ -17,6 +17,8 @@
 --   fp_item.content_version, meta_version
 --                         Opaque bytes, at most 128 each, used as-is for NSFileProviderItemVersion.
 --   fp_item.changed_seq   Unique per observable change; pages the working-set changes.
+--   fp_pin.item_id        Pinned by Make Available Offline: listed with the content policy that keeps
+--                         the item downloaded.
 --   fp_state              Anchor = "v1.<generation>.<seq>". Expired iff the generation differs,
 --                         seq < min_valid_seq or seq > the current seq. Nothing else expires it.
 
@@ -47,6 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_fp_item_parent ON fp_item(parent_item, state);
 CREATE INDEX IF NOT EXISTS idx_fp_item_seq ON fp_item(changed_seq);
 CREATE INDEX IF NOT EXISTS idx_fp_item_path ON fp_item(path_lower);
 CREATE INDEX IF NOT EXISTS idx_fp_item_orphan ON fp_item(path_lower) WHERE state = 3;
+CREATE TABLE IF NOT EXISTS fp_pin (
+    item_id INTEGER PRIMARY KEY REFERENCES fp_identity(item_id)
+);
 CREATE TABLE IF NOT EXISTS fp_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version INTEGER NOT NULL,

@@ -49,6 +49,8 @@ enum ExchangeOutcome: Equatable {
     case gone
     /// The folder a create or a move names was deleted on Dropbox: `noSuchItem` for that folder.
     case goneParent
+    /// A pin or an unpin took.
+    case done
 
     /// A class only: no name or path reaches the log.
     var logLabel: String {
@@ -67,6 +69,22 @@ enum ExchangeOutcome: Equatable {
         case .deletionRejected: return "deletionRejected"
         case .gone: return "gone"
         case .goneParent: return "goneParent"
+        case .done: return "done"
+        }
+    }
+}
+
+/// The two Finder actions of #237, as Info.plist names them.
+enum OfflineAction {
+    static let makeOffline = "com.mobsanchez.dropboxsyncdesktop.fileprovider.action.make_offline"
+    static let makeOnlineOnly = "com.mobsanchez.dropboxsyncdesktop.fileprovider.action.make_online_only"
+
+    /// `true` to pin, `false` to unpin, `nil` for an action that is not one of these.
+    static func pins(_ identifier: String) -> Bool? {
+        switch identifier {
+        case makeOffline: return true
+        case makeOnlineOnly: return false
+        default: return nil
         }
     }
 }
@@ -112,6 +130,8 @@ func decodeExchangeResult(_ data: Data, staged: URL) -> ExchangeOutcome {
         return .gone
     case "gone_parent":
         return .goneParent
+    case "done":
+        return .done
     default:
         return .retry
     }
@@ -202,6 +222,20 @@ final class ExchangeClient {
         send(
             ["op": "delete", "item_id": itemId, "base_version": String(decoding: baseVersion, as: UTF8.self)],
             outgoing: nil, isCancelled, done)
+    }
+
+    /// *Make Available Offline* (`pinned`) or *Make Online-Only* on one item (#237). A pin names the
+    /// domain's folder as the user sees it (`root`), where the host reads the pinned files to download them.
+    func pin(
+        itemId: Int64,
+        pinned: Bool,
+        root: String,
+        isCancelled: @escaping () -> Bool,
+        done: @escaping (ExchangeOutcome) -> Void
+    ) {
+        var fields: [String: Any] = ["op": pinned ? "pin" : "unpin", "item_id": itemId]
+        if pinned { fields["root"] = root }
+        send(fields, outgoing: nil, isCancelled, done)
     }
 
     private func send(

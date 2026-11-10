@@ -308,6 +308,29 @@ extension ProjectionTests {
     }
     expect(goneParent == .goneParent, "a move into a folder deleted on Dropbox names the folder")
 
+    // Make Available Offline and Make Online-Only (#237).
+    for (pinned, op) in [(true, "pin"), (false, "unpin")] {
+        var pinning: String?
+        answerNextRequest(with: #"{"version":1,"outcome":"done"}"#, inspect: { sent in
+            shape.lock()
+            pinning = sent
+            shape.unlock()
+        })
+        let pinOutcome = finish {
+            client().pin(itemId: 8, pinned: pinned, root: "/r", isCancelled: { false }, done: $0)
+        }
+        expect(pinOutcome == .done, "\(op) answers done")
+        let expected = pinned
+            ? #"{"item_id":8,"op":"pin","root":"/r","version":1}"#
+            : #"{"item_id":8,"op":"unpin","version":1}"#
+        shape.lock()
+        expect(pinning == expected, "\(op) is what the host parses: \(pinning ?? "nil")")
+        shape.unlock()
+    }
+    expect(OfflineAction.pins(OfflineAction.makeOffline) == true, "make offline pins")
+    expect(OfflineAction.pins(OfflineAction.makeOnlineOnly) == false, "make online-only unpins")
+    expect(OfflineAction.pins("com.example.other") == nil, "another action is not ours")
+
     // A create given up on before the host took it leaves no bytes behind.
     _ = finish {
         client(deadline: 0.05).create(
