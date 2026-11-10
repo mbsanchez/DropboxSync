@@ -373,8 +373,18 @@ there. Nothing is queued on the host: a failure answers the system, which retrie
   writes with 429 (40 of 50 parallel deletes, 2 of 6 parallel creates). A file larger than one 8 MiB chunk
   goes up in an upload session, and only its `finish` waits for the lane, so a long upload does not hold up
   other writes while its bytes travel. A write that waits for the lane longer than 240 s gives up without
-  sending anything, well inside the extension's 600 s, so nothing is written after the extension stopped
-  waiting.
+  sending anything. The extension's 600 s count from the host's last sign of life, not from the request:
+  while it works on a write the host touches `staging/<id>.alive` every minute, so an upload slower than
+  600 s is not abandoned and restarted from its first byte on every retry (CTO review of #240). Each step
+  is still bounded (request timeouts, the lane's 240 s), so the touches end, and every step first checks
+  the extension's cancel marker, so nothing is written after it stopped waiting. Untested against a real
+  slow link.
+- **A conflicted copy is announced.** It is an item the system was never handed (the answer is Dropbox's
+  version), and its own delta restates a row already written, so the host signals the working set itself.
+- **A delete with no live row** is done only when the row is a tombstone outside a removal hold, or when
+  the populated projection has never heard of the item. While the projection is rebuilt, or a removal may
+  come back as a rename, the system is asked again. Writes are refused (asked again) when Dropbox is not
+  in Finder.
 - **The mass-deletion breaker** (DBSYNC-64) holds a Finder selection that it calls a mass deletion until the
   user confirms or restores it in the app. Each call waits until no delete has arrived for 1.5 s, so every
   call sees the whole burst; refused, each answers `deletionRejected` and the system restores the files. The

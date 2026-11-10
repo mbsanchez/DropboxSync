@@ -135,7 +135,9 @@ Move to Trash, `ItemFormat`, reimports) are in ADR-0004, *Writes (slice 4)*. To 
 ```
 
 Each line ends in the outcome: `written`, `conflict`, `collision`, `deleted`, `deletionRejected`, `hostDown`,
-`offline`, `auth`, `retry` or `cancelled`. The host logs under `dropbox_sync_desktop_lib::file_provider_writes`
+`offline`, `auth`, `retry` or `cancelled`. The extension waits 600 s for an answer, counted from the host's
+last touch of `staging/<id>.alive`, which the host refreshes every minute while it works on a write: a long
+upload keeps the wait open. On macOS a conflict is closed from the app with *Garder les deux* (keep both) only: both files are already in Finder. The host logs under `dropbox_sync_desktop_lib::file_provider_writes`
 by error class, never by name.
 
 **A build that changes what an item reports** (its capabilities, above all) bumps `ItemFormat.current` in

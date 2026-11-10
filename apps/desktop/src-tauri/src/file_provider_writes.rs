@@ -264,6 +264,10 @@ fn keep_both(
     if let WriteOutcome::Failed(f) = record(db, &landed) {
         return WriteOutcome::Failed(f);
     }
+    // The copy is an item the system was never handed: the answer is Dropbox's version, and the copy's
+    // own delta restates a row already written, so no delta signals it either. Without this the edit
+    // stays out of Finder until something unrelated changes (CTO review of #240).
+    crate::file_provider::signal_working_set();
     let key = |p: &str| crate::path_util::key_from_dropbox(p);
     if let Err(e) = db.add_conflict(
         &key(path),
@@ -338,8 +342,7 @@ pub(crate) fn delete(
     base_version: &str,
 ) -> WriteOutcome {
     let Some(target) = read_target(db, item_id) else {
-        // Already gone, or never ours: either way, nothing on Dropbox stands for it.
-        return WriteOutcome::Deleted;
+        return delete_without_row(db, item_id);
     };
     if !target.is_folder && base_version.as_bytes() != target.content_version.as_slice() {
         return WriteOutcome::DeletionRejected;
@@ -799,6 +802,23 @@ fn not_live(db: &Db, item_id: i64, dead: WriteOutcome) -> WriteOutcome {
     }
 }
 
+/// A delete of an item with no live row. Already gone on Dropbox, or never ours, it is done: nothing on
+/// Dropbox stands for it. Not while that cannot be told yet (CTO review of #240): an unpopulated
+/// projection (after a give-up clear, before the reseed) still has the item on Dropbox, and a tombstone
+/// while a removal is held may come back as the second half of a rename. A hidden row or a failed read
+/// is not known to be gone either. The system asks again for all of those.
+fn delete_without_row(db: &Db, item_id: i64) -> WriteOutcome {
+    match db.projection_row_state(item_id) {
+        Ok(Some(crate::storage::db::projection::STATE_DELETED))
+            if !crate::file_provider::removal_held() =>
+        {
+            WriteOutcome::Deleted
+        }
+        Ok(None) if db.projection_state().is_ok_and(|s| s.populated) => WriteOutcome::Deleted,
+        _ => WriteOutcome::Retry,
+    }
+}
+
 /// Whether the staged bytes are the content Dropbox holds under `content_hash`.
 fn same_bytes(staged: &Path, content_hash: &str) -> bool {
     !content_hash.is_empty()
@@ -1228,7 +1248,8 @@ mod tests {
     /// The system edited a version Dropbox no longer has: nothing overwrites Dropbox's, the edit goes up
     /// as a copy, and the conflict is recorded.
     ///
-    /// Proof this test can fail: comparing nothing sends `upload_over` on the stale base.
+    /// Proof this test can fail: comparing nothing sends `upload_over` on the stale base; dropping the
+    /// signal in `keep_both` leaves the copy out of Finder.
     #[test]
     fn an_edit_on_a_stale_version_keeps_both() {
         let (_dir, db) = db();
@@ -1243,10 +1264,16 @@ mod tests {
             content: Some((Path::new(BYTES), "c1:stale")),
             ..Change::default()
         };
+        let signals = crate::file_provider::signals_requested_on_this_thread();
 
         assert_eq!(
             modify(&db, &fake, item_id, &change),
             WriteOutcome::Conflict { item_id }
+        );
+        assert_eq!(
+            crate::file_provider::signals_requested_on_this_thread(),
+            signals + 1,
+            "the copy is announced"
         );
 
         assert_eq!(*fake.paths.borrow(), vec!["copy /Docs/a".to_string()]);
@@ -1409,6 +1436,39 @@ mod tests {
         let unknown = Fake::answering_all(vec![]);
         assert_eq!(delete(&db, &unknown, 9_999, "x"), WriteOutcome::Deleted);
         assert!(unknown.paths.borrow().is_empty());
+    }
+
+    /// After a give-up clear the item is still on Dropbox: a delete in that window is not answered as
+    /// done, or the file comes back with the reseed. Found in the CTO review of #240.
+    ///
+    /// Proof this test can fail: answering `Deleted` for any missing row, as before.
+    #[test]
+    fn a_delete_while_the_projection_is_rebuilt_is_asked_again() {
+        let (_dir, db) = db();
+        let (item_id, base) = with_file(&db);
+        db.project_clear().unwrap();
+        let fake = Fake::answering_all(vec![]);
+
+        assert_eq!(delete(&db, &fake, item_id, &base), WriteOutcome::Retry);
+    }
+
+    /// A tombstone is gone on Dropbox: done, with nothing sent. (Inside a removal hold it is asked
+    /// again instead; tests hold nothing, so that branch is checked live only.)
+    ///
+    /// Proof this test can fail: treating a tombstone as unknown answers `Retry`.
+    #[test]
+    fn a_delete_of_a_tombstone_is_done_without_calling_dropbox() {
+        let (_dir, db) = db();
+        let (item_id, base) = with_file(&db);
+        db.project_delta(&[DropboxEntry {
+            tag: "deleted".into(),
+            ..entry("file", "/Docs/a.txt", "x")
+        }])
+        .unwrap();
+        let fake = Fake::answering_all(vec![]);
+
+        assert_eq!(delete(&db, &fake, item_id, &base), WriteOutcome::Deleted);
+        assert!(fake.paths.borrow().is_empty());
     }
 
     #[test]

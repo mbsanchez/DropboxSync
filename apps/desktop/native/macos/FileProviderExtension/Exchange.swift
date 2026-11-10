@@ -24,6 +24,8 @@ struct ExchangePaths {
     func cancelled(_ id: String) -> URL { root.appendingPathComponent("requests/\(id).cancelled") }
     func staged(_ id: String) -> URL { root.appendingPathComponent("staging/\(id).data") }
     func outgoing(_ id: String) -> URL { root.appendingPathComponent("staging/\(id).up") }
+    /// Touched by the host every minute while it works on a write: the deadline counts from the last touch.
+    func alive(_ id: String) -> URL { root.appendingPathComponent("staging/\(id).alive") }
     func result(_ id: String) -> URL { root.appendingPathComponent("results/\(id).json") }
 }
 
@@ -151,7 +153,9 @@ final class ExchangeClient {
     private let deadline: TimeInterval
 
     /// `deadline` exists for a host that holds the lock and never answers. It is longer than the host's own
-    /// bound on a download, and shorter than the host's sweep.
+    /// bound on a download, and shorter than the host's sweep. While the host works on a write it touches
+    /// `staging/<id>.alive` every minute, and the deadline counts from the last touch, so a long upload is
+    /// not abandoned.
     init(
         paths: ExchangePaths,
         notification: String,
@@ -253,6 +257,10 @@ final class ExchangeClient {
             if let outgoing = outgoing {
                 do {
                     try FileManager.default.copyItem(at: outgoing, to: self.paths.outgoing(id))
+                    // The copy keeps the original's date, and the host's sweep goes by it: a file last
+                    // edited over an hour ago would be swept as soon as it is queued.
+                    try? FileManager.default.setAttributes(
+                        [.modificationDate: Date()], ofItemAtPath: self.paths.outgoing(id).path)
                 } catch {
                     done(.retry)
                     return
@@ -287,6 +295,14 @@ final class ExchangeClient {
         }
     }
 
+    /// `giveUpAt`, or `deadline` after the host last said it is still working on `id`, whichever is later.
+    private func extended(_ giveUpAt: Date, id: String) -> Date {
+        guard let touched = (try? FileManager.default.attributesOfItem(atPath: paths.alive(id).path))?[
+            .modificationDate] as? Date
+        else { return giveUpAt }
+        return max(giveUpAt, touched.addingTimeInterval(deadline))
+    }
+
     private func wait(
         id: String,
         giveUpAt: Date,
@@ -295,6 +311,7 @@ final class ExchangeClient {
     ) {
         if let data = try? Data(contentsOf: paths.result(id)) {
             try? FileManager.default.removeItem(at: paths.result(id))
+            try? FileManager.default.removeItem(at: paths.alive(id))
             let outcome = decodeExchangeResult(data, staged: paths.staged(id))
             if case .staged = outcome, !isCancelled() {
                 done(outcome)
@@ -312,9 +329,10 @@ final class ExchangeClient {
         } else if !hostIsRunning(lockPath: paths.lock) {
             early = .hostDown
         } else {
-            early = Date() >= giveUpAt ? .retry : nil
+            early = Date() >= extended(giveUpAt, id: id) ? .retry : nil
         }
         if let early = early {
+            try? FileManager.default.removeItem(at: paths.alive(id))
             let takenBack = (try? FileManager.default.removeItem(at: paths.request(id))) != nil
             if takenBack {
                 try? FileManager.default.removeItem(at: paths.outgoing(id))

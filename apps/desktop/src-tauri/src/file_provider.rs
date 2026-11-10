@@ -431,10 +431,21 @@ pub(crate) fn start(db: Arc<Db>) {
 /// throttling of every item that got one. Blocks on the framework, so the caller is not the sync thread;
 /// a caller that is uses [`signal_errors_resolved_soon`].
 pub(crate) fn signal_errors_resolved() {
-    if let Err(e) = system::signal_errors_resolved() {
-        tracing::warn!(error = %e, "File Provider: could not signal that errors resolved");
+    match system::signal_errors_resolved() {
+        Ok(()) => {}
+        // Nothing is throttled without a domain. *Start* runs the exchange, and its startup lift,
+        // just before it adds the domain, so this is every fresh start, not a fault (#239).
+        Err(e) if e == NOT_REGISTERED => {
+            tracing::debug!("File Provider: no domain yet, nothing to lift");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "File Provider: could not signal that errors resolved")
+        }
     }
 }
+
+/// What a call on the domain's manager answers when no domain of ours is registered.
+const NOT_REGISTERED: &str = "the domain is not registered";
 
 /// [`signal_errors_resolved`] on its own thread, for the sync thread: a projection that just became
 /// populated cures what `notPopulated` answered with `serverUnreachable`, and a working-set signal does
@@ -975,7 +986,7 @@ mod system {
                     }
                 }
                 if target.is_null() {
-                    return finish(&outer_tx, Err("the domain is not registered".to_string()));
+                    return finish(&outer_tx, Err(super::NOT_REGISTERED.to_string()));
                 }
                 // SAFETY: `+managerForDomain:` takes an NSFileProviderDomain and returns an autoreleased
                 // manager (nil only for a domain it cannot serve), live until this pool drains.
@@ -1567,7 +1578,7 @@ mod tests {
     #[test]
     fn a_signal_failure_is_logged_once_per_transition() {
         let log = SignalOutcomeLog::new();
-        let no_domain = Err("the domain is not registered".to_string());
+        let no_domain = Err(super::NOT_REGISTERED.to_string());
         assert_eq!(log.note(&Ok(())), SignalReport::Quiet);
         assert_eq!(log.note(&no_domain), SignalReport::Failing, "first failure");
         for _ in 0..50 {

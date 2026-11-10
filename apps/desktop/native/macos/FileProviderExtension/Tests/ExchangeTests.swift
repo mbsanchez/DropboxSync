@@ -193,6 +193,24 @@ extension ProjectionTests {
     expect(marked, "the host is told it was given up on")
     if let id = takenId.value { try? FileManager.default.removeItem(at: paths.cancelled(id)) }
 
+    // A write the host keeps touching outlives the deadline: a long upload is not given up on.
+    let slowId = LockIsolated()
+    answerNextRequest(with: #"{"version":1,"outcome":"written","item_id":11}"#) { id in
+        slowId.set(id)
+        for _ in 0..<12 {
+            FileManager.default.createFile(atPath: paths.alive(id).path, contents: nil)
+            try? FileManager.default.setAttributes(
+                [.modificationDate: Date()], ofItemAtPath: paths.alive(id).path)
+            usleep(100_000)
+        }
+    }
+    let slow = finish { client(deadline: 0.5).fetch(itemId: 11, isCancelled: { false }, done: $0) }
+    expect(slow == .written(itemId: 11), "a write still moving at the deadline gets its answer")
+    let slowMarked = slowId.value.map { FileManager.default.fileExists(atPath: paths.cancelled($0).path) } ?? true
+    expect(!slowMarked, "a write still moving is not given up on")
+    let slowAlive = slowId.value.map { FileManager.default.fileExists(atPath: paths.alive($0).path) } ?? true
+    expect(!slowAlive, "the answer clears the alive mark")
+
     // A request not yet taken leaves no marker.
     let before = requests()
     _ = finish { client(deadline: 0.05).fetch(itemId: 9, isCancelled: { false }, done: $0) }

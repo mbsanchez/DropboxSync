@@ -36,9 +36,14 @@ pub(crate) fn sidecar_pipeline() -> bool {
 /// (DBSYNC-98). What the folder pipeline knew goes with it, so nothing synced from the folder is taken
 /// for the domain's. The domain's own state stays: the projection, the pins and the delta cursor, which
 /// a Mac that ran both before the cutover still needs. The folder itself stays on disk, untouched: no
-/// migration or copy (DBSYNC-98). `true` when there was one.
+/// migration or copy (DBSYNC-98). The folder's mass-deletion breaker goes on every launch, folder or
+/// not, because nothing else clears it without the pipeline. `true` when there was a folder.
 pub(crate) fn forget_sync_folder(db: &crate::storage::db::Db) -> crate::error::AppResult<bool> {
-    if sidecar_pipeline() || db.get_sync_folder()?.is_none() {
+    if sidecar_pipeline() {
+        return Ok(false);
+    }
+    crate::sync_pipeline::forget_sync_folder_breaker(db)?;
+    if db.get_sync_folder()?.is_none() {
         return Ok(false);
     }
     db.forget_folder_state()?;

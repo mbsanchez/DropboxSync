@@ -9,6 +9,7 @@
 //! | `requests/<id>.json` | extension | a download request, appeared by rename |
 //! | `requests/<id>.cancelled` | extension | it stopped waiting for a request the host had taken |
 //! | `staging/<id>.data` | host | the downloaded bytes, in place before the result appears |
+//! | `staging/<id>.alive` | host | touched while a write is still moving: the extension keeps waiting |
 //! | `results/<id>.json` | host | how the request ended, appeared by rename |
 //!
 //! The kernel drops the lock when the process dies, however it dies, so the extension can tell a host
@@ -45,8 +46,9 @@ const EXCHANGE_VERSION: u32 = 1;
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// How often the sweep runs.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
-/// What the sweep leaves alone. Longer than any request can take: a download is bounded by a 300 s
-/// timeout, and the extension gives up on a request after 600 s.
+/// What the sweep leaves alone. Longer than a download can take (bounded by a 300 s timeout). An upload
+/// can take longer: its `.alive` is touched every minute, so the sweep leaves that, and the extension
+/// stamps `.up` with the time of the copy, so an hour of upload goes by before the sweep could take it.
 const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 /// How long after an `Offline` or `Auth` answer the host lifts the system's throttling, so the system
 /// asks again. Still offline, it gets the same answer and this comes round again.
@@ -225,6 +227,13 @@ impl Exchange {
     /// The bytes the extension sends up with a create.
     fn outgoing(&self, id: &str) -> PathBuf {
         self.staging().join(format!("{id}.up"))
+    }
+
+    /// Touched by a write's [`KeepAlive`] while the host works on it, so a long upload is not taken for a
+    /// host that never answers: the extension's 600 s count from the last touch, not from the request.
+    /// `Exchange.swift` must agree on the name.
+    fn alive(&self, id: &str) -> PathBuf {
+        self.staging().join(format!("{id}.alive"))
     }
 
     /// Takes the host's lock, waiting out an extension that is testing it at this moment. The handle
@@ -809,6 +818,7 @@ impl AnswerGuard<'_> {
     /// The final step of a request: nothing is left for a host to do if the extension gave up.
     fn answer(mut self, outcome: &Outcome) {
         self.answered = true;
+        let _ = fs::remove_file(self.exchange.alive(self.id));
         if self.exchange.take_cancelled(self.id) {
             let _ = fs::remove_file(self.exchange.staged(self.id));
             return;
@@ -827,6 +837,7 @@ impl AnswerGuard<'_> {
 impl Drop for AnswerGuard<'_> {
     fn drop(&mut self) {
         if !self.answered {
+            let _ = fs::remove_file(self.exchange.alive(self.id));
             let _ = fs::remove_file(self.exchange.staged(self.id));
             let _ = self.exchange.publish(self.id, &Outcome::Retry);
         }
@@ -842,7 +853,18 @@ fn handle(state: &AppState, exchange: &Exchange, id: &str, request: &Request) {
     // A write the extension stopped waiting for is not sent: the system sends it again, and a copy that
     // landed behind its back would collide with the retry.
     let abandoned = || exchange.cancel_marker(id).exists();
+    // A write can spend longer than the extension's deadline between two of those checks (an append's
+    // retries, the lane, a conflicted copy's own upload), so it says it is alive on a timer instead.
+    // Declared after the guard, so it stops before the guard answers and clears the mark.
+    let keep_alive = matches!(request.op, Op::Create | Op::Modify | Op::Delete)
+        .then(|| KeepAlive::start(exchange.alive(id)));
     let outcome = match request.op {
+        // Dropbox is not in Finder: the user left. A write would land in whatever account the host
+        // holds by then; the system asks again, and leaving removes the domain.
+        Op::Create | Op::Modify | Op::Delete if !state.db.projection_active() => {
+            let _ = fs::remove_file(exchange.outgoing(id));
+            Outcome::Retry
+        }
         Op::Fetch => {
             let fetcher = DropboxFetcher {
                 state: state.clone(),
@@ -925,7 +947,75 @@ fn handle(state: &AppState, exchange: &Exchange, id: &str, request: &Request) {
     {
         open_in_browser(&state.db, request.item_id);
     }
+    drop(keep_alive);
     guard.answer(&outcome);
+}
+
+/// How often a write in progress refreshes its `.alive` mark: well inside the extension's 600 s.
+const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(60);
+
+/// Touches a write's `.alive` mark now and every [`KEEP_ALIVE_EVERY`] until dropped. The drop waits for
+/// the thread, so no touch lands after it.
+struct KeepAlive {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeepAlive {
+    fn start(mark: PathBuf) -> Self {
+        Self::every(mark, KEEP_ALIVE_EVERY)
+    }
+
+    fn every(mark: PathBuf, period: Duration) -> Self {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("file-provider-keep-alive".into())
+            .spawn(move || loop {
+                touch(&mark);
+                if !matches!(
+                    stopped.recv_timeout(period),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+            });
+        match thread {
+            Ok(thread) => Self {
+                stop: Some(stop),
+                thread: Some(thread),
+            },
+            Err(e) => {
+                // The write still runs; only a long one risks being given up on, and then retried.
+                tracing::warn!(error = %e, "File Provider exchange: no keep-alive for a write");
+                Self {
+                    stop: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Creates `mark` or refreshes its modification time. A failure only shortens the extension's wait.
+fn touch(mark: &Path) {
+    let touched = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(mark)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    if let Err(e) = touched {
+        tracing::debug!(error = %e, "File Provider exchange: cannot mark a write as alive");
+    }
 }
 
 extern "C" {
@@ -1446,6 +1536,84 @@ mod tests {
         assert!(!w.exchange.staged(ID).exists());
         assert!(!w.exchange.cancel_marker(ID).exists());
         assert!(!w.exchange.results().join(format!("{ID}.json")).exists());
+    }
+
+    /// The extension counts its deadline from the last touch (`Exchange.swift`), so a write that keeps
+    /// touching is not given up on, however long one step takes; the touches stop with the keep-alive,
+    /// and the answer clears the mark.
+    ///
+    /// Proof this test can fail: a keep-alive that touches once fails the first assertion, and an answer
+    /// that leaves the mark fails the last. A drop that does not wait for the thread still passes: the
+    /// thread ends within moments anyway, and the race the join closes (a touch just after the answer
+    /// cleared the mark) is too narrow to hit here.
+    #[test]
+    fn a_write_keeps_its_alive_mark_fresh_until_it_answers() {
+        let w = world(b"hello");
+        let mark = w.exchange.alive(ID);
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let modified = || fs::metadata(&mark).unwrap().modified().unwrap();
+        let age = || {
+            File::options()
+                .write(true)
+                .open(&mark)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+
+        let keep_alive = KeepAlive::every(mark.clone(), Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
+        age();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            modified() > old + Duration::from_secs(3000),
+            "touched again"
+        );
+        drop(keep_alive);
+        age();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(modified(), old, "no touch after the drop");
+
+        AnswerGuard {
+            exchange: &w.exchange,
+            id: ID,
+            answered: false,
+        }
+        .answer(&Outcome::Retry);
+        assert!(!w.exchange.alive(ID).exists());
+    }
+
+    /// A write that reaches a host whose Dropbox is not in Finder (the user left) is not sent: it would
+    /// land in whatever account the host holds by then. CTO review of #240.
+    ///
+    /// Proof this test can fail: without the `projection_active` arm the create goes on to ask for a
+    /// token, which panics under test.
+    #[test]
+    fn a_write_without_dropbox_in_finder_is_asked_again_and_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::new_at(&dir.path().join("app.db")).unwrap();
+        let state = AppState {
+            secure_store: crate::storage::secure_store::SecureStore::new(),
+            db: Arc::new(db),
+            sync_engine: Arc::new(Mutex::new(crate::sync::engine::SyncEngine::new())),
+            token_cache: Arc::new(Mutex::new(None)),
+            scheduler_started: Arc::new(Mutex::new(false)),
+            oauth_listener: Arc::new(Mutex::new(None)),
+            sync_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            token_refresh_lock: Arc::new(Mutex::new(())),
+            http_client: crate::state::build_http_client(),
+        };
+        let exchange = Exchange::open(state.db.data_dir()).unwrap();
+        fs::write(exchange.outgoing(ID), b"bytes").unwrap();
+        let request: Request = serde_json::from_str(
+            r#"{"version":1,"op":"create","parent_item":0,"name":"a.txt","folder":false}"#,
+        )
+        .unwrap();
+
+        handle(&state, &exchange, ID, &request);
+
+        let result = fs::read_to_string(exchange.results().join(format!("{ID}.json"))).unwrap();
+        assert_eq!(result, r#"{"version":1,"outcome":"retry"}"#);
     }
 
     #[test]

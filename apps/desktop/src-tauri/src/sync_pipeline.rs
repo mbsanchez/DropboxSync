@@ -1934,6 +1934,20 @@ pub(crate) fn finder_question_on_screen(state: &AppState) -> AppResult<bool> {
     Ok(finder_deletions_held(state)? && !sync_folder_deletions_held(state)?)
 }
 
+/// Drops what the sync folder's breaker held, for a build without that pipeline (DBSYNC-98). Nothing
+/// else clears it there, since the scan and the sweep that would are off, and a question left held would
+/// keep the Finder one off screen for good (CTO review of #240).
+pub(crate) fn forget_sync_folder_breaker(db: &crate::storage::db::Db) -> AppResult<()> {
+    for key in [
+        MASS_DELETE_BLOCKED_SCAN_KEY,
+        MASS_DELETE_BLOCKED_REMOTE_KEY,
+        MASS_DELETE_OVERRIDE_KEY,
+    ] {
+        db.delete_app_config(key)?;
+    }
+    Ok(())
+}
+
 /// Whether the sync folder's scan or the remote sweep holds deletions.
 fn sync_folder_deletions_held(state: &AppState) -> AppResult<bool> {
     let scan_paused = state
@@ -3912,6 +3926,15 @@ pub(crate) fn resolve_conflict_internal(
     let Some(conflict) = state.db.get_unresolved_conflict(id)? else {
         return Ok(());
     };
+    // DBSYNC-98: without the folder pipeline a conflict is a Finder edit kept beside Dropbox's version,
+    // both already ordinary files in Finder. Keeping both is the only answer, and it leaves nothing to
+    // do but close the conflict; the other two are for the user to make in Finder (CTO review of #240).
+    if !crate::platform::sidecar_pipeline() {
+        return match action {
+            ConflictAction::KeepBoth => state.db.mark_conflict_resolved(id),
+            _ => Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string())),
+        };
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -4212,6 +4235,81 @@ mod tests {
         );
         assert_eq!(super::take_finder_answer(&state).unwrap(), Some(false));
         assert_eq!(super::take_finder_answer(&state).unwrap(), None);
+    }
+
+    /// A conflict from a Finder edit can be closed on macOS, where both files are already in Finder, and
+    /// nothing else is attempted there.
+    ///
+    /// Proof this test can fail: without the `sidecar_pipeline` arm every action reaches the folder code.
+    #[test]
+    fn a_finder_conflict_is_closed_by_keeping_both_and_nothing_else() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+        state
+            .db
+            .add_conflict(
+                "docs/a.txt",
+                "docs/a.txt",
+                "file_provider_stale_edit",
+                Some("docs/a (conflicted copy 1).txt"),
+                false,
+            )
+            .unwrap();
+        let id = state.db.list_recent_conflicts(10).unwrap()[0].id;
+
+        crate::platform::without_sidecar_pipeline(|| {
+            assert!(
+                super::resolve_conflict_internal(&state, id, super::ConflictAction::KeepLocal)
+                    .is_err()
+            );
+            assert!(
+                super::resolve_conflict_internal(&state, id, super::ConflictAction::UseRemote)
+                    .is_err()
+            );
+            assert!(state.db.get_unresolved_conflict(id).unwrap().is_some());
+            super::resolve_conflict_internal(&state, id, super::ConflictAction::KeepBoth).unwrap();
+        });
+        assert!(state.db.get_unresolved_conflict(id).unwrap().is_none());
+    }
+
+    /// A Mac past the cutover (no folder left) whose breaker still held a sync-folder question: the
+    /// startup forget drops it, so the Finder question shows and its answer counts. The case found in the
+    /// CTO review of #240; the first launch after the cutover, with the folder still set, goes the same
+    /// way.
+    ///
+    /// Proof this test can fail: without `forget_sync_folder_breaker`, or with it below the "no folder"
+    /// return, the keys stay and the answer is ignored.
+    #[test]
+    fn a_held_sync_folder_question_does_not_outlive_the_cutover() {
+        for folder_left in [false, true] {
+            let dir = tempdir().unwrap();
+            let state = build_state(dir.path());
+            if !folder_left {
+                state.db.clear_sync_folder().unwrap();
+            }
+            for key in [
+                super::MASS_DELETE_BLOCKED_SCAN_KEY,
+                super::MASS_DELETE_BLOCKED_REMOTE_KEY,
+                super::MASS_DELETE_OVERRIDE_KEY,
+            ] {
+                state.db.set_app_config(key, "1").unwrap();
+            }
+            crate::platform::without_sidecar_pipeline(|| {
+                crate::platform::forget_sync_folder(&state.db).unwrap();
+            });
+            for key in [
+                super::MASS_DELETE_BLOCKED_SCAN_KEY,
+                super::MASS_DELETE_BLOCKED_REMOTE_KEY,
+                super::MASS_DELETE_OVERRIDE_KEY,
+            ] {
+                assert_eq!(state.db.get_app_config(key).unwrap(), None, "{key}");
+            }
+            hold_finder(&state);
+
+            assert!(super::finder_question_on_screen(&state).unwrap());
+            super::answer_mass_deletion(&state, true, true).unwrap();
+            assert_eq!(super::take_finder_answer(&state).unwrap(), Some(true));
+        }
     }
 
     /// The banner shows the sync folder's question first. A click answers the question the user saw,

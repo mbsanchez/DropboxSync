@@ -765,20 +765,25 @@ function FlyoutApp() {
                     <div className="row-main">{conflict.localPath}</div>
                     <div className="row-sub error">{conflict.reason}</div>
                     <div className="conflict-actions">
-                      <button
-                        type="button"
-                        className="conflict-btn"
-                        onClick={() => onResolveConflict(conflict, "keep_local")}
-                      >
-                        Garder local
-                      </button>
-                      <button
-                        type="button"
-                        className={`conflict-btn${conflict.remoteDeleted ? " danger" : ""}`}
-                        onClick={() => onResolveConflict(conflict, "use_remote")}
-                      >
-                        {conflict.remoteDeleted ? "Supprimer local" : "Utiliser distant"}
-                      </button>
+                      {/* macOS: both files are already in Finder, so keeping both is the only answer here. */}
+                      {!fileProvider && (
+                        <button
+                          type="button"
+                          className="conflict-btn"
+                          onClick={() => onResolveConflict(conflict, "keep_local")}
+                        >
+                          Garder local
+                        </button>
+                      )}
+                      {!fileProvider && (
+                        <button
+                          type="button"
+                          className={`conflict-btn${conflict.remoteDeleted ? " danger" : ""}`}
+                          onClick={() => onResolveConflict(conflict, "use_remote")}
+                        >
+                          {conflict.remoteDeleted ? "Supprimer local" : "Utiliser distant"}
+                        </button>
+                      )}
                       {!conflict.remoteDeleted && (
                         <button
                           type="button"
