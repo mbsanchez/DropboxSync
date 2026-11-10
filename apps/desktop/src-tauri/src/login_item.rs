@@ -5,9 +5,10 @@
 //! nothing mirrors it. The one thing recorded is that the default was applied, so a user who turned
 //! it off is not turned back on at the next launch.
 //!
-//! This all belongs to the File Provider switch. With it off and never on, a launch changes nothing
-//! and Settings shows no toggle. Turning it off undoes what the default did, including when the app
-//! was set to open at login by hand, since that toggle exists only behind the same switch.
+//! This all belongs to File Provider being started (DBSYNC-98: onboarding's *Start*, undone by a
+//! disconnect; `switch_on` below). Never started, a launch changes nothing and Settings shows no toggle.
+//! Leaving undoes what the default did, including when the app was set to open at login by hand, since
+//! that toggle exists only while File Provider is started.
 
 use crate::storage::db::Db;
 

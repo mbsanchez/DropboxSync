@@ -874,7 +874,12 @@ impl<'a> Sequence<'a> {
     /// batch can move that folder away and put another at the path: the row would stay live under the
     /// folder that left, and under a tombstone once that one is deleted.
     fn reresolve_touched(&mut self) -> rusqlite::Result<()> {
-        let ids: HashSet<i64> = self.order.iter().chain(self.upserted.iter()).copied().collect();
+        let ids: HashSet<i64> = self
+            .order
+            .iter()
+            .chain(self.upserted.iter())
+            .copied()
+            .collect();
         let mut rows = Vec::new();
         for id in ids {
             if let Some(row) = load_row(self.conn, id)? {
@@ -1063,7 +1068,9 @@ impl<'a> Sequence<'a> {
             return Ok(());
         }
         for (folder, old_parent, new_parent) in moved {
-            if under_pin(self.conn, &pinned, *old_parent)? == under_pin(self.conn, &pinned, *new_parent)? {
+            if under_pin(self.conn, &pinned, *old_parent)?
+                == under_pin(self.conn, &pinned, *new_parent)?
+            {
                 continue;
             }
             let under: Vec<i64> = {
@@ -1215,8 +1222,8 @@ pub(super) fn clear_in(conn: &Connection) -> rusqlite::Result<ProjectionCommit> 
 // ── the Db surface ──────────────────────────────────────────────────────────────────────────────
 
 impl Db {
-    /// Whether the projection is being fed: macOS (this module exists nowhere else) AND the
-    /// `FileProviderEnabled` switch, which `file_provider::start` records once at startup.
+    /// Whether the projection is being fed: macOS (this module exists nowhere else) AND the user put
+    /// Dropbox in Finder, which `file_provider::start`, `enable` and `disable` record (DBSYNC-98).
     pub(crate) fn projection_active(&self) -> bool {
         self.projection_enabled
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1630,7 +1637,12 @@ impl Db {
             "SELECT item_id, name, is_folder, content_hash FROM fp_item WHERE parent_item = ?1 AND state = 0",
         )?;
         let rows = stmt.query_map([parent_item], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?, r.get::<_, String>(3)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })?;
         for row in rows {
             let (id, child, is_folder, hash) = row?;
@@ -1654,7 +1666,9 @@ impl Db {
     pub(crate) fn projection_folder_hides_content(&self, item_id: i64) -> AppResult<bool> {
         let conn = self.read_conn()?;
         let path: Option<String> = conn
-            .prepare_cached("SELECT path_lower FROM fp_item WHERE item_id = ?1 AND state = 0 AND is_folder = 1")?
+            .prepare_cached(
+                "SELECT path_lower FROM fp_item WHERE item_id = ?1 AND state = 0 AND is_folder = 1",
+            )?
             .query_row([item_id], |r| r.get(0))
             .optional()?;
         let Some(path) = path else {
@@ -1811,8 +1825,10 @@ impl Db {
             if changed > 0 {
                 for (id, row_state) in &subtree {
                     if *row_state == STATE_LIVE {
-                        conn.prepare_cached("UPDATE fp_item SET changed_seq = ?2 WHERE item_id = ?1")?
-                            .execute(params![id, st.stamp()])?;
+                        conn.prepare_cached(
+                            "UPDATE fp_item SET changed_seq = ?2 WHERE item_id = ?1",
+                        )?
+                        .execute(params![id, st.stamp()])?;
                     }
                 }
             }
@@ -1846,7 +1862,9 @@ impl Db {
                  WHERE changed_seq BETWEEN ?1 AND ?2 AND state = 0 AND is_folder = 0
                  ORDER BY item_id",
             )?;
-            let found = stmt.query_map(params![first, seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let found = stmt.query_map(params![first, seq], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
             found.collect::<rusqlite::Result<_>>()?
         };
         let mut out = Vec::new();
@@ -1858,7 +1876,9 @@ impl Db {
             let mut reachable = true;
             while at != ROOT_ITEM {
                 let row: Option<(i64, String, i64)> = conn
-                    .prepare_cached("SELECT parent_item, name, state FROM fp_item WHERE item_id = ?1")?
+                    .prepare_cached(
+                        "SELECT parent_item, name, state FROM fp_item WHERE item_id = ?1",
+                    )?
                     .query_row([at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                     .optional()?;
                 match row {
@@ -3589,14 +3609,34 @@ mod tests {
     #[test]
     fn a_child_follows_the_folder_now_at_its_path() {
         let w = world(true, true);
-        run(&w, vec![dir("/e", "id:E"), dir("/e/D", "id:D1"), file("/e/D/a", "id:F", "r1")]);
+        run(
+            &w,
+            vec![
+                dir("/e", "id:E"),
+                dir("/e/D", "id:D1"),
+                file("/e/D/a", "id:F", "r1"),
+            ],
+        );
 
-        run(&w, vec![file("/e/D/a", "id:F", "r1"), dir("/D", "id:D1"), dir("/e/D", "id:D2")]);
+        run(
+            &w,
+            vec![
+                file("/e/D/a", "id:F", "r1"),
+                dir("/D", "id:D1"),
+                dir("/e/D", "id:D2"),
+            ],
+        );
 
         let d2 = row(w.db(), "id:D2").item_id;
-        assert_eq!((row(w.db(), "id:F").parent, row(w.db(), "id:F").state), (d2, STATE_LIVE));
+        assert_eq!(
+            (row(w.db(), "id:F").parent, row(w.db(), "id:F").state),
+            (d2, STATE_LIVE)
+        );
         run(&w, vec![gone("/D")]);
-        assert_eq!((row(w.db(), "id:F").parent, row(w.db(), "id:F").state), (d2, STATE_LIVE));
+        assert_eq!(
+            (row(w.db(), "id:F").parent, row(w.db(), "id:F").state),
+            (d2, STATE_LIVE)
+        );
     }
 
     /// Deferred from the 2a/2b review (#236): a file at `P` leaves nothing under `P/`, also when the
@@ -5625,7 +5665,11 @@ mod tests {
     }
 
     fn row_seq(db: &Db, item_id: i64) -> i64 {
-        all_rows(db).into_iter().find(|r| r.item_id == item_id).unwrap().seq
+        all_rows(db)
+            .into_iter()
+            .find(|r| r.item_id == item_id)
+            .unwrap()
+            .seq
     }
 
     /// A pin that changes takes one sequence value, on the item's own row, so the system reads that item
@@ -5661,7 +5705,7 @@ mod tests {
 
         assert!(!w.db().set_projection_pinned(id, true).unwrap());
         assert!(!w.db().projection_pinned(id).unwrap());
-        assert_eq!(w.db().set_projection_pinned(9_999, true).unwrap(), false);
+        assert!(!w.db().set_projection_pinned(9_999, true).unwrap());
     }
 
     /// A pin goes with its row: a snapshot that no longer lists the item drops it, so the item coming back
@@ -5675,9 +5719,15 @@ mod tests {
         db.set_projection_pinned(id, true).unwrap();
         seed(&w, vec![file("/b.txt", PIN_B, "r1")]).unwrap();
         run(&w, vec![file("/a.txt", PIN_A, "r2")]);
-        assert_eq!(db.projection_item_id("/a.txt"), Some(id), "the same identity came back");
-        assert!(!db.projection_pinned(id).unwrap(), "after a snapshot without it");
-
+        assert_eq!(
+            db.projection_item_id("/a.txt"),
+            Some(id),
+            "the same identity came back"
+        );
+        assert!(
+            !db.projection_pinned(id).unwrap(),
+            "after a snapshot without it"
+        );
     }
 
     /// Found in review: a recovery clear (a failed snapshot, the delta failing) dropped every pin, and the
@@ -5694,10 +5744,16 @@ mod tests {
         db.project_clear().unwrap();
         seed(&w, vec![file("/a.txt", PIN_A, "r3")]).unwrap();
         assert_eq!(db.projection_item_id("/a.txt"), Some(id));
-        assert!(db.projection_pinned(id).unwrap(), "after a clear and the reseed");
+        assert!(
+            db.projection_pinned(id).unwrap(),
+            "after a clear and the reseed"
+        );
 
         db.reset_sync_state().unwrap();
-        assert!(!db.projection_pinned(id).unwrap(), "after leaving the account");
+        assert!(
+            !db.projection_pinned(id).unwrap(),
+            "after leaving the account"
+        );
     }
 
     /// Found in review: what is under a pinned folder kept its old version, so the system never learned
@@ -5725,7 +5781,10 @@ mod tests {
         let before = seq(db);
 
         db.set_projection_pinned(top, true).unwrap();
-        assert!(row_seq(db, a) > before && row_seq(db, b) > before, "the children are read again");
+        assert!(
+            row_seq(db, a) > before && row_seq(db, b) > before,
+            "the children are read again"
+        );
 
         db.set_projection_pinned(top, false).unwrap();
         assert!(!db.projection_pinned(top).unwrap());
@@ -5741,7 +5800,11 @@ mod tests {
         TOMBSTONE_CAP_OVERRIDE.with(|c| c.set(Some(0)));
         run(&w, vec![gone("/a.txt")]);
         TOMBSTONE_CAP_OVERRIDE.with(|c| c.set(None));
-        assert_eq!(db.projection_row_state(id).unwrap(), None, "the tombstone was pruned");
+        assert_eq!(
+            db.projection_row_state(id).unwrap(),
+            None,
+            "the tombstone was pruned"
+        );
 
         run(&w, vec![file("/a.txt", PIN_A, "r2")]);
 
@@ -5773,7 +5836,10 @@ mod tests {
             db.projection_live_files_under(top).unwrap(),
             vec!["Top/Sub/Deep.txt".to_string(), "Top/a.txt".to_string()]
         );
-        assert_eq!(db.projection_live_files_under(deep).unwrap(), vec!["Top/Sub/Deep.txt".to_string()]);
+        assert_eq!(
+            db.projection_live_files_under(deep).unwrap(),
+            vec!["Top/Sub/Deep.txt".to_string()]
+        );
         let gone_id = db.projection_item_id("/top/gone.txt").unwrap();
         assert!(db.projection_live_files_under(gone_id).unwrap().is_empty());
     }
@@ -5819,7 +5885,13 @@ mod tests {
             // folder-only delta re-resolves the rows under it by itself, so this checks the pinned case.)
             if pin {
                 let before = row_seq(db, x);
-                run(&w, vec![gone("/Top/Other"), dir("/Other", "id:t00000000000PINDIR032")]);
+                run(
+                    &w,
+                    vec![
+                        gone("/Top/Other"),
+                        dir("/Other", "id:t00000000000PINDIR032"),
+                    ],
+                );
                 assert!(row_seq(db, x) > before, "moved out");
             }
         }
@@ -5842,7 +5914,8 @@ mod tests {
             ],
         );
         let db = w.db();
-        db.set_projection_pinned(db.projection_item_id("/pinned").unwrap(), true).unwrap();
+        db.set_projection_pinned(db.projection_item_id("/pinned").unwrap(), true)
+            .unwrap();
         let y = db.projection_item_id("/a/y.txt").unwrap();
         let before = row_seq(db, y);
 
@@ -5893,8 +5966,14 @@ mod tests {
 
         assert_eq!(
             db.projection_pinned_files_stamped(after, rows).unwrap(),
-            vec![(top, "Top/a.txt".to_string()), (top, "Top/new.txt".to_string())]
+            vec![
+                (top, "Top/a.txt".to_string()),
+                (top, "Top/new.txt".to_string())
+            ]
         );
-        assert!(db.projection_pinned_files_stamped(after, 0).unwrap().is_empty());
+        assert!(db
+            .projection_pinned_files_stamped(after, 0)
+            .unwrap()
+            .is_empty());
     }
 }

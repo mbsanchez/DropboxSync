@@ -26,6 +26,7 @@ mod oauth_listener;
 mod open_handlers;
 mod overlay_state;
 mod path_util;
+mod platform;
 mod remote_index;
 mod remote_longpoll;
 mod run_events;
@@ -205,6 +206,12 @@ pub fn run() {
         logging::report_startup_failure(&format!("failed to initialize sqlite db: {e}"));
         panic!("failed to initialize sqlite db: {e}");
     });
+    // DBSYNC-98: a macOS install from before the cutover forgets its sync folder before anything reads it.
+    match platform::forget_sync_folder(&db) {
+        Ok(true) => tracing::info!("forgot the sync folder: this build keeps the files in Finder"),
+        Ok(false) => {}
+        Err(e) => tracing::error!(error = %e, "could not forget the sync folder"),
+    }
     let mut sync_engine = SyncEngine::new();
     if let Ok(Some(folder)) = db.get_sync_folder() {
         sync_engine.set_tracked_path(folder);
@@ -442,8 +449,8 @@ pub fn run() {
 
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
 
-                // DBSYNC-95: the File Provider domain, behind the `FileProviderEnabled` defaults key.
-                // Off and never registered is a no-op, so this build behaves as before.
+                // DBSYNC-95/98: the File Provider domain, added when the user started it in onboarding
+                // and removed when they disconnected (`file_provider`).
                 #[cfg(target_os = "macos")]
                 {
                     crate::file_provider::start(state.db.clone());
@@ -499,6 +506,7 @@ pub fn run() {
             finder_extension::open_finder_extension_settings,
             finder_extension::restart_finder,
             commands::pick_sync_folder_dialog,
+            commands::start_file_provider,
             commands::start_background_scheduler,
             commands::hide_main_window,
             commands::show_main_window,

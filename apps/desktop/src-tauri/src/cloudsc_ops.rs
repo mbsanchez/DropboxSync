@@ -31,6 +31,10 @@ pub(crate) fn index_remote_folder_children_as_cloudsc_placeholders_internal(
     remote_folder_path_display: &str,
     local_dir: &Path,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let token = get_access_token(state)?;
     let include_prefixes = parse_prefix_csv(state.db.get_include_prefixes_csv()?);
     let exclude_prefixes = parse_prefix_csv(state.db.get_exclude_prefixes_csv()?);
@@ -769,6 +773,10 @@ fn emit_placeholder_changed(created: &[String], removed: &[String]) {
 pub(crate) fn index_materialized_folders_as_cloudsc_placeholders_internal(
     state: &AppState,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let sync_folder_str = state
         .db
         .get_sync_folder()?
@@ -829,6 +837,10 @@ pub(crate) fn list_cloudsc_placeholders(
     state: &AppState,
     limit: usize,
 ) -> AppResult<Vec<CloudscPlaceholderInfo>> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(Vec::new());
+    }
     let sync_folder_str = state
         .db
         .get_sync_folder()?
@@ -932,6 +944,10 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
     state: &AppState,
     placeholder_local_rel_path: &str,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     let sync_folder = state
         .db
         .get_sync_folder()?
@@ -997,6 +1013,10 @@ pub(crate) fn hydrate_cloudsc_placeholder_internal(
 /// suppresses any remote delete. A file with unsynced local changes is refused
 /// (single file) or skipped (folder) so no data is lost.
 pub(crate) fn dehydrate_path_internal(state: &AppState, rel: &str) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     let sync_folder = state
         .db
         .get_sync_folder()?
@@ -1268,6 +1288,10 @@ fn dehydrate_file_atomic(
 /// couldn't be read. Does not touch the local index; a recovered `original` is
 /// picked up as a normal file by the next scan. Returns the count of asides handled.
 pub(crate) fn recover_stray_dehydrate_asides(state: &AppState) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let Some(sync_folder) = state.db.get_sync_folder()? else {
         return Ok(0);
     };
@@ -2264,6 +2288,121 @@ mod tests {
             token_refresh_lock: Arc::new(Mutex::new(())),
             http_client: crate::state::build_http_client(),
         }
+    }
+
+    /// DBSYNC-98: without the sync-folder pipeline (macOS) none of its entry points touches the folder or
+    /// the index, even with a folder stored and work waiting in it: an aside to recover, a new file to
+    /// scan, a synced file to free, a placeholder to open.
+    ///
+    /// Proof this test can fail: removing any one gate makes its call do the work it does with the
+    /// pipeline, which the matching assertion catches (a recovered file, a scanned row, an `Ok` or a
+    /// network error instead of the refusal, an `overlay_state.json`).
+    #[test]
+    fn without_the_pipeline_no_entry_point_touches_the_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sync = tmp.path().join("synced");
+        let state = build_state(&sync);
+        let aside = sync.join(format!("foo.txt{DEHYDRATE_ASIDE_SUFFIX}"));
+        std::fs::write(&aside, b"aside").unwrap();
+        std::fs::write(sync.join("new.txt"), b"new").unwrap();
+        std::fs::write(sync.join("a.txt"), b"hello").unwrap();
+        let (h, _, _) = hash_file(&sync.join("a.txt")).unwrap();
+        state.db.upsert_local_file("a.txt", &h, 5, 0).unwrap();
+        state
+            .db
+            .upsert_remote_file("a.txt", &h, "rev", 0, None)
+            .unwrap();
+        std::fs::write(sync.join("b.txt.cloudsc"), b"{}").unwrap();
+        let refused = crate::platform::NO_SIDECARS;
+        let _pending = crate::fs_watcher::pending_test_guard();
+        let _ = crate::fs_watcher::take_pending();
+        crate::fs_watcher::remember_dropped(&["moved.txt".to_string()]);
+
+        crate::platform::without_sidecar_pipeline(|| {
+            assert_eq!(recover_stray_dehydrate_asides(&state).unwrap(), 0);
+            assert_eq!(crate::fs_watcher::arm_watcher(&state).ok(), Some(()));
+            assert!(!crate::fs_watcher::is_armed(), "no watcher");
+            assert_eq!(
+                crate::sync_pipeline::scan_local_changes_only(&state).unwrap(),
+                0
+            );
+            assert_eq!(
+                crate::sync_pipeline::scan_local_changes_internal(&state).unwrap(),
+                0
+            );
+            assert_eq!(
+                crate::fs_watcher::take_pending(),
+                ["moved.txt".to_string()],
+                "the watcher's deferred paths are not drained"
+            );
+            assert_eq!(
+                crate::sync_pipeline::process_changed_paths(&state, &["new.txt".to_string()])
+                    .unwrap(),
+                0
+            );
+            let absent = tmp.path().join("absent");
+            state.db.set_sync_folder(&absent.to_string_lossy()).unwrap();
+            assert_eq!(
+                index_materialized_folders_as_cloudsc_placeholders_internal(&state).unwrap(),
+                0
+            );
+            assert!(!absent.exists(), "the folder is not created");
+            state.db.set_sync_folder(&sync.to_string_lossy()).unwrap();
+            assert_eq!(
+                index_remote_folder_children_as_cloudsc_placeholders_internal(&state, "", &sync)
+                    .unwrap(),
+                0
+            );
+            for result in [
+                dehydrate_path_internal(&state, "a.txt"),
+                hydrate_cloudsc_placeholder_internal(&state, "b.txt.cloudsc"),
+                crate::dropbox_transfer::hydrate_remote_folder_internal(&state, "/f"),
+            ] {
+                assert!(
+                    matches!(&result, Err(AppError::Sync(m)) if m == refused),
+                    "{result:?}"
+                );
+            }
+            assert!(list_cloudsc_placeholders(&state, 10).unwrap().is_empty());
+            let download = crate::dropbox_transfer::download_remote_file_internal(&state, "/a.txt");
+            assert!(
+                matches!(&download, Err(AppError::Sync(m)) if m == refused),
+                "{download:?}"
+            );
+            state
+                .db
+                .enqueue_job("upload", None, Some("new.txt"))
+                .unwrap();
+            assert!(!crate::sync_pipeline::process_sync_queue_internal(&state).unwrap());
+            crate::sync_pipeline::full_sync_cycle(&state);
+            let action =
+                crate::shell_actions::dispatch_action(&state, "hydrate", &sync.join("a.txt"));
+            assert!(
+                matches!(&action, Err(AppError::Sync(m)) if m == refused),
+                "{action:?}"
+            );
+            crate::overlay_state::refresh_overlay_state_internal(&state);
+        });
+
+        assert!(aside.exists(), "the aside is not recovered");
+        assert!(sync.join("a.txt").exists(), "the synced file is not freed");
+        assert!(
+            state.db.get_local_file("new.txt").unwrap().is_none(),
+            "nothing scanned"
+        );
+        assert!(
+            state
+                .db
+                .list_recent_jobs(10)
+                .unwrap()
+                .iter()
+                .all(|j| j.status == "queued"),
+            "no job ran"
+        );
+        assert!(
+            !state.db.data_dir().join("overlay_state.json").exists(),
+            "no overlay state for Finder Sync"
+        );
     }
 
     #[test]

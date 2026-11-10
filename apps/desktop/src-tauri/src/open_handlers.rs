@@ -84,6 +84,14 @@ pub(crate) fn cloudsc_paths_from_current_exe_args() -> Vec<PathBuf> {
 }
 
 pub(crate) fn handle_cloudsc_paths_from_os(app_handle: &AppHandle, paths: Vec<PathBuf>) {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        tracing::warn!(
+            count = paths.len(),
+            "a .cloudsc open on a build without sidecars; ignored"
+        );
+        return;
+    }
     let Some(state) = app_handle.try_state::<AppState>() else {
         tracing::warn!("handle_cloudsc_paths_from_os: AppState not available");
         return;

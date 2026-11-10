@@ -121,8 +121,8 @@ pub struct Db {
     /// Keys of "log this once per condition" lines already written by this process
     /// (DBSYNC-114: the exclusion pass must not repeat the same kept-file WARN every tick).
     logged_once: Mutex<HashSet<String>>,
-    /// Whether the File Provider projection is being fed: the `FileProviderEnabled` switch, set once at
-    /// startup by `file_provider::start` (DBSYNC-95). Off by default, and per instance rather than a
+    /// Whether the File Provider projection is being fed: whether the user put Dropbox in Finder, set at
+    /// startup by `file_provider::start` and changed by onboarding and a disconnect (DBSYNC-95, DBSYNC-98). Off by default, and per instance rather than a
     /// process global so a test that turns it on cannot leak into a parallel one. The one reader is
     /// [`Db::projection_active`].
     #[cfg(target_os = "macos")]
@@ -426,18 +426,7 @@ impl Db {
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM local_file_index", [])?;
-        tx.execute("DELETE FROM remote_file_index", [])?;
-        tx.execute("DELETE FROM sync_jobs", [])?;
-        // DBSYNC-99's table. A surviving refusal names relative paths, so after a folder
-        // change a colliding pair suppresses a legitimate rename correlation in the NEW
-        // folder. Added here when the table was added; the next table needs the same line.
-        tx.execute("DELETE FROM refused_moves", [])?;
-        // DBSYNC-114: paths whose upload still owes the clobber guard. Path-keyed like the
-        // index it guards, so it goes with it.
-        tx.execute("DELETE FROM unconfirmed_uploads", [])?;
-        tx.execute("DELETE FROM sync_conflicts", [])?;
-        tx.execute("DELETE FROM known_folders", [])?;
+        delete_folder_state(&tx)?;
         // DBSYNC-95: the File Provider projection mirrors the remote tree of the account that was
         // just left, so it goes with the cursor below, and its anchors expire. A no-op when it holds
         // nothing, which is always the case with the switch off.
@@ -449,6 +438,20 @@ impl Db {
             "DELETE FROM app_config WHERE key = 'remote_delta_cursor'",
             [],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forgets what the sync-folder pipeline knew, and nothing else: the File Provider projection, its
+    /// pins and the delta cursor stay (DBSYNC-98). For a Mac that leaves the folder for the domain, where
+    /// a reset would also drop every *Make Available Offline* the user had set.
+    pub fn forget_folder_state(&self) -> AppResult<()> {
+        let mut conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        delete_folder_state(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -683,7 +686,6 @@ impl Db {
 
     /// Removes one `app_config` key; a key that is not there is not an error. Used by the File
     /// Provider breadcrumb (DBSYNC-95), whose absence means "no domain was registered".
-    #[cfg(target_os = "macos")]
     pub fn delete_app_config(&self, key: &str) -> AppResult<()> {
         let conn = self
             .write
@@ -3482,6 +3484,23 @@ pub(super) fn db_path() -> AppResult<PathBuf> {
     let mut path = app_data_dir()?;
     path.push("app.db");
     Ok(path)
+}
+
+/// The sync-folder pipeline's tables (`reset_sync_state`, `forget_folder_state`).
+fn delete_folder_state(tx: &rusqlite::Transaction<'_>) -> AppResult<()> {
+    tx.execute("DELETE FROM local_file_index", [])?;
+    tx.execute("DELETE FROM remote_file_index", [])?;
+    tx.execute("DELETE FROM sync_jobs", [])?;
+    // DBSYNC-99's table. A surviving refusal names relative paths, so after a folder
+    // change a colliding pair suppresses a legitimate rename correlation in the NEW
+    // folder. Added here when the table was added; the next table needs the same line.
+    tx.execute("DELETE FROM refused_moves", [])?;
+    // DBSYNC-114: paths whose upload still owes the clobber guard. Path-keyed like the
+    // index it guards, so it goes with it.
+    tx.execute("DELETE FROM unconfirmed_uploads", [])?;
+    tx.execute("DELETE FROM sync_conflicts", [])?;
+    tx.execute("DELETE FROM known_folders", [])?;
+    Ok(())
 }
 
 #[cfg(test)]

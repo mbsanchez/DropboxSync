@@ -1,41 +1,42 @@
-//! Registers and removes the File Provider domain (DBSYNC-95 slice 1, ADR-0004). macOS only.
+//! Registers and removes the File Provider domain (DBSYNC-95, DBSYNC-98, ADR-0004). macOS only.
 //!
-//! Until the cutover slice the domain sits behind a switch, so `main` keeps today's sidecar path:
+//! On macOS the domain is how the files reach Finder: there is no sync folder (`platform`). The user
+//! starts it once, in onboarding, after being told that the files download again from Dropbox
+//! ([`enable`]), and disconnecting Dropbox removes it ([`disable`]). What records that the user started
+//! it is the breadcrumb, an `app_config` row; each launch makes the system match it:
 //!
-//! | switch | breadcrumb | action |
+//! | breadcrumb | domain registered | action |
 //! | --- | --- | --- |
-//! | off | none | nothing: **zero File Provider calls**, exactly today's behaviour |
-//! | off | present | remove the domain, clear the breadcrumb |
-//! | on | any | set the breadcrumb, add the domain (idempotent) |
+//! | present | any | add the domain (idempotent) |
+//! | absent | yes | remove it: a disconnect whose removal failed |
+//! | absent | no | nothing |
 //!
-//! The switch is the per-user defaults key `FileProviderEnabled` in the app's defaults domain, read once
-//! at startup (`defaults write com.mobsanchez.dropboxsyncdesktop FileProviderEnabled -bool YES`). It is
-//! not an environment variable: a Finder or login-item launch never inherits one. The breadcrumb is an
-//! `app_config` row that records "this install registered a domain", so turning the switch off removes
-//! the domain, while an install that never opted in makes no File Provider call at all.
+//! [`disable`] clears the breadcrumb BEFORE it removes the domain, so a removal that fails is retried at
+//! the next launch by the second row. [`enable`] writes it BEFORE it adds the domain, so a crash between
+//! the two adds the domain at the next launch.
 //!
 //! The calls go through `objc2` + `block2` (no Swift shim); `build.rs` links `FileProvider.framework`,
 //! without which `AnyClass::get` silently returns `None`. Nothing in this module's tests reaches the
-//! framework or the real user defaults: the defaults read is `None` under `cfg(test)`, and the decision
-//! and the sequencing are written against the `DomainOps` and `Breadcrumb` traits that tests replace.
+//! framework: the decision and the sequencing are written against the `DomainOps` and `Breadcrumb`
+//! traits that tests replace.
 //!
 //! ## The projection (DBSYNC-95 slice 2a)
 //!
-//! The same switch also decides whether the host feeds the projection of the remote tree that the
-//! extension reads (`storage/db/projection.rs`). `start` records it on the `Db`
-//! (`Db::projection_active`), clears the projection when it is off and holds something, and, when it is
-//! on and the projection is unpopulated, leaves the stored cursor alone (`usable_delta_cursor` treats it
-//! as absent, so the loop seeds, and a failed seed falls back to it). After a commit the sync thread calls [`signal_working_set`], which
-//! only hands a unit to a worker thread: the worker resolves the domain and asks the system to
-//! re-enumerate the working set, and the sync thread never waits for it.
+//! The breadcrumb also decides whether the host feeds the projection of the remote tree that the
+//! extension reads (`storage/db/projection.rs`). `start` and `enable` record it on the `Db`
+//! (`Db::projection_active`). `start` clears the projection when it is off and holds something, and,
+//! when it is on and the projection is unpopulated, leaves the stored cursor alone
+//! (`usable_delta_cursor` treats it as absent, so the loop seeds, and a failed seed falls back to it).
+//! After a commit the sync thread calls [`signal_working_set`], which only hands a unit to a worker
+//! thread: the worker resolves the domain and asks the system to re-enumerate the working set, and the
+//! sync thread never waits for it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::state::AppState;
 use crate::storage::db::Db;
 
-/// The per-user defaults key that turns the domain on. Documented in `FileProviderExtension/README.md`.
-pub(crate) const SWITCH_KEY: &str = "FileProviderEnabled";
 /// `app_config` key of the breadcrumb.
 pub(crate) const BREADCRUMB_KEY: &str = "file_provider_domain_registered";
 /// The one value that means "present". Anything else, including an empty string, is "absent".
@@ -44,21 +45,6 @@ pub(crate) const BREADCRUMB_VALUE: &str = "registered";
 pub(crate) const DOMAIN_ID: &str = "dropbox-sync";
 /// The name shown in Finder's sidebar and used for the `~/Library/CloudStorage` folder.
 pub(crate) const DOMAIN_DISPLAY_NAME: &str = "DropboxSync";
-
-/// What a defaults lookup found. Only an explicit boolean `true` turns the switch on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DefaultsValue {
-    Absent,
-    Bool(bool),
-    /// A string, number or anything else stored under the key: not an explicit boolean.
-    Other,
-}
-
-/// The switch from a defaults lookup: on only for an explicit `true`. A stray string such as `"YES"`
-/// written with `-string` is `Other` and stays off, so the switch is never on by accident.
-pub(crate) fn switch_from_defaults(value: DefaultsValue) -> bool {
-    value == DefaultsValue::Bool(true)
-}
 
 /// Whether an `app_config` value is the breadcrumb. Decided once, here: exactly `BREADCRUMB_VALUE`.
 pub(crate) fn breadcrumb_present(value: Option<&str>) -> bool {
@@ -75,9 +61,9 @@ pub(crate) enum DomainAction {
     Remove,
 }
 
-/// The whole decision table, as a pure function.
-pub(crate) fn decide_domain_action(switch_on: bool, breadcrumb: bool) -> DomainAction {
-    match (switch_on, breadcrumb) {
+/// The whole decision table, as a pure function. `registered` is asked only without a breadcrumb.
+pub(crate) fn decide_domain_action(breadcrumb: bool, registered: bool) -> DomainAction {
+    match (breadcrumb, registered) {
         (true, _) => DomainAction::Add,
         (false, true) => DomainAction::Remove,
         (false, false) => DomainAction::None,
@@ -112,6 +98,9 @@ pub(crate) trait DomainOps {
     fn add(&self) -> Result<(), String>;
     /// Removes the domain in the given mode; a domain that is not registered counts as removed.
     fn remove(&self, mode: RemovalMode) -> Result<(), String>;
+    fn is_registered(&self) -> Result<bool, String>;
+    /// The domain's root folder as the user sees it (`getUserVisibleURL` of the root container).
+    fn visible_root(&self) -> Result<String, String>;
 }
 
 /// The breadcrumb, behind a trait so the sequencing can be tested with a real or a failing store.
@@ -149,58 +138,53 @@ pub(crate) enum Outcome {
     Failed(DomainAction, String),
 }
 
-/// Reads the breadcrumb, decides, logs the decision once, and carries it out.
-///
-/// Ordering matters. On add the breadcrumb is written BEFORE the domain is added, so a crash between
-/// the two leaves a breadcrumb for a domain that may exist (and a later switch-off removes it) rather
-/// than a domain nothing remembers. On remove the breadcrumb is cleared only AFTER the domain is gone,
-/// so a failed removal is retried at the next launch instead of being forgotten.
-pub(crate) fn reconcile(switch_on: bool, crumb: &impl Breadcrumb, ops: &impl DomainOps) -> Outcome {
+/// Reads the breadcrumb, decides, logs the decision once, and carries it out. The breadcrumb is not
+/// written here: [`enable`] and [`disable`] own it, so a launch only makes the system match it.
+pub(crate) fn reconcile(crumb: &impl Breadcrumb, ops: &impl DomainOps) -> Outcome {
     let present = match crumb.is_set() {
         Ok(p) => p,
         Err(e) => {
-            // Without the breadcrumb the off path cannot tell "never opted in" from "must remove".
-            tracing::error!(error = %e, switch_on, "File Provider: cannot read the breadcrumb; making no File Provider call");
+            // Without the breadcrumb a launch cannot tell "started" from "never started" or "left".
+            tracing::error!(error = %e, "File Provider: cannot read the breadcrumb; making no File Provider call");
             return Outcome::Untouched;
         }
     };
-    let action = decide_domain_action(switch_on, present);
+    let registered = if present {
+        false
+    } else {
+        match ops.is_registered() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "File Provider: cannot list the domains; making no other call");
+                return Outcome::Untouched;
+            }
+        }
+    };
+    let action = decide_domain_action(present, registered);
     tracing::info!(
-        switch_on,
         breadcrumb = present,
+        registered,
         ?action,
         "File Provider startup decision"
     );
     match action {
         DomainAction::None => Outcome::Untouched,
-        DomainAction::Add => {
-            if let Err(e) = crumb.set() {
-                tracing::error!(error = %e, "File Provider: cannot record the breadcrumb; not adding the domain");
-                return Outcome::Failed(action, e);
+        DomainAction::Add => match ops.add() {
+            Ok(()) => {
+                tracing::info!("File Provider: domain added");
+                Outcome::Added
             }
-            match ops.add() {
-                Ok(()) => {
-                    tracing::info!("File Provider: domain added");
-                    Outcome::Added
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "File Provider: adding the domain failed");
-                    Outcome::Failed(action, e)
-                }
+            Err(e) => {
+                tracing::error!(error = %e, "File Provider: adding the domain failed");
+                Outcome::Failed(action, e)
             }
-        }
-        // Switching the feature off must never discard the user's unsynced local changes.
+        },
+        // Leaving must never discard the user's unsynced local changes.
         DomainAction::Remove => match ops.remove(RemovalMode::PreserveDirtyUserData) {
-            Ok(()) => match crumb.clear() {
-                Ok(()) => {
-                    tracing::info!("File Provider: domain removed");
-                    Outcome::Removed
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "File Provider: domain removed but the breadcrumb could not be cleared");
-                    Outcome::Failed(action, e)
-                }
-            },
+            Ok(()) => {
+                tracing::info!("File Provider: domain removed");
+                Outcome::Removed
+            }
             Err(e) => {
                 tracing::error!(error = %e, "File Provider: removing the domain failed; will retry at next launch");
                 Outcome::Failed(action, e)
@@ -209,24 +193,179 @@ pub(crate) fn reconcile(switch_on: bool, crumb: &impl Breadcrumb, ops: &impl Dom
     }
 }
 
+/// Serialises what adds and removes the domain: launch, *Start* and a disconnect's removal. Without it a
+/// removal still running from a disconnect could land after a reconnect's *Start* had added the domain,
+/// and leave the user started with no domain until the next launch. Each holder reads the breadcrumb
+/// after taking it, so the last word is always the breadcrumb's.
+static LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lifecycle() -> std::sync::MutexGuard<'static, ()> {
+    LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Onboarding's *Start* (DBSYNC-98): records that the user started File Provider, turns the projection
+/// on, adds the domain, and answers where the files are, as macOS shows them. Blocks on the framework,
+/// so the caller is not the main thread. A failed add keeps the breadcrumb, so the next launch, or the
+/// user pressing *Start* again, retries it.
+pub(crate) fn enable(state: &AppState) -> Result<String, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    enable_with(
+        &state.db,
+        &system::SystemDomain,
+        std::path::Path::new(&home),
+        || {
+            // Before the add: the extension may ask for something as soon as the domain exists.
+            crate::file_provider_exchange::start(state);
+            crate::login_item::apply_default(&state.db, true);
+        },
+    )
+}
+
+/// [`enable`] with its calls named: the breadcrumb, then `before_add`, then the domain.
+pub(crate) fn enable_with(
+    db: &Db,
+    ops: &impl DomainOps,
+    home: &std::path::Path,
+    before_add: impl FnOnce(),
+) -> Result<String, String> {
+    let _lifecycle = lifecycle();
+    mark_started(db)?;
+    before_add();
+    add_and_locate(db, ops, home)
+}
+
+/// The database half of [`enable`]: the breadcrumb first, then the projection.
+pub(crate) fn mark_started(db: &Db) -> Result<(), String> {
+    db.set()?;
+    db.set_projection_enabled(true);
+    match apply_switch(db, true) {
+        Ok(effect) => tracing::info!(?effect, "File Provider: started from onboarding"),
+        Err(e) => {
+            tracing::error!(error = %e, "File Provider: could not apply the start to the projection")
+        }
+    }
+    Ok(())
+}
+
+/// Adds the domain and answers where its folder is.
+pub(crate) fn add_and_locate(
+    db: &Db,
+    ops: &impl DomainOps,
+    home: &std::path::Path,
+) -> Result<String, String> {
+    ops.add()?;
+    tracing::info!("File Provider: domain added");
+    remember_visible_root(db, ops, home)
+        .ok_or_else(|| "the domain was added but macOS did not say where it is".to_string())
+}
+
+/// Disconnecting Dropbox (DBSYNC-98): forgets that the user started File Provider, turns the projection
+/// off and removes the domain on its own thread, keeping the user's unsynced changes. A removal that
+/// fails is retried at the next launch, which finds a domain and no breadcrumb. An error is a breadcrumb
+/// that could not be cleared: the domain stays, and the caller says so.
+pub(crate) fn disable(db: Arc<Db>) -> Result<(), String> {
+    mark_left(&db)?;
+    crate::login_item::apply_default(&db, false);
+    let spawned = std::thread::Builder::new()
+        .name("file-provider-remove".into())
+        .spawn(move || {
+            objc2::rc::autoreleasepool(|_| leave_with(&db, &system::SystemDomain));
+        });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "File Provider: could not start the removal; the next launch does it");
+    }
+    Ok(())
+}
+
+/// The domain half of [`disable`], after [`mark_left`]: the removal, under the lifecycle lock.
+pub(crate) fn leave_with(db: &Db, ops: &impl DomainOps) -> Outcome {
+    let _lifecycle = lifecycle();
+    reconcile(db, ops)
+}
+
+/// The database half of [`disable`]: the breadcrumb first, so nothing after it can leave the user
+/// marked as started; then the projection, emptied now so that a delta already in flight cannot hand a
+/// later *Start* a populated projection of the account that was left; then the folder it was in.
+pub(crate) fn mark_left(db: &Db) -> Result<(), String> {
+    db.clear()?;
+    db.set_projection_enabled(false);
+    if let Err(e) = apply_switch(db, false) {
+        tracing::warn!(error = %e, "File Provider: cannot empty the projection; the next launch does");
+    }
+    if let Err(e) = db.delete_app_config(VISIBLE_ROOT_KEY) {
+        tracing::warn!(error = %e, "File Provider: cannot forget where the domain was");
+    }
+    Ok(())
+}
+
+/// `app_config` key: the domain's folder as macOS shows it, `~/Library/CloudStorage/…`. Written when
+/// the domain is added, and by a pin, which carries it from the extension.
+pub(crate) const VISIBLE_ROOT_KEY: &str = "fp_visible_root";
+
+/// Asks macOS where the domain's folder is, and records it when it is one a host may read
+/// (`file_provider_exchange::domain_root`). `None` when macOS does not say, or says somewhere else.
+fn remember_visible_root(db: &Db, ops: &impl DomainOps, home: &std::path::Path) -> Option<String> {
+    let root = match ops.visible_root() {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(error = %e, "File Provider: macOS did not say where the domain is");
+            return None;
+        }
+    };
+    if crate::file_provider_exchange::domain_root(&root, home).is_none() {
+        tracing::warn!("File Provider: the domain is not where a host may read it");
+        return None;
+    }
+    if let Err(e) = db.set_app_config(VISIBLE_ROOT_KEY, &root) {
+        tracing::warn!(error = %e, "File Provider: cannot record where the domain is");
+    }
+    Some(root)
+}
+
+/// Where the domain's folder is, as last recorded. `None` before the first add.
+pub(crate) fn visible_root(db: &Db) -> Option<String> {
+    db.get_app_config(VISIBLE_ROOT_KEY)
+        .ok()
+        .flatten()
+        .filter(|r| !r.is_empty())
+}
+
+/// Whether Dropbox is in Finder as far as onboarding is concerned: started, and macOS said where. A
+/// *Start* whose add or whose location failed is not done, so onboarding keeps showing it.
+pub(crate) fn in_finder(db: &Db) -> bool {
+    started(db) && visible_root(db).is_some()
+}
+
+/// Whether the user started File Provider: the breadcrumb, read from the database. An unreadable one
+/// is "not started", which shows onboarding rather than a broken Finder.
+pub(crate) fn started(db: &Db) -> bool {
+    db.is_set().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "File Provider: cannot read the breadcrumb");
+        false
+    })
+}
+
 /// What the startup decision did to the projection, for the log and for tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwitchEffect {
     /// Nothing was written.
     Untouched,
-    /// The switch is off and the projection held rows or was populated: it was emptied.
+    /// File Provider is off and the projection held rows or was populated: it was emptied.
     Cleared,
-    /// The switch is on and the projection is not populated. Nothing was written: the stored delta
+    /// File Provider is on and the projection is not populated. Nothing was written: the stored delta
     /// cursor stays, and `usable_delta_cursor` treats it as absent beside an unpopulated projection,
     /// so the next loop iteration seeds, and a failed seed falls back to the stored cursor.
     SeedPending,
 }
 
 /// The projection half of the startup decision. Off: clear the projection, but only when it holds
-/// something, found by a read, so a switch that was never on never opens a write transaction. On: write
+/// something, found by a read, so an install that never started File Provider never opens a write
+/// transaction. On: write
 /// nothing; an unpopulated projection is reported, and seeded by the loop (see [`SwitchEffect::SeedPending`]).
-pub(crate) fn apply_switch(db: &Db, switch_on: bool) -> Result<SwitchEffect, String> {
-    if !switch_on {
+pub(crate) fn apply_switch(db: &Db, active: bool) -> Result<SwitchEffect, String> {
+    if !active {
         if !db.projection_holds_anything().map_err(|e| e.to_string())? {
             return Ok(SwitchEffect::Untouched);
         }
@@ -245,21 +384,17 @@ pub(crate) fn apply_switch(db: &Db, switch_on: bool) -> Result<SwitchEffect, Str
     })
 }
 
-/// Startup entry point, called from `lib.rs` `setup` once the database exists. The switch is read here,
-/// once, and recorded on the `Db` before this returns (the remote loop starts after it, so it never
+/// Startup entry point, called from `lib.rs` `setup` once the database exists. The breadcrumb is read
+/// here and recorded on the `Db` before this returns (the remote loop starts after it, so it never
 /// sees a stale value); the File Provider calls run on their own thread so a slow `fileproviderd`
 /// never delays startup.
 pub(crate) fn start(db: Arc<Db>) {
-    let switch_on = read_switch();
-    db.set_projection_enabled(switch_on);
-    match apply_switch(&db, switch_on) {
-        Ok(effect) => tracing::info!(
-            switch_on,
-            ?effect,
-            "File Provider projection startup decision"
-        ),
+    let active = started(&db);
+    db.set_projection_enabled(active);
+    match apply_switch(&db, active) {
+        Ok(effect) => tracing::info!(active, ?effect, "File Provider projection startup decision"),
         Err(e) => {
-            tracing::error!(error = %e, "File Provider: could not apply the switch to the projection")
+            tracing::error!(error = %e, "File Provider: could not apply the breadcrumb to the projection")
         }
     }
     let spawned = std::thread::Builder::new()
@@ -267,12 +402,23 @@ pub(crate) fn start(db: Arc<Db>) {
         .spawn(move || {
             // The thread has no run loop, so Foundation objects autoreleased by the calls would otherwise
             // be held until it exits.
-            objc2::rc::autoreleasepool(|_| {
-                reconcile(switch_on, &*db, &system::SystemDomain);
-            });
+            {
+                let _lifecycle = lifecycle();
+                let outcome =
+                    objc2::rc::autoreleasepool(|_| reconcile(&*db, &system::SystemDomain));
+                if let (Outcome::Added, Some(home)) = (&outcome, std::env::var_os("HOME")) {
+                    objc2::rc::autoreleasepool(|_| {
+                        remember_visible_root(
+                            &db,
+                            &system::SystemDomain,
+                            std::path::Path::new(&home),
+                        )
+                    });
+                }
+            }
             // The projection may have been populated by an earlier run: tell the system once, so a
             // domain mounted after the last commit enumerates it.
-            if switch_on && db.projection_state().is_ok_and(|s| s.populated) {
+            if active && db.projection_state().is_ok_and(|s| s.populated) {
                 signal_working_set();
             }
         });
@@ -440,7 +586,7 @@ pub(crate) enum SignalReport {
     Recovered,
 }
 
-/// Turns the stream of signal outcomes into log transitions. With the switch on and no domain
+/// Turns the stream of signal outcomes into log transitions. With the projection fed and no domain
 /// registered every delta fails the same way, and a WARN per delta would bury the log; the Swift
 /// extension follows the same discipline (log on a transition, not on every repeat).
 pub(crate) struct SignalOutcomeLog {
@@ -512,18 +658,6 @@ pub(crate) fn signal_if_active(db: &Db) {
     }
 }
 
-/// Reads `FileProviderEnabled` from the app's own defaults domain. Under `cfg(test)` this is always off:
-/// no unit test may read the real user defaults.
-#[cfg(not(test))]
-fn read_switch() -> bool {
-    switch_from_defaults(system::read_defaults_value(SWITCH_KEY))
-}
-
-#[cfg(test)]
-fn read_switch() -> bool {
-    false
-}
-
 #[cfg(not(test))]
 mod system {
     //! The only unsafe code: `msg_send!` calls to `NSUserDefaults` and `NSFileProviderManager`.
@@ -536,7 +670,7 @@ mod system {
     use objc2::rc::{autoreleasepool, Allocated, Retained};
     use objc2::runtime::{AnyClass, AnyObject};
 
-    use super::{DefaultsValue, DomainOps, RemovalMode, DOMAIN_DISPLAY_NAME, DOMAIN_ID};
+    use super::{DomainOps, RemovalMode, DOMAIN_DISPLAY_NAME, DOMAIN_ID};
 
     /// How long to wait for a File Provider completion handler before giving up.
     const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -584,37 +718,6 @@ mod system {
                 to_rust_string(desc).unwrap_or_default()
             )
         }
-    }
-
-    pub(super) fn read_defaults_value(key: &str) -> DefaultsValue {
-        autoreleasepool(|_| {
-            let (Some(cls), Some(k)) = (AnyClass::get(c"NSUserDefaults"), ns_string(key)) else {
-                return DefaultsValue::Absent;
-            };
-            // SAFETY: `standardUserDefaults` and `objectForKey:` are documented Foundation API with
-            // the signatures used; every object is read inside this pool.
-            unsafe {
-                let defaults: *mut AnyObject = msg_send![cls, standardUserDefaults];
-                if defaults.is_null() {
-                    return DefaultsValue::Absent;
-                }
-                let value: *mut AnyObject = msg_send![defaults, objectForKey: &*k];
-                if value.is_null() {
-                    return DefaultsValue::Absent;
-                }
-                let Some(number) = AnyClass::get(c"NSNumber") else {
-                    return DefaultsValue::Other;
-                };
-                let is_number: bool = msg_send![value, isKindOfClass: number];
-                if !is_number {
-                    return DefaultsValue::Other;
-                }
-                // `-bool YES` is stored as a boolean NSNumber; an integer 1 would read the same, which
-                // is acceptable: both are an explicit, deliberate write.
-                let b: bool = msg_send![value, boolValue];
-                DefaultsValue::Bool(b)
-            }
-        })
     }
 
     fn new_domain() -> Result<Retained<AnyObject>, String> {
@@ -765,6 +868,8 @@ mod system {
         /// `NSFileProviderWorkingSetContainerItemIdentifier` (NSFileProviderItem.h:51). Read from the
         /// framework rather than spelled out, so a changed string value cannot silently stop the signal.
         static NSFileProviderWorkingSetContainerItemIdentifier: *const AnyObject;
+        /// `NSFileProviderRootContainerItemIdentifier` (NSFileProviderItem.h).
+        static NSFileProviderRootContainerItemIdentifier: *const AnyObject;
         /// `NSFileProviderErrorDomain` (NSFileProviderError.h).
         static NSFileProviderErrorDomain: *const AnyObject;
     }
@@ -898,6 +1003,41 @@ mod system {
             .map_err(|_| "timed out waiting for the File Provider manager".to_string())?
     }
 
+    /// `-getUserVisibleURLForItemIdentifier:completionHandler:` (Manager.h) on the root container: the
+    /// folder under `~/Library/CloudStorage` that Finder shows. Only the path leaves the handler.
+    fn visible_root_blocking() -> Result<String, String> {
+        let found = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen = found.clone();
+        on_domain_manager(move |manager, done| {
+            let done = done.copy();
+            let seen = seen.clone();
+            let handler = RcBlock::new(move |url: *mut AnyObject, err: *mut AnyObject| {
+                if err.is_null() && !url.is_null() {
+                    // SAFETY: `url` is a live NSURL while the completion handler runs; `path` returns
+                    // an NSString that is copied out at once.
+                    let path: *mut AnyObject = unsafe { msg_send![url, path] };
+                    if let Ok(mut slot) = seen.lock() {
+                        *slot = to_rust_string(path);
+                    }
+                }
+                done.call((err,));
+            });
+            // SAFETY: an instance method taking an NSString identifier and a
+            // `void (^)(NSURL *, NSError *)` block. The identifier is a framework constant, valid for the
+            // process lifetime; the block is copied by the framework until it runs.
+            unsafe {
+                let root: *const AnyObject = NSFileProviderRootContainerItemIdentifier;
+                let _: () = msg_send![
+                    manager,
+                    getUserVisibleURLForItemIdentifier: root,
+                    completionHandler: &*handler
+                ];
+            }
+        })?;
+        let path = found.lock().map_err(|_| "poisoned".to_string())?.take();
+        path.ok_or_else(|| "macOS returned no folder for the domain".to_string())
+    }
+
     /// The worker's queue: one unit per wake-up, created with the first request.
     static SIGNAL_WORKER: std::sync::OnceLock<Option<mpsc::Sender<()>>> =
         std::sync::OnceLock::new();
@@ -967,20 +1107,28 @@ mod system {
         }
 
         fn remove(&self, mode: RemovalMode) -> Result<(), String> {
-            // Removing a domain that is not registered is an error from the framework; for the switch-off
-            // path that state is already the goal, so it counts as removed.
+            // Removing a domain that is not registered is an error from the framework; for a disconnect
+            // that state is already the goal, so it counts as removed.
             if !domain_is_registered()? {
                 return Ok(());
             }
             let domain = new_domain()?;
             remove_domain(&domain, mode)
         }
+
+        fn is_registered(&self) -> Result<bool, String> {
+            domain_is_registered()
+        }
+
+        fn visible_root(&self) -> Result<String, String> {
+            visible_root_blocking()
+        }
     }
 }
 
 #[cfg(test)]
 mod system {
-    //! Inert stand-ins: no unit test may reach FileProvider or the user defaults.
+    //! Inert stand-ins: no unit test may reach FileProvider.
     use super::{DomainOps, RemovalMode};
 
     thread_local! {
@@ -1029,6 +1177,12 @@ mod system {
         fn remove(&self, _mode: RemovalMode) -> Result<(), String> {
             panic!("a unit test reached the real File Provider remove");
         }
+        fn is_registered(&self) -> Result<bool, String> {
+            panic!("a unit test reached the real File Provider domain list");
+        }
+        fn visible_root(&self) -> Result<String, String> {
+            panic!("a unit test reached the real File Provider visible URL");
+        }
     }
 }
 
@@ -1043,14 +1197,6 @@ mod tests {
         assert_eq!(decide_domain_action(false, true), DomainAction::Remove);
         assert_eq!(decide_domain_action(true, false), DomainAction::Add);
         assert_eq!(decide_domain_action(true, true), DomainAction::Add);
-    }
-
-    #[test]
-    fn only_an_explicit_boolean_true_turns_the_switch_on() {
-        assert!(switch_from_defaults(DefaultsValue::Bool(true)));
-        assert!(!switch_from_defaults(DefaultsValue::Bool(false)));
-        assert!(!switch_from_defaults(DefaultsValue::Absent));
-        assert!(!switch_from_defaults(DefaultsValue::Other));
     }
 
     #[test]
@@ -1073,45 +1219,69 @@ mod tests {
         assert!(!DOMAIN_ID.contains('/') && !DOMAIN_ID.contains(':') && !DOMAIN_ID.is_empty());
     }
 
-    /// The key is a user-facing contract (README, ADR-0004, `defaults write`): renaming it silently
-    /// would leave everyone's switch off.
+    /// The display name names the `~/Library/CloudStorage` folder and Finder's sidebar entry.
     #[test]
-    fn the_switch_key_and_the_display_name_are_the_documented_ones() {
-        assert_eq!(SWITCH_KEY, "FileProviderEnabled");
+    fn the_display_name_is_the_documented_one() {
         assert_eq!(DOMAIN_DISPLAY_NAME, "DropboxSync");
     }
 
-    #[derive(Default)]
     struct FakeOps {
         calls: RefCell<Vec<&'static str>>,
         remove_modes: RefCell<Vec<RemovalMode>>,
+        registered: Cell<bool>,
         fail_add: Cell<bool>,
         fail_remove: Cell<bool>,
+        fail_list: Cell<bool>,
+        root: RefCell<Result<String, String>>,
+    }
+    impl Default for FakeOps {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                remove_modes: RefCell::default(),
+                registered: Cell::new(false),
+                fail_add: Cell::new(false),
+                fail_remove: Cell::new(false),
+                fail_list: Cell::new(false),
+                root: RefCell::new(Err("no root".into())),
+            }
+        }
     }
     impl DomainOps for FakeOps {
         fn add(&self) -> Result<(), String> {
             self.calls.borrow_mut().push("add");
             if self.fail_add.get() {
-                Err("add failed".into())
-            } else {
-                Ok(())
+                return Err("add failed".into());
             }
+            self.registered.set(true);
+            Ok(())
         }
         fn remove(&self, mode: RemovalMode) -> Result<(), String> {
             self.calls.borrow_mut().push("remove");
             self.remove_modes.borrow_mut().push(mode);
             if self.fail_remove.get() {
-                Err("remove failed".into())
-            } else {
-                Ok(())
+                return Err("remove failed".into());
             }
+            self.registered.set(false);
+            Ok(())
+        }
+        fn is_registered(&self) -> Result<bool, String> {
+            self.calls.borrow_mut().push("list");
+            if self.fail_list.get() {
+                Err("list failed".into())
+            } else {
+                Ok(self.registered.get())
+            }
+        }
+        fn visible_root(&self) -> Result<String, String> {
+            self.calls.borrow_mut().push("root");
+            self.root.borrow().clone()
         }
     }
 
     struct FakeCrumb {
         present: Cell<bool>,
         fail_read: Cell<bool>,
-        fail_set: Cell<bool>,
         events: RefCell<Vec<&'static str>>,
     }
     impl FakeCrumb {
@@ -1119,7 +1289,6 @@ mod tests {
             Self {
                 present: Cell::new(present),
                 fail_read: Cell::new(false),
-                fail_set: Cell::new(false),
                 events: RefCell::new(Vec::new()),
             }
         }
@@ -1134,9 +1303,6 @@ mod tests {
         }
         fn set(&self) -> Result<(), String> {
             self.events.borrow_mut().push("set");
-            if self.fail_set.get() {
-                return Err("set failed".into());
-            }
             self.present.set(true);
             Ok(())
         }
@@ -1147,30 +1313,32 @@ mod tests {
         }
     }
 
+    /// Never started and nothing registered: one question to the system and nothing else.
     #[test]
-    fn off_without_a_breadcrumb_makes_no_file_provider_call_and_writes_nothing() {
+    fn without_a_breadcrumb_or_a_domain_a_launch_only_asks() {
         let (crumb, ops) = (FakeCrumb::new(false), FakeOps::default());
-        assert_eq!(reconcile(false, &crumb, &ops), Outcome::Untouched);
-        assert!(ops.calls.borrow().is_empty());
+        assert_eq!(reconcile(&crumb, &ops), Outcome::Untouched);
+        assert_eq!(*ops.calls.borrow(), ["list"]);
         assert!(crumb.events.borrow().is_empty());
     }
 
+    /// A domain without a breadcrumb is a disconnect whose removal failed: the launch removes it, and
+    /// keeps what the user changed and never synced.
+    ///
+    /// Proof this test can fail: answering `None` for `(false, true)` in the table leaves the domain.
     #[test]
-    fn off_with_a_breadcrumb_removes_the_domain_and_clears_the_breadcrumb() {
-        let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
-        assert_eq!(reconcile(false, &crumb, &ops), Outcome::Removed);
-        assert_eq!(*ops.calls.borrow(), ["remove"]);
-        assert!(!crumb.present.get());
-    }
-
-    #[test]
-    fn removal_asks_to_preserve_unsynced_local_data() {
-        let crumb = FakeCrumb::new(true);
-        let ops = FakeOps::default();
-        reconcile(false, &crumb, &ops);
+    fn a_domain_left_without_a_breadcrumb_is_removed_keeping_unsynced_data() {
+        let (crumb, ops) = (FakeCrumb::new(false), FakeOps::default());
+        ops.registered.set(true);
+        assert_eq!(reconcile(&crumb, &ops), Outcome::Removed);
+        assert_eq!(*ops.calls.borrow(), ["list", "remove"]);
         assert_eq!(
             *ops.remove_modes.borrow(),
             [RemovalMode::PreserveDirtyUserData]
+        );
+        assert!(
+            crumb.events.borrow().is_empty(),
+            "a launch writes no breadcrumb"
         );
     }
 
@@ -1181,67 +1349,56 @@ mod tests {
         assert_eq!(RemovalMode::PreserveDirtyUserData.raw(), 1);
     }
 
+    /// Started: every launch adds the domain again, which the framework takes as a no-op, and does not
+    /// ask whether it is there.
     #[test]
-    fn on_adds_the_domain_and_sets_the_breadcrumb_first() {
+    fn with_a_breadcrumb_a_launch_adds_the_domain_again() {
+        for registered in [false, true] {
+            let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
+            ops.registered.set(registered);
+            assert_eq!(reconcile(&crumb, &ops), Outcome::Added);
+            assert_eq!(*ops.calls.borrow(), ["add"]);
+            assert!(crumb.events.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failed_removal_is_retried_by_the_next_launch() {
         let (crumb, ops) = (FakeCrumb::new(false), FakeOps::default());
-        assert_eq!(reconcile(true, &crumb, &ops), Outcome::Added);
-        assert_eq!(*ops.calls.borrow(), ["add"]);
-        assert!(crumb.present.get());
-    }
-
-    #[test]
-    fn on_again_adds_again_which_is_idempotent_for_the_framework() {
-        let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
-        assert_eq!(reconcile(true, &crumb, &ops), Outcome::Added);
-        assert_eq!(*ops.calls.borrow(), ["add"]);
-        assert!(crumb.present.get());
-    }
-
-    #[test]
-    fn a_failed_removal_keeps_the_breadcrumb_so_the_next_launch_retries() {
-        let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
+        ops.registered.set(true);
         ops.fail_remove.set(true);
         assert!(matches!(
-            reconcile(false, &crumb, &ops),
+            reconcile(&crumb, &ops),
             Outcome::Failed(DomainAction::Remove, _)
         ));
-        assert!(crumb.present.get());
-        assert!(
-            crumb.events.borrow().is_empty(),
-            "clear must not run after a failed removal"
-        );
+        ops.fail_remove.set(false);
+        assert_eq!(reconcile(&crumb, &ops), Outcome::Removed);
     }
 
     #[test]
-    fn a_failed_breadcrumb_write_means_the_domain_is_not_added() {
-        let (crumb, ops) = (FakeCrumb::new(false), FakeOps::default());
-        crumb.fail_set.set(true);
-        assert!(matches!(
-            reconcile(true, &crumb, &ops),
-            Outcome::Failed(DomainAction::Add, _)
-        ));
-        assert!(ops.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_failed_add_leaves_the_breadcrumb_so_a_later_switch_off_removes_the_domain() {
-        let (crumb, ops) = (FakeCrumb::new(false), FakeOps::default());
+    fn a_failed_add_is_reported() {
+        let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
         ops.fail_add.set(true);
         assert!(matches!(
-            reconcile(true, &crumb, &ops),
+            reconcile(&crumb, &ops),
             Outcome::Failed(DomainAction::Add, _)
         ));
-        assert!(crumb.present.get());
     }
 
+    /// Unknown state makes no change: neither an unreadable breadcrumb nor a domain list that failed may
+    /// remove a domain the user is using.
     #[test]
-    fn an_unreadable_breadcrumb_makes_no_file_provider_call_whatever_the_switch() {
-        for switch_on in [false, true] {
-            let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
-            crumb.fail_read.set(true);
-            assert_eq!(reconcile(switch_on, &crumb, &ops), Outcome::Untouched);
-            assert!(ops.calls.borrow().is_empty());
-        }
+    fn an_unreadable_breadcrumb_or_domain_list_makes_no_change() {
+        let (crumb, ops) = (FakeCrumb::new(true), FakeOps::default());
+        crumb.fail_read.set(true);
+        assert_eq!(reconcile(&crumb, &ops), Outcome::Untouched);
+        assert!(ops.calls.borrow().is_empty());
+
+        let (crumb, ops) = (FakeCrumb::new(false), FakeOps::default());
+        ops.registered.set(true);
+        ops.fail_list.set(true);
+        assert_eq!(reconcile(&crumb, &ops), Outcome::Untouched);
+        assert_eq!(*ops.calls.borrow(), ["list"]);
     }
 
     /// The breadcrumb through the real database, not a fake: set, read, clear, and a stale value.
@@ -1259,20 +1416,122 @@ mod tests {
         assert_eq!(db.is_set(), Ok(false), "an empty value is not a breadcrumb");
     }
 
-    /// Whole sequence through the real database: off/none -> on -> off.
+    /// A folder macOS could name for the domain, inside a temporary home.
+    fn domain_folder(home: &std::path::Path) -> String {
+        let root = home.join("Library/CloudStorage/DropboxSyncDesktop-DropboxSync");
+        std::fs::create_dir_all(&root).expect("folder");
+        root.to_string_lossy().into_owned()
+    }
+
+    /// [`FakeOps`] that also records whether the user was marked as started when the domain was added
+    /// or removed: the breadcrumb must already say so, or a crash in between would be forgotten.
+    struct ProbeOps<'a> {
+        ops: FakeOps,
+        db: &'a Db,
+        started_at: RefCell<Vec<(&'static str, bool)>>,
+    }
+    impl DomainOps for ProbeOps<'_> {
+        fn add(&self) -> Result<(), String> {
+            self.started_at.borrow_mut().push(("add", started(self.db)));
+            self.ops.add()
+        }
+        fn remove(&self, mode: RemovalMode) -> Result<(), String> {
+            self.started_at
+                .borrow_mut()
+                .push(("remove", started(self.db)));
+            self.ops.remove(mode)
+        }
+        fn is_registered(&self) -> Result<bool, String> {
+            self.ops.is_registered()
+        }
+        fn visible_root(&self) -> Result<String, String> {
+            self.ops.visible_root()
+        }
+    }
+
+    /// Onboarding's *Start* then a disconnect, through the real database: started, the projection is
+    /// fed, the domain is added after the breadcrumb and its folder recorded; left, the breadcrumb goes
+    /// before the removal, the projection is emptied, and a later launch has nothing to do.
+    ///
+    /// Proof this test can fail: dropping `set_projection_enabled(true)` from `mark_started` fails the
+    /// projection assertion; moving `mark_started` after the add in `enable_with` fails the order
+    /// assertion; dropping `db.clear()` from `mark_left` makes the removal an add.
     #[test]
-    fn switching_on_then_off_leaves_no_breadcrumb_and_calls_add_then_remove() {
+    fn starting_then_leaving_adds_then_removes_the_domain() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Db::new_at(&tmp.path().join("app.db")).expect("db");
+        let ops = ProbeOps {
+            ops: FakeOps::default(),
+            db: &db,
+            started_at: RefCell::default(),
+        };
+        let home = tmp.path().join("home");
+        let folder = domain_folder(&home);
+        *ops.ops.root.borrow_mut() = Ok(folder.clone());
+
+        assert_eq!(reconcile(&db, &ops), Outcome::Untouched, "a fresh install");
+        assert!(!in_finder(&db));
+        let mut before_add_ran = false;
+        assert_eq!(
+            enable_with(&db, &ops, &home, || before_add_ran = true),
+            Ok(folder.clone())
+        );
+        assert!(before_add_ran);
+        assert!(in_finder(&db));
+        assert!(db.projection_active());
+        assert_eq!(visible_root(&db), Some(folder.clone()));
+        db.project_snapshot(&[]).expect("populate");
+        assert_eq!(reconcile(&db, &ops), Outcome::Added, "the next launch");
+
+        mark_left(&db).expect("leave");
+        assert!(!started(&db) && !in_finder(&db));
+        assert!(!db.projection_active());
+        assert!(!db.projection_state().unwrap().populated, "emptied at once");
+        assert_eq!(visible_root(&db), None);
+        assert_eq!(leave_with(&db, &ops), Outcome::Removed);
+        assert_eq!(reconcile(&db, &ops), Outcome::Untouched);
+        assert_eq!(
+            *ops.started_at.borrow(),
+            [("add", true), ("add", true), ("remove", false)]
+        );
+    }
+
+    /// A *Start* whose add fails, or whose folder macOS does not name, is not done: onboarding keeps
+    /// showing it, though the breadcrumb stays so the next launch retries the add.
+    ///
+    /// Proof this test can fail: making `in_finder` read the breadcrumb alone fails both assertions.
+    #[test]
+    fn a_start_that_failed_is_not_in_finder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Db::new_at(&tmp.path().join("app.db")).expect("db");
+        let home = tmp.path().join("home");
+        let ops = FakeOps::default();
+        ops.fail_add.set(true);
+        assert!(enable_with(&db, &ops, &home, || {}).is_err());
+        assert!(started(&db) && !in_finder(&db));
+
+        ops.fail_add.set(false);
+        *ops.root.borrow_mut() = Err("no URL".into());
+        assert!(enable_with(&db, &ops, &home, || {}).is_err());
+        assert!(!in_finder(&db));
+    }
+
+    /// A folder macOS names outside `~/Library/CloudStorage` is not recorded, and *Start* says so, so the
+    /// host never reads pinned files somewhere else.
+    #[test]
+    fn a_domain_folder_outside_cloud_storage_is_not_recorded() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = Db::new_at(&tmp.path().join("app.db")).expect("db");
         let ops = FakeOps::default();
-        assert_eq!(reconcile(false, &db, &ops), Outcome::Untouched);
-        assert_eq!(reconcile(true, &db, &ops), Outcome::Added);
-        assert_eq!(reconcile(false, &db, &ops), Outcome::Removed);
-        assert_eq!(reconcile(false, &db, &ops), Outcome::Untouched);
-        assert_eq!(*ops.calls.borrow(), ["add", "remove"]);
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("Elsewhere")).unwrap();
+        *ops.root.borrow_mut() = Ok(home.join("Elsewhere").to_string_lossy().into_owned());
+
+        assert!(add_and_locate(&db, &ops, &home).is_err());
+        assert_eq!(visible_root(&db), None);
     }
 
-    // ── DBSYNC-95 slice 2a: the switch and the projection, the signal ───────────────────────────
+    // ── DBSYNC-95 slice 2a: on, off and the projection, the signal ───────────────────────────
 
     fn real_db() -> (tempfile::TempDir, Db) {
         let tmp = tempfile::tempdir().expect("tempdir");

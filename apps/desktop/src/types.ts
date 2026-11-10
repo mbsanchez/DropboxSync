@@ -24,6 +24,11 @@ export type StartupRequirements = {
   syncFolderOk: boolean;
   syncFolder?: string;
   finderExtension: FinderExtensionState;
+  /**
+   * The files live in the File Provider domain (macOS, DBSYNC-98): there is no sync folder to
+   * choose, `syncFolderOk` means Dropbox was put in Finder, and `syncFolder` is where Finder shows it.
+   */
+  fileProvider?: boolean;
 };
 
 export type SyncStatus = {
@@ -105,7 +110,7 @@ export type TriggerActionResponse = {
   accepted: boolean;
 };
 
-export type TriggerSyncReason = "started" | "already_running";
+export type TriggerSyncReason = "started" | "already_running" | "nothing_to_sync";
 
 /** Mirror of Rust `models::TriggerSyncResponse`, returned by `trigger_sync_tick` only. */
 export type TriggerSyncResponse = {

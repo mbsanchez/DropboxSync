@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
+use crate::file_provider::VISIBLE_ROOT_KEY;
 use crate::state::AppState;
 use crate::storage::db::Db;
 
@@ -533,11 +534,14 @@ const PIN_READERS: usize = 2;
 
 /// The domain's folder, if `root` is one: a real directory (not a symlink) directly under
 /// `~/Library/CloudStorage`. The host reads only there, whatever the request says.
-fn domain_root(root: &str, home: &Path) -> Option<PathBuf> {
+pub(crate) fn domain_root(root: &str, home: &Path) -> Option<PathBuf> {
     let path = Path::new(root);
     let storage = home.join("Library/CloudStorage");
     let plain = path.components().all(|c| {
-        matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))
+        matches!(
+            c,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
     });
     let real_dir = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir());
     (path.is_absolute() && plain && path.parent() == Some(storage.as_path()) && real_dir)
@@ -589,13 +593,21 @@ fn next_pin_read(
 /// download. A read blocks until `fetchContents` is served through this exchange, whose requests each run
 /// on a thread of their own, so the readers are threads of their own too.
 fn download_pinned(state: &AppState, item_id: i64, root: &str) {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
     let Some(root) = domain_root(root, &home) else {
-        tracing::warn!(item_id, "File Provider pin: no usable domain folder, nothing read");
+        tracing::warn!(
+            item_id,
+            "File Provider pin: no usable domain folder, nothing read"
+        );
         return;
     };
     // Kept for what a later delta brings under a pin, when no request names the folder.
-    if let Err(e) = state.db.set_app_config(VISIBLE_ROOT_KEY, &root.to_string_lossy()) {
+    if let Err(e) = state
+        .db
+        .set_app_config(VISIBLE_ROOT_KEY, &root.to_string_lossy())
+    {
         tracing::warn!(error = %e, "File Provider pin: cannot keep the domain folder");
     }
     let files = match state.db.projection_live_files_under(item_id) {
@@ -605,16 +617,22 @@ fn download_pinned(state: &AppState, item_id: i64, root: &str) {
             return;
         }
     };
-    tracing::info!(item_id, files = files.len(), "File Provider pin: reading the pinned files");
-    queue_pin_reads(state, &root, files.into_iter().map(|rel| (item_id, rel)).collect(), false);
+    tracing::info!(
+        item_id,
+        files = files.len(),
+        "File Provider pin: reading the pinned files"
+    );
+    queue_pin_reads(
+        state,
+        &root,
+        files.into_iter().map(|rel| (item_id, rel)).collect(),
+        false,
+    );
 }
-
-/// Where the last pin said the domain's folder is (`app_config`).
-const VISIBLE_ROOT_KEY: &str = "fp_visible_root";
 
 /// After a delta commit: reads the pinned files it changed, a new revision or a file added under a pinned
 /// folder, which the content policy alone would leave in the cloud while on battery. Nothing without a pin,
-/// or without a domain folder a pin has named.
+/// or without a known domain folder.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn download_pinned_changes(state: &AppState, seq: i64, rows: usize) {
     let files = match state.db.projection_pinned_files_stamped(seq, rows) {
@@ -625,13 +643,26 @@ pub(crate) fn download_pinned_changes(state: &AppState, seq: i64, rows: usize) {
             return;
         }
     };
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
-    let stored = state.db.get_app_config(VISIBLE_ROOT_KEY).ok().flatten().unwrap_or_default();
-    let Some(root) = domain_root(&stored, &home) else {
-        tracing::warn!(files = files.len(), "File Provider pin: no known domain folder, changes not read");
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
-    tracing::info!(files = files.len(), "File Provider pin: reading changed pinned files");
+    let stored = state
+        .db
+        .get_app_config(VISIBLE_ROOT_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let Some(root) = domain_root(&stored, &home) else {
+        tracing::warn!(
+            files = files.len(),
+            "File Provider pin: no known domain folder, changes not read"
+        );
+        return;
+    };
+    tracing::info!(
+        files = files.len(),
+        "File Provider pin: reading changed pinned files"
+    );
     queue_pin_reads(state, &root, files, true);
 }
 
@@ -996,12 +1027,23 @@ fn lift_throttling_at_startup() {
     }
 }
 
-/// Starts the exchange when the switch is on, and removes what an earlier run left when it is off, which
-/// may be staged user content. A failure logs and leaves the extension answering that the host is down,
-/// which is true of this host's ability to serve it.
+/// Starts the exchange when File Provider is on, and removes what an earlier run left when it is off,
+/// which may be staged user content. Once per process: launch starts it when the user started File
+/// Provider earlier, onboarding's *Start* when they start it now, and a second start would wait for ever
+/// on the host lock this process already holds. A failure logs and leaves the extension answering that
+/// the host is down, which is true of this host's ability to serve it.
 pub(crate) fn start(state: &AppState) {
     if !state.db.projection_active() {
         remove_leftovers(state.db.data_dir());
+        return;
+    }
+    // Held from the check to the end, so two starts cannot both pass it; set only once the exchange
+    // opened, so a launch whose open failed leaves *Start* free to try again.
+    static STARTED: Mutex<bool> = Mutex::new(false);
+    let mut started = STARTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *started {
         return;
     }
     let exchange = match Exchange::open(state.db.data_dir()) {
@@ -1041,8 +1083,9 @@ pub(crate) fn start(state: &AppState) {
             lift_throttling_at_startup();
             run_queue(&state, &exchange, &woken);
         });
-    if let Err(e) = spawned {
-        tracing::error!(error = %e, "File Provider exchange: could not start");
+    match spawned {
+        Ok(_) => *started = true,
+        Err(e) => tracing::error!(error = %e, "File Provider exchange: could not start"),
     }
 }
 
@@ -1067,7 +1110,10 @@ mod tests {
     fn a_deleted_target_is_gone_and_a_hidden_one_refused() {
         use crate::file_provider_writes::WriteOutcome;
         assert_eq!(outcome_for_write(WriteOutcome::NotLive), Outcome::Gone);
-        assert_eq!(outcome_for_write(WriteOutcome::ParentNotLive), Outcome::GoneParent);
+        assert_eq!(
+            outcome_for_write(WriteOutcome::ParentNotLive),
+            Outcome::GoneParent
+        );
         assert_eq!(outcome_for_write(WriteOutcome::Hidden), Outcome::Refused);
         assert_eq!(Outcome::Gone.label(), "gone");
     }
@@ -1721,18 +1767,42 @@ mod tests {
         fs::create_dir_all(domain.join("deeper")).unwrap();
         let text = |p: &Path| p.to_str().unwrap().to_string();
 
-        assert_eq!(domain_root(&text(&domain), home.path()), Some(domain.clone()));
-        assert_eq!(domain_root(&text(&domain.join("deeper")), home.path()), None, "not the domain itself");
+        assert_eq!(
+            domain_root(&text(&domain), home.path()),
+            Some(domain.clone())
+        );
+        assert_eq!(
+            domain_root(&text(&domain.join("deeper")), home.path()),
+            None,
+            "not the domain itself"
+        );
         assert_eq!(domain_root(&text(&storage), home.path()), None);
         assert_eq!(domain_root(&text(home.path()), home.path()), None);
-        assert_eq!(domain_root(&format!("{}/x/../DropboxSyncDesktop-Test", text(&storage)), home.path()), None);
-        assert_eq!(domain_root(&text(&storage.join("missing")), home.path()), None);
+        assert_eq!(
+            domain_root(
+                &format!("{}/x/../DropboxSyncDesktop-Test", text(&storage)),
+                home.path()
+            ),
+            None
+        );
+        assert_eq!(
+            domain_root(&text(&storage.join("missing")), home.path()),
+            None
+        );
         // Lexically directly under CloudStorage, and Library itself on disk.
-        assert_eq!(domain_root(&format!("{}/..", text(&storage)), home.path()), None, "a trailing ..");
+        assert_eq!(
+            domain_root(&format!("{}/..", text(&storage)), home.path()),
+            None,
+            "a trailing .."
+        );
         let elsewhere = home.path().join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, storage.join("Link")).unwrap();
-        assert_eq!(domain_root(&text(&storage.join("Link")), home.path()), None, "a symlink");
+        assert_eq!(
+            domain_root(&text(&storage.join("Link")), home.path()),
+            None,
+            "a symlink"
+        );
         assert_eq!(domain_root("", home.path()), None);
         let pin: Request =
             serde_json::from_str(r#"{"item_id":5,"op":"pin","root":"/r","version":1}"#).unwrap();

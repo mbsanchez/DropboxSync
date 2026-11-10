@@ -634,6 +634,10 @@ const DELETE_CONFIRM_MS: u64 = 150;
 /// path being explicitly absent on disk (never from an incomplete walk), and the
 /// whole-root-missing case is still gated by `is_dir()`, so this can't mass-delete.
 pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -1719,7 +1723,9 @@ pub(crate) fn answer_mass_deletion(state: &AppState, confirm: bool, finder: bool
     if finder {
         if finder_question_on_screen(state)? {
             let answer = if confirm { "confirm" } else { "restore" };
-            state.db.set_app_config(MASS_DELETE_ANSWER_FINDER_KEY, answer)?;
+            state
+                .db
+                .set_app_config(MASS_DELETE_ANSWER_FINDER_KEY, answer)?;
         }
     } else if confirm && sync_folder_deletions_held(state)? {
         state.db.set_app_config(MASS_DELETE_OVERRIDE_KEY, "1")?;
@@ -1730,7 +1736,11 @@ pub(crate) fn answer_mass_deletion(state: &AppState, confirm: bool, finder: bool
 /// The user's answer to the Finder question, consumed: `Some(true)` to delete, `Some(false)` to restore.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn take_finder_answer(state: &AppState) -> AppResult<Option<bool>> {
-    let answer = match state.db.get_app_config(MASS_DELETE_ANSWER_FINDER_KEY)?.as_deref() {
+    let answer = match state
+        .db
+        .get_app_config(MASS_DELETE_ANSWER_FINDER_KEY)?
+        .as_deref()
+    {
         Some("confirm") => Some(true),
         Some("restore") => Some(false),
         _ => None,
@@ -1755,7 +1765,9 @@ pub(crate) fn reset_finder_question(state: &AppState) -> AppResult<()> {
     forget_finder_answers(state)?;
     // The two flags of an earlier build.
     state.db.delete_app_config("mass_delete_reject_once")?;
-    state.db.delete_app_config("mass_delete_confirm_finder_once")?;
+    state
+        .db
+        .delete_app_config("mass_delete_confirm_finder_once")?;
     clear_mass_delete_blocked(state, MassDeleteSource::Finder);
     Ok(())
 }
@@ -1877,7 +1889,10 @@ pub(crate) fn recount_finder_deletion(state: &AppState, candidates: usize, track
         return;
     }
     let msg = mass_deletion_message(candidates, tracked, MassDeleteSource::Finder);
-    if let Err(e) = state.db.set_app_config(MASS_DELETE_BLOCKED_FINDER_KEY, &msg) {
+    if let Err(e) = state
+        .db
+        .set_app_config(MASS_DELETE_BLOCKED_FINDER_KEY, &msg)
+    {
         tracing::warn!(error = %e, "failed to update the mass-deletion banner");
     }
     if let Ok(mut engine) = state.sync_engine.lock() {
@@ -1948,6 +1963,10 @@ pub(crate) fn finder_deletions_held(state: &AppState) -> AppResult<bool> {
 /// decisions be exercised without an access token — which is what a test of the
 /// mass-deletion guard actually wants.
 pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -3094,6 +3113,10 @@ fn scan_local_half(state: &AppState) -> AppResult<usize> {
 /// The remote half needs an access token, so this is the entry point for production and
 /// NOT the one to reach for from a test that only cares about local decisions.
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let enqueued_jobs = scan_local_half(state)?;
     let remote_enqueued = refresh_remote_index_and_enqueue_downloads_internal(state)?;
 
@@ -3280,6 +3303,10 @@ fn split_protected_folder_delete(
 /// the maintainer's real Dropbox account; drive `process_sync_queue_core` directly
 /// instead, with a fake lookup.
 pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(false);
+    }
     process_sync_queue_core(state, |rel| {
         crate::remote_index::fetch_remote_file_metadata(state, rel)
     })
@@ -4161,7 +4188,10 @@ mod tests {
         hold_finder(&state);
 
         assert_eq!(super::take_finder_answer(&state).unwrap(), None);
-        assert!(!override_set(&state), "nor does it authorise the sync folder's next one");
+        assert!(
+            !override_set(&state),
+            "nor does it authorise the sync folder's next one"
+        );
     }
 
     /// One key: the last click wins, and the answer is consumed once.
@@ -4176,7 +4206,10 @@ mod tests {
         super::answer_mass_deletion(&state, true, true).unwrap();
         super::answer_mass_deletion(&state, false, true).unwrap();
 
-        assert!(!override_set(&state), "a Finder answer must not release the sync folder");
+        assert!(
+            !override_set(&state),
+            "a Finder answer must not release the sync folder"
+        );
         assert_eq!(super::take_finder_answer(&state).unwrap(), Some(false));
         assert_eq!(super::take_finder_answer(&state).unwrap(), None);
     }
@@ -4198,8 +4231,15 @@ mod tests {
         assert!(!super::finder_question_on_screen(&state).unwrap());
 
         super::answer_mass_deletion(&state, true, true).unwrap();
-        assert!(!override_set(&state), "the Finder click does not release the sync folder");
-        assert_eq!(super::take_finder_answer(&state).unwrap(), None, "nor Finder, no longer on screen");
+        assert!(
+            !override_set(&state),
+            "the Finder click does not release the sync folder"
+        );
+        assert_eq!(
+            super::take_finder_answer(&state).unwrap(),
+            None,
+            "nor Finder, no longer on screen"
+        );
 
         super::answer_mass_deletion(&state, true, false).unwrap();
         assert!(override_set(&state));

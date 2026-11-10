@@ -79,6 +79,10 @@ fn unresolved_conflict_paths(db: &db::Db) -> AppResult<HashSet<String>> {
 
 /// Recomputes per-file overlay tiers and atomically writes `overlay_state.json` under [`db::app_data_dir`].
 pub(crate) fn refresh_overlay_state_internal(state: &AppState) {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return;
+    }
     if let Err(e) = refresh_overlay_state_inner(state) {
         tracing::error!(error = %e, "refresh overlay state failed");
     }

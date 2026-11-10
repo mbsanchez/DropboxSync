@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { FinderExtensionState, StartupRequirements } from "../types";
 
 /**
- * Tracks whether Dropbox auth + the local sync folder are configured. Refreshes on
+ * Tracks whether Dropbox auth + the local sync folder are configured (on macOS, whether Dropbox was
+ * put in Finder: `fileProvider`). Refreshes on
  * mount and on window focus (e.g. coming back from the OAuth browser tab). Exposes
  * the raw setters too: `useAuthFlow` needs to update this same state for immediate
  * UI feedback before its own network round-trip (via `refreshStartupRequirements`)
@@ -14,6 +15,7 @@ export function useStartupRequirements(pushLog: (line: string) => void) {
   const [authOk, setAuthOk] = useState(false);
   const [syncFolderOk, setSyncFolderOk] = useState(false);
   const [syncFolder, setSyncFolder] = useState("");
+  const [fileProvider, setFileProvider] = useState(false);
   // Starts as "notApplicable" so nothing is warned about before the first read lands
   // (DBSYNC-86). Defaulting to "disabled" would flash a banner on every launch.
   const [finderExtension, setFinderExtension] =
@@ -27,6 +29,7 @@ export function useStartupRequirements(pushLog: (line: string) => void) {
       if (requirements.syncFolder) {
         setSyncFolder(requirements.syncFolder);
       }
+      setFileProvider(requirements.fileProvider ?? false);
       setFinderExtension(requirements.finderExtension ?? "notApplicable");
     } catch (error) {
       pushLog(`Startup check failed: ${String(error)}`);
@@ -53,6 +56,7 @@ export function useStartupRequirements(pushLog: (line: string) => void) {
     authOk,
     syncFolderOk,
     syncFolder,
+    fileProvider,
     finderExtension,
     setSyncFolder,
     setAuthOk,

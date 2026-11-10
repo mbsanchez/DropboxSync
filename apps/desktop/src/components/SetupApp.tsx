@@ -27,8 +27,9 @@ function SaveResult({ status }: { status: SaveStatus | null }) {
 }
 
 /**
- * Decorated onboarding/settings window. Connect Dropbox -> choose sync folder ->
- * (once both are OK) auto-closes itself so the app drops back to the tray flyout.
+ * Decorated onboarding/settings window. Connect Dropbox -> choose sync folder (on macOS: put
+ * Dropbox in Finder, DBSYNC-98) -> (once both are OK) auto-closes itself so the app drops back to
+ * the tray flyout.
  * If opened later via the flyout's settings affordance while already fully
  * configured, it stays open as a small settings panel (reconnect / change folder /
  * selective sync) instead of instantly closing.
@@ -40,6 +41,7 @@ function SetupApp() {
     authOk,
     syncFolderOk,
     syncFolder,
+    fileProvider,
     setSyncFolder,
     setAuthOk,
     setSyncFolderOk,
@@ -70,6 +72,11 @@ function SetupApp() {
   const ignoreSave = useSaveAction();
 
   const [showFolderSetup, setShowFolderSetup] = useState(false);
+  // macOS: *Start* was pressed in this window. The window then stays open on "You're all set", so
+  // the user reads where the files are instead of watching it close.
+  const [startedHere, setStartedHere] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!authOk) {
@@ -87,12 +94,12 @@ function SetupApp() {
       wasIncompleteRef.current = true;
       return;
     }
-    if (!wasIncompleteRef.current) return;
+    if (!wasIncompleteRef.current || startedHere) return;
     const timer = window.setTimeout(() => {
       void getCurrentWindow().close();
     }, 900);
     return () => window.clearTimeout(timer);
-  }, [startupLoading, authOk, syncFolderOk]);
+  }, [startupLoading, authOk, syncFolderOk, startedHere]);
 
   const handleStartOAuth = () => {
     setShowFolderSetup(false);
@@ -110,10 +117,36 @@ function SetupApp() {
     }
   };
 
+  const startFileProvider = async () => {
+    setStarting(true);
+    setStartError(null);
+    try {
+      const location = await invoke<string>("start_file_provider");
+      setStartedHere(true);
+      pushLog(`Dropbox is in Finder: ${location}`);
+      await refreshStartupRequirements();
+    } catch (e) {
+      setStartError(String(e));
+      pushLog(`Could not put Dropbox in Finder: ${String(e)}`);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const openInFinder = async () => {
+    try {
+      await invoke("open_sync_folder");
+    } catch (e) {
+      pushLog(`Failed to open the Dropbox folder: ${String(e)}`);
+    }
+  };
+
   const handleDisconnect = async () => {
     const ok = await confirmAction(
       "Disconnect Dropbox",
-      "Disconnect Dropbox? This signs you out and clears local sync state. Your files on Dropbox are not affected.",
+      fileProvider
+        ? "Disconnect Dropbox? This signs you out and removes Dropbox from Finder, with the copies downloaded to this Mac. Changes not synced yet are kept. Your files on Dropbox are not affected."
+        : "Disconnect Dropbox? This signs you out and clears local sync state. Your files on Dropbox are not affected.",
     );
     if (!ok) return;
     await disconnect();
@@ -135,7 +168,11 @@ function SetupApp() {
     <main className="container">
       <section className="card hero">
         <h1 className="title">Dropbox Sync Desktop</h1>
-        <p className="subtitle">Smart placeholders, selective hydration, and background sync.</p>
+        <p className="subtitle">
+          {fileProvider
+            ? "Your Dropbox in Finder, downloaded when you open a file."
+            : "Smart placeholders, selective hydration, and background sync."}
+        </p>
       </section>
 
       {startupLoading && (
@@ -168,7 +205,29 @@ function SetupApp() {
         </section>
       )}
 
-      {!startupLoading && authOk && !syncFolderOk && !showFolderSetup && (
+      {!startupLoading && authOk && !syncFolderOk && fileProvider && (
+        <section className="card onboarding">
+          <h2>Put Dropbox in Finder</h2>
+          <p>
+            Your Dropbox appears in Finder under Locations, as DropboxSync. Files show right away and
+            download from Dropbox when you open them.
+          </p>
+          <p>
+            Everything downloads again from Dropbox: nothing is copied from a folder an earlier version
+            of this app used, which stays where it is.
+          </p>
+          <button type="button" disabled={starting} onClick={() => void startFileProvider()}>
+            {starting ? "Starting…" : "Start"}
+          </button>
+          {startError && (
+            <p role="alert" style={{ color: "#b00020", marginTop: 12, whiteSpace: "pre-wrap" }}>
+              {startError}
+            </p>
+          )}
+        </section>
+      )}
+
+      {!startupLoading && authOk && !syncFolderOk && !fileProvider && !showFolderSetup && (
         <section className="card onboarding">
           <h2>Dropbox connected</h2>
           <p>Your token was registered successfully. Continue to choose the local sync folder.</p>
@@ -176,7 +235,7 @@ function SetupApp() {
         </section>
       )}
 
-      {!startupLoading && authOk && !syncFolderOk && showFolderSetup && (
+      {!startupLoading && authOk && !syncFolderOk && !fileProvider && showFolderSetup && (
         <section className="card onboarding">
           <h2>Choose Sync Folder</h2>
           <p>Select the local folder where placeholders and hydrated files will be stored.</p>
@@ -202,7 +261,11 @@ function SetupApp() {
       {!startupLoading && authOk && syncFolderOk && (
         <section className="card onboarding">
           <h2>You're all set</h2>
-          <p>Dropbox is connected and the sync folder is configured.</p>
+          <p>
+            {fileProvider
+              ? "Dropbox is connected and in Finder."
+              : "Dropbox is connected and the sync folder is configured."}
+          </p>
 
           <h3>Dropbox account</h3>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -229,23 +292,39 @@ function SetupApp() {
             </p>
           )}
 
-          <h3>Sync folder</h3>
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
-              value={syncFolder}
-              onChange={(e) => {
-                setSyncFolder(e.currentTarget.value);
-                folderSave.clearStatus();
-              }}
-              placeholder="/Users/me/DropboxSync"
-              disabled={folderSave.saving}
-            />
-            <button disabled={folderSave.saving} onClick={pickFolder}>...</button>
-            <button disabled={folderSave.saving} onClick={() => void folderSave.run(saveFolder)}>
-              {folderSave.saving ? "Saving…" : "Save"}
-            </button>
-          </div>
-          <SaveResult status={folderSave.status} />
+          {fileProvider ? (
+            <>
+              <h3>Location</h3>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <code style={{ wordBreak: "break-all" }}>
+                  {syncFolder || "Finder › Locations › DropboxSync"}
+                </code>
+                <button type="button" onClick={() => void openInFinder()}>
+                  Open in Finder
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <h3>Sync folder</h3>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  value={syncFolder}
+                  onChange={(e) => {
+                    setSyncFolder(e.currentTarget.value);
+                    folderSave.clearStatus();
+                  }}
+                  placeholder="/Users/me/DropboxSync"
+                  disabled={folderSave.saving}
+                />
+                <button disabled={folderSave.saving} onClick={pickFolder}>...</button>
+                <button disabled={folderSave.saving} onClick={() => void folderSave.run(saveFolder)}>
+                  {folderSave.saving ? "Saving…" : "Save"}
+                </button>
+              </div>
+              <SaveResult status={folderSave.status} />
+            </>
+          )}
 
           <h3>Selective sync</h3>
           <div style={{ display: "grid", gap: 8 }}>

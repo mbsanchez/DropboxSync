@@ -96,26 +96,43 @@ signalled, so the host calls `signalErrorResolved:` when it starts, when a proje
 `contentPolicy` (behind *Make Available Offline*) both need macOS 13, which is why the minimum system version
 rises to 13.0. The target stays arm64 only.
 
-### Rollout switch
+### Rollout switch (until the cutover)
 
-Until the cutover slice, domain registration sits behind a switch, so `main` keeps the sidecar path. (See *Merge ordering* below: the switch keeps the domain off, but it does not keep Finder Sync enabled.)
+Until the cutover (slice 6, DBSYNC-98), domain registration sat behind the per-user defaults key
+`FileProviderEnabled`, so the branch could keep the sidecar path while the domain was built. The cutover
+removed the key: nothing reads it any more. (See *Merge ordering* below: the switch kept the domain off, but it
+did not keep Finder Sync enabled.)
 
-- The switch is the **per-user defaults key `FileProviderEnabled`** in the app's defaults domain
-  (`defaults write com.mobsanchez.dropboxsyncdesktop FileProviderEnabled -bool YES`), read once at startup
-  through `NSUserDefaults`. It defaults to off, and no script or workflow writes it.
-- It is not an environment variable, because a launch from Finder or by a login item never inherits one, so an
-  env-var switch would remove the domain on every normal launch. It is not a compile-time feature, because the
-  off build would then contain no removal code.
-- An `app_config` breadcrumb records that this install registered a domain. The decision is a pure function:
+### Starting and leaving (the cutover)
 
-  | Switch | Breadcrumb | Action |
+On macOS the domain is how the files reach Finder, and nothing else runs (*What stays and what is gated at the
+cutover*). The user starts it once, in onboarding, after connecting Dropbox: a step tells them the files appear
+in Finder under Locations and that **everything downloads again from Dropbox**, and its *Start* adds the domain
+and then shows the folder macOS gives it (`getUserVisibleURL` of the root container, kept as
+`fp_visible_root`). It is never added before the user has read that, except on an install that already had it
+behind the switch (below). Onboarding counts as done only once macOS has said where the folder is, so a *Start*
+whose add or location failed keeps showing, with its error.
+
+- An `app_config` breadcrumb records that the user started it. It is written **before** the domain is added, so a
+  crash between the two adds the domain at the next launch, and cleared **before** the domain is removed, so a
+  failed removal is retried by the next launch. Each launch makes the system match it:
+
+  | Breadcrumb | Domain registered | Action |
   | --- | --- | --- |
-  | off | none | nothing; **no File Provider call at all**, which is today's behaviour |
-  | off | present | remove the domain, clear the breadcrumb |
-  | on | any | add the domain (idempotent), set the breadcrumb |
+  | present | any | add the domain (idempotent) |
+  | absent | yes | remove it, keeping unsynced changes: a disconnect whose removal failed |
+  | absent | no | nothing |
 
-- The File Provider appex is bundled in every macOS build and does nothing as a File Provider until a domain is
-  added (it still disables Finder Sync on macOS 26; see *Merge ordering*). The decision is logged once at startup.
+- **Disconnecting Dropbox removes the domain** (`PreserveDirtyUserData`): the system deletes what was downloaded
+  and keeps what was changed and never synced. Connecting again goes through *Start* again.
+- **A Mac that used the sync folder** forgets it at the first launch of a cutover build, with what the folder
+  pipeline knew (`forget_folder_state`). The domain's state stays: the projection, the pins and the delta
+  cursor. The folder stays on disk untouched; nothing is copied or migrated (ADR-0003, *The folder relocation
+  copies nothing*).
+- Launch, *Start* and a disconnect's removal take one lock and read the breadcrumb under it, so a removal still
+  running from a disconnect cannot land after a reconnect's *Start*.
+- An install that already had the domain behind the switch keeps it: the switch wrote the same breadcrumb.
+- The File Provider appex is bundled in every macOS build and does nothing until the domain is added.
 
 ### Merge ordering: DBSYNC-95 and DBSYNC-98 land together
 
@@ -459,6 +476,17 @@ placeholder-folder logic (DBSYNC-111), sidecar materialization and the `hydrate_
 remote delta, the longpoll and the job engine, the retry classification and the mass-deletion guard, moves,
 deletes and the conflict resolver, and the download and upload paths adapted to staging. On macOS `sync_folder`
 stays unset, and the gating is explicit rather than implied by the unset value. Windows does not change.
+
+How (slice 6): `platform::sidecar_pipeline()` is false in a macOS build, and the pipeline's entry points ask it
+first: the watcher, the scan, the job executor (`process_sync_queue_internal`), the delta's half that feeds the
+folder (`apply_delta_entries`), the seed's reconcile of the local index and its `known_folders` backfill, the
+remote refresh behind the periodic scan, the placeholder indexing and listing, `.cloudsc` opens, hydrate,
+dehydrate and the manual download, the shell actions and the Finder Sync overlay state. Tests turn it off and
+check each of them with a folder stored and work waiting in it, except the `.cloudsc` open handler, which needs
+a running app. The longpoll runs for the projection there and for the sync folder elsewhere, never for both;
+`set_sync_folder` refuses, and *Sync now* answers that there is nothing to run. The `.cloudsc` file association moved to `tauri.windows.conf.json` and
+`tauri.linux.conf.json`, so a macOS bundle declares none, and the Finder Sync extension sets an empty
+`directoryURLs` and reads nothing.
 
 ## Consequences
 

@@ -73,6 +73,14 @@ pub fn set_selective_sync_filters(
 /// place that owns the `sync_running` compare-exchange for a user-requested cycle, shared by
 /// `trigger_sync_tick` and Save (`set_selective_sync_filters`).
 pub(crate) fn request_sync_cycle(state: &AppState) -> TriggerSyncResponse {
+    // DBSYNC-98: macOS has no cycle to run; taking the gate for nothing would only make the longpoll
+    // wait for it.
+    if !crate::platform::sidecar_pipeline() {
+        return TriggerSyncResponse {
+            accepted: false,
+            reason: TriggerSyncReason::NothingToSync,
+        };
+    }
     if state
         .sync_running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -157,6 +165,10 @@ pub fn cancel_oauth_flow(state: tauri::State<AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn set_sync_folder(state: tauri::State<AppState>, folder: String) -> Result<(), String> {
+    // DBSYNC-98: macOS keeps no sync folder, and a stored one would be read by nothing but older code.
+    if !crate::platform::sidecar_pipeline() {
+        return Err(crate::platform::NO_SIDECARS.to_string());
+    }
     fs::create_dir_all(&folder).map_err(|e| format!("failed to create sync folder: {e}"))?;
     let prev = state.db.get_sync_folder()?.unwrap_or_default();
     state.db.set_sync_folder(&folder)?;
@@ -180,6 +192,26 @@ pub fn set_sync_folder(state: tauri::State<AppState>, folder: String) -> Result<
         tracing::warn!(error = %e, "failed to re-arm filesystem watcher after folder change");
     }
     Ok(())
+}
+
+/// Onboarding's *Start* on macOS (DBSYNC-98): puts Dropbox in Finder, after the user was told the files
+/// download again, and answers the folder macOS shows them in. Not on other platforms.
+#[tauri::command]
+pub async fn start_file_provider(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let state = app.state::<AppState>().inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            objc2::rc::autoreleasepool(|_| crate::file_provider::enable(&state))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("File Provider is macOS only".to_string())
+    }
 }
 
 #[tauri::command]
@@ -227,9 +259,10 @@ pub fn disconnect_dropbox(state: tauri::State<AppState>) -> Result<(), String> {
     }
 
     state.db.reset_sync_state()?;
-    // DBSYNC-95: the reset emptied the projection and expired its anchors; tell the system.
+    // DBSYNC-98: leaving the account removes the domain; onboarding's *Start* adds it again.
     #[cfg(target_os = "macos")]
-    crate::file_provider::signal_if_active(&state.db);
+    crate::file_provider::disable(state.db.clone())
+        .map_err(|e| format!("signed out, but Dropbox could not be removed from Finder: {e}"))?;
     state.db.clear_sync_folder()?;
 
     {
@@ -247,11 +280,12 @@ pub fn disconnect_dropbox(state: tauri::State<AppState>) -> Result<(), String> {
 pub(crate) fn compute_startup_requirements(
     state: &AppState,
 ) -> AppResult<StartupRequirementsResponse> {
-    let sync_folder = state.db.get_sync_folder()?;
-    let sync_folder_ok = sync_folder
-        .as_ref()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
+    let (sync_folder_ok, sync_folder, file_provider) = where_files_live(state)?;
+    let finder_extension = if file_provider {
+        file_provider_finder_state()
+    } else {
+        crate::finder_extension::finder_extension_state()
+    };
 
     // In-memory session (e.g. just completed OAuth): trust it for onboarding without a network probe.
     // Keychain reads can lag on some platforms; do not require `has_stored_credentials` here.
@@ -261,7 +295,8 @@ pub(crate) fn compute_startup_requirements(
                 auth_ok: true,
                 sync_folder_ok,
                 sync_folder,
-                finder_extension: crate::finder_extension::finder_extension_state(),
+                finder_extension,
+                file_provider,
             });
         }
     }
@@ -280,8 +315,43 @@ pub(crate) fn compute_startup_requirements(
         auth_ok,
         sync_folder_ok,
         sync_folder,
-        finder_extension: crate::finder_extension::finder_extension_state(),
+        finder_extension,
+        file_provider,
     })
+}
+
+/// Whether the files have somewhere to live, where, and whether that is the File Provider domain. With
+/// the sync-folder pipeline: the sync folder. Without it (macOS, DBSYNC-98): whether the user started
+/// File Provider, and the folder macOS shows it in.
+fn where_files_live(state: &AppState) -> AppResult<(bool, Option<String>, bool)> {
+    #[cfg(target_os = "macos")]
+    if !crate::platform::sidecar_pipeline() {
+        return Ok((
+            crate::file_provider::in_finder(&state.db),
+            crate::file_provider::visible_root(&state.db),
+            true,
+        ));
+    }
+    let sync_folder = state.db.get_sync_folder()?;
+    let ok = sync_folder
+        .as_ref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    Ok((ok, sync_folder, false))
+}
+
+/// The Finder Sync extension does not monitor anything beside File Provider (ADR-0003), so whether it
+/// is enabled says nothing; only a translocated app, which breaks File Provider too, is worth a word.
+fn file_provider_finder_state() -> crate::finder_extension::FinderExtensionState {
+    use crate::finder_extension::{is_translocated_path, FinderExtensionState};
+    let translocated = std::env::current_exe()
+        .map(|p| is_translocated_path(&p.display().to_string()))
+        .unwrap_or(false);
+    if translocated {
+        FinderExtensionState::Translocated
+    } else {
+        FinderExtensionState::NotApplicable
+    }
 }
 
 /// When `true`, the main window should be visible (Connect Dropbox / folder setup). When `false`, the
@@ -459,9 +529,16 @@ pub fn open_logs() -> Result<(), String> {
 }
 
 /// Opens the configured sync-root folder in the OS file manager (Explorer /
-/// Finder / xdg-open). Used by the flyout's "Dossiers" action.
+/// Finder / xdg-open). Used by the flyout's "Dossiers" action. On macOS, the File Provider domain's
+/// folder (DBSYNC-98).
 #[tauri::command]
 pub fn open_sync_folder(state: tauri::State<AppState>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if !crate::platform::sidecar_pipeline() {
+        let root = crate::file_provider::visible_root(&state.db)
+            .ok_or_else(|| "Dropbox is not in Finder yet".to_string())?;
+        return open_in_file_manager(std::path::Path::new(&root));
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -837,6 +914,50 @@ mod tests {
             .build(mock_context(noop_assets()))
             .expect("mock app");
         (app, db, dir)
+    }
+
+    /// DBSYNC-98: without the sync-folder pipeline (macOS) onboarding asks whether Dropbox is in Finder
+    /// and ignores a stored folder, and "Sync now" has nothing to start. With it, the folder decides.
+    ///
+    /// Proof this test can fail: dropping the gate in `where_files_live` reports the stray folder;
+    /// dropping the one in `request_sync_cycle` takes the sync gate.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn without_the_pipeline_the_files_live_in_finder_and_nothing_cycles() {
+        let (app, db, _dir) = mock_app();
+        let state = app.state::<AppState>();
+        db.set_sync_folder("/Users/me/DropboxSync").unwrap();
+        let home = _dir.path().join("home");
+        let root = home.join("Library/CloudStorage/DropboxSyncDesktop-DropboxSync");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_string_lossy().into_owned();
+
+        crate::platform::without_sidecar_pipeline(|| {
+            assert_eq!(
+                super::where_files_live(&state).unwrap(),
+                (false, None, true)
+            );
+            crate::file_provider::mark_started(&db).unwrap();
+            db.set_app_config(crate::file_provider::VISIBLE_ROOT_KEY, &root)
+                .unwrap();
+            assert_eq!(
+                super::where_files_live(&state).unwrap(),
+                (true, Some(root.clone()), true)
+            );
+            let response = super::request_sync_cycle(&state);
+            assert!(!response.accepted);
+            assert!(matches!(
+                response.reason,
+                crate::models::TriggerSyncReason::NothingToSync
+            ));
+            assert!(!state
+                .sync_running
+                .load(std::sync::atomic::Ordering::Acquire));
+        });
+        assert_eq!(
+            super::where_files_live(&state).unwrap(),
+            (true, Some("/Users/me/DropboxSync".to_string()), false)
+        );
     }
 
     fn invoke(

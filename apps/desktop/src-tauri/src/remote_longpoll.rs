@@ -38,11 +38,18 @@ pub(crate) fn start_longpoll(state: &AppState) {
     std::thread::spawn(move || longpoll_loop(&st));
 }
 
-/// Whether the remote loop has anything to keep in sync: a sync folder, or (macOS, DBSYNC-95) the
-/// File Provider projection.
-#[cfg(target_os = "macos")]
-fn remote_loop_has_work(sync_folder_set: bool, projection_active: bool) -> bool {
-    sync_folder_set || projection_active
+/// Whether the remote loop has anything to keep in sync. With the sync-folder pipeline, a sync folder;
+/// without it (macOS, DBSYNC-98), the File Provider projection, whatever `sync_folder` holds.
+fn remote_loop_has_work(
+    sidecar_pipeline: bool,
+    sync_folder_set: bool,
+    projection_active: bool,
+) -> bool {
+    if sidecar_pipeline {
+        sync_folder_set
+    } else {
+        projection_active
+    }
 }
 
 /// Exponential error backoff: 0 → 5s → 10s → … capped at 60s.
@@ -57,20 +64,25 @@ fn next_backoff(prev: u64) -> u64 {
 fn longpoll_loop(state: &AppState) {
     let mut err_backoff = 0u64;
     loop {
-        // 1. Ready check: a sync folder AND a usable token. Handles logout —
+        // 1. Ready check: something to keep in sync AND a usable token. Handles logout —
         // get_access_token errs → idle; a later login resumes the loop.
-        let folder_ok = state
+        let folder_set = state
             .db
             .get_sync_folder()
             .ok()
             .flatten()
             .map(|f| !f.trim().is_empty())
             .unwrap_or(false);
-        // DBSYNC-95: with the File Provider projection on, macOS keeps no sync folder (ADR-0004), so the
-        // loop must run without one.
         #[cfg(target_os = "macos")]
-        let folder_ok = remote_loop_has_work(folder_ok, state.db.projection_active());
-        if !folder_ok || crate::auth_session::get_access_token(state).is_err() {
+        let projection_active = state.db.projection_active();
+        #[cfg(not(target_os = "macos"))]
+        let projection_active = false;
+        let has_work = remote_loop_has_work(
+            crate::platform::sidecar_pipeline(),
+            folder_set,
+            projection_active,
+        );
+        if !has_work || crate::auth_session::get_access_token(state).is_err() {
             std::thread::sleep(Duration::from_secs(IDLE_SLEEP_SECS));
             continue;
         }
@@ -235,14 +247,9 @@ fn apply_and_drain(state: &AppState) -> DrainOutcome {
     // before discovery). The DBSYNC-66 grace window is armed inside the sweep, so
     // restore churn still can't be read as a user delete.
     //
-    // DBSYNC-95: skipped without a sync folder (the loop now also runs for the projection alone),
-    // where the sweep would only log "sync folder not configured" on every change.
-    #[cfg(target_os = "macos")]
-    let has_sync_folder = state.db.get_sync_folder().ok().flatten().is_some();
-    // Other platforms always have one here (the ready check requires it): unchanged.
-    #[cfg(not(target_os = "macos"))]
-    let has_sync_folder = true;
-    if has_sync_folder {
+    // DBSYNC-98: not on macOS, which has no sidecars (`platform`). Elsewhere the ready check required a
+    // sync folder: unchanged.
+    if crate::platform::sidecar_pipeline() {
         match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state)
         {
             Ok(n) if n > 0 => {
@@ -266,27 +273,31 @@ mod tests {
     use super::{next_backoff, MAX_BACKOFF_SECS, MIN_BACKOFF_SECS};
     use crate::models::DropboxLongpollResponse;
 
-    /// DBSYNC-95: the loop runs for a sync folder OR for the projection, and idles for neither.
+    /// DBSYNC-98: with the sync-folder pipeline the loop runs for a sync folder; without it (macOS) for
+    /// the projection, and a folder an older build left behind does not count.
     ///
-    /// Proof this test can fail: turning the `||` of `remote_loop_has_work` into `&&` fails the
-    /// projection-only row; dropping the folder operand fails the folder-only row.
-    #[cfg(target_os = "macos")]
+    /// Proof this test can fail: answering `sync_folder_set || projection_active` fails the two
+    /// "ignored" rows.
     #[test]
-    fn the_remote_loop_runs_for_a_sync_folder_or_for_the_projection() {
+    fn the_remote_loop_runs_for_the_folder_or_the_projection_by_platform_never_both() {
         use super::remote_loop_has_work;
         assert!(
-            remote_loop_has_work(true, false),
-            "sync folder only (today)"
+            remote_loop_has_work(true, true, false),
+            "folder pipeline: a folder"
         );
         assert!(
-            remote_loop_has_work(false, true),
-            "projection only (macOS, no folder)"
+            !remote_loop_has_work(true, false, true),
+            "folder pipeline: projection ignored"
         );
-        assert!(remote_loop_has_work(true, true));
         assert!(
-            !remote_loop_has_work(false, false),
-            "neither: idle, as today"
+            remote_loop_has_work(false, false, true),
+            "macOS: the projection"
         );
+        assert!(
+            !remote_loop_has_work(false, true, false),
+            "macOS: a stray folder ignored"
+        );
+        assert!(!remote_loop_has_work(false, false, false));
     }
 
     #[test]

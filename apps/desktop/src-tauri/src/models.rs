@@ -46,6 +46,8 @@ pub(crate) struct TriggerSyncResponse {
 pub(crate) enum TriggerSyncReason {
     Started,
     AlreadyRunning,
+    /// macOS (DBSYNC-98): no cycle exists there; changes reach Finder as they come.
+    NothingToSync,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +155,9 @@ pub(crate) struct StartupRequirementsResponse {
     /// its own command because the UI already re-reads this shape on window focus, which is
     /// exactly when `FinderSync.h` says to re-check.
     pub finder_extension: crate::finder_extension::FinderExtensionState,
+    /// The files live in the File Provider domain, not in a sync folder (macOS, DBSYNC-98): onboarding
+    /// asks for no folder, and `sync_folder` is the domain's folder as macOS shows it.
+    pub file_provider: bool,
 }
 
 /// Emitted to the webview after the localhost OAuth redirect is handled (success or failure).

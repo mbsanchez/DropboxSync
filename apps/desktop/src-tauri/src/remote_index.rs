@@ -563,7 +563,8 @@ fn fetch_remote_snapshot(
             // This is the ONLY writer, and there is no reader yet — see
             // `Db::set_known_folder_dropbox_id`, which records why that is deliberate and
             // the two coverage holes any future reader has to allow for (DBSYNC-106).
-            if entry.tag == "folder" {
+            // DBSYNC-98: `known_folders` is the folder pipeline's, which macOS does not run.
+            if entry.tag == "folder" && crate::platform::sidecar_pipeline() {
                 if let (Some(path_display), Some(id)) =
                     (entry.path_display.as_deref(), entry.id.as_deref())
                 {
@@ -607,6 +608,10 @@ fn fetch_remote_snapshot(
 pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     state: &AppState,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let local_files = state.db.list_local_files()?;
     if local_files.is_empty() {
         return Ok(0);
@@ -997,6 +1002,10 @@ fn reconcile_seed_snapshot(
     state: &AppState,
     remote_by_path: &HashMap<String, RemoteFileMeta>,
 ) -> AppResult<()> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(());
+    }
     let local_files = state.db.list_local_files()?;
     if !local_files.is_empty() {
         let pending_targets = pending_job_targets(state)?;
@@ -1206,6 +1215,10 @@ pub(crate) fn apply_delta_entries(
     pending_targets: &HashSet<String>,
     pending_job_types: &[(String, String)],
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let mut enqueued = 0usize;
     // DBSYNC-102 (#179): see the doc above for why this must be an owned, mutable,
     // per-invocation copy rather than the borrowed snapshot the caller passed in.
@@ -2566,6 +2579,48 @@ mod tests {
     // `apply_remote_delta` itself, which fetches the access token and would make a
     // live `list_folder/continue` call against the real account.
     // ---------------------------------------------------------------------------
+
+    /// DBSYNC-98: without the sync-folder pipeline (macOS) a delta writes nothing for it: no remote row,
+    /// no job. The projection is the only thing the delta feeds there.
+    ///
+    /// Proof this test can fail: removing the gate at the top of `apply_delta_entries` stores the row.
+    #[test]
+    fn a_delta_writes_nothing_for_the_folder_pipeline_without_it() {
+        let state = build_state();
+        // An indexed local file, so the remote refresh has work and would reach for a token.
+        state.db.upsert_local_file("b.txt", "H", 1, 0).unwrap();
+        let entries = vec![file_entry(Some("/a.txt"), Some("H"), Some("rev1"), None)];
+        crate::platform::without_sidecar_pipeline(|| {
+            assert_eq!(
+                apply_delta_entries(&state, &entries, &HashSet::new(), &[]).unwrap(),
+                0
+            );
+            assert_eq!(
+                refresh_remote_index_and_enqueue_downloads_internal(&state).unwrap(),
+                0
+            );
+            // A snapshot where `b.txt` changed: the folder pipeline would download it.
+            let changed = file_entry(Some("/b.txt"), Some("OTHER"), Some("rev2"), None);
+            let snapshot: HashMap<String, RemoteFileMeta> =
+                remote_meta_from_entry(&changed).into_iter().collect();
+            assert_eq!(snapshot.len(), 1);
+            reconcile_seed_snapshot(&state, &snapshot).unwrap();
+        });
+        assert!(
+            state.db.list_recent_jobs(10).unwrap().is_empty(),
+            "the seed reconciled nothing"
+        );
+        assert!(
+            state.db.get_remote_file("b.txt").unwrap().is_none(),
+            "the seed wrote no remote row"
+        );
+        assert!(state.db.get_remote_file("a.txt").unwrap().is_none());
+        apply_delta_entries(&state, &entries, &HashSet::new(), &[]).unwrap();
+        assert!(
+            state.db.get_remote_file("a.txt").unwrap().is_some(),
+            "with the pipeline the same delta stores the row"
+        );
+    }
 
     /// **DBSYNC-102 fix, proven at the seam.** Until slice #173 landed, this exact
     /// input batch produced the data-loss defect described below; the assertions now

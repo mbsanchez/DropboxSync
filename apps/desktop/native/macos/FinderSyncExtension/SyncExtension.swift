@@ -51,13 +51,12 @@ final class DropboxSyncFinderSync: FIFinderSync {
     /// whole diff can be skipped — which matters because this runs every 2 seconds forever.
     private var lastUpdatedAt: String?
 
+    /// Monitors nothing (DBSYNC-98, ADR-0003): on macOS the files live in the File Provider domain,
+    /// which shows their state natively, and there is no sync folder to badge. The extension stays
+    /// bundled until a ticket of its own removes it, so it reads no state and badges nothing.
     override init() {
         super.init()
-        registerBadgeImages()
-        reloadState()
-        scheduleReload()
-
-        FIFinderSyncController.default().directoryURLs = monitoredDirectoryURLs()
+        FIFinderSyncController.default().directoryURLs = []
     }
 
     private func scheduleReload() {

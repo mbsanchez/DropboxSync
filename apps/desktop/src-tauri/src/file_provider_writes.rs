@@ -177,7 +177,11 @@ pub(crate) fn modify(
             Err(_) => return WriteOutcome::Retry,
         };
         let to = format!("{parent}/{name}");
-        if to != target.path && db.projection_would_hide(&to, target.is_folder).unwrap_or(false) {
+        if to != target.path
+            && db
+                .projection_would_hide(&to, target.is_folder)
+                .unwrap_or(false)
+        {
             return WriteOutcome::Hidden;
         }
         if to != target.path {
@@ -216,7 +220,12 @@ pub(crate) fn modify(
                     // Dropbox moved past the row: the edit may be the one that moved it, sent again
                     // after its answer was lost and before the delta caught up.
                     match dropbox.metadata(&target.path) {
-                        Ok(now) if now.content_hash.as_deref().is_some_and(|h| same_bytes(bytes, h)) => {
+                        Ok(now)
+                            if now
+                                .content_hash
+                                .as_deref()
+                                .is_some_and(|h| same_bytes(bytes, h)) =>
+                        {
                             return record(db, &now);
                         }
                         Ok(_) => {}
@@ -798,8 +807,15 @@ fn same_bytes(staged: &Path, content_hash: &str) -> bool {
 
 /// The live child of `parent_item` named `name` that is already what a create asks for: a folder, or a
 /// file with these bytes.
-fn already_there(db: &Db, parent_item: i64, name: &str, folder: bool, staged: &Path) -> Option<i64> {
-    let (item_id, is_folder, content_hash) = db.projection_child(parent_item, name).ok().flatten()?;
+fn already_there(
+    db: &Db,
+    parent_item: i64,
+    name: &str,
+    folder: bool,
+    staged: &Path,
+) -> Option<i64> {
+    let (item_id, is_folder, content_hash) =
+        db.projection_child(parent_item, name).ok().flatten()?;
     // An item whose delete is still held or waiting to be sent again is going: a file put back under
     // its name is a new item, or it would go with the delete.
     if DELETE_GUARD.involves(item_id) {
@@ -869,7 +885,13 @@ impl LiveDropbox<'_> {
         // Anything past one chunk goes through a session, so the lane is held for the `finish` alone and
         // not while the bytes travel.
         let body = if len > crate::dropbox_transfer::UPLOAD_CHUNK_SIZE as u64 {
-            crate::dropbox_transfer::post_content_session(self.state, &arg, handle, len, self.abandoned)?
+            crate::dropbox_transfer::post_content_session(
+                self.state,
+                &arg,
+                handle,
+                len,
+                self.abandoned,
+            )?
         } else {
             let _lane = self.lane()?;
             crate::dropbox_transfer::post_content(self.state, "files/upload", &arg, handle, len)?
@@ -938,7 +960,11 @@ impl DropboxWrites for LiveDropbox<'_> {
     fn metadata(&self, dropbox_path: &str) -> AppResult<DropboxEntry> {
         let arg = serde_json::json!({ "path": dropbox_path });
         let body = crate::dropbox_transfer::post_rpc(self.state, "files/get_metadata", &arg)?;
-        let tag = body.get(".tag").and_then(Value::as_str).unwrap_or("file").to_string();
+        let tag = body
+            .get(".tag")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_string();
         entry_from_metadata(body, &tag)
     }
 }
@@ -1430,9 +1456,15 @@ mod tests {
         let (item_id, _) = with_file(&db);
         let fake = Fake::answering(Err(conflict_409("to/conflict/file/..")));
 
-        let change = Change { place: Some((docs(&db), "b.txt")), content: None };
+        let change = Change {
+            place: Some((docs(&db), "b.txt")),
+            content: None,
+        };
 
-        assert_eq!(modify(&db, &fake, item_id, &change), WriteOutcome::Collision);
+        assert_eq!(
+            modify(&db, &fake, item_id, &change),
+            WriteOutcome::Collision
+        );
     }
 
     /// Found in review: an edit of a file deleted on Dropbox, or a create in a folder deleted there, was
@@ -1444,17 +1476,32 @@ mod tests {
         let (dir, db) = db();
         let (item_id, base) = with_file(&db);
         let (bytes, _) = staged(&dir, b"edit");
-        db.project_delta(&[DropboxEntry { tag: "deleted".into(), ..entry("file", "/Docs/a.txt", "x") }])
-            .unwrap();
+        db.project_delta(&[DropboxEntry {
+            tag: "deleted".into(),
+            ..entry("file", "/Docs/a.txt", "x")
+        }])
+        .unwrap();
         let fake = Fake::answering_all(vec![]);
 
-        let edit = Change { place: None, content: Some((bytes.as_path(), base.as_str())) };
+        let edit = Change {
+            place: None,
+            content: Some((bytes.as_path(), base.as_str())),
+        };
         assert_eq!(modify(&db, &fake, item_id, &edit), WriteOutcome::NotLive);
         let parent = docs(&db);
-        db.project_delta(&[DropboxEntry { tag: "deleted".into(), ..entry("folder", "/Docs", "x") }])
-            .unwrap();
-        assert_eq!(create(&db, &fake, parent, "b.txt", false, &bytes), WriteOutcome::ParentNotLive);
-        assert_eq!(create(&db, &fake, 9_999, "b.txt", false, &bytes), WriteOutcome::Retry);
+        db.project_delta(&[DropboxEntry {
+            tag: "deleted".into(),
+            ..entry("folder", "/Docs", "x")
+        }])
+        .unwrap();
+        assert_eq!(
+            create(&db, &fake, parent, "b.txt", false, &bytes),
+            WriteOutcome::ParentNotLive
+        );
+        assert_eq!(
+            create(&db, &fake, 9_999, "b.txt", false, &bytes),
+            WriteOutcome::Retry
+        );
         assert!(fake.paths.borrow().is_empty());
     }
 
@@ -1466,17 +1513,35 @@ mod tests {
     fn a_move_into_a_deleted_or_hidden_place_names_the_place() {
         let (_dir, db) = db();
         let (item_id, _) = with_file(&db);
-        db.project_delta(&[entry("folder", "/Gone", "id:G")]).unwrap();
+        db.project_delta(&[entry("folder", "/Gone", "id:G")])
+            .unwrap();
         let gone = db.projection_item_id("/gone").unwrap();
-        db.project_delta(&[DropboxEntry { tag: "deleted".into(), ..entry("folder", "/Gone", "x") }]).unwrap();
+        db.project_delta(&[DropboxEntry {
+            tag: "deleted".into(),
+            ..entry("folder", "/Gone", "x")
+        }])
+        .unwrap();
         let fake = Fake::answering_all(vec![]);
 
-        let into_gone = Change { place: Some((gone, "a.txt")), content: None };
-        assert_eq!(modify(&db, &fake, item_id, &into_gone), WriteOutcome::ParentNotLive);
+        let into_gone = Change {
+            place: Some((gone, "a.txt")),
+            content: None,
+        };
+        assert_eq!(
+            modify(&db, &fake, item_id, &into_gone),
+            WriteOutcome::ParentNotLive
+        );
 
-        db.set_app_config("include_prefixes_csv", "Docs/Keep").unwrap();
-        let out_of_scope = Change { place: Some((0, "a.txt")), content: None };
-        assert_eq!(modify(&db, &fake, item_id, &out_of_scope), WriteOutcome::Hidden);
+        db.set_app_config("include_prefixes_csv", "Docs/Keep")
+            .unwrap();
+        let out_of_scope = Change {
+            place: Some((0, "a.txt")),
+            content: None,
+        };
+        assert_eq!(
+            modify(&db, &fake, item_id, &out_of_scope),
+            WriteOutcome::Hidden
+        );
         assert!(fake.paths.borrow().is_empty());
     }
 
@@ -1488,7 +1553,8 @@ mod tests {
     fn a_create_sent_again_after_it_landed_is_the_same_item() {
         let (dir, db) = db();
         let (bytes, hash) = staged(&dir, b"same bytes");
-        db.project_delta(&[file_with("/Docs/a.txt", "id:A", "r1", &hash)]).unwrap();
+        db.project_delta(&[file_with("/Docs/a.txt", "id:A", "r1", &hash)])
+            .unwrap();
         let existing = db.projection_item_id("/docs/a.txt").unwrap();
         let fake = Fake::answering_all(vec![]);
 
@@ -1498,7 +1564,10 @@ mod tests {
         assert!(fake.paths.borrow().is_empty());
         let (other, _) = staged(&dir, b"other bytes");
         let fake = Fake::answering(Err(conflict_409("path/conflict/file/..")));
-        assert_eq!(create(&db, &fake, docs(&db), "a.txt", false, &other), WriteOutcome::Collision);
+        assert_eq!(
+            create(&db, &fake, docs(&db), "a.txt", false, &other),
+            WriteOutcome::Collision
+        );
     }
 
     /// Found in review: an edit sent again after it landed found a newer rev and became a conflicted
@@ -1509,13 +1578,20 @@ mod tests {
     fn an_edit_sent_again_after_it_landed_writes_nothing() {
         let (dir, db) = db();
         let (bytes, hash) = staged(&dir, b"the edit");
-        db.project_delta(&[file_with("/Docs/a.txt", "id:A", "r2", &hash)]).unwrap();
+        db.project_delta(&[file_with("/Docs/a.txt", "id:A", "r2", &hash)])
+            .unwrap();
         let item_id = db.projection_item_id("/docs/a.txt").unwrap();
         let fake = Fake::answering_all(vec![]);
 
-        let edit = Change { place: None, content: Some((bytes.as_path(), "an older version")) };
+        let edit = Change {
+            place: None,
+            content: Some((bytes.as_path(), "an older version")),
+        };
 
-        assert_eq!(modify(&db, &fake, item_id, &edit), WriteOutcome::Written { item_id });
+        assert_eq!(
+            modify(&db, &fake, item_id, &edit),
+            WriteOutcome::Written { item_id }
+        );
         assert!(fake.paths.borrow().is_empty());
     }
 
@@ -1527,10 +1603,14 @@ mod tests {
     fn a_folder_holding_content_finder_never_showed_is_not_deleted() {
         let (_dir, db) = db();
         // A file whose folder the projection does not hold yet: an orphan under /Docs.
-        db.project_delta(&[entry("file", "/Docs/sub/x.txt", "id:X")]).unwrap();
+        db.project_delta(&[entry("file", "/Docs/sub/x.txt", "id:X")])
+            .unwrap();
         let fake = Fake::answering_all(vec![]);
 
-        assert_eq!(delete(&db, &fake, docs(&db), ""), WriteOutcome::DeletionRejected);
+        assert_eq!(
+            delete(&db, &fake, docs(&db), ""),
+            WriteOutcome::DeletionRejected
+        );
         assert!(fake.paths.borrow().is_empty());
     }
 
@@ -1541,11 +1621,15 @@ mod tests {
     #[test]
     fn a_create_selective_sync_would_hide_is_refused() {
         let (dir, db) = db();
-        db.set_app_config("include_prefixes_csv", "Docs/Keep").unwrap();
+        db.set_app_config("include_prefixes_csv", "Docs/Keep")
+            .unwrap();
         let (bytes, _) = staged(&dir, b"x");
         let fake = Fake::answering_all(vec![]);
 
-        assert_eq!(create(&db, &fake, docs(&db), "loose.txt", false, &bytes), WriteOutcome::Hidden);
+        assert_eq!(
+            create(&db, &fake, docs(&db), "loose.txt", false, &bytes),
+            WriteOutcome::Hidden
+        );
         assert!(fake.paths.borrow().is_empty());
     }
 
@@ -1563,9 +1647,18 @@ mod tests {
             Ok(entry("file", "/unused", "id:unused")),
         ]);
 
-        let rename = Change { place: Some((0, "Papers")), content: None };
-        assert_eq!(modify(&db, &fake, docs_id, &rename), WriteOutcome::Written { item_id: docs_id });
-        assert_eq!(db.projection_path_lower(file_id).unwrap().as_deref(), Some("/papers/a.txt"));
+        let rename = Change {
+            place: Some((0, "Papers")),
+            content: None,
+        };
+        assert_eq!(
+            modify(&db, &fake, docs_id, &rename),
+            WriteOutcome::Written { item_id: docs_id }
+        );
+        assert_eq!(
+            db.projection_path_lower(file_id).unwrap().as_deref(),
+            Some("/papers/a.txt")
+        );
 
         assert_eq!(delete(&db, &fake, file_id, &base), WriteOutcome::Deleted);
         assert_eq!(
@@ -1588,10 +1681,21 @@ mod tests {
             Ok(file_with("/Docs/a.txt", "id:A", "r2", &hash)),
         ]);
 
-        let edit = Change { place: None, content: Some((bytes.as_path(), base.as_str())) };
+        let edit = Change {
+            place: None,
+            content: Some((bytes.as_path(), base.as_str())),
+        };
 
-        assert_eq!(modify(&db, &fake, item_id, &edit), WriteOutcome::Written { item_id });
-        assert_eq!(fake.paths.borrow().len(), 2, "no conflicted copy: {:?}", fake.paths.borrow());
+        assert_eq!(
+            modify(&db, &fake, item_id, &edit),
+            WriteOutcome::Written { item_id }
+        );
+        assert_eq!(
+            fake.paths.borrow().len(),
+            2,
+            "no conflicted copy: {:?}",
+            fake.paths.borrow()
+        );
     }
 
     // ── the breaker ─────────────────────────────────────────────────────────────────────────────
@@ -1658,7 +1762,15 @@ mod tests {
             .map(|item| {
                 let (guard, decisions) = (guard.clone(), decisions.clone());
                 std::thread::spawn(move || {
-                    guard.admit(item, weight, tracked, &FAST, &*decisions, &Instant::now, &std::thread::sleep)
+                    guard.admit(
+                        item,
+                        weight,
+                        tracked,
+                        &FAST,
+                        &*decisions,
+                        &Instant::now,
+                        &std::thread::sleep,
+                    )
                 })
             })
             .collect()
@@ -1718,7 +1830,10 @@ mod tests {
 
         let handles = burst(&guard, &decisions, 30, 1, 100);
         std::thread::sleep(Duration::from_millis(300));
-        assert!(handles.iter().all(|h| !h.is_finished()), "nothing may go before the user decides");
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "nothing may go before the user decides"
+        );
         assert_eq!(decisions.holds.load(Ordering::SeqCst), 1);
         decisions.confirm();
 
@@ -1749,7 +1864,15 @@ mod tests {
         decisions.restore();
         results(handles);
 
-        let late = guard.admit(31, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let late = guard.admit(
+            31,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
 
         assert_eq!(late, Admission::Refuse);
     }
@@ -1763,7 +1886,15 @@ mod tests {
         let (guard, decisions) = decided(false);
         std::thread::sleep(FAST.settle * 3);
 
-        let own = guard.admit(999, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let own = guard.admit(
+            999,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
 
         assert_eq!(own, Admission::Proceed);
     }
@@ -1778,12 +1909,23 @@ mod tests {
         guard.unfinished(1);
         std::thread::sleep(FAST.settle * 3);
 
-        let retry = guard.admit(1, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let retry = guard.admit(
+            1,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
         assert_eq!(retry, Admission::ProceedConfirmed);
         let fresh = burst_of(&guard, &decisions, 101..=130, 1, 100);
         std::thread::sleep(Duration::from_millis(300));
 
-        assert!(fresh.iter().all(|h| !h.is_finished()), "the new selection is held");
+        assert!(
+            fresh.iter().all(|h| !h.is_finished()),
+            "the new selection is held"
+        );
         assert_eq!(decisions.holds.load(Ordering::SeqCst), 2);
         decisions.restore();
         assert!(results(fresh).iter().all(|a| *a == Admission::Refuse));
@@ -1800,11 +1942,16 @@ mod tests {
 
         let again = burst(&guard, &decisions, 30, 1, 100);
         std::thread::sleep(Duration::from_millis(300));
-        assert!(again.iter().all(|h| !h.is_finished()), "the second burst is held, not answered");
+        assert!(
+            again.iter().all(|h| !h.is_finished()),
+            "the second burst is held, not answered"
+        );
         assert_eq!(decisions.holds.load(Ordering::SeqCst), 2);
         decisions.confirm();
 
-        assert!(results(again).iter().all(|a| *a == Admission::ProceedConfirmed));
+        assert!(results(again)
+            .iter()
+            .all(|a| *a == Admission::ProceedConfirmed));
     }
 
     /// An item that gave up waiting takes the answer when the system retries it, however late, and an
@@ -1819,20 +1966,48 @@ mod tests {
             patience: Duration::from_millis(50),
             ..FAST
         };
-        let out = guard.admit(7, 300, 1000, &impatient, &*decisions, &Instant::now, &std::thread::sleep);
+        let out = guard.admit(
+            7,
+            300,
+            1000,
+            &impatient,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
         assert_eq!(out, Admission::StillHeld);
         let waiting = burst_of(&guard, &decisions, [8], 1, 1000);
         std::thread::sleep(Duration::from_millis(100));
         decisions.confirm();
         assert_eq!(results(waiting), vec![Admission::ProceedConfirmed]);
         std::thread::sleep(FAST.settle * 3);
-        let unrelated = guard.admit(50, 1, 1000, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let unrelated = guard.admit(
+            50,
+            1,
+            1000,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
         assert_eq!(unrelated, Admission::Proceed);
 
-        let retry = guard.admit(7, 300, 1000, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let retry = guard.admit(
+            7,
+            300,
+            1000,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
 
         assert_eq!(retry, Admission::ProceedConfirmed);
-        assert_eq!(decisions.holds.load(Ordering::SeqCst), 1, "no second question");
+        assert_eq!(
+            decisions.holds.load(Ordering::SeqCst),
+            1,
+            "no second question"
+        );
     }
 
     /// Measured live: 40 of 50 confirmed deletes answered 429 and came back as a new burst, which asked
@@ -1846,12 +2021,22 @@ mod tests {
             guard.unfinished(item);
         }
         std::thread::sleep(FAST.settle * 3);
-        let unrelated = guard.admit(500, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let unrelated = guard.admit(
+            500,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
         assert_eq!(unrelated, Admission::Proceed);
 
         let retries = burst(&guard, &decisions, 30, 1, 100);
 
-        assert!(results(retries).iter().all(|a| *a == Admission::ProceedConfirmed));
+        assert!(results(retries)
+            .iter()
+            .all(|a| *a == Admission::ProceedConfirmed));
         assert_eq!(decisions.holds.load(Ordering::SeqCst), 1, "asked once");
     }
 
@@ -1908,17 +2093,27 @@ mod tests {
         let mass: Vec<_> = (1..=30)
             .map(|item| {
                 let (guard, decisions) = (guard.clone(), decisions.clone());
-                std::thread::spawn(move || guard.admit(item, 1, 100, &FAST, &*decisions, &Instant::now, &slow))
+                std::thread::spawn(move || {
+                    guard.admit(item, 1, 100, &FAST, &*decisions, &Instant::now, &slow)
+                })
             })
             .collect();
         std::thread::sleep(FAST.settle + Duration::from_millis(40));
         let other = burst_of(&guard, &decisions, [999], 1, 100);
         std::thread::sleep(Duration::from_millis(600));
 
-        assert_eq!(decisions.holds.load(Ordering::SeqCst), 1, "the mass deletion is asked about");
+        assert_eq!(
+            decisions.holds.load(Ordering::SeqCst),
+            1,
+            "the mass deletion is asked about"
+        );
         decisions.restore();
         assert!(results(mass).iter().all(|a| *a == Admission::Refuse));
-        assert_eq!(results(other), vec![Admission::Refuse], "it arrived before the burst was judged");
+        assert_eq!(
+            results(other),
+            vec![Admission::Refuse],
+            "it arrived before the burst was judged"
+        );
     }
 
     /// Measured live: a 300-file selection arrived as 32 calls, then one per call answered. The answer
@@ -1946,11 +2141,22 @@ mod tests {
                     if confirm {
                         std::thread::sleep(Duration::from_millis(2));
                     }
-                    guard.admit(item, 1, 100_000, &FAST, &*decisions, &Instant::now, &std::thread::sleep)
+                    guard.admit(
+                        item,
+                        1,
+                        100_000,
+                        &FAST,
+                        &*decisions,
+                        &Instant::now,
+                        &std::thread::sleep,
+                    )
                 })
                 .collect();
 
-            assert!(rest.iter().all(|a| *a == answer_for(confirm)), "{confirm}: {rest:?}");
+            assert!(
+                rest.iter().all(|a| *a == answer_for(confirm)),
+                "{confirm}: {rest:?}"
+            );
             assert_eq!(decisions.holds.load(Ordering::SeqCst), 1, "asked once");
         }
     }
@@ -1959,19 +2165,38 @@ mod tests {
     /// `settle`; it is still the same selection.
     ///
     /// Proof this test can fail: ending the stream at `settle` sends the slow rest as new bursts.
+    ///
+    /// Its own policy, with a wide margin between `settle` and `stream_gap`: with `FAST`'s 40 ms a
+    /// sleep that overran by 20 ms on a loaded CI runner ended the stream (PR #240, macOS leg).
     #[test]
     fn a_slow_confirmed_stream_keeps_its_answer() {
+        const SLOW_STREAM: DeletePolicy = DeletePolicy {
+            stream_gap: Duration::from_millis(600),
+            window: Duration::from_secs(3),
+            ..FAST
+        };
         let (guard, decisions) = decided(true);
-        let gap = FAST.settle + (FAST.stream_gap - FAST.settle) / 2;
+        let gap = SLOW_STREAM.settle + Duration::from_millis(120);
 
         let rest: Vec<Admission> = (100..105)
             .map(|item| {
                 std::thread::sleep(gap);
-                guard.admit(item, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep)
+                guard.admit(
+                    item,
+                    1,
+                    100,
+                    &SLOW_STREAM,
+                    &*decisions,
+                    &Instant::now,
+                    &std::thread::sleep,
+                )
             })
             .collect();
 
-        assert!(rest.iter().all(|a| *a == Admission::ProceedConfirmed), "{rest:?}");
+        assert!(
+            rest.iter().all(|a| *a == Admission::ProceedConfirmed),
+            "{rest:?}"
+        );
     }
 
     /// Measured live: in an account of 440 files the first 32 of a 300-file selection were under the
@@ -1983,11 +2208,23 @@ mod tests {
     #[test]
     fn a_burst_that_fills_every_slot_is_held_below_the_threshold() {
         let (guard, decisions) = pair();
-        let short = results(burst(&guard, &decisions, SATURATED_BURST as i64 - 1, 1, 100_000));
+        let short = results(burst(
+            &guard,
+            &decisions,
+            SATURATED_BURST as i64 - 1,
+            1,
+            100_000,
+        ));
         assert!(short.iter().all(|a| *a == Admission::Proceed));
         std::thread::sleep(FAST.window + FAST.settle);
 
-        let full = burst_of(&guard, &decisions, 1000..1000 + SATURATED_BURST as i64, 1, 100_000);
+        let full = burst_of(
+            &guard,
+            &decisions,
+            1000..1000 + SATURATED_BURST as i64,
+            1,
+            100_000,
+        );
         std::thread::sleep(Duration::from_millis(300));
 
         assert!(full.iter().all(|h| !h.is_finished()), "held, not sent");
@@ -2012,7 +2249,15 @@ mod tests {
                 .map(|item| {
                     let (guard, decisions, impatient) = (&guard, &decisions, &impatient);
                     scope.spawn(move || {
-                        guard.admit(item, 1, 100, impatient, &**decisions, &Instant::now, &std::thread::sleep)
+                        guard.admit(
+                            item,
+                            1,
+                            100,
+                            impatient,
+                            &**decisions,
+                            &Instant::now,
+                            &std::thread::sleep,
+                        )
                     })
                 })
                 .collect();
@@ -2023,10 +2268,25 @@ mod tests {
 
         let unrelated = burst_of(&guard, &decisions, 200..=230, 1, 100);
         std::thread::sleep(Duration::from_millis(300));
-        assert!(unrelated.iter().all(|h| !h.is_finished()), "a new question, not the old answer");
+        assert!(
+            unrelated.iter().all(|h| !h.is_finished()),
+            "a new question, not the old answer"
+        );
         assert_eq!(decisions.holds.load(Ordering::SeqCst), 2);
-        let retry = guard.admit(5, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
-        assert_eq!(retry, Admission::ProceedConfirmed, "the old burst got its answer");
+        let retry = guard.admit(
+            5,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
+        assert_eq!(
+            retry,
+            Admission::ProceedConfirmed,
+            "the old burst got its answer"
+        );
         decisions.restore();
         assert!(results(unrelated).iter().all(|a| *a == Admission::Refuse));
     }
@@ -2047,7 +2307,15 @@ mod tests {
                 .map(|item| {
                     let (guard, decisions, impatient) = (&guard, &decisions, &impatient);
                     scope.spawn(move || {
-                        guard.admit(item, 1, 100, impatient, &**decisions, &Instant::now, &std::thread::sleep)
+                        guard.admit(
+                            item,
+                            1,
+                            100,
+                            impatient,
+                            &**decisions,
+                            &Instant::now,
+                            &std::thread::sleep,
+                        )
                     })
                 })
                 .collect();
@@ -2057,8 +2325,24 @@ mod tests {
         });
         decisions.restore();
 
-        let first = guard.admit(5, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
-        let second = guard.admit(6, 1, 100, &FAST, &*decisions, &Instant::now, &std::thread::sleep);
+        let first = guard.admit(
+            5,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
+        let second = guard.admit(
+            6,
+            1,
+            100,
+            &FAST,
+            &*decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
 
         assert_eq!((first, second), (Admission::Refuse, Admission::Refuse));
     }
@@ -2077,7 +2361,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
 
         assert_eq!(decisions.holds.load(Ordering::SeqCst), 1);
-        assert_eq!(decisions.counted.load(Ordering::SeqCst), 30, "the banner counts both waves");
+        assert_eq!(
+            decisions.counted.load(Ordering::SeqCst),
+            30,
+            "the banner counts both waves"
+        );
         decisions.restore();
         results(second);
     }
@@ -2099,7 +2387,15 @@ mod tests {
                     .map(|item| {
                         let (guard, decisions, policy) = (&guard, &decisions, &policy);
                         scope.spawn(move || {
-                            guard.admit(item, 1, 100, policy, &**decisions, &Instant::now, &std::thread::sleep)
+                            guard.admit(
+                                item,
+                                1,
+                                100,
+                                policy,
+                                &**decisions,
+                                &Instant::now,
+                                &std::thread::sleep,
+                            )
                         })
                     })
                     .collect();
@@ -2118,8 +2414,15 @@ mod tests {
         // the window, kept, would tip 7 more over the threshold of 25.
         assert!(wave(1..=20, None).iter().all(|a| *a == Admission::Proceed));
         std::thread::sleep(FAST.settle * 2);
-        assert!(wave(21..=30, Some(true)).iter().all(|a| *a == Admission::ProceedConfirmed));
-        assert!(wave(41..=60, None).iter().all(|a| *a == Admission::ProceedConfirmed), "stragglers");
+        assert!(wave(21..=30, Some(true))
+            .iter()
+            .all(|a| *a == Admission::ProceedConfirmed));
+        assert!(
+            wave(41..=60, None)
+                .iter()
+                .all(|a| *a == Admission::ProceedConfirmed),
+            "stragglers"
+        );
         std::thread::sleep(FAST.settle * 2);
 
         let later = wave(70..=76, None);
@@ -2150,10 +2453,26 @@ mod tests {
             ..FAST
         };
 
-        let out = guard.admit(1, 300, 1000, &policy, &decisions, &Instant::now, &std::thread::sleep);
+        let out = guard.admit(
+            1,
+            300,
+            1000,
+            &policy,
+            &decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
 
         assert_eq!(out, Admission::StillHeld);
-        let again = guard.admit(2, 1, 1000, &policy, &decisions, &Instant::now, &std::thread::sleep);
+        let again = guard.admit(
+            2,
+            1,
+            1000,
+            &policy,
+            &decisions,
+            &Instant::now,
+            &std::thread::sleep,
+        );
         assert_eq!(again, Admission::StillHeld, "a retry joins the held burst");
     }
 

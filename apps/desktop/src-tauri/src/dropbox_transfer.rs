@@ -221,7 +221,9 @@ pub(crate) fn fp_write_lane() -> AppResult<std::sync::MutexGuard<'static, ()>> {
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
         if started.elapsed() >= FP_WRITE_LANE_PATIENCE {
-            return Err(AppError::Other("another write held the lane too long".into()));
+            return Err(AppError::Other(
+                "another write held the lane too long".into(),
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2827,6 +2829,10 @@ pub(crate) fn record_downloaded_file(
 }
 
 pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> AppResult<()> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     // The scope check comes BEFORE the token: an excluded path must not cost a keychain read
     // or a network call, and must fail the same way whether or not the user is signed in.
     let relative = key_from_dropbox(path_display);
@@ -2878,6 +2884,10 @@ pub(crate) fn hydrate_remote_folder_internal(
     state: &AppState,
     folder_path_display: &str,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     // DBSYNC-114 H5: a manual download of an excluded folder is refused, before the token.
     // (An Ancestor of an include is allowed through: its included children are the point.)
     let folder_rel = key_from_dropbox(folder_path_display);
