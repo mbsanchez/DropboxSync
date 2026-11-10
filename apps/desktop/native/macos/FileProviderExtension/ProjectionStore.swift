@@ -50,6 +50,18 @@ struct ProjectionStore {
         }
     }
 
+    /// The live child of `parent` with this name, ignoring case as Dropbox does: what a create collided
+    /// with.
+    func child(of parent: Int64, named name: String) throws -> ProjectionRow? {
+        try read { db in
+            _ = try Self.readyHead(db)
+            let wanted = name.lowercased()
+            return try Self.rows(
+                db, "SELECT \(Self.rowColumns) FROM fp_item WHERE parent_item = ?1 AND state = 0", [parent]
+            ).first { $0.name.lowercased() == wanted }
+        }
+    }
+
     /// What enumerating `parent` lists: its live children after `afterItem`, at most `limit`, in
     /// `item_id` order. A live file lists itself, because the system also opens an enumerator on a single
     /// document to follow it. `nil`: there is no live row, and `presence` says what to answer. The domain

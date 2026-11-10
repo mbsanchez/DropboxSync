@@ -21,6 +21,9 @@ pub(crate) struct SyncDashboard {
     /// frontend can show a "review & confirm deletions" button that calls
     /// `confirm_pending_deletions`. See `sync_pipeline::mass_delete_pause_active`.
     pub mass_delete_paused: bool,
+    /// DBSYNC-95: the held deletions were made in Finder, so they can also be refused, which restores
+    /// the files (`reject_pending_deletions`).
+    pub mass_delete_restorable: bool,
 }
 
 #[derive(Serialize)]

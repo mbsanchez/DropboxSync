@@ -188,6 +188,22 @@ pub fn pick_sync_folder_dialog() -> Result<Option<String>, String> {
     Ok(picked.map(|p| p.to_string_lossy().to_string()))
 }
 
+/// Asks the user to confirm an action, in a native dialog: true for OK.
+///
+/// `window.confirm` cannot ask on macOS. wry (0.54) implements none of the webview's JavaScript panels,
+/// so it answers false at once without showing anything, and every confirmation the UI asked for was
+/// declined in silence: measured live, "Confirm & resume" never reached the host.
+#[tauri::command]
+pub fn confirm_dialog(title: String, message: String) -> bool {
+    let answer = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(&title)
+        .set_description(&message)
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show();
+    matches!(answer, rfd::MessageDialogResult::Ok)
+}
+
 /// Disconnects Dropbox and returns the app to a pre-onboarding state (DBSYNC-36).
 /// Order matters: the token is revoked with Dropbox BEFORE any local credential is
 /// cleared (revoke needs a still-valid token), then the in-memory cache, then the
@@ -531,12 +547,14 @@ pub fn get_sync_dashboard(state: tauri::State<AppState>) -> Result<SyncDashboard
         .current_status(state.sync_running.load(Ordering::Acquire));
 
     let mass_delete_paused = mass_delete_pause_active(state.inner())?;
+    let mass_delete_restorable = crate::sync_pipeline::finder_question_on_screen(state.inner())?;
 
     Ok(SyncDashboard {
         status,
         jobs,
         conflicts,
         mass_delete_paused,
+        mass_delete_restorable,
     })
 }
 
@@ -567,8 +585,20 @@ pub fn resolve_conflict(
 /// by the next scan pass. Only call this after the user has reviewed the blocked
 /// deletion and confirmed it is an intentional bulk delete.
 #[tauri::command]
-pub fn confirm_pending_deletions(state: tauri::State<AppState>) -> Result<(), String> {
-    state.db.set_app_config("mass_delete_override_once", "1")?;
+pub fn confirm_pending_deletions(
+    state: tauri::State<AppState>,
+    finder: Option<bool>,
+) -> Result<(), String> {
+    // `finder`: the banner showed the Finder question. Absent, it showed the sync folder's.
+    crate::sync_pipeline::answer_mass_deletion(state.inner(), true, finder.unwrap_or(false))?;
+    Ok(())
+}
+
+/// DBSYNC-95: the user refused the deletions made in Finder that the breaker holds. The system is told
+/// each was rejected, and restores the files.
+#[tauri::command]
+pub fn reject_pending_deletions(state: tauri::State<AppState>) -> Result<(), String> {
+    crate::sync_pipeline::answer_mass_deletion(state.inner(), false, true)?;
     Ok(())
 }
 

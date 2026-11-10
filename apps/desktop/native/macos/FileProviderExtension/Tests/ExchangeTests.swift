@@ -78,6 +78,8 @@ extension ProjectionTests {
                     try? FileManager.default.removeItem(at: paths.request(id))
                     if staged { try? Data("hi".utf8).write(to: paths.staged(id)) }
                     beforeResult(id)
+                    // As the host does once it has sent them.
+                    try? FileManager.default.removeItem(at: paths.outgoing(id))
                     guard publishes else { return }
                     let temp = paths.root.appendingPathComponent("results/.\(id).tmp")
                     try? Data(body.utf8).write(to: temp)
@@ -206,7 +208,7 @@ extension ProjectionTests {
     })
     _ = finish { client().fetch(itemId: 7, isCancelled: { false }, done: $0) }
     shape.lock()
-    expect(sent == #"{"version":1,"item_id":7,"viewer":false}"#, "the request is what the host parses")
+    expect(sent == #"{"item_id":7,"op":"fetch","version":1,"viewer":false}"#, "the request is what the host parses")
     shape.unlock()
     answerNextRequest(with: #"{"version":1,"outcome":"retry"}"#, inspect: { body in
         shape.lock()
@@ -215,8 +217,105 @@ extension ProjectionTests {
     })
     _ = finish { client().fetch(itemId: 7, viewer: true, isCancelled: { false }, done: $0) }
     shape.lock()
-    expect(sent == #"{"version":1,"item_id":7,"viewer":true}"#, "a double click is what the host's test parses")
+    expect(sent == #"{"item_id":7,"op":"fetch","version":1,"viewer":true}"#, "a double click is what the host's test parses")
     shape.unlock()
+
+    // A create: the bytes go to staging before the request, and the answer names the row.
+    let source = base.appendingPathComponent("source.txt")
+    try? Data("new".utf8).write(to: source)
+    var created: String?
+    var outgoingBytes: Data?
+    answerNextRequest(
+        with: #"{"version":1,"outcome":"written","item_id":42}"#,
+        inspect: { body in
+            shape.lock()
+            created = body
+            shape.unlock()
+        },
+        beforeResult: { id in
+            shape.lock()
+            outgoingBytes = try? Data(contentsOf: paths.outgoing(id))
+            shape.unlock()
+        })
+    let written = finish {
+        client().create(
+            parentItem: 3, name: "ñ \"a\"/b.txt", folder: false, contents: source, isCancelled: { false }, done: $0)
+    }
+    expect(written == .written(itemId: 42), "a create answers with the row")
+    shape.lock()
+    expect(
+        created == #"{"folder":false,"name":"ñ \"a\"/b.txt","op":"create","parent_item":3,"version":1}"#,
+        "a create is what the host parses, with the name escaped")
+    expect(outgoingBytes == Data("new".utf8), "the bytes are in staging when the request appears")
+    shape.unlock()
+    answerNextRequest(with: #"{"version":1,"outcome":"collision"}"#)
+    let taken = finish {
+        client().create(parentItem: 3, name: "x", folder: true, contents: nil, isCancelled: { false }, done: $0)
+    }
+    expect(taken == .collision, "a taken name answers collision")
+
+    // A modify and a delete, in the shapes the host parses, and their answers.
+    var modified: String?
+    answerNextRequest(with: #"{"version":1,"outcome":"conflict","item_id":5}"#, inspect: { body in
+        shape.lock()
+        modified = body
+        shape.unlock()
+    })
+    let edited = finish {
+        client().modify(
+            itemId: 5, baseVersion: Data("c1:base".utf8), newPlace: (parent: 2, name: "b.txt"), contents: source,
+            isCancelled: { false }, done: $0)
+    }
+    expect(edited == .conflict(itemId: 5), "a stale edit answers conflict")
+    shape.lock()
+    expect(
+        modified
+            == #"{"base_version":"c1:base","content":true,"item_id":5,"new_name":"b.txt","new_parent":2,"op":"modify","version":1}"#,
+        "a modify is what the host parses: \(modified ?? "nil")")
+    shape.unlock()
+    var deleting: String?
+    answerNextRequest(with: #"{"version":1,"outcome":"deletion_rejected"}"#, inspect: { body in
+        shape.lock()
+        deleting = body
+        shape.unlock()
+    })
+    let rejected = finish {
+        client().delete(itemId: 6, baseVersion: Data("c1:x".utf8), isCancelled: { false }, done: $0)
+    }
+    expect(rejected == .deletionRejected, "a delete Dropbox would lose an edit to is rejected")
+    shape.lock()
+    expect(
+        deleting == #"{"base_version":"c1:x","item_id":6,"op":"delete","version":1}"#,
+        "a delete is what the host parses: \(deleting ?? "nil")")
+    shape.unlock()
+    answerNextRequest(with: #"{"version":1,"outcome":"deleted"}"#)
+    let deletedOutcome = finish {
+        client().delete(itemId: 6, baseVersion: Data("c1:x".utf8), isCancelled: { false }, done: $0)
+    }
+    expect(deletedOutcome == .deleted, "a delete answers deleted")
+    answerNextRequest(with: #"{"version":1,"outcome":"gone"}"#)
+    let goneOutcome = finish {
+        client().modify(
+            itemId: 5, baseVersion: Data("c1:base".utf8), newPlace: nil, contents: source,
+            isCancelled: { false }, done: $0)
+    }
+    expect(goneOutcome == .gone, "an edit of something deleted on Dropbox answers gone")
+    answerNextRequest(with: #"{"version":1,"outcome":"gone_parent"}"#)
+    let goneParent = finish {
+        client().modify(
+            itemId: 5, baseVersion: Data("c1:base".utf8), newPlace: (parent: 9, name: "a"), contents: nil,
+            isCancelled: { false }, done: $0)
+    }
+    expect(goneParent == .goneParent, "a move into a folder deleted on Dropbox names the folder")
+
+    // A create given up on before the host took it leaves no bytes behind.
+    _ = finish {
+        client(deadline: 0.05).create(
+            parentItem: 3, name: "y", folder: false, contents: source, isCancelled: { false }, done: $0)
+    }
+    let leftovers = (try? FileManager.default.contentsOfDirectory(
+        atPath: paths.root.appendingPathComponent("staging").path)) ?? []
+    expect(leftovers.isEmpty, "a create taken back takes its bytes back: \(leftovers)")
 
     // The handover.
     let row = ProjectionTests.row(1)

@@ -5,6 +5,7 @@ import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useSyncDashboard } from "../hooks/useSyncDashboard";
 import { useTransferProgress } from "../hooks/useTransferProgress";
 import { usePlaceholderEvents } from "../hooks/usePlaceholderEvents";
+import { confirmAction } from "../confirm";
 import { formatBytes, formatSpeed } from "../format";
 import type { ActiveTransfer, ActivityEntry, FinderExtensionState, SyncConflict, SyncJob, TriggerSyncResponse } from "../types";
 import "./FlyoutApp.css";
@@ -368,10 +369,12 @@ function FlyoutApp() {
     jobs,
     conflicts,
     massDeletePaused,
+    massDeleteRestorable,
     refreshDashboardNow,
     retryFailedJobs,
     resolveConflict,
     confirmPendingDeletions,
+    rejectPendingDeletions,
   } = useSyncDashboard(pushLog);
   const [confirmingDeletions, setConfirmingDeletions] = useState(false);
   // DBSYNC-68: optimistic "Sync Now" flag — flips the disabled/Syncing state
@@ -387,13 +390,16 @@ function FlyoutApp() {
     conflict: SyncConflict,
     action: "keep_local" | "use_remote" | "keep_both",
   ) => {
-    if (action === "use_remote" && conflict.remoteDeleted) {
-      const ok = window.confirm(
-        `Le distant a été supprimé. « Utiliser distant » supprimera définitivement le fichier local « ${conflict.localPath} ». Continuer ?`,
-      );
-      if (!ok) return;
-    }
-    void resolveConflict(conflict.id, action);
+    void (async () => {
+      if (action === "use_remote" && conflict.remoteDeleted) {
+        const ok = await confirmAction(
+          "Utiliser distant",
+          `Le distant a été supprimé. « Utiliser distant » supprimera définitivement le fichier local « ${conflict.localPath} ». Continuer ?`,
+        );
+        if (!ok) return;
+      }
+      await resolveConflict(conflict.id, action);
+    })();
   };
 
   const [section, setSection] = useState<Section>("home");
@@ -469,13 +475,14 @@ function FlyoutApp() {
   // DBSYNC-64: mass-delete circuit breaker paused sync. Nothing was deleted yet;
   // require an explicit confirm before letting the blocked batch proceed.
   const onConfirmPendingDeletions = async () => {
-    const ok = window.confirm(
+    const ok = await confirmAction(
+      "Confirm deletions",
       "This will delete the blocked items from Dropbox (or locally). Only confirm if you intentionally deleted them. Continue?",
     );
     if (!ok) return;
     setConfirmingDeletions(true);
     try {
-      await confirmPendingDeletions();
+      await confirmPendingDeletions(massDeleteRestorable);
     } finally {
       setConfirmingDeletions(false);
     }
@@ -676,6 +683,16 @@ function FlyoutApp() {
                 >
                   {confirmingDeletions ? "Confirming..." : "Confirm & resume"}
                 </button>
+                {massDeleteRestorable && (
+                  <button
+                    type="button"
+                    className="flyout-btn"
+                    onClick={() => void rejectPendingDeletions()}
+                    disabled={confirmingDeletions}
+                  >
+                    Restore files
+                  </button>
+                )}
               </div>
             </div>
           </div>

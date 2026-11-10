@@ -37,10 +37,11 @@ struct ProjectionTests {
 
     static func anchors() {
         let anchor = ProjectionAnchor(generation: 7, seq: 60)
-        check("anchor format", String(data: anchor.encoded, encoding: .utf8) == "v1.7.60")
+        check("anchor format", String(data: anchor.encoded, encoding: .utf8) == "v3.7.60")
         check("anchor round trip", ProjectionAnchor(encoded: anchor.encoded) == anchor)
-        // The tracer's anchor must expire into a rescan, not be read as a position.
-        for bad in ["1", "v1.7", "v2.7.60", "v1.x.60", "v1.7.", "v1.7.60.1", ""] {
+        // The tracer's anchor, and every anchor of an older item format, must expire into a rescan, not be
+        // read as a position: that rescan is what replaces the capabilities the system cached before.
+        for bad in ["1", "v1.7.60", "v2.7.60", "v4.7.60", "v3.7", "v3.x.60", "v3.7.", "v3.7.60.1", ""] {
             check("not an anchor: \(bad)", ProjectionAnchor(encoded: Data(bad.utf8)) == nil)
         }
         // The cases of `anchor_expired` in the host.
@@ -50,6 +51,28 @@ struct ProjectionTests {
         check("other generation", anchor.isExpired(against: head(generation: 8)))
         check("below min_valid_seq", ProjectionAnchor(generation: 7, seq: 49).isExpired(against: head()))
         check("past the head", ProjectionAnchor(generation: 7, seq: 101).isExpired(against: head()))
+    }
+
+    static func itemFormat() {
+        check("metadata version carries the format",
+              ItemFormat.metadataVersion(Data([3, 4])) == Data("f3.".utf8) + Data([3, 4]))
+        check("older format versions differ", ItemFormat.metadataVersion(Data([3, 4])) != Data([3, 4]))
+    }
+
+    static func reimports() {
+        let file = row(5)
+        var folder = row(6)
+        folder.isFolder = true
+        check("a known folder is itself", Reimport.decide(existing: folder, folder: true, hasContents: false) == .existing(folder))
+        check("a known dataless file is itself",
+              Reimport.decide(existing: file, folder: false, hasContents: false) == .existing(file))
+        check("a file with content is created, not matched",
+              Reimport.decide(existing: file, folder: false, hasContents: true) == .create)
+        check("an unknown dataless file is refused", Reimport.decide(existing: nil, folder: false, hasContents: false) == .refuse)
+        check("an unknown folder is created", Reimport.decide(existing: nil, folder: true, hasContents: false) == .create)
+        check("a folder never matches a file", Reimport.decide(existing: file, folder: true, hasContents: false) == .create)
+        check("a dataless file never matches a folder",
+              Reimport.decide(existing: folder, folder: false, hasContents: false) == .refuse)
     }
 
     static func pages() {
@@ -113,6 +136,8 @@ struct ProjectionTests {
     static func main() {
         itemIds()
         anchors()
+        itemFormat()
+        reimports()
         pages()
         plans()
         readAnswers()

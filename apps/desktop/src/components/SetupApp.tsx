@@ -9,6 +9,7 @@ import { useIgnoreGlobs } from "../hooks/useIgnoreGlobs";
 import { useDisconnect } from "../hooks/useDisconnect";
 import { useStartupAtLogin } from "../hooks/useStartupAtLogin";
 import { useSaveAction, type SaveStatus } from "../hooks/useSaveAction";
+import { confirmAction } from "../confirm";
 import "../App.css";
 
 /** Inline result under a Settings Save button: "Saved", or the save's error. */
@@ -109,12 +110,13 @@ function SetupApp() {
     }
   };
 
-  const handleDisconnect = () => {
-    const ok = window.confirm(
+  const handleDisconnect = async () => {
+    const ok = await confirmAction(
+      "Disconnect Dropbox",
       "Disconnect Dropbox? This signs you out and clears local sync state. Your files on Dropbox are not affected.",
     );
     if (!ok) return;
-    void disconnect();
+    await disconnect();
   };
 
   const pickFolder = async () => {
@@ -212,7 +214,7 @@ function SetupApp() {
                 Cancel OAuth
               </button>
             )}
-            <button type="button" disabled={disconnecting} onClick={handleDisconnect}>
+            <button type="button" disabled={disconnecting} onClick={() => void handleDisconnect()}>
               {disconnecting ? "Disconnecting..." : "Disconnect"}
             </button>
           </div>

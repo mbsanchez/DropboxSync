@@ -4,8 +4,8 @@
 `com.apple.fileprovider-nonui`) written in Swift. It ships in every macOS build next to the Finder Sync appex
 and does nothing until the host app registers a File Provider domain.
 
-It lists the host's projection of the Dropbox tree and downloads a file when it is opened. Create, modify and
-delete answer with `cannotSynchronize` until slice 4. The process model (the host is the only Dropbox client;
+It lists the host's projection of the Dropbox tree, downloads a file when it is opened, and sends creates,
+edits, renames, moves and deletes made in Finder to Dropbox through the host. The process model (the host is the only Dropbox client;
 the extension has no network and no keychain access) is
 [ADR-0004](../../../../docs/adr/0004-host-is-the-single-dropbox-client.md).
 
@@ -15,7 +15,7 @@ the extension has no network and no keychain access) is
 | --- | --- |
 | `FileProviderExtension.swift` | The extension, its items and the enumerator. Logs with `os.Logger`. |
 | `ProjectionModel.swift`, `ProjectionStore.swift` | The read-only projection in `app.db`. |
-| `Exchange.swift` | Asks the host for a file. |
+| `Exchange.swift` | Asks the host for a file, or to write a change. |
 | `Info.plist` | Extension point, bare ObjC principal class, `NSExtensionFileProviderSupportsEnumeration`, `DBSyncAppGroupID`. Deliberately no `NSExtensionFileProviderDocumentGroup`. |
 | `DropboxSyncFileProvider.entitlements` | Template: sandbox plus `__APP_GROUP_ID__`. No network entitlement. |
 | `build-appex.sh` | Builds and signs the appex. Copied from the Finder Sync script. |
@@ -87,9 +87,8 @@ backs off until the next signal. `currentSyncAnchor` answers `nil` for any faile
 because the system takes it to mean the item was deleted and tries to delete it from disk; a live file asked
 for as a container lists itself.
 
-Opening a file downloads it (see *Download on open*). Nothing else reaches Dropbox from the domain (slice 4):
-subfolders refuse changes, but the domain root is writable, so a file created there stays local while
-`createItem` refuses it.
+Opening a file downloads it (see *Download on open*), and changes made in Finder go to Dropbox (see
+*Writes*).
 
 How it is fed: the entries of each Dropbox delta are applied one at a time, in Dropbox's order, in one write
 transaction, and each item changes only through its own entry (no inference about a renamed folder's
@@ -132,6 +131,24 @@ Each line ends in the class of the outcome: `staged`, `hostDown`, `offline`, `au
 empty `requests/`, `staging/` and `results/` is the resting state; a download that was cancelled clears when it
 finishes. The host's side logs under
 `dropbox_sync_desktop_lib::file_provider_exchange`, and `=debug` shows each notification it receives.
+
+## Writes
+
+`createItem`, `modifyItem` and `deleteItem` go through the same exchange: new bytes are cloned into
+`staging/<id>.up`, the host calls Dropbox and writes the row from Dropbox's answer. The rules (conflicted
+copies, `deletionRejected`, one write at a time, upload sessions above one 8 MiB chunk, the mass-deletion breaker,
+Move to Trash, `ItemFormat`, reimports) are in ADR-0004, *Writes (slice 4)*. To follow them:
+
+```bash
+/usr/bin/log show --last 5m --info --predicate 'subsystem == "com.mobsanchez.dropboxsyncdesktop.fileprovider" AND (eventMessage CONTAINS "Item")'
+```
+
+Each line ends in the outcome: `written`, `conflict`, `collision`, `deleted`, `deletionRejected`, `hostDown`,
+`offline`, `auth`, `retry` or `cancelled`. The host logs under `dropbox_sync_desktop_lib::file_provider_writes`
+by error class, never by name.
+
+**A build that changes what an item reports** (its capabilities, above all) bumps `ItemFormat.current` in
+`ProjectionModel.swift`. Without it the system keeps what it cached for every item it already knows.
 
 ## Live checks (with the maintainer)
 

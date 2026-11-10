@@ -43,6 +43,26 @@ enum ItemPresence: Equatable {
     case unknown
 }
 
+/// What a create marked `mayAlreadyExist` becomes. The system sends it when it re-imports what is on disk
+/// (a domain added again, a reimport), so the item is usually one the projection already holds.
+/// Creating it again would collide, and the system would keep both under a new name.
+enum Reimport: Equatable {
+    /// The item is this row: answer it, and the system keeps its identifier.
+    case existing(ProjectionRow)
+    /// A file with no content on disk that matches nothing: answer no item, and the system removes the
+    /// empty placeholder. The header's rule for a reimport that cannot be matched.
+    case refuse
+    /// Real content that is not known here: an ordinary create.
+    case create
+
+    static func decide(existing: ProjectionRow?, folder: Bool, hasContents: Bool) -> Reimport {
+        if let row = existing, row.isFolder == folder, folder || !hasContents {
+            return .existing(row)
+        }
+        return !folder && !hasContents ? .refuse : .create
+    }
+}
+
 /// The `fp_state` row.
 struct ProjectionHead: Equatable {
     var schemaVersion: Int64
@@ -116,20 +136,35 @@ enum ItemIdCodec {
     }
 }
 
-/// A position in the change sequence, as `v1.<generation>.<seq>`.
+/// What the system caches about an item beyond its row: today, its capabilities. The system keeps an
+/// item's capabilities until the item reaches it again with a different version, so a build that
+/// changes them must change this number. It is the anchor's prefix, so every anchor of an older build
+/// expires into a rescan, and it is part of every metadata version, so that rescan replaces each item
+/// instead of keeping the cached one. Slice 3 served read-only items under format 1, and Finder went on
+/// refusing to delete them after slice 4 allowed it. Format 3 adds trashing.
+enum ItemFormat {
+    static let current = 3
+
+    static func metadataVersion(_ rowVersion: Data) -> Data {
+        Data("f\(current).".utf8) + rowVersion
+    }
+}
+
+/// A position in the change sequence, as `v<ItemFormat.current>.<generation>.<seq>`.
 struct ProjectionAnchor: Equatable {
     var generation: Int64
     var seq: Int64
 
     var encoded: Data {
-        Data("v1.\(generation).\(seq)".utf8)
+        Data("v\(ItemFormat.current).\(generation).\(seq)".utf8)
     }
 
-    /// `nil` for anything that is not an anchor of this format, such as the tracer's `1`.
+    /// `nil` for anything that is not an anchor of this format, such as the tracer's `1` or an anchor of an
+    /// older item format.
     init?(encoded: Data) {
         guard let text = String(data: encoded, encoding: .utf8) else { return nil }
         let parts = text.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 3, parts[0] == "v1",
+        guard parts.count == 3, parts[0] == "v\(ItemFormat.current)",
               let generation = Int64(parts[1]), let seq = Int64(parts[2]) else { return nil }
         self.generation = generation
         self.seq = seq

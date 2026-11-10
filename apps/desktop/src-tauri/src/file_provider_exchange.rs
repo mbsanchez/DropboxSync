@@ -54,14 +54,47 @@ const RESOLVE_DELAY: Duration = Duration::from_secs(30);
 /// takes it and answer just after the first lift, which that lift would then miss.
 const STARTUP_RESOLVE_REPEAT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 struct Request {
     version: u32,
+    /// `fetch` (the default), or `create`.
+    #[serde(default)]
+    op: Op,
+    /// The item fetched.
+    #[serde(default)]
     item_id: i64,
     /// The system says Finder asked (`NSFileProviderRequest.isFileViewerRequest`): a person opened the
     /// file, as opposed to Spotlight or Quick Look reading it.
     #[serde(default)]
     viewer: bool,
+    /// A create: the folder it goes in (0 is the domain root), its name, and whether it is a folder. A
+    /// file's bytes are at `staging/<id>.up`.
+    #[serde(default)]
+    parent_item: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    folder: bool,
+    /// A modify or a delete: the content version the system had. A modify's new place, when it moved,
+    /// and whether new bytes are at `staging/<id>.up`.
+    #[serde(default)]
+    base_version: String,
+    #[serde(default)]
+    new_parent: Option<i64>,
+    #[serde(default)]
+    new_name: Option<String>,
+    #[serde(default)]
+    content: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Op {
+    #[default]
+    Fetch,
+    Create,
+    Modify,
+    Delete,
 }
 
 /// What the queue held under one id.
@@ -77,7 +110,9 @@ enum Pending {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum Outcome {
     /// The bytes are in staging, and this is the row's `content_version` they were checked against.
-    Ok { content_version: String },
+    Ok {
+        content_version: String,
+    },
     /// Dropbox could not be reached: `serverUnreachable`.
     Offline,
     /// The session needs the user: `notAuthenticated`.
@@ -87,6 +122,45 @@ enum Outcome {
     Refused,
     /// Anything that can pass by itself: a transient error, and the system asks again.
     Retry,
+    /// A write landed, and this row is the item to return.
+    Written {
+        item_id: i64,
+    },
+    /// The name is taken: `filenameCollision`, and the system picks another.
+    Collision,
+    /// The edit went up as a conflicted copy, and this row, Dropbox's version, is the item to return.
+    Conflict {
+        item_id: i64,
+    },
+    Deleted,
+    /// `deletionRejected`: the system restores the item.
+    DeletionRejected,
+    /// The item was deleted on Dropbox: `noSuchItem` for it. The system deletes the item from disk, or
+    /// re-creates it when it holds an edit (`NSFileProviderReplicatedExtension.h`, modifyItem error cases).
+    Gone,
+    /// The folder a create or a move names was deleted on Dropbox: `noSuchItem` for that folder, which
+    /// the system re-creates (createItem error cases). The item itself is fine.
+    GoneParent,
+}
+
+impl Outcome {
+    /// A class for the log.
+    fn label(&self) -> &'static str {
+        match self {
+            Outcome::Ok { .. } => "ok",
+            Outcome::Offline => "offline",
+            Outcome::Auth => "auth",
+            Outcome::Refused => "refused",
+            Outcome::Retry => "retry",
+            Outcome::Written { .. } => "written",
+            Outcome::Collision => "collision",
+            Outcome::Conflict { .. } => "conflict",
+            Outcome::Deleted => "deleted",
+            Outcome::DeletionRejected => "deletion_rejected",
+            Outcome::Gone => "gone",
+            Outcome::GoneParent => "gone_parent",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -135,6 +209,11 @@ impl Exchange {
 
     fn staged(&self, id: &str) -> PathBuf {
         self.staging().join(format!("{id}.data"))
+    }
+
+    /// The bytes the extension sends up with a create.
+    fn outgoing(&self, id: &str) -> PathBuf {
+        self.staging().join(format!("{id}.up"))
     }
 
     /// Takes the host's lock, waiting out an extension that is testing it at this moment. The handle
@@ -267,7 +346,7 @@ fn outcome_for_error(error: &AppError) -> Outcome {
 
 /// Dropbox's `error_summary`, such as `unsupported_file/..`, out of an error message that also holds the
 /// path. It names the error and never the file.
-fn error_summary(message: &str) -> Option<&str> {
+pub(crate) fn error_summary(message: &str) -> Option<&str> {
     const KEY: &str = r#""error_summary":"#;
     let rest = message[message.find(KEY)? + KEY.len()..].trim_start();
     let rest = rest.strip_prefix('"')?;
@@ -275,7 +354,7 @@ fn error_summary(message: &str) -> Option<&str> {
 }
 
 /// An error for the log. `AppError::Dropbox` carries the path, and the log lives in the container.
-fn error_class(error: &AppError) -> String {
+pub(crate) fn error_class(error: &AppError) -> String {
     match error {
         AppError::Network(_) => "network".to_string(),
         AppError::Auth(_) => "auth".to_string(),
@@ -399,6 +478,31 @@ fn lift_throttling_later() {
     }
 }
 
+fn outcome_for_write(written: crate::file_provider_writes::WriteOutcome) -> Outcome {
+    use crate::file_provider_writes::{WriteFailure, WriteOutcome};
+    match written {
+        WriteOutcome::Written { item_id } => Outcome::Written { item_id },
+        WriteOutcome::Collision => Outcome::Collision,
+        WriteOutcome::Conflict { item_id } => Outcome::Conflict { item_id },
+        WriteOutcome::Deleted => Outcome::Deleted,
+        WriteOutcome::DeletionRejected => Outcome::DeletionRejected,
+        // While a removal may still be the first half of a split rename, the row can come back with the
+        // same id: answering `noSuchItem` then would make the system delete or re-create a live item.
+        WriteOutcome::NotLive | WriteOutcome::ParentNotLive
+            if crate::file_provider::removal_held() =>
+        {
+            Outcome::Retry
+        }
+        WriteOutcome::NotLive => Outcome::Gone,
+        WriteOutcome::ParentNotLive => Outcome::GoneParent,
+        // Selective sync would hide it: refused rather than sent to Dropbox out of sight.
+        WriteOutcome::Hidden => Outcome::Refused,
+        WriteOutcome::Retry | WriteOutcome::Failed(WriteFailure::Retry) => Outcome::Retry,
+        WriteOutcome::Failed(WriteFailure::Offline) => Outcome::Offline,
+        WriteOutcome::Failed(WriteFailure::Auth) => Outcome::Auth,
+    }
+}
+
 /// What a person who opened a file Dropbox will not hand out gets instead: the file on dropbox.com, where a
 /// Paper document opens in its editor. The system shows nothing for the refusal itself.
 fn open_in_browser(db: &Db, item_id: i64) {
@@ -507,13 +611,71 @@ fn handle(state: &AppState, exchange: &Exchange, id: &str, request: &Request) {
         id,
         answered: false,
     };
-    let fetcher = DropboxFetcher {
-        state: state.clone(),
+    // A write the extension stopped waiting for is not sent: the system sends it again, and a copy that
+    // landed behind its back would collide with the retry.
+    let abandoned = || exchange.cancel_marker(id).exists();
+    let outcome = match request.op {
+        Op::Fetch => {
+            let fetcher = DropboxFetcher {
+                state: state.clone(),
+            };
+            serve(&state.db, exchange, id, request, &fetcher)
+        }
+        Op::Create => {
+            let dropbox = crate::file_provider_writes::LiveDropbox {
+                state,
+                abandoned: &abandoned,
+            };
+            let outgoing = exchange.outgoing(id);
+            let written = crate::file_provider_writes::create(
+                &state.db,
+                &dropbox,
+                request.parent_item,
+                &request.name,
+                request.folder,
+                &outgoing,
+            );
+            let _ = fs::remove_file(&outgoing);
+            outcome_for_write(written)
+        }
+        Op::Modify => {
+            let dropbox = crate::file_provider_writes::LiveDropbox {
+                state,
+                abandoned: &abandoned,
+            };
+            let outgoing = exchange.outgoing(id);
+            let place = match (request.new_parent, request.new_name.as_deref()) {
+                (Some(parent), Some(name)) => Some((parent, name)),
+                _ => None,
+            };
+            let change = crate::file_provider_writes::Change {
+                place,
+                content: request
+                    .content
+                    .then_some((outgoing.as_path(), request.base_version.as_str())),
+            };
+            let written =
+                crate::file_provider_writes::modify(&state.db, &dropbox, request.item_id, &change);
+            let _ = fs::remove_file(&outgoing);
+            outcome_for_write(written)
+        }
+        Op::Delete => {
+            let dropbox = crate::file_provider_writes::LiveDropbox {
+                state,
+                abandoned: &abandoned,
+            };
+            outcome_for_write(crate::file_provider_writes::delete_guarded(
+                state,
+                &dropbox,
+                request.item_id,
+                &request.base_version,
+            ))
+        }
     };
-    let outcome = serve(&state.db, exchange, id, request, &fetcher);
     tracing::info!(
+        op = ?request.op,
         item_id = request.item_id,
-        ok = matches!(outcome, Outcome::Ok { .. }),
+        outcome = outcome.label(),
         "File Provider exchange: request served"
     );
     if matches!(outcome, Outcome::Offline | Outcome::Auth) {
@@ -665,6 +827,10 @@ pub(crate) fn start(state: &AppState) {
                 }
             };
             tracing::info!("File Provider exchange: running");
+            // After the lock: only the host that serves requests may drop the last run's question.
+            if let Err(e) = crate::sync_pipeline::reset_finder_question(&state) {
+                tracing::warn!(error = %e, "File Provider exchange: cannot clear the last run's question");
+            }
             lift_throttling_at_startup();
             run_queue(&state, &exchange, &woken);
         });
@@ -685,6 +851,19 @@ fn remove_leftovers(data_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tombstone answers `noSuchItem` once no removal is held (tests hold none), and selective sync's
+    /// refusal is a refusal, not a retry.
+    ///
+    /// Proof this test can fail: mapping either to `Retry`.
+    #[test]
+    fn a_deleted_target_is_gone_and_a_hidden_one_refused() {
+        use crate::file_provider_writes::WriteOutcome;
+        assert_eq!(outcome_for_write(WriteOutcome::NotLive), Outcome::Gone);
+        assert_eq!(outcome_for_write(WriteOutcome::ParentNotLive), Outcome::GoneParent);
+        assert_eq!(outcome_for_write(WriteOutcome::Hidden), Outcome::Refused);
+        assert_eq!(Outcome::Gone.label(), "gone");
+    }
     use crate::models::DropboxEntry;
     use crate::storage::db::projection::ProjectedEntry;
     use std::cell::Cell;
@@ -747,6 +926,7 @@ mod tests {
                 version: EXCHANGE_VERSION,
                 item_id: self.item_id(),
                 viewer: false,
+                ..Request::default()
             }
         }
     }
@@ -853,6 +1033,7 @@ mod tests {
             version: EXCHANGE_VERSION,
             item_id: 987_654,
             viewer: false,
+            ..Request::default()
         };
 
         assert_eq!(
@@ -919,6 +1100,7 @@ mod tests {
                     version: 1,
                     item_id: 7,
                     viewer: false,
+                    ..Request::default()
                 })
             )]
         );
@@ -1161,6 +1343,7 @@ mod tests {
                     version: 1,
                     item_id: 7,
                     viewer: true,
+                    ..Request::default()
                 })
             )]
         );
@@ -1197,6 +1380,101 @@ mod tests {
         assert!(!opens.allow(1, now + Duration::from_secs(1)));
         assert!(opens.allow(2, now + Duration::from_secs(2)));
         assert!(opens.allow(1, now + BROWSER_REPEAT + Duration::from_secs(3)));
+    }
+
+    /// The shape `Exchange.swift` writes for a create.
+    #[test]
+    fn a_create_names_its_parent_and_its_name() {
+        let w = world(b"hello");
+        write_request(
+            &w,
+            &format!("{ID}.json"),
+            r#"{"version":1,"op":"create","parent_item":4,"name":"ñ a.txt","folder":false}"#,
+        );
+
+        let taken = w.exchange.take_pending().unwrap();
+
+        assert_eq!(
+            taken,
+            vec![(
+                ID.to_string(),
+                Pending::Serve(Request {
+                    version: 1,
+                    op: Op::Create,
+                    parent_item: 4,
+                    name: "ñ a.txt".into(),
+                    ..Request::default()
+                })
+            )]
+        );
+    }
+
+    /// The exact bytes `ExchangeTests.swift` checks the extension sends.
+    #[test]
+    fn a_modify_and_a_delete_parse_as_the_extension_writes_them() {
+        let modify: Request = serde_json::from_str(
+            r#"{"base_version":"c1:base","content":true,"item_id":5,"new_name":"b.txt","new_parent":2,"op":"modify","version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            modify,
+            Request {
+                version: 1,
+                op: Op::Modify,
+                item_id: 5,
+                base_version: "c1:base".into(),
+                new_parent: Some(2),
+                new_name: Some("b.txt".into()),
+                content: true,
+                ..Request::default()
+            }
+        );
+        let delete: Request = serde_json::from_str(
+            r#"{"base_version":"c1:x","item_id":6,"op":"delete","version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            delete,
+            Request {
+                version: 1,
+                op: Op::Delete,
+                item_id: 6,
+                base_version: "c1:x".into(),
+                ..Request::default()
+            }
+        );
+        let outcomes = [
+            (
+                Outcome::Conflict { item_id: 5 },
+                r#"{"version":1,"outcome":"conflict","item_id":5}"#,
+            ),
+            (Outcome::Deleted, r#"{"version":1,"outcome":"deleted"}"#),
+            (
+                Outcome::DeletionRejected,
+                r#"{"version":1,"outcome":"deletion_rejected"}"#,
+            ),
+            (Outcome::Collision, r#"{"version":1,"outcome":"collision"}"#),
+        ];
+        for (outcome, expected) in outcomes {
+            let body = serde_json::to_string(&ResultFile {
+                version: 1,
+                outcome: &outcome,
+            })
+            .unwrap();
+            assert_eq!(body, expected);
+        }
+    }
+
+    #[test]
+    fn a_written_result_carries_the_row() {
+        let w = world(b"hello");
+
+        w.exchange
+            .publish(ID, &Outcome::Written { item_id: 42 })
+            .unwrap();
+
+        let body = fs::read_to_string(w.exchange.results().join(format!("{ID}.json"))).unwrap();
+        assert_eq!(body, r#"{"version":1,"outcome":"written","item_id":42}"#);
     }
 
     #[test]

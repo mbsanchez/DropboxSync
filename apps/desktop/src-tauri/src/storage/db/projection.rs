@@ -252,6 +252,17 @@ pub(crate) fn meta_version(name: &str, parent_item: i64, rev: &str) -> Vec<u8> {
 
 // ── entries ─────────────────────────────────────────────────────────────────────────────────────
 
+/// What a write needs of a live item (`Db::projection_write_target`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WriteTarget {
+    /// From the root, `/`-separated, in the names' own case.
+    pub(crate) path: String,
+    pub(crate) is_folder: bool,
+    pub(crate) rev: String,
+    pub(crate) content_version: Vec<u8>,
+    pub(crate) content_hash: String,
+}
+
 /// What the host needs to download a live file.
 pub(crate) struct ProjectionDownloadTarget {
     pub(crate) rev: String,
@@ -395,7 +406,7 @@ pub(crate) struct ProjectionState {
     pub populated: bool,
 }
 
-/// Whether an anchor `v1.<generation>.<seq>` is expired: a different generation, a sequence below
+/// Whether an anchor `v<format>.<generation>.<seq>` is expired: a different generation, a sequence below
 /// `min_valid_seq` or one the database has not reached. Nothing else expires it. The extension holds
 /// the same rule in Swift (slice 2b).
 #[allow(dead_code)]
@@ -521,15 +532,13 @@ fn parent_path(path_lower: &str) -> &str {
 #[derive(Debug, Clone)]
 struct Hit {
     id: i64,
-    path: String,
     is_folder: bool,
 }
 
 fn hit_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
     Ok(Hit {
         id: r.get(0)?,
-        path: r.get(1)?,
-        is_folder: r.get::<_, i64>(2)? != 0,
+        is_folder: r.get::<_, i64>(1)? != 0,
     })
 }
 
@@ -538,7 +547,7 @@ fn hit_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
 /// which cannot match a sibling such as `path2`. `path` is a folded path, like every stored one.
 fn rows_under(conn: &Connection, path: &str) -> rusqlite::Result<Vec<Hit>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT item_id, path_lower, is_folder FROM fp_item
+        "SELECT item_id, is_folder FROM fp_item
          WHERE state != 2 AND path_lower >= ?1 AND path_lower < ?2",
     )?;
     let rows = stmt.query_map([format!("{path}/"), format!("{path}0")], hit_from)?;
@@ -548,7 +557,7 @@ fn rows_under(conn: &Connection, path: &str) -> rusqlite::Result<Vec<Hit>> {
 /// Every non-deleted row stored exactly at the folded `path`.
 fn rows_at(conn: &Connection, path: &str) -> rusqlite::Result<Vec<Hit>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT item_id, path_lower, is_folder FROM fp_item
+        "SELECT item_id, is_folder FROM fp_item
          WHERE state != 2 AND path_lower = ?1",
     )?;
     let rows = stmt.query_map([path], hit_from)?;
@@ -770,7 +779,7 @@ impl<'a> Sequence<'a> {
     }
 
     /// `file|folder P` with id `I`. A different non-deleted item `R` at `P` is replaced: a file
-    /// tombstones `R` and, when `R` is a folder, its subtree (a file has no children); a folder
+    /// tombstones `R` and everything under `P/` (a file has no children); a folder
     /// tombstones only `R` and, when `R` is a folder too, hands `R`'s children to `I`. Then `I` itself
     /// is updated in place wherever it is and whatever its state, or created when the id is new. Nothing
     /// else moves: a folder's children change only through their own entries.
@@ -789,8 +798,14 @@ impl<'a> Sequence<'a> {
             }
             if e.is_folder {
                 adopted.extend(children_of(self.conn, hit.id)?);
-            } else {
-                for sub in rows_under(self.conn, &hit.path)? {
+            }
+        }
+
+        // A file at `P` leaves nothing under `P/`, whether or not it displaced a row there: a replayed
+        // batch finds itself already at `P` and must still clear what a folder there once held.
+        if !e.is_folder {
+            for sub in rows_under(self.conn, &e.path_lower)? {
+                if sub.id != item_id {
                     self.tombstone(sub.id)?;
                 }
             }
@@ -849,6 +864,30 @@ impl<'a> Sequence<'a> {
             self.put(&new)?;
         }
         Ok(state)
+    }
+
+    /// End of a delta batch: every row the batch named or wrote takes the parent its path gives it now,
+    /// parents first. A row's parent is bound when the row is written, and a later entry of the same
+    /// batch can move that folder away and put another at the path: the row would stay live under the
+    /// folder that left, and under a tombstone once that one is deleted.
+    fn reresolve_touched(&mut self) -> rusqlite::Result<()> {
+        let ids: HashSet<i64> = self.order.iter().chain(self.upserted.iter()).copied().collect();
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(row) = load_row(self.conn, id)? {
+                if row.state == STATE_LIVE || row.state == STATE_HIDDEN {
+                    rows.push(row);
+                }
+            }
+        }
+        rows.sort_by(|a, b| a.path_lower.cmp(&b.path_lower));
+        for row in rows {
+            let (parent, state) = self.place(&row.path_lower, row.is_folder)?;
+            if parent != row.parent_item || state != row.state {
+                self.put_stored(&row, parent, state)?;
+            }
+        }
+        Ok(())
     }
 
     /// Ids upserted so far.
@@ -1034,6 +1073,7 @@ fn apply_steps<'a>(
     for step in steps {
         run.apply(step)?;
     }
+    run.reresolve_touched()?;
     run.heal_orphans()?;
     run.finish()
 }
@@ -1407,19 +1447,229 @@ impl Db {
         Ok(location)
     }
 
+    /// What a write needs of a live item: its Dropbox path, built from the names along its parents, and
+    /// its versions. `None`: the item is not live, or a parent on the way is not.
+    ///
+    /// The path comes from the names and not from `path_lower`: a folder renamed through the File
+    /// Provider is rewritten at once, but its children's `path_lower` only when the delta's echo lists
+    /// them, and a write sent to the old path would recreate the old folder on Dropbox.
+    pub(crate) fn projection_write_target(&self, item_id: i64) -> AppResult<Option<WriteTarget>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let mut names = Vec::new();
+        let mut current = item_id;
+        let mut target: Option<(bool, String, Vec<u8>, String)> = None;
+        // A bound on the walk, in case a cycle ever got stored: no Dropbox tree is this deep.
+        for _ in 0..4096 {
+            let row: Option<(i64, String, bool, String, Vec<u8>, String)> = conn
+                .prepare_cached(
+                    "SELECT parent_item, name, is_folder, rev, content_version, content_hash FROM fp_item
+                     WHERE item_id = ?1 AND state = 0",
+                )?
+                .query_row([current], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                })
+                .optional()?;
+            let Some((parent, name, is_folder, rev, content_version, content_hash)) = row else {
+                return Ok(None);
+            };
+            if target.is_none() {
+                target = Some((is_folder, rev, content_version, content_hash));
+            }
+            names.push(name);
+            if parent == 0 {
+                let (is_folder, rev, content_version, content_hash) =
+                    target.expect("set on the first row");
+                names.reverse();
+                return Ok(Some(WriteTarget {
+                    path: format!("/{}", names.join("/")),
+                    is_folder,
+                    rev,
+                    content_version,
+                    content_hash,
+                }));
+            }
+            current = parent;
+        }
+        Ok(None)
+    }
+
+    fn read_conn(&self) -> AppResult<std::sync::MutexGuard<'_, Connection>> {
+        self.read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))
+    }
+
+    /// The state of a row, whatever it is; `None` for an id with no row.
+    pub(crate) fn projection_row_state(&self, item_id: i64) -> AppResult<Option<i64>> {
+        let conn = self.read_conn()?;
+        let value = conn
+            .prepare_cached("SELECT state FROM fp_item WHERE item_id = ?1")?
+            .query_row([item_id], |r| r.get(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    /// The stored `path_lower` of a row, whatever its state.
+    pub(crate) fn projection_path_lower(&self, item_id: i64) -> AppResult<Option<String>> {
+        let conn = self.read_conn()?;
+        let value = conn
+            .prepare_cached("SELECT path_lower FROM fp_item WHERE item_id = ?1")?
+            .query_row([item_id], |r| r.get(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    /// The live child of `parent_item` with this name, ignoring case as Dropbox does: its id, whether it
+    /// is a folder, and its `content_hash`.
+    pub(crate) fn projection_child(
+        &self,
+        parent_item: i64,
+        name: &str,
+    ) -> AppResult<Option<(i64, bool, String)>> {
+        let conn = self.read_conn()?;
+        let wanted = name.to_lowercase();
+        let mut stmt = conn.prepare_cached(
+            "SELECT item_id, name, is_folder, content_hash FROM fp_item WHERE parent_item = ?1 AND state = 0",
+        )?;
+        let rows = stmt.query_map([parent_item], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?, r.get::<_, String>(3)?))
+        })?;
+        for row in rows {
+            let (id, child, is_folder, hash) = row?;
+            if child.to_lowercase() == wanted {
+                return Ok(Some((id, is_folder, hash)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether selective sync would hide an item written at `path` (any case): it would not show in
+    /// Finder once recorded.
+    pub(crate) fn projection_would_hide(&self, path: &str, is_folder: bool) -> AppResult<bool> {
+        let conn = self.read_conn()?;
+        let filter = load_filter_in(&conn)?;
+        Ok(visibility(&filter, &path.to_lowercase(), is_folder) != STATE_LIVE)
+    }
+
+    /// Whether anything under a folder is hidden by selective sync or waiting as an orphan: content
+    /// Finder never showed, which a recursive delete on Dropbox would take too.
+    pub(crate) fn projection_folder_hides_content(&self, item_id: i64) -> AppResult<bool> {
+        let conn = self.read_conn()?;
+        let path: Option<String> = conn
+            .prepare_cached("SELECT path_lower FROM fp_item WHERE item_id = ?1 AND state = 0 AND is_folder = 1")?
+            .query_row([item_id], |r| r.get(0))
+            .optional()?;
+        let Some(path) = path else {
+            return Ok(false);
+        };
+        let hidden: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fp_item WHERE state IN (1, 3) AND path_lower >= ?1 AND path_lower < ?2",
+            [format!("{path}/"), format!("{path}0")],
+            |r| r.get(0),
+        )?;
+        Ok(hidden > 0)
+    }
+
+    /// After a folder moved here (a rename or move made in Finder), the rows under its old path take the
+    /// new one. Only `path_lower` changes: it is bookkeeping the extension never sees, and the parents
+    /// already follow the folder. Without it, a delete or a sweep that matches by path misses them until
+    /// the delta echoes the move.
+    pub(crate) fn projection_move_subtree(&self, item_id: i64, old_lower: &str) -> AppResult<()> {
+        self.write_projection("move", |conn, _st| {
+            let new_lower: Option<String> = conn
+                .prepare_cached("SELECT path_lower FROM fp_item WHERE item_id = ?1 AND state = 0")?
+                .query_row([item_id], |r| r.get(0))
+                .optional()?;
+            let Some(new_lower) = new_lower.filter(|n| n != old_lower) else {
+                return Ok(());
+            };
+            conn.execute(
+                "UPDATE fp_item SET path_lower = ?2 || substr(path_lower, length(?1) + 1)
+                 WHERE state != 2 AND path_lower >= ?1 || '/' AND path_lower < ?1 || '0'",
+                params![old_lower, new_lower],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// The Dropbox path of a live folder, for a child created in it: `""` for the domain root.
+    /// `None`: no live folder has this id.
+    pub(crate) fn projection_folder_path(&self, item_id: i64) -> AppResult<Option<String>> {
+        if item_id == 0 {
+            return Ok(Some(String::new()));
+        }
+        Ok(self
+            .projection_write_target(item_id)?
+            .filter(|t| t.is_folder)
+            .map(|t| t.path))
+    }
+
+    /// What deleting a live item weighs for the mass-deletion breaker, and against what: the live files it
+    /// takes with it (1 for a file, those under a folder), and every live file of the projection.
+    pub(crate) fn projection_delete_weight(&self, item_id: i64) -> AppResult<(usize, usize)> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let tracked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fp_item WHERE state = 0 AND is_folder = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        let row: Option<(bool, String)> = conn
+            .prepare_cached(
+                "SELECT is_folder, path_lower FROM fp_item WHERE item_id = ?1 AND state = 0",
+            )?
+            .query_row([item_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let weight = match row {
+            None => 0,
+            Some((false, _)) => 1,
+            Some((true, path)) => {
+                let under: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM fp_item
+                     WHERE state = 0 AND is_folder = 0 AND substr(path_lower, 1, length(?1) + 1) = ?1 || '/'",
+                    [&path],
+                    |r| r.get(0),
+                )?;
+                // An empty folder still counts as something deleted.
+                usize::try_from(under).unwrap_or(0).max(1)
+            }
+        };
+        Ok((weight, usize::try_from(tracked).unwrap_or(0)))
+    }
+
+    /// The item a Dropbox id was given, live or not.
+    pub(crate) fn projection_item_for_dropbox_id(
+        &self,
+        dropbox_id: &str,
+    ) -> AppResult<Option<i64>> {
+        let conn = self
+            .read
+            .lock()
+            .map_err(|_| AppError::Storage("db read lock poisoned".into()))?;
+        let id = conn
+            .prepare_cached("SELECT item_id FROM fp_identity WHERE dropbox_id = ?1")?
+            .query_row([dropbox_id], |r| r.get(0))
+            .optional()?;
+        Ok(id)
+    }
+
     /// Test hook: the id of the row at `path_lower`.
     #[cfg(test)]
     pub(crate) fn projection_item_id(&self, path_lower: &str) -> Option<i64> {
         let conn = self.read.lock().unwrap();
-        let id = conn
-            .query_row(
-                "SELECT item_id FROM fp_item WHERE path_lower = ?1",
-                [path_lower],
-                |r| r.get(0),
-            )
-            .optional()
-            .unwrap();
-        id
+        conn.query_row(
+            "SELECT item_id FROM fp_item WHERE path_lower = ?1",
+            [path_lower],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
     }
 
     /// Records whether the local copy of a file matches the version the projection holds. Nothing calls
@@ -3070,6 +3320,46 @@ mod tests {
         assert_eq!(row(w.db(), X_DIR).state, STATE_LIVE);
         assert_eq!(row(w.db(), X_CHILD).state, STATE_LIVE, "a bystander");
         assert_replay_changes_nothing(&w, &batch, "folder over file");
+    }
+
+    /// Deferred from the 2a/2b review (#236), found by a model-based fuzz harness: a row's parent is
+    /// bound when it is written, and a later entry of the batch moved that folder away and put another
+    /// at the path.
+    ///
+    /// Proof this test can fail: without `reresolve_touched`, `a` stays under the folder that moved to
+    /// `/D`, and stays live under a tombstone once that one is deleted.
+    #[test]
+    fn a_child_follows_the_folder_now_at_its_path() {
+        let w = world(true, true);
+        run(&w, vec![dir("/e", "id:E"), dir("/e/D", "id:D1"), file("/e/D/a", "id:F", "r1")]);
+
+        run(&w, vec![file("/e/D/a", "id:F", "r1"), dir("/D", "id:D1"), dir("/e/D", "id:D2")]);
+
+        let d2 = row(w.db(), "id:D2").item_id;
+        assert_eq!((row(w.db(), "id:F").parent, row(w.db(), "id:F").state), (d2, STATE_LIVE));
+        run(&w, vec![gone("/D")]);
+        assert_eq!((row(w.db(), "id:F").parent, row(w.db(), "id:F").state), (d2, STATE_LIVE));
+    }
+
+    /// Deferred from the 2a/2b review (#236): a file at `P` leaves nothing under `P/`, also when the
+    /// batch is replayed because its cursor was not saved, and a later folder at `P` brings back nothing.
+    ///
+    /// Proof this test can fail: sweeping `P/` only when the file displaced a row at `P` leaves `/a/b`
+    /// an orphan, which the folder at `/a` heals into a live ghost.
+    #[test]
+    fn a_file_replacing_a_folder_leaves_nothing_under_it_even_replayed() {
+        let w = world(true, true);
+        let first = || vec![dir("/a/b", "id:B4")];
+        let second = || vec![file("/a", "id:A5", "r1")];
+        run(&w, first());
+        run(&w, second());
+        run(&w, first());
+        run(&w, second());
+        assert_eq!(row(w.db(), "id:B4").state, STATE_DELETED);
+
+        run(&w, vec![gone("/a"), dir("/a", "id:A6")]);
+
+        assert_eq!(row(w.db(), "id:B4").state, STATE_DELETED);
     }
 
     /// What the batch itself upserts at a path is never "a different item": two listed items that swap

@@ -69,6 +69,9 @@ export type SyncDashboard = {
   /** DBSYNC-64: true while the mass-deletion circuit breaker has paused sync
    *  (a blocked deletion batch is pending `confirm_pending_deletions`). */
   massDeletePaused: boolean;
+  /** DBSYNC-95: the held deletions were made in Finder, so they can also be refused
+   *  (`reject_pending_deletions`), which restores the files. */
+  massDeleteRestorable: boolean;
 };
 
 export type RemoteEntry = {

@@ -416,6 +416,19 @@ pub(crate) fn wait_out_hold(
 #[cfg(not(test))]
 static SIGNAL_HOLD: SignalHold = SignalHold::new();
 
+/// Whether a removal is still being held back from the system: it may be the first half of a split
+/// rename, and the rows it removed may come back with their ids (ADR-0004, *A rename split in two*).
+#[cfg(not(test))]
+pub(crate) fn removal_held() -> bool {
+    !SIGNAL_HOLD.remaining(Instant::now()).is_zero()
+}
+
+/// Tests hold nothing.
+#[cfg(test)]
+pub(crate) fn removal_held() -> bool {
+    false
+}
+
 /// What a signal outcome means for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalReport {
@@ -615,7 +628,21 @@ mod system {
             let alloc: Allocated<AnyObject> = msg_send![cls, alloc];
             msg_send![alloc, initWithIdentifier: &*id, displayName: &*name]
         };
-        domain.ok_or_else(|| "NSFileProviderDomain init returned nil".to_string())
+        let domain = domain.ok_or_else(|| "NSFileProviderDomain init returned nil".to_string())?;
+        // Finder's Move to Trash (Cmd+Delete) puts the file in the user's own Trash and sends the
+        // extension a delete, instead of a domain trash the extension would have to keep. macOS 15+
+        // (Domain.h, `supportsSyncingTrash`); before it the setter does not exist, the items do not
+        // offer trashing, and Finder offers Delete Immediately only.
+        let setter = objc2::sel!(setSupportsSyncingTrash:);
+        // SAFETY: `respondsToSelector:` takes a selector and returns BOOL; the setter takes a BOOL and
+        // is only sent when the object answers to it.
+        unsafe {
+            let responds: bool = msg_send![&*domain, respondsToSelector: setter];
+            if responds {
+                let _: () = msg_send![&*domain, setSupportsSyncingTrash: false];
+            }
+        }
+        Ok(domain)
     }
 
     fn manager_class() -> Result<&'static AnyClass, String> {

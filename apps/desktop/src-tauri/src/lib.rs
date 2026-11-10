@@ -13,6 +13,8 @@ mod error;
 mod file_provider;
 #[cfg(target_os = "macos")]
 mod file_provider_exchange;
+#[cfg(target_os = "macos")]
+mod file_provider_writes;
 mod finder_extension;
 mod flyout_geometry;
 mod fs_watcher;
@@ -509,6 +511,8 @@ pub fn run() {
             commands::retry_failed_jobs,
             commands::resolve_conflict,
             commands::confirm_pending_deletions,
+            commands::reject_pending_deletions,
+            commands::confirm_dialog,
             commands::scan_local_changes,
             commands::process_sync_queue,
             commands::sync_tick,

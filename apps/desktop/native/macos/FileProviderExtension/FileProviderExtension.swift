@@ -139,7 +139,7 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
                 // The header's answer for content the user cannot have: not retried. The system shows
                 // nothing for it, so the host opens the file on dropbox.com for a Finder request.
                 completionHandler(nil, nil, CocoaError(.fileReadNoPermission))
-            case .retry:
+            case .retry, .written, .collision, .conflict, .deleted, .deletionRejected, .gone, .goneParent:
                 completionHandler(nil, nil, ReadAnswer.transientError(code: 0))
             case .cancelled:
                 completionHandler(nil, nil, CocoaError(.userCancelled))
@@ -156,9 +156,99 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        fpLog.info("createItem refused")
-        completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
-        return Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
+        let store = self.store
+        let parent: Int64
+        switch itemTemplate.parentItemIdentifier {
+        case .rootContainer:
+            parent = projectionRootItem
+        case .trashContainer:
+            completionHandler(nil, [], false, CocoaError(.featureUnsupported))
+            return progress
+        default:
+            guard let decoded = ItemIdCodec.decode(itemTemplate.parentItemIdentifier.rawValue) else {
+                completionHandler(nil, [], false, noSuchItem(itemTemplate.parentItemIdentifier))
+                return progress
+            }
+            parent = decoded
+        }
+        let type = itemTemplate.contentType ?? .data
+        // A symbolic link or an alias has no Dropbox counterpart this app writes, and neither has a package
+        // (an .rtfd, a .pages bundle): a directory the host would have to send as one file.
+        guard !type.conforms(to: .symbolicLink), !type.conforms(to: .aliasFile),
+              type.conforms(to: .folder) || !type.conforms(to: .package) else {
+            completionHandler(nil, [], false, CocoaError(.featureUnsupported))
+            return progress
+        }
+        let folder = type.conforms(to: .folder)
+        fpLog.info("createItem options=\(options.rawValue, privacy: .public) folder=\(folder, privacy: .public)")
+        if options.contains(.mayAlreadyExist) {
+            let existing: ProjectionRow?
+            do {
+                existing = try requireStore(store).child(of: parent, named: itemTemplate.filename)
+            } catch {
+                completionHandler(nil, [], false, readError(error, during: "createItem reimport"))
+                return progress
+            }
+            switch Reimport.decide(existing: existing, folder: folder, hasContents: url != nil) {
+            case .existing(let row):
+                progress.completedUnitCount = 1
+                completionHandler(ProjectionItem(row: row), [], false, nil)
+                return progress
+            case .refuse:
+                progress.completedUnitCount = 1
+                completionHandler(nil, [], false, nil)
+                return progress
+            case .create:
+                break
+            }
+        }
+        guard folder || url != nil else {
+            completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+            return progress
+        }
+        guard let exchange = exchange else {
+            completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        let name = itemTemplate.filename
+        exchange.create(
+            parentItem: parent, name: name, folder: folder, contents: url,
+            isCancelled: { progress.isCancelled }
+        ) { outcome in
+            fpLog.info("createItem: \(outcome.logLabel, privacy: .public)")
+            switch outcome {
+            case .written(let itemId):
+                guard case .live(let row)? = try? requireStore(store).presence(itemId) else {
+                    completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+                    return
+                }
+                progress.completedUnitCount = 1
+                completionHandler(ProjectionItem(row: row), [], false, nil)
+            case .collision:
+                if let existing = try? requireStore(store).child(of: parent, named: name) {
+                    completionHandler(
+                        nil, [], false, NSError.fileProviderErrorForCollision(with: ProjectionItem(row: existing)))
+                } else {
+                    completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+                }
+            case .hostDown, .offline:
+                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+            case .auth:
+                completionHandler(nil, [], false, NSFileProviderError(.notAuthenticated))
+            case .cancelled:
+                completionHandler(nil, [], false, CocoaError(.userCancelled))
+            case .gone, .goneParent:
+                // The folder was deleted on Dropbox: the system re-creates it, then this item.
+                completionHandler(nil, [], false, noSuchItem(itemTemplate.parentItemIdentifier))
+            case .refused:
+                // Selective sync would hide it: it would reach Dropbox and never show here.
+                completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
+            case .staged, .retry, .conflict, .deleted, .deletionRejected:
+                completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+            }
+        }
+        return progress
     }
 
     func modifyItem(
@@ -170,9 +260,91 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        fpLog.info("modifyItem refused")
-        completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
-        return Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
+        guard let itemId = ItemIdCodec.decode(item.itemIdentifier.rawValue) else {
+            completionHandler(nil, [], false, noSuchItem(item.itemIdentifier))
+            return progress
+        }
+        var newPlace: (parent: Int64, name: String)?
+        if !changedFields.isDisjoint(with: [.filename, .parentItemIdentifier]) {
+            switch item.parentItemIdentifier {
+            case .rootContainer:
+                newPlace = (projectionRootItem, item.filename)
+            case .trashContainer:
+                completionHandler(nil, [], false, CocoaError(.featureUnsupported))
+                return progress
+            default:
+                guard let parent = ItemIdCodec.decode(item.parentItemIdentifier.rawValue) else {
+                    completionHandler(nil, [], false, noSuchItem(item.parentItemIdentifier))
+                    return progress
+                }
+                newPlace = (parent, item.filename)
+            }
+        }
+        let contents = changedFields.contains(.contents) ? newContents : nil
+        if let contents = contents,
+           (try? contents.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            // A package's content: see createItem.
+            completionHandler(nil, [], false, CocoaError(.featureUnsupported))
+            return progress
+        }
+        let store = self.store
+        guard newPlace != nil || contents != nil else {
+            // Dates, tags and the like: nothing Dropbox stores. The item is what it was.
+            if case .live(let row)? = try? requireStore(store).presence(itemId) {
+                completionHandler(ProjectionItem(row: row), [], false, nil)
+            } else {
+                completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+            }
+            return progress
+        }
+        guard let exchange = exchange else {
+            completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        exchange.modify(
+            itemId: itemId, baseVersion: version.contentVersion, newPlace: newPlace, contents: contents,
+            isCancelled: { progress.isCancelled }
+        ) { outcome in
+            fpLog.info("modifyItem \(itemId, privacy: .public): \(outcome.logLabel, privacy: .public)")
+            switch outcome {
+            case .written(let id), .conflict(let id):
+                guard case .live(let row)? = try? requireStore(store).presence(id) else {
+                    completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+                    return
+                }
+                progress.completedUnitCount = 1
+                // A conflict leaves Dropbox's version as the item; the system fetches it again, and the
+                // edit is the conflicted copy beside it.
+                let refetch: Bool
+                if case .conflict = outcome { refetch = true } else { refetch = false }
+                completionHandler(ProjectionItem(row: row), [], refetch, nil)
+            case .collision:
+                let existing = newPlace.flatMap { try? requireStore(store).child(of: $0.parent, named: $0.name) }
+                completionHandler(
+                    nil, [], false,
+                    existing.map { NSError.fileProviderErrorForCollision(with: ProjectionItem(row: $0)) }
+                        ?? ReadAnswer.transientError(code: 0))
+            case .hostDown, .offline:
+                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+            case .auth:
+                completionHandler(nil, [], false, NSFileProviderError(.notAuthenticated))
+            case .cancelled:
+                completionHandler(nil, [], false, CocoaError(.userCancelled))
+            case .gone:
+                // Deleted on Dropbox: the system deletes it from disk, or re-creates it if it holds an edit.
+                completionHandler(nil, [], false, noSuchItem(item.itemIdentifier))
+            case .goneParent:
+                // The folder it was moved into was deleted on Dropbox: the system re-creates that folder.
+                completionHandler(nil, [], false, noSuchItem(item.parentItemIdentifier))
+            case .refused:
+                // Selective sync would hide it where it was moved.
+                completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
+            case .staged, .retry, .deleted, .deletionRejected:
+                completionHandler(nil, [], false, ReadAnswer.transientError(code: 0))
+            }
+        }
+        return progress
     }
 
     func deleteItem(
@@ -182,9 +354,51 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
         request: NSFileProviderRequest,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
-        fpLog.info("deleteItem refused")
-        completionHandler(NSFileProviderError(.cannotSynchronize))
-        return Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
+        guard let itemId = ItemIdCodec.decode(identifier.rawValue) else {
+            completionHandler(noSuchItem(identifier))
+            return progress
+        }
+        let store = self.store
+        // A delete that is not recursive must not take children the system has not seen yet, such as
+        // files added on Dropbox since the folder was last listed: Dropbox deletes a folder whole.
+        if !options.contains(.recursive),
+           case .live(let row)? = try? requireStore(store).presence(itemId), row.isFolder,
+           let children = try? requireStore(store).children(of: itemId, afterItem: 0, limit: 1),
+           !children.isEmpty {
+            completionHandler(NSFileProviderError(.directoryNotEmpty))
+            return progress
+        }
+        guard let exchange = exchange else {
+            completionHandler(NSFileProviderError(.serverUnreachable))
+            return progress
+        }
+        exchange.delete(itemId: itemId, baseVersion: version.contentVersion, isCancelled: { progress.isCancelled }) {
+            outcome in
+            fpLog.info("deleteItem \(itemId, privacy: .public): \(outcome.logLabel, privacy: .public)")
+            switch outcome {
+            case .deleted, .gone:
+                progress.completedUnitCount = 1
+                completionHandler(nil)
+            case .goneParent:
+                completionHandler(ReadAnswer.transientError(code: 0))
+            case .deletionRejected:
+                if case .live(let row)? = try? requireStore(store).presence(itemId) {
+                    completionHandler(NSError.fileProviderErrorForRejectedDeletion(of: ProjectionItem(row: row)))
+                } else {
+                    completionHandler(ReadAnswer.transientError(code: 0))
+                }
+            case .hostDown, .offline:
+                completionHandler(NSFileProviderError(.serverUnreachable))
+            case .auth:
+                completionHandler(NSFileProviderError(.notAuthenticated))
+            case .cancelled:
+                completionHandler(CocoaError(.userCancelled))
+            case .staged, .refused, .retry, .written, .conflict, .collision:
+                completionHandler(ReadAnswer.transientError(code: 0))
+            }
+        }
+        return progress
     }
 }
 
@@ -241,9 +455,11 @@ final class RootItem: NSObject, NSFileProviderItem {
     var parentItemIdentifier: NSFileProviderItemIdentifier { .rootContainer }
     var filename: String { "Dropbox Sync" }
     var contentType: UTType { .folder }
-    var capabilities: NSFileProviderItemCapabilities { [.allowsReading, .allowsContentEnumerating] }
+    var capabilities: NSFileProviderItemCapabilities {
+        [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
+    }
     var itemVersion: NSFileProviderItemVersion {
-        NSFileProviderItemVersion(contentVersion: Data("1".utf8), metadataVersion: Data("1".utf8))
+        NSFileProviderItemVersion(contentVersion: Data("1".utf8), metadataVersion: ItemFormat.metadataVersion(Data()))
     }
 }
 
@@ -274,8 +490,17 @@ final class ProjectionItem: NSObject, NSFileProviderItem {
         return UTType(filenameExtension: suffix) ?? .data
     }
 
+    /// Trashing only from macOS 15, where the host tells the domain not to sync a trash: Finder then
+    /// moves the item to the user's Trash and sends `deleteItem`. Before that, trashing would mean a
+    /// domain trash this extension does not keep.
     var capabilities: NSFileProviderItemCapabilities {
-        row.isFolder ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading]
+        var moving: NSFileProviderItemCapabilities = [.allowsRenaming, .allowsReparenting, .allowsDeleting]
+        if #available(macOS 15, *) {
+            moving.insert(.allowsTrashing)
+        }
+        return row.isFolder
+            ? moving.union([.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems])
+            : moving.union([.allowsReading, .allowsWriting])
     }
 
     var documentSize: NSNumber? { row.isFolder ? nil : NSNumber(value: row.sizeBytes) }
@@ -285,7 +510,8 @@ final class ProjectionItem: NSObject, NSFileProviderItem {
     }
 
     var itemVersion: NSFileProviderItemVersion {
-        NSFileProviderItemVersion(contentVersion: row.contentVersion, metadataVersion: row.metaVersion)
+        NSFileProviderItemVersion(
+            contentVersion: row.contentVersion, metadataVersion: ItemFormat.metadataVersion(row.metaVersion))
     }
 }
 

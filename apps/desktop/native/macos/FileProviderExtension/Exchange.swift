@@ -23,6 +23,7 @@ struct ExchangePaths {
     func requestTemp(_ id: String) -> URL { root.appendingPathComponent("requests/.\(id).tmp") }
     func cancelled(_ id: String) -> URL { root.appendingPathComponent("requests/\(id).cancelled") }
     func staged(_ id: String) -> URL { root.appendingPathComponent("staging/\(id).data") }
+    func outgoing(_ id: String) -> URL { root.appendingPathComponent("staging/\(id).up") }
     func result(_ id: String) -> URL { root.appendingPathComponent("results/\(id).json") }
 }
 
@@ -36,6 +37,18 @@ enum ExchangeOutcome: Equatable {
     case refused
     case retry
     case cancelled
+    /// A write landed, and this row is the item to return.
+    case written(itemId: Int64)
+    /// The name is taken.
+    case collision
+    /// The edit went up as a conflicted copy, and this row, Dropbox's version, is the item.
+    case conflict(itemId: Int64)
+    case deleted
+    case deletionRejected
+    /// The item was deleted on Dropbox: `noSuchItem` for it.
+    case gone
+    /// The folder a create or a move names was deleted on Dropbox: `noSuchItem` for that folder.
+    case goneParent
 
     /// A class only: no name or path reaches the log.
     var logLabel: String {
@@ -47,6 +60,13 @@ enum ExchangeOutcome: Equatable {
         case .refused: return "refused"
         case .retry: return "retry"
         case .cancelled: return "cancelled"
+        case .written: return "written"
+        case .collision: return "collision"
+        case .conflict: return "conflict"
+        case .deleted: return "deleted"
+        case .deletionRejected: return "deletionRejected"
+        case .gone: return "gone"
+        case .goneParent: return "goneParent"
         }
     }
 }
@@ -79,6 +99,19 @@ func decodeExchangeResult(_ data: Data, staged: URL) -> ExchangeOutcome {
         return .auth
     case "refused":
         return .refused
+    case "written", "conflict":
+        guard let itemId = (object["item_id"] as? NSNumber)?.int64Value else { return .retry }
+        return outcome == "written" ? .written(itemId: itemId) : .conflict(itemId: itemId)
+    case "collision":
+        return .collision
+    case "deleted":
+        return .deleted
+    case "deletion_rejected":
+        return .deletionRejected
+    case "gone":
+        return .gone
+    case "gone_parent":
+        return .goneParent
     default:
         return .retry
     }
@@ -121,13 +154,78 @@ final class ExchangeClient {
         isCancelled: @escaping () -> Bool,
         done: @escaping (ExchangeOutcome) -> Void
     ) {
+        send(["op": "fetch", "item_id": itemId, "viewer": viewer], outgoing: nil, isCancelled, done)
+    }
+
+    /// Asks the host to create `name` in `parentItem` (0 is the domain root). A file's bytes are cloned
+    /// from `contents` into staging first: the host cannot read where the system keeps them.
+    func create(
+        parentItem: Int64,
+        name: String,
+        folder: Bool,
+        contents: URL?,
+        isCancelled: @escaping () -> Bool,
+        done: @escaping (ExchangeOutcome) -> Void
+    ) {
+        send(
+            ["op": "create", "parent_item": parentItem, "name": name, "folder": folder],
+            outgoing: folder ? nil : contents, isCancelled, done)
+    }
+
+    /// A rename or move (`newParent` and `newName` together), new bytes, or both. `baseVersion` is the
+    /// content version the edit was made against.
+    func modify(
+        itemId: Int64,
+        baseVersion: Data,
+        newPlace: (parent: Int64, name: String)?,
+        contents: URL?,
+        isCancelled: @escaping () -> Bool,
+        done: @escaping (ExchangeOutcome) -> Void
+    ) {
+        var fields: [String: Any] = [
+            "op": "modify", "item_id": itemId, "base_version": String(decoding: baseVersion, as: UTF8.self),
+            "content": contents != nil,
+        ]
+        if let place = newPlace {
+            fields["new_parent"] = place.parent
+            fields["new_name"] = place.name
+        }
+        send(fields, outgoing: contents, isCancelled, done)
+    }
+
+    func delete(
+        itemId: Int64,
+        baseVersion: Data,
+        isCancelled: @escaping () -> Bool,
+        done: @escaping (ExchangeOutcome) -> Void
+    ) {
+        send(
+            ["op": "delete", "item_id": itemId, "base_version": String(decoding: baseVersion, as: UTF8.self)],
+            outgoing: nil, isCancelled, done)
+    }
+
+    private func send(
+        _ fields: [String: Any],
+        outgoing: URL?,
+        _ isCancelled: @escaping () -> Bool,
+        _ done: @escaping (ExchangeOutcome) -> Void
+    ) {
         let id = UUID().uuidString
         DispatchQueue.global(qos: .userInitiated).async {
             guard hostIsRunning(lockPath: self.paths.lock) else {
                 done(.hostDown)
                 return
             }
-            guard self.enqueue(id: id, itemId: itemId, viewer: viewer) else {
+            if let outgoing = outgoing {
+                do {
+                    try FileManager.default.copyItem(at: outgoing, to: self.paths.outgoing(id))
+                } catch {
+                    done(.retry)
+                    return
+                }
+            }
+            guard self.enqueue(id: id, fields: fields) else {
+                try? FileManager.default.removeItem(at: self.paths.outgoing(id))
                 done(.retry)
                 return
             }
@@ -136,8 +234,15 @@ final class ExchangeClient {
         }
     }
 
-    private func enqueue(id: String, itemId: Int64, viewer: Bool) -> Bool {
-        let body = Data("{\"version\":1,\"item_id\":\(itemId),\"viewer\":\(viewer)}".utf8)
+    /// The request's JSON, keys sorted so its bytes are stable.
+    static func requestBody(_ fields: [String: Any]) -> Data? {
+        var all = fields
+        all["version"] = 1
+        return try? JSONSerialization.data(withJSONObject: all, options: [.sortedKeys, .withoutEscapingSlashes])
+    }
+
+    private func enqueue(id: String, fields: [String: Any]) -> Bool {
+        guard let body = Self.requestBody(fields) else { return false }
         do {
             try body.write(to: paths.requestTemp(id))
             try FileManager.default.moveItem(at: paths.requestTemp(id), to: paths.request(id))
@@ -177,7 +282,9 @@ final class ExchangeClient {
         }
         if let early = early {
             let takenBack = (try? FileManager.default.removeItem(at: paths.request(id))) != nil
-            if !takenBack && early != .hostDown {
+            if takenBack {
+                try? FileManager.default.removeItem(at: paths.outgoing(id))
+            } else if early != .hostDown {
                 FileManager.default.createFile(atPath: paths.cancelled(id).path, contents: nil)
             }
             done(early)

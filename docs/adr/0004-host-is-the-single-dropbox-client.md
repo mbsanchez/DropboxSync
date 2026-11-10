@@ -83,7 +83,8 @@ change.
 
 - When a modification's base version is stale, **both versions are kept** as a conflicted copy, through the
   existing resolver and `sync_conflicts`.
-- A delete that races a remote edit becomes a re-create.
+- A delete that races a remote edit is refused (`deletionRejected`), and the system restores the file with
+  Dropbox's version.
 - No lingering "refused" state is ever left behind: every collision resolves into ordinary state.
 
 ### When the host is not running
@@ -319,6 +320,83 @@ and hands the file over; a row that moved on meanwhile answers a transient error
   The host sweeps exchange files older than an hour, which a crash leaves behind, and removes the directory
   at startup with the switch off.
 
+### Writes (slice 4)
+
+`createItem`, `modifyItem` and `deleteItem` go through the same queue; the extension clones new bytes into
+`fp-exchange/staging/<id>.up`. The host calls Dropbox, waits for its answer and writes the row from the
+metadata Dropbox returns, through the delta writer, so the echo of the change in the feed finds it already
+there. Nothing is queued on the host: a failure answers the system, which retries.
+
+- **Paths** are built from the chain of names up to the root, not from `path_lower`, so a write under a folder
+  renamed here uses the new name. The rows under a folder renamed or moved here take its new `path_lower` at once,
+  so deletes and sweeps that match by path find them before the echo arrives.
+- **Edits** upload with `mode: update` on the row's `rev`. A stale base, or Dropbox refusing the `rev`, sends
+  the edit up beside Dropbox's version as `name (conflicted copy <UTC stamp>).ext`, records it in
+  `sync_conflicts` and makes the system fetch Dropbox's version again. An edit to a file deleted on Dropbox in
+  the meantime ended the same way when measured live: the edit came back as a conflicted copy.
+- **Deletes** carry `parent_rev`; a file edited on Dropbox since is refused with `deletionRejected`. So is a
+  folder holding anything selective sync hides or that waits as an orphan: Dropbox deletes a folder whole,
+  and that content was never in Finder (the sync folder refuses the same, DBSYNC-114). A delete the system
+  does not mark recursive is refused with `directoryNotEmpty` when the projection holds children.
+- **Deleted on Dropbox meanwhile.** An edit or a move of an item that Dropbox deleted answers `noSuchItem`
+  for the item (the header's rule: the system deletes it from disk, or re-creates it when it holds an
+  edit); a create in, or a move into, a folder that Dropbox deleted answers `noSuchItem` for that folder. While a removal is still held back from the system it answers a transient error instead,
+  because the row may be the first half of a split rename and come back with its id.
+- **Sent again.** A create whose item is already a live child with the same bytes (or, for a folder, a
+  folder), and an edit refused as stale whose bytes are already Dropbox's, answer that item without
+  calling Dropbox: the system sends a write again when the extension stopped waiting, and the first one may
+  have landed. Before the delta catches up, a refused upload reads Dropbox's metadata to tell its own landed
+  edit from someone else's; when that read fails, the edit is retried rather than kept as a copy. A child whose delete is still held or waiting does not count, so a file put back under its
+  name is a new item. Before a write is sent, and between the chunks of a session, the host checks that the
+  extension still waits for it; one it stopped waiting for is not sent.
+- **Not sent.** A create, or a move, that selective sync would hide is refused with `cannotSynchronize`, since it would
+  reach Dropbox and never show. Packages (`.rtfd`, `.pages`) are refused with `featureUnsupported`: they are
+  directories the host would have to send as one file.
+- **One write at a time.** Finder sends a selection as concurrent calls, and Dropbox answered concurrent
+  writes with 429 (40 of 50 parallel deletes, 2 of 6 parallel creates). A file larger than one 8 MiB chunk
+  goes up in an upload session, and only its `finish` waits for the lane, so a long upload does not hold up
+  other writes while its bytes travel. A write that waits for the lane longer than 240 s gives up without
+  sending anything, well inside the extension's 600 s, so nothing is written after the extension stopped
+  waiting.
+- **The mass-deletion breaker** (DBSYNC-64) holds a Finder selection that it calls a mass deletion until the
+  user confirms or restores it in the app. Each call waits until no delete has arrived for 1.5 s, so every
+  call sees the whole burst; refused, each answers `deletionRejected` and the system restores the files. The
+  system keeps at most 32 deletes in flight and sends the next only as one returns (measured: a 300-file
+  selection arrived as 32, then one per answered call), so the breaker never sees a large selection whole.
+  A burst that fills all 32 slots is therefore held whatever the threshold says: judged on the threshold
+  alone, the first 32 of a 300-file selection went to Dropbox in an account of 440 files, and with 2,000
+  files or more the one-by-one stream that follows (about 1.5 deletes a second through the write lane)
+  could never reach 200 within the window, so a whole folder would have gone unasked. The cost: deleting 32
+  files or more in Finder always asks, and the banner gives the count so far, since the rest has not arrived.
+  An answer covers the operation: the calls waiting, the rest of the selection while it keeps arriving with
+  no pause over 5 s (one Dropbox delete), however long, and items the system sends again (a call that gave
+  up waiting, a confirmed delete Dropbox did not take), which carry their answer whatever comes between. A
+  pause ends it, and any later delete is a new question, including the same files deleted again after a
+  restore: the system does not retry a `deletionRejected`. A burst under 32 is judged together with the
+  small bursts let through in the last 60 s, so small selections made one after another are asked about
+  once they add up; those let through before the question have gone. A confirmation empties the window. A
+  burst is judged before another can start, so a delete that arrives as a mass deletion settles cannot let
+  it through unasked; an answer nobody was waiting for (every call gave up) settles its own burst before
+  the next delete is looked at. The cost of the stream is that a delete of something else made while the
+  rest of an answered selection is still arriving takes that answer. The answer is one key, last click
+  wins; the click names the question it answers, and counts only if that question is still on screen (the
+  sync folder's comes first); it is cleared when a question opens and dropped with the question at
+  startup, because the burst it was about lived in memory.
+- **Move to Trash** (Cmd+Delete) needs `allowsTrashing`. The domain sets `supportsSyncingTrash` to NO, so
+  Finder moves a downloaded file to the user's Trash and sends `deleteItem`, and offers to delete one that is
+  not downloaded. The setter exists from macOS 15; before it the items do not offer trashing, and only Delete
+  Immediately works.
+- **Cached capabilities.** The system keeps an item's capabilities until the item reaches it with another
+  version. `ItemFormat` is part of every anchor and every metadata version, so a build that changes what an
+  item reports bumps it, every older anchor expires into a rescan, and the rescan replaces each item. Slice
+  3's read-only items kept Finder refusing deletes until this existed.
+- **Reimport** (`mayAlreadyExist`): a folder, or a file with no content on disk, that matches a live child of
+  the same name is answered with that row; an unmatched file with no content is refused, which removes the
+  empty placeholder; anything else is an ordinary create.
+- **Change order.** `enumerateChanges` reports updates before deletes. The other order would delete a child
+  that moves out of a folder deleted in the same batch; this one can make the system rename one of two items
+  that swap a path in one batch, which loses nothing.
+
 ### What stays and what is gated at the cutover
 
 Gated off on macOS, kept for Windows: the filesystem watcher, the local scan and the rename heuristics, the
@@ -364,6 +442,20 @@ stays unset, and the gating is explicit rather than implied by the unset value. 
   `https://www.dropbox.com/preview/<path>` opens the document, with the parent folder in lower case, by
   redirecting to its link. A `/home?preview=` URL does not: it lands on the home page.
 - **The login item** (`SMAppService`) registers in this app. Starting at a real login has not been observed.
+- **Measured by slice 4 (#236), signed but not notarized:** creates, edits, renames, moves and deletes of
+  files and folders; a 200 MB upload through a session, with Dropbox's `content_hash` matching the file; a
+  stale edit and an edit racing a remote delete both ending as conflicted copies; a delete racing a remote
+  edit restored; 50-file selections restored, then confirmed with a single question; Move to Trash on a
+  downloaded and on a dataless file, on macOS 26; how the system sends a 300-file selection (32 at once,
+  then one per answered call).
+- **Not observed:** a modification arriving after the feed has already removed its row (the host answers
+  `noSuchItem` and the header says the system then re-creates an edited item); a reimport
+  (`mayAlreadyExist`); the order of updates and deletes when one item replaces another at a path; a
+  non-recursive folder delete; a package; Put Back from the Trash.
+- **Known gaps, left to the delta's echo:** the subtree path rewrite after a folder moved here applies to
+  whatever sits under the old path when it runs, and does not recompute selective-sync state; and paths
+  this host lowercases itself (the hide check, a delete's tombstone) use Rust's `to_lowercase`, which
+  differs from Dropbox's `path_lower` for a few characters.
 - **Deep or large folder deletes and renames** (fact 4 above): the prefix fallback exists because the
   listing of every descendant is unproven. The contract text itself comes from the classic `/delta` rules and
   was only checked against the shapes captured in #234.
