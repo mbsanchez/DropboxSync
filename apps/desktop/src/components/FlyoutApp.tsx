@@ -5,6 +5,7 @@ import { useStartupRequirements } from "../hooks/useStartupRequirements";
 import { useSyncDashboard } from "../hooks/useSyncDashboard";
 import { useTransferProgress } from "../hooks/useTransferProgress";
 import { usePlaceholderEvents } from "../hooks/usePlaceholderEvents";
+import { confirmAction } from "../confirm";
 import { formatBytes, formatSpeed } from "../format";
 import type { ActiveTransfer, ActivityEntry, FinderExtensionState, SyncConflict, SyncJob, TriggerSyncResponse } from "../types";
 import "./FlyoutApp.css";
@@ -46,7 +47,11 @@ function isSettledNotPerformed(job: SyncJob): boolean {
  * superseded, DBSYNC-103 kept-for-debt uploads), so it must not name a cause. */
 const SETTLED_NOT_PERFORMED_DETAIL = "Non effectuée";
 
-function queueActionLabel(job: SyncJob): string {
+/**
+ * `fileProvider`: macOS, where the files live in Finder (DBSYNC-98). No `.cloudsc` is ever named
+ * there; a `hydrate_cloudsc` row can only be history from an earlier build, and it was a download.
+ */
+function queueActionLabel(job: SyncJob, fileProvider: boolean): string {
   switch (job.jobType) {
     case "upload":
       return "Upload (local -> Dropbox)";
@@ -81,7 +86,7 @@ function queueActionLabel(job: SyncJob): string {
       }
       return "Supprimé (retiré du remote)";
     case "hydrate_cloudsc":
-      return "Hydrate (.cloudsc)";
+      return fileProvider ? "Download" : "Hydrate (.cloudsc)";
     default:
       return job.jobType;
   }
@@ -243,11 +248,11 @@ function CurrentTransferCard({ transfer }: CurrentTransferCardProps) {
   );
 }
 
-type RecentRowProps = { job: SyncJob };
+type RecentRowProps = { job: SyncJob; fileProvider: boolean };
 
-function RecentTransferRow({ job }: RecentRowProps) {
+function RecentTransferRow({ job, fileProvider }: RecentRowProps) {
   const kind = jobEventKind(job);
-  const name = basename(job.targetPath) || queueActionLabel(job);
+  const name = basename(job.targetPath) || queueActionLabel(job, fileProvider);
   return (
     <li className="recent-row">
       <EventIcon kind={kind} />
@@ -283,14 +288,16 @@ function ActivityRow({ entry }: ActivityRowProps) {
   );
 }
 
-type JobActivityRowProps = { job: SyncJob };
+type JobActivityRowProps = { job: SyncJob; fileProvider: boolean };
 
 /** Renders a background sync job (upload/download/delete/local_delete/hydrate) as
  * an Activité row, so events driven by the scheduler (not pushLog) are visible too. */
-function JobActivityRow({ job }: JobActivityRowProps) {
+function JobActivityRow({ job, fileProvider }: JobActivityRowProps) {
   const kind = jobEventKind(job);
   const name = basename(job.targetPath);
-  const main = name ? `${queueActionLabel(job)} — ${name}` : queueActionLabel(job);
+  const main = name
+    ? `${queueActionLabel(job, fileProvider)} — ${name}`
+    : queueActionLabel(job, fileProvider);
   return (
     <li className="activity-row">
       <EventIcon kind={kind} />
@@ -343,7 +350,7 @@ function buildActivityFeed(jobs: SyncJob[], activity: ActivityEntry[]): Activity
  * the `.cloudsc` placeholder in the OS file manager. */
 function FlyoutApp() {
   const { activity, pushLog } = useActivityLog();
-  const { startupLoading, authOk, syncFolderOk, syncFolder, finderExtension } =
+  const { startupLoading, authOk, syncFolderOk, syncFolder, fileProvider, finderExtension } =
     useStartupRequirements(pushLog);
 
   /*
@@ -368,10 +375,12 @@ function FlyoutApp() {
     jobs,
     conflicts,
     massDeletePaused,
+    massDeleteRestorable,
     refreshDashboardNow,
     retryFailedJobs,
     resolveConflict,
     confirmPendingDeletions,
+    rejectPendingDeletions,
   } = useSyncDashboard(pushLog);
   const [confirmingDeletions, setConfirmingDeletions] = useState(false);
   // DBSYNC-68: optimistic "Sync Now" flag — flips the disabled/Syncing state
@@ -387,13 +396,16 @@ function FlyoutApp() {
     conflict: SyncConflict,
     action: "keep_local" | "use_remote" | "keep_both",
   ) => {
-    if (action === "use_remote" && conflict.remoteDeleted) {
-      const ok = window.confirm(
-        `Le distant a été supprimé. « Utiliser distant » supprimera définitivement le fichier local « ${conflict.localPath} ». Continuer ?`,
-      );
-      if (!ok) return;
-    }
-    void resolveConflict(conflict.id, action);
+    void (async () => {
+      if (action === "use_remote" && conflict.remoteDeleted) {
+        const ok = await confirmAction(
+          "Utiliser distant",
+          `Le distant a été supprimé. « Utiliser distant » supprimera définitivement le fichier local « ${conflict.localPath} ». Continuer ?`,
+        );
+        if (!ok) return;
+      }
+      await resolveConflict(conflict.id, action);
+    })();
   };
 
   const [section, setSection] = useState<Section>("home");
@@ -447,6 +459,10 @@ function FlyoutApp() {
         pushLog("Sync already running.");
         return;
       }
+      if (result.reason === "nothing_to_sync") {
+        pushLog("Finder receives Dropbox changes as they happen; there is nothing to run.");
+        return;
+      }
       pushLog("Sync requested.");
       // Optimistic feedback: disable the button/indicator immediately, then
       // hand off to the real dashboard status. The flag only bridges the
@@ -469,13 +485,14 @@ function FlyoutApp() {
   // DBSYNC-64: mass-delete circuit breaker paused sync. Nothing was deleted yet;
   // require an explicit confirm before letting the blocked batch proceed.
   const onConfirmPendingDeletions = async () => {
-    const ok = window.confirm(
+    const ok = await confirmAction(
+      "Confirm deletions",
       "This will delete the blocked items from Dropbox (or locally). Only confirm if you intentionally deleted them. Continue?",
     );
     if (!ok) return;
     setConfirmingDeletions(true);
     try {
-      await confirmPendingDeletions();
+      await confirmPendingDeletions(massDeleteRestorable);
     } finally {
       setConfirmingDeletions(false);
     }
@@ -676,6 +693,16 @@ function FlyoutApp() {
                 >
                   {confirmingDeletions ? "Confirming..." : "Confirm & resume"}
                 </button>
+                {massDeleteRestorable && (
+                  <button
+                    type="button"
+                    className="flyout-btn"
+                    onClick={() => void rejectPendingDeletions()}
+                    disabled={confirmingDeletions}
+                  >
+                    Restore files
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -708,7 +735,7 @@ function FlyoutApp() {
             <ul className="flyout-list recent-list">
               {recentJobs.length === 0 && <li className="muted">Aucune activité récente.</li>}
               {recentJobs.map((job) => (
-                <RecentTransferRow key={job.id} job={job} />
+                <RecentTransferRow key={job.id} job={job} fileProvider={fileProvider} />
               ))}
             </ul>
           </section>
@@ -716,11 +743,11 @@ function FlyoutApp() {
 
         {section === "folders" && (
           <section className="flyout-section">
-            <h2>Dossier synchronisé</h2>
+            <h2>{fileProvider ? "Dropbox dans le Finder" : "Dossier synchronisé"}</h2>
             <div className="folder-panel">
               <span className="path">{syncFolder || "Non configuré"}</span>
               <button type="button" className="flyout-btn" onClick={() => void openSyncFolder()}>
-                Ouvrir dans l'explorateur
+                {fileProvider ? "Ouvrir dans le Finder" : "Ouvrir dans l'explorateur"}
               </button>
             </div>
           </section>
@@ -738,20 +765,25 @@ function FlyoutApp() {
                     <div className="row-main">{conflict.localPath}</div>
                     <div className="row-sub error">{conflict.reason}</div>
                     <div className="conflict-actions">
-                      <button
-                        type="button"
-                        className="conflict-btn"
-                        onClick={() => onResolveConflict(conflict, "keep_local")}
-                      >
-                        Garder local
-                      </button>
-                      <button
-                        type="button"
-                        className={`conflict-btn${conflict.remoteDeleted ? " danger" : ""}`}
-                        onClick={() => onResolveConflict(conflict, "use_remote")}
-                      >
-                        {conflict.remoteDeleted ? "Supprimer local" : "Utiliser distant"}
-                      </button>
+                      {/* macOS: both files are already in Finder, so keeping both is the only answer here. */}
+                      {!fileProvider && (
+                        <button
+                          type="button"
+                          className="conflict-btn"
+                          onClick={() => onResolveConflict(conflict, "keep_local")}
+                        >
+                          Garder local
+                        </button>
+                      )}
+                      {!fileProvider && (
+                        <button
+                          type="button"
+                          className={`conflict-btn${conflict.remoteDeleted ? " danger" : ""}`}
+                          onClick={() => onResolveConflict(conflict, "use_remote")}
+                        >
+                          {conflict.remoteDeleted ? "Supprimer local" : "Utiliser distant"}
+                        </button>
+                      )}
                       {!conflict.remoteDeleted && (
                         <button
                           type="button"
@@ -772,7 +804,7 @@ function FlyoutApp() {
               {activityFeed.length === 0 && <li className="muted">No entries yet.</li>}
               {activityFeed.map((item) =>
                 item.kind === "job" ? (
-                  <JobActivityRow key={item.key} job={item.job} />
+                  <JobActivityRow key={item.key} job={item.job} fileProvider={fileProvider} />
                 ) : (
                   <ActivityRow key={item.key} entry={item.entry} />
                 ),

@@ -18,6 +18,7 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
   const [jobs, setJobs] = useState<SyncJob[]>([]);
   const [conflicts, setConflicts] = useState<SyncConflict[]>([]);
   const [massDeletePaused, setMassDeletePaused] = useState(false);
+  const [massDeleteRestorable, setMassDeleteRestorable] = useState(false);
   const prevSyncRunningRef = useRef(false);
 
   const refreshDashboard = useCallback(async () => {
@@ -27,6 +28,7 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
       setJobs(dashboard.jobs);
       setConflicts(dashboard.conflicts);
       setMassDeletePaused(dashboard.massDeletePaused);
+      setMassDeleteRestorable(dashboard.massDeleteRestorable);
     } catch (e) {
       pushLog(`Dashboard refresh failed: ${String(e)}`);
     }
@@ -60,12 +62,24 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
 
   // DBSYNC-64: user reviewed the blocked deletion batch and wants to proceed.
   // Sets a one-shot backend override for the next scan/sweep and clears the pause.
-  const confirmPendingDeletions = useCallback(async () => {
+  // `finder`: the banner showed the Finder question (the one that can also be restored).
+  const confirmPendingDeletions = useCallback(async (finder: boolean) => {
     try {
-      await invoke("confirm_pending_deletions");
+      await invoke("confirm_pending_deletions", { finder });
       pushLog("Confirmed pending deletions; sync will resume and apply them.");
     } catch (error) {
       pushLog(`Confirm pending deletions error: ${String(error)}`);
+    }
+    await refreshDashboard();
+  }, [pushLog, refreshDashboard]);
+
+  // DBSYNC-95: the user refused deletions made in Finder; the system restores the files.
+  const rejectPendingDeletions = useCallback(async () => {
+    try {
+      await invoke("reject_pending_deletions");
+      pushLog("Refused the pending deletions; Finder will restore the files.");
+    } catch (error) {
+      pushLog(`Refuse pending deletions error: ${String(error)}`);
     }
     await refreshDashboard();
   }, [pushLog, refreshDashboard]);
@@ -158,6 +172,8 @@ export function useSyncDashboard(pushLog: (line: string) => void) {
     jobs,
     conflicts,
     massDeletePaused,
+    massDeleteRestorable,
+    rejectPendingDeletions,
     refreshDashboard,
     // One-shot immediate dashboard fetch (same fetch logic as refreshDashboard),
     // exposed under this name for callers that want to read the freshest status

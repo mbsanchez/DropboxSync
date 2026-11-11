@@ -1,5 +1,5 @@
 /**
- * Tauri beforeBuildCommand: frontend build + Finder Sync appex (macOS only), plus the host app's
+ * Tauri beforeBuildCommand: frontend build + Finder Sync and File Provider appexes (macOS only), plus the host app's
  * entitlements (DBSYNC-97). `bundle.macOS.entitlements` in tauri.conf.json points at the rendered file.
  */
 import { spawnSync } from "node:child_process";
@@ -33,4 +33,6 @@ if (process.platform === "darwin") {
     "src-tauri/.generated/host.entitlements",
   ]);
   run("npm", ["run", "build:finder-sync"]);
+  // The File Provider appex ships in every macOS build and is inert until a domain is added (ADR-0004).
+  run("npm", ["run", "build:file-provider"]);
 }

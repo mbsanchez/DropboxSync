@@ -194,6 +194,9 @@ pub(crate) fn delta_action_from_entry(entry: &DropboxEntry) -> DeltaAction {
 /// | `deleted` only                                   | the `deleted` entry → Remove |
 /// | `folder`-tagged (or any other unrecognised tag)  | ignored — never enters the map |
 ///
+/// (The File Provider projection of DBSYNC-95 does need folders. It is fed from the RAW entries by
+/// `run_remote_delta`, not from this collapse, and resolves its own batch.)
+///
 /// Folder entries are dropped here rather than resolved against anything, which is
 /// safe only because `remote_file_index` holds no folder rows at all — DBSYNC-30
 /// scoped the cursor-delta index to files only. If that ever changes, this silent
@@ -493,6 +496,17 @@ pub(crate) fn remote_meta_from_entry(entry: &DropboxEntry) -> Option<(String, Re
 pub(crate) fn fetch_all_remote_file_metadata(
     state: &AppState,
 ) -> AppResult<(HashMap<String, RemoteFileMeta>, String)> {
+    fetch_remote_snapshot(state, |_| {})
+}
+
+/// [`fetch_all_remote_file_metadata`] with a hook that sees every raw entry of the listing, folders
+/// included, as it arrives (DBSYNC-95). The snapshot that seeds the delta cursor uses it to feed the
+/// File Provider projection from the very listing the cursor belongs to, so the projection costs no
+/// extra Dropbox call; every other caller passes a no-op.
+fn fetch_remote_snapshot(
+    state: &AppState,
+    mut on_entry: impl FnMut(&DropboxEntry),
+) -> AppResult<(HashMap<String, RemoteFileMeta>, String)> {
     let token = get_access_token(state)?;
     let client = &state.http_client;
 
@@ -532,6 +546,7 @@ pub(crate) fn fetch_all_remote_file_metadata(
     // full snapshot.
     loop {
         for entry in &entries_resp.entries {
+            on_entry(entry);
             if let Some((path_key, meta)) = remote_meta_from_entry(entry) {
                 remote_by_path.insert(path_key, meta);
                 continue;
@@ -548,7 +563,8 @@ pub(crate) fn fetch_all_remote_file_metadata(
             // This is the ONLY writer, and there is no reader yet — see
             // `Db::set_known_folder_dropbox_id`, which records why that is deliberate and
             // the two coverage holes any future reader has to allow for (DBSYNC-106).
-            if entry.tag == "folder" {
+            // DBSYNC-98: `known_folders` is the folder pipeline's, which macOS does not run.
+            if entry.tag == "folder" && crate::platform::sidecar_pipeline() {
                 if let (Some(path_display), Some(id)) =
                     (entry.path_display.as_deref(), entry.id.as_deref())
                 {
@@ -592,6 +608,10 @@ pub(crate) fn fetch_all_remote_file_metadata(
 pub(crate) fn refresh_remote_index_and_enqueue_downloads_internal(
     state: &AppState,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let local_files = state.db.list_local_files()?;
     if local_files.is_empty() {
         return Ok(0);
@@ -945,21 +965,184 @@ pub(crate) fn reconcile_remote_absent(state: &AppState, rel: &str) -> AppResult<
 /// otherwise mass-delete local files ungated — so this goes through the exact
 /// same `reconcile_remote_snapshot_with_breaker` gate as the periodic sweep.
 pub(crate) fn seed_remote_delta_cursor(state: &AppState) -> AppResult<String> {
-    let (remote_by_path, cursor) = fetch_all_remote_file_metadata(state)?;
+    // DBSYNC-95: collect the projection's entries from this same listing, but only when the switch is
+    // on. Off, nothing is allocated and the listing is exactly what it was.
+    #[cfg(target_os = "macos")]
+    {
+        let mut projection: SnapshotProjection = state.db.projection_active().then(Vec::new);
+        let (remote_by_path, cursor) = fetch_remote_snapshot(state, |entry| {
+            if let Some(list) = projection.as_mut() {
+                if let Some(projected) =
+                    crate::storage::db::projection::ProjectedEntry::from_entry(entry)
+                {
+                    list.push(projected);
+                }
+            }
+        })?;
+        finish_seed(state, &remote_by_path, &cursor, projection)?;
+        Ok(cursor)
+    }
+    // Other platforms have no projection: the seed is what it always was.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (remote_by_path, cursor) = fetch_all_remote_file_metadata(state)?;
+        finish_seed(state, &remote_by_path, &cursor)?;
+        Ok(cursor)
+    }
+}
 
+/// What a snapshot collected for the File Provider projection: `None` when the projection is not
+/// being fed.
+#[cfg(target_os = "macos")]
+type SnapshotProjection = Option<Vec<crate::storage::db::projection::ProjectedEntry>>;
+
+/// Reconciles the local index against a snapshot of the remote tree: the part of the seed that is
+/// the same on every platform.
+fn reconcile_seed_snapshot(
+    state: &AppState,
+    remote_by_path: &HashMap<String, RemoteFileMeta>,
+) -> AppResult<()> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(());
+    }
     let local_files = state.db.list_local_files()?;
     if !local_files.is_empty() {
         let pending_targets = pending_job_targets(state)?;
         reconcile_remote_snapshot_with_breaker(
             state,
             &local_files,
-            &remote_by_path,
+            remote_by_path,
             &pending_targets,
         )?;
     }
+    Ok(())
+}
 
-    state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
-    Ok(cursor)
+/// Everything `seed_remote_delta_cursor` does once the listing is in hand, so a test can drive it
+/// without the network: reconcile the local index, write the projection snapshot, and persist the
+/// cursor. A projection that cannot take the snapshot is emptied and retried later, never allowed to
+/// hold the cursor back: a cursor beside an unpopulated projection is what makes the next iteration
+/// reseed (`usable_delta_cursor`).
+#[cfg(target_os = "macos")]
+pub(crate) fn finish_seed(
+    state: &AppState,
+    remote_by_path: &HashMap<String, RemoteFileMeta>,
+    cursor: &str,
+    projection: SnapshotProjection,
+) -> AppResult<()> {
+    reconcile_seed_snapshot(state, remote_by_path)?;
+    if let Some(entries) = projection {
+        // The one writer that expires anchors, with the clear (ADR-0004: only a Dropbox cursor reset
+        // may make the system rescan everything).
+        match state.db.project_snapshot(&entries) {
+            Ok(commit) => {
+                state.db.note_snapshot_landed();
+                if commit.rows > 0 {
+                    crate::file_provider::signal_working_set();
+                }
+                // A read during the seed answered `serverUnreachable`, and only this lifts it.
+                crate::file_provider::signal_errors_resolved_soon();
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "File Provider projection: the snapshot failed; emptying the projection and \
+                     retrying later, normal sync is not held back"
+                );
+                // Only a failure to empty it too holds the cursor back: a populated projection must
+                // not outlive the cursor it no longer matches.
+                let cleared = state.db.note_snapshot_failed()?;
+                if cleared.rows > 0 {
+                    crate::file_provider::signal_working_set();
+                }
+            }
+        }
+    }
+    state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, cursor)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn finish_seed(
+    state: &AppState,
+    remote_by_path: &HashMap<String, RemoteFileMeta>,
+    cursor: &str,
+) -> AppResult<()> {
+    reconcile_seed_snapshot(state, remote_by_path)?;
+    state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, cursor)?;
+    Ok(())
+}
+
+/// The stored delta cursor, unless it must not be used. On macOS with the File Provider projection on,
+/// a cursor beside an UNPOPULATED projection is no cursor: a delta would patch a base that is not
+/// there and every later one would be a no-op until relaunch. That state arises when
+/// `reset_sync_state` races an in-flight delta (which then saves its cursor), when startup's
+/// `apply_switch` fails, and after a give-up or a failed snapshot. Treating it as absent makes the
+/// caller seed. A reseed backoff (after a failure) keeps the cursor usable meanwhile, so normal sync
+/// goes on. With the switch off nothing here differs from reading the config.
+pub(crate) fn usable_delta_cursor(state: &AppState) -> AppResult<Option<String>> {
+    let stored = state
+        .db
+        .get_app_config(REMOTE_DELTA_CURSOR_KEY)?
+        .filter(|c| !c.is_empty());
+    #[cfg(target_os = "macos")]
+    if stored.is_some() && state.db.projection_reseed_due()? {
+        return Ok(None);
+    }
+    Ok(stored)
+}
+
+/// The cursor to continue from, or `None` after seeding because there was none to use. The one place
+/// the longpoll loop and `apply_remote_delta` decide it.
+///
+/// A seed that fails while a cursor is stored must not pin normal sync: the stored cursor is only being
+/// set aside so the projection can reseed, so on a failure the reseed is backed off and the stored
+/// cursor is used. With no stored cursor there is nothing to fall back on and the error is returned,
+/// as it always was.
+pub(crate) fn cursor_or_seed(
+    state: &AppState,
+    seed: impl FnOnce(&AppState) -> AppResult<String>,
+) -> AppResult<Option<String>> {
+    if let Some(cursor) = usable_delta_cursor(state)? {
+        return Ok(Some(cursor));
+    }
+    match seed(state) {
+        Ok(_) => Ok(None),
+        Err(e) => fall_back_to_stored_cursor(state, e),
+    }
+}
+
+/// The seed failed: use the stored cursor when there is one (macOS, the switch on, the projection asked
+/// for the reseed), after backing the next reseed off.
+#[cfg(target_os = "macos")]
+fn fall_back_to_stored_cursor(state: &AppState, error: AppError) -> AppResult<Option<String>> {
+    // Only the projection ever sets a stored cursor aside. With the switch off (a stored cursor that
+    // appeared in a race with the seed, say) a failed seed is a failure, exactly as before, and no
+    // reseed backoff or WARN exists.
+    if !state.db.projection_active() {
+        return Err(error);
+    }
+    let stored = state
+        .db
+        .get_app_config(REMOTE_DELTA_CURSOR_KEY)?
+        .filter(|c| !c.is_empty());
+    let Some(stored) = stored else {
+        return Err(error);
+    };
+    tracing::warn!(
+        error = %error,
+        "File Provider projection: the reseed listing failed; continuing from the stored cursor and \
+         retrying the reseed later"
+    );
+    state.db.schedule_projection_reseed();
+    Ok(Some(stored))
+}
+
+/// Other platforms never set a stored cursor aside, so a failed seed is simply a failure.
+#[cfg(not(target_os = "macos"))]
+fn fall_back_to_stored_cursor(_state: &AppState, error: AppError) -> AppResult<Option<String>> {
+    Err(error)
 }
 
 /// Applies one invocation's worth of accumulated delta entries to the local index —
@@ -1032,6 +1215,10 @@ pub(crate) fn apply_delta_entries(
     pending_targets: &HashSet<String>,
     pending_job_types: &[(String, String)],
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let mut enqueued = 0usize;
     // DBSYNC-102 (#179): see the doc above for why this must be an owned, mutable,
     // per-invocation copy rather than the borrowed snapshot the caller passed in.
@@ -1429,6 +1616,20 @@ pub(crate) fn run_remote_delta(
     let pending_job_types = state.db.active_jobs_with_type()?;
     let enqueued = apply_delta_entries(state, &all_entries, &pending_targets, &pending_job_types)?;
 
+    // DBSYNC-95: feed the File Provider projection from the RAW entries (folders included; the collapse
+    // above drops them), before the cursor moves. `?` is the point: a failure leaves the cursor where
+    // it was and the whole batch replays, which the projection tolerates because an unchanged row
+    // stamps nothing. With the switch off this is one atomic load.
+    #[cfg(target_os = "macos")]
+    if state.db.projection_active() {
+        // Gives up after a few failures in a row (clearing the projection) so it never pins the cursor.
+        let commit = state.db.project_delta_or_give_up(&all_entries)?;
+        if commit.rows > 0 {
+            crate::file_provider::signal_after_delta(commit.vanished > 0);
+            crate::file_provider_exchange::download_pinned_changes(state, commit.seq, commit.rows);
+        }
+    }
+
     // Persist once, after applying, not per page. Safe because replay is idempotent
     // (see the doc above); what a crash costs is re-fetching pages, not correctness.
     state.db.set_app_config(REMOTE_DELTA_CURSOR_KEY, &cursor)?;
@@ -1488,13 +1689,9 @@ pub(crate) fn run_remote_delta(
 /// drive `apply_delta_entries` directly for a single already-collapsed batch with no
 /// pagination concerns at all.
 pub(crate) fn apply_remote_delta(state: &AppState) -> AppResult<usize> {
-    let starting_cursor = match state.db.get_app_config(REMOTE_DELTA_CURSOR_KEY)? {
-        Some(c) if !c.is_empty() => c,
-        // No cursor yet: seed a fresh snapshot; the next longpoll continues from it.
-        _ => {
-            seed_remote_delta_cursor(state)?;
-            return Ok(0);
-        }
+    // No usable cursor: seed a fresh snapshot; the next longpoll continues from it.
+    let Some(starting_cursor) = cursor_or_seed(state, seed_remote_delta_cursor)? else {
+        return Ok(0);
     };
 
     let token = get_access_token(state)?;
@@ -2382,6 +2579,48 @@ mod tests {
     // `apply_remote_delta` itself, which fetches the access token and would make a
     // live `list_folder/continue` call against the real account.
     // ---------------------------------------------------------------------------
+
+    /// DBSYNC-98: without the sync-folder pipeline (macOS) a delta writes nothing for it: no remote row,
+    /// no job. The projection is the only thing the delta feeds there.
+    ///
+    /// Proof this test can fail: removing the gate at the top of `apply_delta_entries` stores the row.
+    #[test]
+    fn a_delta_writes_nothing_for_the_folder_pipeline_without_it() {
+        let state = build_state();
+        // An indexed local file, so the remote refresh has work and would reach for a token.
+        state.db.upsert_local_file("b.txt", "H", 1, 0).unwrap();
+        let entries = vec![file_entry(Some("/a.txt"), Some("H"), Some("rev1"), None)];
+        crate::platform::without_sidecar_pipeline(|| {
+            assert_eq!(
+                apply_delta_entries(&state, &entries, &HashSet::new(), &[]).unwrap(),
+                0
+            );
+            assert_eq!(
+                refresh_remote_index_and_enqueue_downloads_internal(&state).unwrap(),
+                0
+            );
+            // A snapshot where `b.txt` changed: the folder pipeline would download it.
+            let changed = file_entry(Some("/b.txt"), Some("OTHER"), Some("rev2"), None);
+            let snapshot: HashMap<String, RemoteFileMeta> =
+                remote_meta_from_entry(&changed).into_iter().collect();
+            assert_eq!(snapshot.len(), 1);
+            reconcile_seed_snapshot(&state, &snapshot).unwrap();
+        });
+        assert!(
+            state.db.list_recent_jobs(10).unwrap().is_empty(),
+            "the seed reconciled nothing"
+        );
+        assert!(
+            state.db.get_remote_file("b.txt").unwrap().is_none(),
+            "the seed wrote no remote row"
+        );
+        assert!(state.db.get_remote_file("a.txt").unwrap().is_none());
+        apply_delta_entries(&state, &entries, &HashSet::new(), &[]).unwrap();
+        assert!(
+            state.db.get_remote_file("a.txt").unwrap().is_some(),
+            "with the pipeline the same delta stores the row"
+        );
+    }
 
     /// **DBSYNC-102 fix, proven at the seam.** Until slice #173 landed, this exact
     /// input batch produced the data-loss defect described below; the assertions now
@@ -4992,5 +5231,100 @@ mod tests {
             "present under another spelling is not absent"
         );
         assert_eq!(candidates, 0);
+    }
+
+    // ── DBSYNC-95: the snapshot feeds the File Provider projection, then the cursor ─────────────
+
+    #[cfg(target_os = "macos")]
+    fn projected(
+        display: &str,
+        id: &str,
+        folder: bool,
+    ) -> crate::storage::db::projection::ProjectedEntry {
+        let mut e = file_entry(Some(display), Some("H"), Some("r"), None);
+        e.id = Some(id.to_string());
+        if folder {
+            e.tag = "folder".to_string();
+        }
+        crate::storage::db::projection::ProjectedEntry::from_entry(&e).expect("projectable")
+    }
+
+    /// The snapshot writes the projection and only then persists the cursor it belongs to.
+    ///
+    /// Proof this test can fail: dropping the `project_snapshot` call from `finish_seed` leaves the
+    /// projection unpopulated.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_seed_projects_the_snapshot_and_persists_the_cursor() {
+        let state = build_state();
+        state.db.set_projection_enabled(true);
+        let entries = vec![
+            projected("/A", "id:a", true),
+            projected("/A/b.txt", "id:b", false),
+        ];
+
+        finish_seed(&state, &HashMap::new(), "seed-cursor", Some(entries)).expect("seed");
+
+        let projection = state.db.projection_state().expect("state");
+        assert!(projection.populated);
+        assert_eq!(
+            state
+                .db
+                .get_app_config(REMOTE_DELTA_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("seed-cursor")
+        );
+    }
+
+    /// Switch off: the seed hands over no projection, writes none, and persists the cursor as before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_seed_with_the_switch_off_writes_no_projection() {
+        let state = build_state();
+        let before = state.db.projection_state().expect("state");
+
+        finish_seed(&state, &HashMap::new(), "seed-cursor", None).expect("seed");
+
+        assert_eq!(state.db.projection_state().expect("state"), before);
+        assert_eq!(
+            state
+                .db
+                .get_app_config(REMOTE_DELTA_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("seed-cursor")
+        );
+    }
+
+    /// A projection failure does NOT hold the cursor back (that would pin normal sync behind the
+    /// projection): the seed completes, the cursor is stored, the projection is left unpopulated, and
+    /// that state is what makes a later iteration reseed (`usable_delta_cursor`).
+    ///
+    /// Proof this test can fail: propagating the snapshot error from `finish_seed` leaves the cursor
+    /// unset; not emptying the projection on failure leaves rows beside the new cursor.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_snapshot_projection_does_not_hold_the_cursor_back() {
+        let state = build_state();
+        state.db.set_projection_enabled(true);
+        state.db.make_projection_writes_fail_for("b.txt");
+        let entries = vec![
+            projected("/A", "id:a", true),
+            projected("/A/b.txt", "id:b", false),
+        ];
+
+        finish_seed(&state, &HashMap::new(), "seed-cursor", Some(entries))
+            .expect("the seed itself succeeds");
+
+        assert_eq!(
+            state
+                .db
+                .get_app_config(REMOTE_DELTA_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("seed-cursor")
+        );
+        assert!(!state.db.projection_state().expect("state").populated);
     }
 }

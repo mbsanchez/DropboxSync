@@ -127,12 +127,25 @@ pub(crate) fn take_pending() -> Vec<String> {
     }
 }
 
+/// Whether a watcher is armed in this process.
+#[cfg(test)]
+pub(crate) fn is_armed() -> bool {
+    WATCHER
+        .get()
+        .and_then(|slot| slot.lock().ok().map(|guard| guard.is_some()))
+        .unwrap_or(false)
+}
+
 /// (Re)create the watcher for the currently-configured sync folder. Idempotent:
 /// the previous debouncer is dropped (stopping the old watch) before the new one
 /// is stored, so calling this on startup and again on every sync-folder change
 /// never leaks or double-watches. Best-effort: returns `Ok(())` when there is no
 /// folder to watch, and any watcher failure is surfaced for the caller to log.
 pub(crate) fn arm_watcher(state: &AppState) -> AppResult<()> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(());
+    }
     let Some(folder) = state.db.get_sync_folder()? else {
         return Ok(());
     };

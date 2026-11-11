@@ -177,14 +177,20 @@ jobs:
         # by construction, and the only automated coverage the extension has.
         run: apps/desktop/native/macos/FinderSyncExtension/Tests/run-badge-diff-tests.sh
 
+      - name: File Provider projection checks
+        # Compiles the real ProjectionModel.swift, ProjectionStore.swift and Exchange.swift and runs them
+        # against a temporary WAL database built from the schema fixture, including readers against a
+        # writer, and against a real exchange directory and flock.
+        run: apps/desktop/native/macos/FileProviderExtension/Tests/run-projection-tests.sh
+
       - name: Build macOS app bundle
         # `bundle:dev` (--bundles app), not `tauri build`. The full build also produces a
         # DMG, a stage that has never executed in CI even once because every run died
         # earlier. Producing an installer belongs to the release workflow (GitHub #85);
         # a PR check only needs to prove the app links.
         #
-        # This step also builds the Swift appex: `beforeBuildCommand` runs
-        # `scripts/tauri-before-build.mjs`, which calls `build:finder-sync` on darwin.
+        # This step also builds the Swift appexes: `beforeBuildCommand` runs
+        # `scripts/tauri-before-build.mjs`, which calls `build:finder-sync` and `build:file-provider` on darwin.
         # That is why it must never be matrixed onto another OS.
         run: npm --workspace apps/desktop run bundle:dev
 

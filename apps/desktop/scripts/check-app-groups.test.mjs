@@ -86,6 +86,26 @@ test("several appexes all matching pass", () => {
   assert.equal(run(TEAM, good, good, good).status, 0);
 });
 
+test("with two appexes, a missing group in the second one fails and names that file", () => {
+  const r = run(TEAM, good, good, plist());
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /2\.plist has no com\.apple\.security\.application-groups/);
+  assert.doesNotMatch(r.stderr, /1\.plist has no/);
+});
+
+test("with two appexes, a missing group in the first one fails and names that file", () => {
+  const r = run(TEAM, good, plist(), good);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /1\.plist has no com\.apple\.security\.application-groups/);
+  assert.doesNotMatch(r.stderr, /2\.plist has no/);
+});
+
+test("with two appexes, a wrong group in either one fails", () => {
+  const wrong = plist(`${OTHER}.com.dropboxsyncdesktop`);
+  assert.equal(run(TEAM, good, wrong, good).status, 1);
+  assert.equal(run(TEAM, good, good, wrong).status, 1);
+});
+
 test("a missing group on the appex fails", () => {
   const r = run(TEAM, good, plist());
   assert.equal(r.status, 1);

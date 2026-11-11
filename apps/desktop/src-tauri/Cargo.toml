@@ -51,6 +51,9 @@ tauri = { version = "2", features = ["test"] }
 # Already in Cargo.lock transitively via Tauri, but a transitive crate cannot be imported —
 # it has to be declared. Used by `finder_extension.rs` (DBSYNC-86), `app_group.rs` (DBSYNC-97) and `logging.rs`.
 objc2 = "0.6"
+# Completion-handler blocks for `NSFileProviderManager` in `file_provider.rs` (DBSYNC-95). 0.6.2 is already in
+# Cargo.lock via Tauri.
+block2 = "0.6"
 # NFC/NFD index-key identity (DBSYNC-103). APFS is form-insensitive, the index is not.
 unicode-normalization = "0.1"
 

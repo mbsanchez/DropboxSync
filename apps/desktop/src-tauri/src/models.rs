@@ -21,6 +21,9 @@ pub(crate) struct SyncDashboard {
     /// frontend can show a "review & confirm deletions" button that calls
     /// `confirm_pending_deletions`. See `sync_pipeline::mass_delete_pause_active`.
     pub mass_delete_paused: bool,
+    /// DBSYNC-95: the held deletions were made in Finder, so they can also be refused, which restores
+    /// the files (`reject_pending_deletions`).
+    pub mass_delete_restorable: bool,
 }
 
 #[derive(Serialize)]
@@ -43,6 +46,8 @@ pub(crate) struct TriggerSyncResponse {
 pub(crate) enum TriggerSyncReason {
     Started,
     AlreadyRunning,
+    /// macOS (DBSYNC-98): no cycle exists there; changes reach Finder as they come.
+    NothingToSync,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +155,9 @@ pub(crate) struct StartupRequirementsResponse {
     /// its own command because the UI already re-reads this shape on window focus, which is
     /// exactly when `FinderSync.h` says to re-check.
     pub finder_extension: crate::finder_extension::FinderExtensionState,
+    /// The files live in the File Provider domain, not in a sync folder (macOS, DBSYNC-98): onboarding
+    /// asks for no folder, and `sync_folder` is the domain's folder as macOS shows it.
+    pub file_provider: bool,
 }
 
 /// Emitted to the webview after the localhost OAuth redirect is handled (success or failure).

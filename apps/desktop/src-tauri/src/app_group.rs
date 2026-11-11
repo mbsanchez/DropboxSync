@@ -33,6 +33,20 @@ fn entitled_group_id(team: Option<&str>, entitled_groups: &[String]) -> Option<S
     app_group_id(team).filter(|id| is_entitled(entitled_groups, id))
 }
 
+/// This build's group id, when its signature holds it. `None` without a team or the entitlement.
+#[cfg(not(test))]
+pub(crate) fn group_id() -> Option<String> {
+    entitled_group_id(
+        option_env!("APPLE_TEAM_ID"),
+        &own_entitlements::application_groups(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn group_id() -> Option<String> {
+    None
+}
+
 /// What the process's own signature says about this build's group, for the startup log.
 #[derive(Debug, PartialEq, Eq)]
 struct EntitlementReport {
@@ -199,11 +213,7 @@ pub(crate) fn container_path() -> Option<String> {
     use objc2::runtime::{AnyClass, AnyObject};
     use std::ffi::{c_char, CStr, CString};
 
-    let id = entitled_group_id(
-        option_env!("APPLE_TEAM_ID"),
-        &own_entitlements::application_groups(),
-    )?;
-    let id = CString::new(id).ok()?;
+    let id = CString::new(group_id()?).ok()?;
     autoreleasepool(|_| {
         // SAFETY: every selector below is documented Foundation API with the signature used here.
         // `stringWithUTF8String:` takes a NUL-terminated C string that `id` outlives; the returned

@@ -9,15 +9,24 @@ mod cloudsc_ops;
 mod commands;
 mod dropbox_transfer;
 mod error;
+#[cfg(target_os = "macos")]
+mod file_provider;
+#[cfg(target_os = "macos")]
+mod file_provider_exchange;
+#[cfg(target_os = "macos")]
+mod file_provider_writes;
 mod finder_extension;
 mod flyout_geometry;
 mod fs_watcher;
 mod logging;
+#[cfg(target_os = "macos")]
+mod login_item;
 mod models;
 mod oauth_listener;
 mod open_handlers;
 mod overlay_state;
 mod path_util;
+mod platform;
 mod remote_index;
 mod remote_longpoll;
 mod run_events;
@@ -197,6 +206,12 @@ pub fn run() {
         logging::report_startup_failure(&format!("failed to initialize sqlite db: {e}"));
         panic!("failed to initialize sqlite db: {e}");
     });
+    // DBSYNC-98: a macOS install from before the cutover forgets its sync folder before anything reads it.
+    match platform::forget_sync_folder(&db) {
+        Ok(true) => tracing::info!("forgot the sync folder: this build keeps the files in Finder"),
+        Ok(false) => {}
+        Err(e) => tracing::error!(error = %e, "could not forget the sync folder"),
+    }
     let mut sync_engine = SyncEngine::new();
     if let Ok(Some(folder)) = db.get_sync_folder() {
         sync_engine.set_tracked_path(folder);
@@ -434,6 +449,15 @@ pub fn run() {
 
                 crate::overlay_state::refresh_overlay_state_internal(state.inner());
 
+                // DBSYNC-95/98: the File Provider domain, added when the user started it in onboarding
+                // and removed when they disconnected (`file_provider`).
+                #[cfg(target_os = "macos")]
+                {
+                    crate::file_provider::start(state.db.clone());
+                    crate::file_provider_exchange::start(state.inner());
+                    crate::login_item::apply_default(&state.db, state.db.projection_active());
+                }
+
                 // DBSYNC-36: the ignore-glob predicate is backed by a process-wide
                 // static (`path_util::USER_IGNORE_GLOBS`), so the persisted CSV must be
                 // loaded into it here — otherwise saved patterns stay inactive until the
@@ -482,6 +506,7 @@ pub fn run() {
             finder_extension::open_finder_extension_settings,
             finder_extension::restart_finder,
             commands::pick_sync_folder_dialog,
+            commands::start_file_provider,
             commands::start_background_scheduler,
             commands::hide_main_window,
             commands::show_main_window,
@@ -494,6 +519,8 @@ pub fn run() {
             commands::retry_failed_jobs,
             commands::resolve_conflict,
             commands::confirm_pending_deletions,
+            commands::reject_pending_deletions,
+            commands::confirm_dialog,
             commands::scan_local_changes,
             commands::process_sync_queue,
             commands::sync_tick,

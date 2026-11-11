@@ -48,7 +48,11 @@ pub(crate) fn refresh_queue_depth_internal(state: &AppState) -> AppResult<()> {
         .db
         .get_app_config(MASS_DELETE_BLOCKED_REMOTE_KEY)?
         .filter(|s| !s.is_empty());
-    let paused = scan_paused.or(remote_paused);
+    let finder_paused = state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_FINDER_KEY)?
+        .filter(|s| !s.is_empty());
+    let paused = scan_paused.or(remote_paused).or(finder_paused);
 
     // DBSYNC-99: a source deletion owed by an upload that will never run again.
     //
@@ -630,6 +634,10 @@ const DELETE_CONFIRM_MS: u64 = 150;
 /// path being explicitly absent on disk (never from an incomplete walk), and the
 /// whole-root-missing case is still gated by `is_dir()`, so this can't mass-delete.
 pub(crate) fn process_changed_paths(state: &AppState, paths: &[String]) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -1696,6 +1704,74 @@ const MASS_DELETE_BLOCKED_SCAN_KEY: &str = "mass_delete_blocked_scan";
 /// local index still intact).
 const MASS_DELETE_BLOCKED_REMOTE_KEY: &str = "mass_delete_blocked_remote";
 
+/// Same again for deletions made in Finder through the File Provider domain (DBSYNC-95), which can be
+/// confirmed or refused: refused, the system restores the files.
+const MASS_DELETE_BLOCKED_FINDER_KEY: &str = "mass_delete_blocked_finder";
+
+/// The user's answer to the Finder deletions held by the breaker (DBSYNC-95): `confirm` or `restore`.
+/// One key, so the last click wins. Separate from the sync folder's override so a confirmation meant for
+/// one cannot release the other.
+const MASS_DELETE_ANSWER_FINDER_KEY: &str = "mass_delete_answer_finder";
+
+/// The user's answer to the question the banner showed them: `finder` says which. The banner shows one
+/// question, the sync folder's before Finder's (`refresh_queue_depth_internal`), and an answer counts only
+/// if that question is still the one on screen, so a click cannot answer a question that appeared while
+/// the confirmation dialog was open, nor a burst not yet asked about. Measured live: a refusal left over
+/// from an earlier question restored a new 50-file selection the moment it was held, and a stray
+/// confirmation set the sync folder's override with nothing held there.
+pub(crate) fn answer_mass_deletion(state: &AppState, confirm: bool, finder: bool) -> AppResult<()> {
+    if finder {
+        if finder_question_on_screen(state)? {
+            let answer = if confirm { "confirm" } else { "restore" };
+            state
+                .db
+                .set_app_config(MASS_DELETE_ANSWER_FINDER_KEY, answer)?;
+        }
+    } else if confirm && sync_folder_deletions_held(state)? {
+        state.db.set_app_config(MASS_DELETE_OVERRIDE_KEY, "1")?;
+    }
+    Ok(())
+}
+
+/// The user's answer to the Finder question, consumed: `Some(true)` to delete, `Some(false)` to restore.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn take_finder_answer(state: &AppState) -> AppResult<Option<bool>> {
+    let answer = match state
+        .db
+        .get_app_config(MASS_DELETE_ANSWER_FINDER_KEY)?
+        .as_deref()
+    {
+        Some("confirm") => Some(true),
+        Some("restore") => Some(false),
+        _ => None,
+    };
+    if answer.is_some() {
+        state.db.delete_app_config(MASS_DELETE_ANSWER_FINDER_KEY)?;
+    }
+    Ok(answer)
+}
+
+/// Drops any Finder answer recorded before the question about to be asked.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn forget_finder_answers(state: &AppState) -> AppResult<()> {
+    state.db.delete_app_config(MASS_DELETE_ANSWER_FINDER_KEY)
+}
+
+/// At startup: the breaker's Finder burst lives in memory, so a question left on screen by the last run
+/// has nobody waiting for its answer. The system sends those deletes again, and they are asked about
+/// afresh.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn reset_finder_question(state: &AppState) -> AppResult<()> {
+    forget_finder_answers(state)?;
+    // The two flags of an earlier build.
+    state.db.delete_app_config("mass_delete_reject_once")?;
+    state
+        .db
+        .delete_app_config("mass_delete_confirm_finder_once")?;
+    clear_mass_delete_blocked(state, MassDeleteSource::Finder);
+    Ok(())
+}
+
 /// Which direction tripped the mass-deletion circuit breaker (DBSYNC-64), so
 /// `block_mass_deletion`/`clear_mass_delete_blocked` write/clear the right durable
 /// flag instead of a single shared one both directions could clobber.
@@ -1705,6 +1781,9 @@ pub(crate) enum MassDeleteSource {
     LocalScan,
     /// `remote_index.rs`'s remote→local sweep (full snapshot + cursor reseed).
     RemoteSweep,
+    /// Deletions made in Finder through the File Provider domain (DBSYNC-95).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Finder,
 }
 
 impl MassDeleteSource {
@@ -1712,6 +1791,7 @@ impl MassDeleteSource {
         match self {
             MassDeleteSource::LocalScan => MASS_DELETE_BLOCKED_SCAN_KEY,
             MassDeleteSource::RemoteSweep => MASS_DELETE_BLOCKED_REMOTE_KEY,
+            MassDeleteSource::Finder => MASS_DELETE_BLOCKED_FINDER_KEY,
         }
     }
 
@@ -1719,6 +1799,7 @@ impl MassDeleteSource {
         match self {
             MassDeleteSource::LocalScan => "local scan",
             MassDeleteSource::RemoteSweep => "remote sweep",
+            MassDeleteSource::Finder => "Finder",
         }
     }
 }
@@ -1766,12 +1847,7 @@ pub(crate) fn block_mass_deletion(
     tracked: usize,
     source: MassDeleteSource,
 ) {
-    let msg = format!(
-        "Sync paused: {candidates} deletions in one pass ({tracked} tracked, {}) look like a \
-         bug or missing files, not an intentional delete — nothing was deleted. Review, then \
-         confirm to proceed.",
-        source.label()
-    );
+    let msg = mass_deletion_message(candidates, tracked, source);
     tracing::error!(
         candidates,
         tracked,
@@ -1786,6 +1862,42 @@ pub(crate) fn block_mass_deletion(
         engine.set_last_error(msg.clone());
     }
     crate::sharing::notify("DropboxSync - sync paused", &msg);
+}
+
+/// What the banner says. A Finder deletion is the user's own act, so it is described as one, not as a
+/// suspected bug.
+fn mass_deletion_message(candidates: usize, tracked: usize, source: MassDeleteSource) -> String {
+    match source {
+        MassDeleteSource::Finder => format!(
+            "You are deleting files in Finder: {candidates} of {tracked} so far, and the rest of the \
+             selection waits with them. Confirm to delete them from Dropbox, or restore them."
+        ),
+        _ => format!(
+            "Sync paused: {candidates} deletions in one pass ({tracked} tracked, {}) look like a \
+             bug or missing files, not an intentional delete — nothing was deleted. Review, then \
+             confirm to proceed.",
+            source.label()
+        ),
+    }
+}
+
+/// Rewrites the banner of a held Finder deletion as more of the selection arrives. No notification:
+/// the user was told once.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn recount_finder_deletion(state: &AppState, candidates: usize, tracked: usize) {
+    if !finder_deletions_held(state).unwrap_or(false) {
+        return;
+    }
+    let msg = mass_deletion_message(candidates, tracked, MassDeleteSource::Finder);
+    if let Err(e) = state
+        .db
+        .set_app_config(MASS_DELETE_BLOCKED_FINDER_KEY, &msg)
+    {
+        tracing::warn!(error = %e, "failed to update the mass-deletion banner");
+    }
+    if let Ok(mut engine) = state.sync_engine.lock() {
+        engine.set_last_error(msg);
+    }
 }
 
 /// Clear the durable mass-deletion pause flag for `source` — that direction's
@@ -1813,6 +1925,31 @@ pub(crate) fn clear_mass_delete_blocked(state: &AppState, source: MassDeleteSour
 /// `get_sync_dashboard`'s `massDeletePaused` flag, so the frontend can show a
 /// "review & confirm deletions" button without re-deriving the two key names.
 pub(crate) fn mass_delete_pause_active(state: &AppState) -> AppResult<bool> {
+    Ok(sync_folder_deletions_held(state)? || finder_deletions_held(state)?)
+}
+
+/// Whether the banner shows the Finder question, which is the one that can also be refused: the sync
+/// folder's question comes first when both are held.
+pub(crate) fn finder_question_on_screen(state: &AppState) -> AppResult<bool> {
+    Ok(finder_deletions_held(state)? && !sync_folder_deletions_held(state)?)
+}
+
+/// Drops what the sync folder's breaker held, for a build without that pipeline (DBSYNC-98). Nothing
+/// else clears it there, since the scan and the sweep that would are off, and a question left held would
+/// keep the Finder one off screen for good (CTO review of #240).
+pub(crate) fn forget_sync_folder_breaker(db: &crate::storage::db::Db) -> AppResult<()> {
+    for key in [
+        MASS_DELETE_BLOCKED_SCAN_KEY,
+        MASS_DELETE_BLOCKED_REMOTE_KEY,
+        MASS_DELETE_OVERRIDE_KEY,
+    ] {
+        db.delete_app_config(key)?;
+    }
+    Ok(())
+}
+
+/// Whether the sync folder's scan or the remote sweep holds deletions.
+fn sync_folder_deletions_held(state: &AppState) -> AppResult<bool> {
     let scan_paused = state
         .db
         .get_app_config(MASS_DELETE_BLOCKED_SCAN_KEY)?
@@ -1824,6 +1961,14 @@ pub(crate) fn mass_delete_pause_active(state: &AppState) -> AppResult<bool> {
     Ok(scan_paused || remote_paused)
 }
 
+/// Whether Finder deletions are held by the breaker: those, and only those, can also be refused.
+pub(crate) fn finder_deletions_held(state: &AppState) -> AppResult<bool> {
+    Ok(state
+        .db
+        .get_app_config(MASS_DELETE_BLOCKED_FINDER_KEY)?
+        .is_some_and(|s| !s.is_empty()))
+}
+
 /// The LOCAL half of a scan: walk the sync folder, decide what changed, and enqueue
 /// uploads and deletions. Returns how many jobs it enqueued.
 ///
@@ -1832,6 +1977,10 @@ pub(crate) fn mass_delete_pause_active(state: &AppState) -> AppResult<bool> {
 /// decisions be exercised without an access token — which is what a test of the
 /// mass-deletion guard actually wants.
 pub(crate) fn scan_local_changes_only(state: &AppState) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -2978,6 +3127,10 @@ fn scan_local_half(state: &AppState) -> AppResult<usize> {
 /// The remote half needs an access token, so this is the entry point for production and
 /// NOT the one to reach for from a test that only cares about local decisions.
 pub(crate) fn scan_local_changes_internal(state: &AppState) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(0);
+    }
     let enqueued_jobs = scan_local_half(state)?;
     let remote_enqueued = refresh_remote_index_and_enqueue_downloads_internal(state)?;
 
@@ -3164,6 +3317,10 @@ fn split_protected_folder_delete(
 /// the maintainer's real Dropbox account; drive `process_sync_queue_core` directly
 /// instead, with a fake lookup.
 pub(crate) fn process_sync_queue_internal(state: &AppState) -> AppResult<bool> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Ok(false);
+    }
     process_sync_queue_core(state, |rel| {
         crate::remote_index::fetch_remote_file_metadata(state, rel)
     })
@@ -3769,6 +3926,15 @@ pub(crate) fn resolve_conflict_internal(
     let Some(conflict) = state.db.get_unresolved_conflict(id)? else {
         return Ok(());
     };
+    // DBSYNC-98: without the folder pipeline a conflict is a Finder edit kept beside Dropbox's version,
+    // both already ordinary files in Finder. Keeping both is the only answer, and it leaves nothing to
+    // do but close the conflict; the other two are for the user to make in Finder (CTO review of #240).
+    if !crate::platform::sidecar_pipeline() {
+        return match action {
+            ConflictAction::KeepBoth => state.db.mark_conflict_resolved(id),
+            _ => Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string())),
+        };
+    }
     let folder = state
         .db
         .get_sync_folder()?
@@ -4010,6 +4176,203 @@ mod tests {
             token_refresh_lock: Arc::new(Mutex::new(())),
             http_client: crate::state::build_http_client(),
         }
+    }
+
+    // ── answers to the breaker's Finder question (DBSYNC-95) ───────────────────────────────
+
+    fn hold_finder(state: &AppState) {
+        state
+            .db
+            .set_app_config(super::MASS_DELETE_BLOCKED_FINDER_KEY, "held")
+            .unwrap();
+    }
+
+    fn override_set(state: &AppState) -> bool {
+        state
+            .db
+            .get_app_config(super::MASS_DELETE_OVERRIDE_KEY)
+            .unwrap()
+            .as_deref()
+            == Some("1")
+    }
+
+    /// Measured live: a Restore click left over from an earlier question refused a new selection the
+    /// moment it was held.
+    ///
+    /// Proof this test can fail: recording the answer without checking for a held question.
+    #[test]
+    fn an_answer_with_no_question_open_answers_nothing() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+
+        super::answer_mass_deletion(&state, false, true).unwrap();
+        super::answer_mass_deletion(&state, true, true).unwrap();
+        super::answer_mass_deletion(&state, true, false).unwrap();
+        hold_finder(&state);
+
+        assert_eq!(super::take_finder_answer(&state).unwrap(), None);
+        assert!(
+            !override_set(&state),
+            "nor does it authorise the sync folder's next one"
+        );
+    }
+
+    /// One key: the last click wins, and the answer is consumed once.
+    ///
+    /// Proof this test can fail: two flags read confirm-first delete what the user asked to restore.
+    #[test]
+    fn the_last_finder_answer_wins_and_is_consumed_once() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+        hold_finder(&state);
+
+        super::answer_mass_deletion(&state, true, true).unwrap();
+        super::answer_mass_deletion(&state, false, true).unwrap();
+
+        assert!(
+            !override_set(&state),
+            "a Finder answer must not release the sync folder"
+        );
+        assert_eq!(super::take_finder_answer(&state).unwrap(), Some(false));
+        assert_eq!(super::take_finder_answer(&state).unwrap(), None);
+    }
+
+    /// A conflict from a Finder edit can be closed on macOS, where both files are already in Finder, and
+    /// nothing else is attempted there.
+    ///
+    /// Proof this test can fail: without the `sidecar_pipeline` arm every action reaches the folder code.
+    #[test]
+    fn a_finder_conflict_is_closed_by_keeping_both_and_nothing_else() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+        state
+            .db
+            .add_conflict(
+                "docs/a.txt",
+                "docs/a.txt",
+                "file_provider_stale_edit",
+                Some("docs/a (conflicted copy 1).txt"),
+                false,
+            )
+            .unwrap();
+        let id = state.db.list_recent_conflicts(10).unwrap()[0].id;
+
+        crate::platform::without_sidecar_pipeline(|| {
+            assert!(
+                super::resolve_conflict_internal(&state, id, super::ConflictAction::KeepLocal)
+                    .is_err()
+            );
+            assert!(
+                super::resolve_conflict_internal(&state, id, super::ConflictAction::UseRemote)
+                    .is_err()
+            );
+            assert!(state.db.get_unresolved_conflict(id).unwrap().is_some());
+            super::resolve_conflict_internal(&state, id, super::ConflictAction::KeepBoth).unwrap();
+        });
+        assert!(state.db.get_unresolved_conflict(id).unwrap().is_none());
+    }
+
+    /// A Mac past the cutover (no folder left) whose breaker still held a sync-folder question: the
+    /// startup forget drops it, so the Finder question shows and its answer counts. The case found in the
+    /// CTO review of #240; the first launch after the cutover, with the folder still set, goes the same
+    /// way.
+    ///
+    /// Proof this test can fail: without `forget_sync_folder_breaker`, or with it below the "no folder"
+    /// return, the keys stay and the answer is ignored.
+    #[test]
+    fn a_held_sync_folder_question_does_not_outlive_the_cutover() {
+        for folder_left in [false, true] {
+            let dir = tempdir().unwrap();
+            let state = build_state(dir.path());
+            if !folder_left {
+                state.db.clear_sync_folder().unwrap();
+            }
+            for key in [
+                super::MASS_DELETE_BLOCKED_SCAN_KEY,
+                super::MASS_DELETE_BLOCKED_REMOTE_KEY,
+                super::MASS_DELETE_OVERRIDE_KEY,
+            ] {
+                state.db.set_app_config(key, "1").unwrap();
+            }
+            crate::platform::without_sidecar_pipeline(|| {
+                crate::platform::forget_sync_folder(&state.db).unwrap();
+            });
+            for key in [
+                super::MASS_DELETE_BLOCKED_SCAN_KEY,
+                super::MASS_DELETE_BLOCKED_REMOTE_KEY,
+                super::MASS_DELETE_OVERRIDE_KEY,
+            ] {
+                assert_eq!(state.db.get_app_config(key).unwrap(), None, "{key}");
+            }
+            hold_finder(&state);
+
+            assert!(super::finder_question_on_screen(&state).unwrap());
+            super::answer_mass_deletion(&state, true, true).unwrap();
+            assert_eq!(super::take_finder_answer(&state).unwrap(), Some(true));
+        }
+    }
+
+    /// The banner shows the sync folder's question first. A click answers the question the user saw,
+    /// and only while it is still the one on screen: found in review, a Finder confirmation could
+    /// release a sync-folder question that appeared while the dialog was open.
+    ///
+    /// Proof this test can fail: answering whichever question is on top when the click lands.
+    #[test]
+    fn a_click_answers_only_the_question_it_was_given_for() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+        hold_finder(&state);
+        state
+            .db
+            .set_app_config(super::MASS_DELETE_BLOCKED_SCAN_KEY, "held")
+            .unwrap();
+        assert!(!super::finder_question_on_screen(&state).unwrap());
+
+        super::answer_mass_deletion(&state, true, true).unwrap();
+        assert!(
+            !override_set(&state),
+            "the Finder click does not release the sync folder"
+        );
+        assert_eq!(
+            super::take_finder_answer(&state).unwrap(),
+            None,
+            "nor Finder, no longer on screen"
+        );
+
+        super::answer_mass_deletion(&state, true, false).unwrap();
+        assert!(override_set(&state));
+    }
+
+    /// An answer recorded before a question is asked does not answer it.
+    ///
+    /// Proof this test can fail: not clearing the answer when the question opens.
+    #[test]
+    fn opening_a_question_forgets_earlier_answers() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+        hold_finder(&state);
+        super::answer_mass_deletion(&state, false, true).unwrap();
+
+        super::forget_finder_answers(&state).unwrap();
+
+        assert_eq!(super::take_finder_answer(&state).unwrap(), None);
+    }
+
+    /// The burst a question was about lives in memory: after a restart nobody waits for its answer, so
+    /// the banner and any answer go.
+    ///
+    /// Proof this test can fail: leaving the flag set keeps a banner nobody can resolve.
+    #[test]
+    fn a_restart_drops_the_last_runs_question() {
+        let dir = tempdir().unwrap();
+        let state = build_state(dir.path());
+        hold_finder(&state);
+        super::answer_mass_deletion(&state, true, true).unwrap();
+
+        super::reset_finder_question(&state).unwrap();
+
+        assert!(!super::finder_deletions_held(&state).unwrap());
+        assert_eq!(super::take_finder_answer(&state).unwrap(), None);
     }
 
     // -------------------------------------------------------------------------------

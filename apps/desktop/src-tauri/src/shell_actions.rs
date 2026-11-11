@@ -52,6 +52,10 @@ pub(crate) fn parse_action_args(args: &[String]) -> Option<(String, PathBuf)> {
 /// work the caller should drain. Validates the path is under the sync root;
 /// unknown actions and out-of-root paths are rejected.
 pub(crate) fn dispatch_action(state: &AppState, action: &str, abs_path: &Path) -> AppResult<bool> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     match action {
         // Foundation smoke verb: reuse the proven `.cloudsc`-open path (which
         // validates the path is under the root and is a placeholder).

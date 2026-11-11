@@ -24,6 +24,11 @@ export type StartupRequirements = {
   syncFolderOk: boolean;
   syncFolder?: string;
   finderExtension: FinderExtensionState;
+  /**
+   * The files live in the File Provider domain (macOS, DBSYNC-98): there is no sync folder to
+   * choose, `syncFolderOk` means Dropbox was put in Finder, and `syncFolder` is where Finder shows it.
+   */
+  fileProvider?: boolean;
 };
 
 export type SyncStatus = {
@@ -69,6 +74,9 @@ export type SyncDashboard = {
   /** DBSYNC-64: true while the mass-deletion circuit breaker has paused sync
    *  (a blocked deletion batch is pending `confirm_pending_deletions`). */
   massDeletePaused: boolean;
+  /** DBSYNC-95: the held deletions were made in Finder, so they can also be refused
+   *  (`reject_pending_deletions`), which restores the files. */
+  massDeleteRestorable: boolean;
 };
 
 export type RemoteEntry = {
@@ -102,7 +110,7 @@ export type TriggerActionResponse = {
   accepted: boolean;
 };
 
-export type TriggerSyncReason = "started" | "already_running";
+export type TriggerSyncReason = "started" | "already_running" | "nothing_to_sync";
 
 /** Mirror of Rust `models::TriggerSyncResponse`, returned by `trigger_sync_tick` only. */
 export type TriggerSyncResponse = {

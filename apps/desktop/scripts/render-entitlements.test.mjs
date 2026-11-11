@@ -79,10 +79,14 @@ test("a template that still holds the token after rendering is an error", () => 
 const ROOT = "/r";
 const GEN = `${ROOT}/apps/desktop/src-tauri/.generated`;
 const APPEX_BUILD = `${ROOT}/apps/desktop/native/macos/FinderSyncExtension/build`;
+const FILE_PROVIDER_BUILD = `${ROOT}/apps/desktop/native/macos/FileProviderExtension/build`;
 
-test("output is only allowed in the two gitignored output directories", () => {
+test("output is only allowed in the gitignored output directories", () => {
   assert.equal(isGeneratedPath(`${GEN}/host.entitlements`, ROOT), true);
   assert.equal(isGeneratedPath(`${APPEX_BUILD}/x.entitlements`, ROOT), true);
+  assert.equal(isGeneratedPath(`${FILE_PROVIDER_BUILD}/x.entitlements`, ROOT), true);
+  assert.equal(isGeneratedPath(`${ROOT}/apps/desktop/native/macos/FileProviderExtension/x.entitlements`, ROOT), false);
+  assert.equal(isGeneratedPath(`${ROOT}/apps/desktop/native/macos/FileProviderExtension/build-evil/x`, ROOT), false);
   assert.equal(isGeneratedPath(`${ROOT}/apps/desktop/native/macos/FinderSyncExtension/x.entitlements`, ROOT), false);
   assert.equal(isGeneratedPath(`${ROOT}/apps/desktop/src-tauri/host.entitlements`, ROOT), false);
 });
@@ -170,6 +174,11 @@ test("CLI with a team writes the group and prints the id", () => {
 
 test("CLI writes the appex output directory too", () => {
   const r = runCli(TEAM, "apps/desktop/native/macos/FinderSyncExtension/build/x.entitlements");
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test("CLI writes the File Provider appex output directory too", () => {
+  const r = runCli(TEAM, "apps/desktop/native/macos/FileProviderExtension/build/x.entitlements");
   assert.equal(r.status, 0, r.stderr);
 });
 

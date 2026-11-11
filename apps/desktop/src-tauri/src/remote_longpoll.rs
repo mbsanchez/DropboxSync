@@ -38,6 +38,20 @@ pub(crate) fn start_longpoll(state: &AppState) {
     std::thread::spawn(move || longpoll_loop(&st));
 }
 
+/// Whether the remote loop has anything to keep in sync. With the sync-folder pipeline, a sync folder;
+/// without it (macOS, DBSYNC-98), the File Provider projection, whatever `sync_folder` holds.
+fn remote_loop_has_work(
+    sidecar_pipeline: bool,
+    sync_folder_set: bool,
+    projection_active: bool,
+) -> bool {
+    if sidecar_pipeline {
+        sync_folder_set
+    } else {
+        projection_active
+    }
+}
+
 /// Exponential error backoff: 0 → 5s → 10s → … capped at 60s.
 fn next_backoff(prev: u64) -> u64 {
     if prev == 0 {
@@ -50,16 +64,25 @@ fn next_backoff(prev: u64) -> u64 {
 fn longpoll_loop(state: &AppState) {
     let mut err_backoff = 0u64;
     loop {
-        // 1. Ready check: a sync folder AND a usable token. Handles logout —
+        // 1. Ready check: something to keep in sync AND a usable token. Handles logout —
         // get_access_token errs → idle; a later login resumes the loop.
-        let folder_ok = state
+        let folder_set = state
             .db
             .get_sync_folder()
             .ok()
             .flatten()
             .map(|f| !f.trim().is_empty())
             .unwrap_or(false);
-        if !folder_ok || crate::auth_session::get_access_token(state).is_err() {
+        #[cfg(target_os = "macos")]
+        let projection_active = state.db.projection_active();
+        #[cfg(not(target_os = "macos"))]
+        let projection_active = false;
+        let has_work = remote_loop_has_work(
+            crate::platform::sidecar_pipeline(),
+            folder_set,
+            projection_active,
+        );
+        if !has_work || crate::auth_session::get_access_token(state).is_err() {
             std::thread::sleep(Duration::from_secs(IDLE_SLEEP_SECS));
             continue;
         }
@@ -128,16 +151,7 @@ fn longpoll_loop(state: &AppState) {
 /// Return the current delta cursor, seeding a fresh snapshot if none exists.
 /// Returns `Ok(None)` when it had to seed this round (caller loops again).
 fn ensure_cursor(state: &AppState) -> AppResult<Option<String>> {
-    match state
-        .db
-        .get_app_config(crate::remote_index::REMOTE_DELTA_CURSOR_KEY)?
-    {
-        Some(c) if !c.is_empty() => Ok(Some(c)),
-        _ => {
-            crate::remote_index::seed_remote_delta_cursor(state)?;
-            Ok(None)
-        }
-    }
+    crate::remote_index::cursor_or_seed(state, crate::remote_index::seed_remote_delta_cursor)
 }
 
 fn do_longpoll(state: &AppState, cursor: &str) -> AppResult<DropboxLongpollResponse> {
@@ -232,10 +246,18 @@ fn apply_and_drain(state: &AppState) -> DrainOutcome {
     // this same sync_running gate, AFTER the drain (so delta-driven deletes drain
     // before discovery). The DBSYNC-66 grace window is armed inside the sweep, so
     // restore churn still can't be read as a user delete.
-    match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state) {
-        Ok(n) if n > 0 => tracing::info!(count = n, "indexed new remote placeholder(s) (longpoll)"),
-        Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed (longpoll)"),
+    //
+    // DBSYNC-98: not on macOS, which has no sidecars (`platform`). Elsewhere the ready check required a
+    // sync folder: unchanged.
+    if crate::platform::sidecar_pipeline() {
+        match crate::cloudsc_ops::index_materialized_folders_as_cloudsc_placeholders_internal(state)
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "indexed new remote placeholder(s) (longpoll)")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "remote placeholder indexing failed (longpoll)"),
+        }
     }
     state.sync_running.store(false, Ordering::Release);
     crate::auth_session::refresh_tray_tooltip(state);
@@ -250,6 +272,33 @@ fn apply_and_drain(state: &AppState) -> DrainOutcome {
 mod tests {
     use super::{next_backoff, MAX_BACKOFF_SECS, MIN_BACKOFF_SECS};
     use crate::models::DropboxLongpollResponse;
+
+    /// DBSYNC-98: with the sync-folder pipeline the loop runs for a sync folder; without it (macOS) for
+    /// the projection, and a folder an older build left behind does not count.
+    ///
+    /// Proof this test can fail: answering `sync_folder_set || projection_active` fails the two
+    /// "ignored" rows.
+    #[test]
+    fn the_remote_loop_runs_for_the_folder_or_the_projection_by_platform_never_both() {
+        use super::remote_loop_has_work;
+        assert!(
+            remote_loop_has_work(true, true, false),
+            "folder pipeline: a folder"
+        );
+        assert!(
+            !remote_loop_has_work(true, false, true),
+            "folder pipeline: projection ignored"
+        );
+        assert!(
+            remote_loop_has_work(false, false, true),
+            "macOS: the projection"
+        );
+        assert!(
+            !remote_loop_has_work(false, true, false),
+            "macOS: a stray folder ignored"
+        );
+        assert!(!remote_loop_has_work(false, false, false));
+    }
 
     #[test]
     fn backoff_grows_and_caps() {

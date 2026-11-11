@@ -1,0 +1,13 @@
+{
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": ["cloudsc"],
+        "name": "Cloudsc placeholder",
+        "description": "Placeholder .cloudsc (Dropbox Sync Desktop)",
+        "mimeType": "application/x-cloudsc-placeholder",
+        "role": "Editor"
+      }
+    ]
+  }
+}

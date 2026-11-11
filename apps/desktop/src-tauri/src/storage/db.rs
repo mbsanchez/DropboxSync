@@ -6,6 +6,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// The File Provider projection of the remote tree (DBSYNC-95 slice 2a). macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) mod projection;
+
 /// What Dropbox reported for an upload that landed (see `Db::confirm_upload_landed`).
 pub struct LandedUpload<'a> {
     pub content_hash: &'a str,
@@ -117,6 +121,15 @@ pub struct Db {
     /// Keys of "log this once per condition" lines already written by this process
     /// (DBSYNC-114: the exclusion pass must not repeat the same kept-file WARN every tick).
     logged_once: Mutex<HashSet<String>>,
+    /// Whether the File Provider projection is being fed: whether the user put Dropbox in Finder, set at
+    /// startup by `file_provider::start` and changed by onboarding and a disconnect (DBSYNC-95, DBSYNC-98). Off by default, and per instance rather than a
+    /// process global so a test that turns it on cannot leak into a parallel one. The one reader is
+    /// [`Db::projection_active`].
+    #[cfg(target_os = "macos")]
+    projection_enabled: std::sync::atomic::AtomicBool,
+    /// In-memory health of the projection feed: consecutive failures and the reseed backoff.
+    #[cfg(target_os = "macos")]
+    projection_health: Mutex<projection::ProjectionHealth>,
 }
 
 /// Debug-only contract check: every index key reaching the storage layer is already
@@ -190,6 +203,38 @@ pub(crate) fn startup_error_path(db_path: &std::path::Path) -> std::path::PathBu
     db_path.with_file_name("startup-error.txt")
 }
 
+/// Keeps `app.db-wal` and `app.db-shm` when the last connection closes (DBSYNC-95).
+///
+/// SQLite deletes both on a clean close, and the File Provider extension cannot read without the
+/// `-wal`: its read-only open goes through Apple's SQLite, which then fails every prepare with
+/// `SQLITE_CANTOPEN`.
+/// An ordinary quit leaves them by not closing at all; this covers whatever does close. The write
+/// connection is the only one that needs it: the read-only one leaves both files whenever it closes.
+#[cfg(target_os = "macos")]
+fn keep_wal_files(conn: &Connection) -> AppResult<()> {
+    use rusqlite::ffi;
+    let mut on: std::ffi::c_int = 1;
+    // SAFETY: `handle` is valid while `conn` is borrowed, the name is a NUL-terminated literal, and
+    // this opcode reads and writes one `c_int` through the pointer, which outlives the call.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            std::ptr::from_mut(&mut on).cast(),
+        )
+    };
+    if rc != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), None).into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keep_wal_files(_conn: &Connection) -> AppResult<()> {
+    Ok(())
+}
+
 /// Writes `msg` with a timestamp to `file`, synchronously. Best effort: the caller decides
 /// what to say when this fails, and failing to write the diagnostic must not mask the error
 /// being reported.
@@ -236,6 +281,7 @@ impl Db {
 
     fn open_and_migrate(path: &std::path::Path) -> AppResult<Self> {
         let mut write = Connection::open(path)?;
+        keep_wal_files(&write)?;
         // DBSYNC-103 (L5): `Db::new` runs the schema migrate and the NFC re-key BEFORE
         // `tauri_plugin_single_instance` can hand a second launch off to the first (the
         // plugin is registered on the builder, after `Db::new`; reordering it is out of scope
@@ -288,6 +334,10 @@ impl Db {
                 _ => PathBuf::from("."),
             },
             logged_once: Mutex::new(HashSet::new()),
+            #[cfg(target_os = "macos")]
+            projection_enabled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            projection_health: Mutex::new(projection::ProjectionHealth::default()),
         })
     }
 
@@ -376,24 +426,32 @@ impl Db {
             .lock()
             .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM local_file_index", [])?;
-        tx.execute("DELETE FROM remote_file_index", [])?;
-        tx.execute("DELETE FROM sync_jobs", [])?;
-        // DBSYNC-99's table. A surviving refusal names relative paths, so after a folder
-        // change a colliding pair suppresses a legitimate rename correlation in the NEW
-        // folder. Added here when the table was added; the next table needs the same line.
-        tx.execute("DELETE FROM refused_moves", [])?;
-        // DBSYNC-114: paths whose upload still owes the clobber guard. Path-keyed like the
-        // index it guards, so it goes with it.
-        tx.execute("DELETE FROM unconfirmed_uploads", [])?;
-        tx.execute("DELETE FROM sync_conflicts", [])?;
-        tx.execute("DELETE FROM known_folders", [])?;
+        delete_folder_state(&tx)?;
+        // DBSYNC-95: the File Provider projection mirrors the remote tree of the account that was
+        // just left, so it goes with the cursor below, and its anchors expire. A no-op when it holds
+        // nothing, which is always the case with the switch off.
+        #[cfg(target_os = "macos")]
+        projection::clear_in(&tx)?;
         // Drop the cursor-delta cursor so remote change detection re-seeds
         // against the new folder (DBSYNC-30); other app_config keys are kept.
         tx.execute(
             "DELETE FROM app_config WHERE key = 'remote_delta_cursor'",
             [],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forgets what the sync-folder pipeline knew, and nothing else: the File Provider projection, its
+    /// pins and the delta cursor stay (DBSYNC-98). For a Mac that leaves the folder for the domain, where
+    /// a reset would also drop every *Make Available Offline* the user had set.
+    pub fn forget_folder_state(&self) -> AppResult<()> {
+        let mut conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        let tx = conn.transaction()?;
+        delete_folder_state(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -624,6 +682,17 @@ impl Db {
             return Ok(Some(value));
         }
         Ok(None)
+    }
+
+    /// Removes one `app_config` key; a key that is not there is not an error. Used by the File
+    /// Provider breadcrumb (DBSYNC-95), whose absence means "no domain was registered".
+    pub fn delete_app_config(&self, key: &str) -> AppResult<()> {
+        let conn = self
+            .write
+            .lock()
+            .map_err(|_| AppError::Storage("db write lock poisoned".into()))?;
+        conn.execute("DELETE FROM app_config WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     // Selective sync (prefix-based). CSV of prefixes without leading '/' (e.g. "Fotos,Videos/2024").
@@ -3124,6 +3193,11 @@ fn migrate_in_tx(conn: &rusqlite::Transaction<'_>) -> AppResult<()> {
         [],
     )?;
 
+    // DBSYNC-95: the File Provider projection tables. Additive and macOS only, so Windows and Linux
+    // databases gain nothing.
+    #[cfg(target_os = "macos")]
+    projection::migrate(conn)?;
+
     // Only ONE active job per (job_type, target_path); DONE/failed history is exempt
     // (partial index), so `enqueue_job`'s ON CONFLICT collapses re-enqueues of the same
     // pending work instead of piling up duplicates.
@@ -3410,6 +3484,23 @@ pub(super) fn db_path() -> AppResult<PathBuf> {
     let mut path = app_data_dir()?;
     path.push("app.db");
     Ok(path)
+}
+
+/// The sync-folder pipeline's tables (`reset_sync_state`, `forget_folder_state`).
+fn delete_folder_state(tx: &rusqlite::Transaction<'_>) -> AppResult<()> {
+    tx.execute("DELETE FROM local_file_index", [])?;
+    tx.execute("DELETE FROM remote_file_index", [])?;
+    tx.execute("DELETE FROM sync_jobs", [])?;
+    // DBSYNC-99's table. A surviving refusal names relative paths, so after a folder
+    // change a colliding pair suppresses a legitimate rename correlation in the NEW
+    // folder. Added here when the table was added; the next table needs the same line.
+    tx.execute("DELETE FROM refused_moves", [])?;
+    // DBSYNC-114: paths whose upload still owes the clobber guard. Path-keyed like the
+    // index it guards, so it goes with it.
+    tx.execute("DELETE FROM unconfirmed_uploads", [])?;
+    tx.execute("DELETE FROM sync_conflicts", [])?;
+    tx.execute("DELETE FROM known_folders", [])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4916,6 +5007,50 @@ mod tests {
         let want = crate::storage::db::DB_BUSY_TIMEOUT.as_millis() as i64;
         assert_eq!(ms(&db.write), want, "write connection");
         assert_eq!(ms(&db.read), want, "read connection");
+    }
+
+    /// The File Provider extension cannot read `app.db` once these two are gone, whichever connection
+    /// closes last (`keep_wal_files`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_wal_files_outlive_the_last_connection() {
+        for read_closes_last in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app.db");
+            let Db {
+                write, mut read, ..
+            } = Db::new_at(&path).unwrap();
+            // A connection that never read is not in the WAL, and its close would prove nothing.
+            let _: i64 = read
+                .get_mut()
+                .unwrap()
+                .query_row("SELECT count(*) FROM fp_state", [], |r| r.get(0))
+                .unwrap();
+            if read_closes_last {
+                drop(write);
+                drop(read);
+            } else {
+                drop(read);
+                drop(write);
+            }
+            for sidecar in ["app.db-wal", "app.db-shm"] {
+                assert!(
+                    dir.path().join(sidecar).exists(),
+                    "{sidecar} is gone, read_closes_last={read_closes_last}"
+                );
+            }
+            // What the extension's read goes through: Apple's SQLite, not the bundled one.
+            let read_back = std::process::Command::new("/usr/bin/sqlite3")
+                .arg(format!("file:{}?mode=ro", path.display()))
+                .arg("SELECT count(*) FROM fp_state")
+                .output()
+                .unwrap();
+            assert!(
+                read_back.status.success(),
+                "read_closes_last={read_closes_last}: {}",
+                String::from_utf8_lossy(&read_back.stderr)
+            );
+        }
     }
 
     /// Retry must not fail because a `failed` row has an active twin (the partial unique index

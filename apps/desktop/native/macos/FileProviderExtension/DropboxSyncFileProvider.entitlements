@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Sandbox: every File Provider extension on a reference Mac is sandboxed. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- No network entitlement, on purpose: the host app is the only Dropbox client (ADR-0004). -->
+	<!-- TEMPLATE. scripts/render-entitlements.mjs renders it to build/ (gitignored), substituting the team id
+	     from APPLE_TEAM_ID (Team ID: see FinderSyncExtension/README.md, App Group ADR). The group is how this
+	     sandboxed extension will reach the host's database. Team-prefixed, so it needs no provisioning profile. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>__APP_GROUP_ID__</string>
+	</array>
+</dict>
+</plist>

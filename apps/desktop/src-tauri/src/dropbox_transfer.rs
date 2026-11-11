@@ -151,9 +151,207 @@ pub(crate) fn download_to_path(
     fetch_and_write_file(&state.http_client, &token, path_display, target)
 }
 
+/// Downloads exactly revision `rev` into `target`, for the File Provider exchange (DBSYNC-95). Like
+/// [`download_to_path`] it touches neither the index nor the sync root. `shown_path` is what the
+/// progress events and errors name.
+#[cfg(target_os = "macos")]
+pub(crate) fn download_revision_to_path(
+    state: &AppState,
+    rev: &str,
+    shown_path: &str,
+    target: &Path,
+) -> AppResult<()> {
+    let token = get_access_token(state)?;
+    fetch_revision_or_path(
+        &state.http_client,
+        &token,
+        &format!("rev:{rev}"),
+        shown_path,
+        target,
+    )
+}
+
+/// One content-endpoint call (`content.dropboxapi.com/2/<endpoint>`) with `body` as the payload, for
+/// the File Provider writes (DBSYNC-95). Returns the JSON answer; a non-success status is
+/// `AppError::Dropbox` with the body, whose `error_summary` the caller reads.
+#[cfg(target_os = "macos")]
+pub(crate) fn post_content(
+    state: &AppState,
+    endpoint: &str,
+    arg: &serde_json::Value,
+    body: File,
+    len: u64,
+) -> AppResult<serde_json::Value> {
+    let token = get_access_token(state)?;
+    let resp = state
+        .http_client
+        .post(format!("https://content.dropboxapi.com/2/{endpoint}"))
+        .bearer_auth(token.as_str())
+        .header("Dropbox-API-Arg", arg.to_string())
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::sized(body, len))
+        .timeout(Duration::from_secs(300))
+        .send()
+        .map_err(|e| {
+            AppError::Network(format!("{endpoint} failed: {}", describe_reqwest_error(&e)))
+        })?;
+    json_or_dropbox_error(resp, endpoint)
+}
+
+/// One File Provider write to Dropbox at a time (DBSYNC-95). Finder sends a selection as concurrent
+/// calls, and Dropbox answers concurrent writes with 429: measured live, 40 of 50 parallel deletes and
+/// 2 of 6 parallel creates.
+#[cfg(target_os = "macos")]
+static FP_WRITE_LANE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long a write waits for the lane before it gives up untried. A write also checks, once it has the
+/// lane, that the extension still waits for it (`LiveDropbox::lane`).
+#[cfg(target_os = "macos")]
+const FP_WRITE_LANE_PATIENCE: Duration = Duration::from_secs(240);
+
+/// Takes the lane, or fails with a retryable error after [`FP_WRITE_LANE_PATIENCE`] without sending
+/// anything.
+#[cfg(target_os = "macos")]
+pub(crate) fn fp_write_lane() -> AppResult<std::sync::MutexGuard<'static, ()>> {
+    let started = std::time::Instant::now();
+    loop {
+        match FP_WRITE_LANE.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if started.elapsed() >= FP_WRITE_LANE_PATIENCE {
+            return Err(AppError::Other(
+                "another write held the lane too long".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A File Provider upload above one chunk, through an upload session (DBSYNC-95).
+/// `commit` is what `files/upload` would take (path, mode, autorename, strict_conflict), so a conflict
+/// answers the same `path/conflict/..` either way. Chunks are retried as the sync folder's are; the
+/// `finish` is not, because a retry after a commit that landed would answer a conflict for the file
+/// just written. Only `finish` writes to the namespace, so only it takes the lane: a long upload does
+/// not hold up deletes and renames while its bytes travel.
+#[cfg(target_os = "macos")]
+pub(crate) fn post_content_session(
+    state: &AppState,
+    commit: &serde_json::Value,
+    mut file: File,
+    len: u64,
+    abandoned: &dyn Fn() -> bool,
+) -> AppResult<serde_json::Value> {
+    let gave_up = || AppError::Other("the extension stopped waiting".into());
+    let client = &state.http_client;
+    let token = get_access_token(state)?;
+    let session = retry_transient("upload_session/start", 4, || {
+        start_upload_session(client, token.as_str())
+    })?;
+    let (appends, last_offset) = session_plan(len, UPLOAD_CHUNK_SIZE as u64);
+    let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
+    for i in 0..appends {
+        if abandoned() {
+            return Err(gave_up());
+        }
+        file.read_exact(&mut buf)?;
+        let offset = i * UPLOAD_CHUNK_SIZE as u64;
+        retry_transient("upload_session/append_v2", 4, || {
+            append_upload_chunk(client, token.as_str(), &session, offset, &buf)
+        })?;
+    }
+    let mut last = vec![0u8; (len - last_offset) as usize];
+    file.read_exact(&mut last)?;
+    let arg = serde_json::json!({
+        "cursor": { "session_id": session, "offset": last_offset },
+        "commit": commit,
+    });
+    let _lane = fp_write_lane()?;
+    if abandoned() {
+        return Err(gave_up());
+    }
+    let resp = client
+        .post("https://content.dropboxapi.com/2/files/upload_session/finish")
+        .bearer_auth(token.as_str())
+        .header("Dropbox-API-Arg", arg.to_string())
+        .header("Content-Type", "application/octet-stream")
+        .body(last)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .map_err(|e| {
+            AppError::Network(format!(
+                "upload_session/finish failed: {}",
+                describe_reqwest_error(&e)
+            ))
+        })?;
+    json_or_dropbox_error(resp, "upload_session/finish")
+}
+
+/// How a session sends `len` bytes in chunks of `chunk`: the number of full appends, and the offset of
+/// the rest, which goes with `finish`. The rest is never empty for a non-empty file: a file of whole
+/// chunks keeps its last chunk for `finish`.
+#[cfg(target_os = "macos")]
+fn session_plan(len: u64, chunk: u64) -> (u64, u64) {
+    let appends = len.saturating_sub(1) / chunk;
+    (appends, appends * chunk)
+}
+
+/// One RPC call (`api.dropboxapi.com/2/<endpoint>`) for the File Provider writes (DBSYNC-95).
+#[cfg(target_os = "macos")]
+pub(crate) fn post_rpc(
+    state: &AppState,
+    endpoint: &str,
+    arg: &serde_json::Value,
+) -> AppResult<serde_json::Value> {
+    let token = get_access_token(state)?;
+    let resp = state
+        .http_client
+        .post(format!("https://api.dropboxapi.com/2/{endpoint}"))
+        .bearer_auth(token.as_str())
+        .json(arg)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .map_err(|e| {
+            AppError::Network(format!("{endpoint} failed: {}", describe_reqwest_error(&e)))
+        })?;
+    json_or_dropbox_error(resp, endpoint)
+}
+
+#[cfg(target_os = "macos")]
+fn json_or_dropbox_error(
+    resp: reqwest::blocking::Response,
+    endpoint: &str,
+) -> AppResult<serde_json::Value> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp
+            .text()
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        return Err(AppError::Dropbox {
+            status: status.as_u16(),
+            message: format!("{endpoint}: {body}"),
+        });
+    }
+    resp.json::<serde_json::Value>()
+        .map_err(|e| AppError::Network(format!("{endpoint} answer unreadable: {e}")))
+}
+
 fn fetch_and_write_file(
     client: &Client,
     token: &str,
+    path_display: &str,
+    target: &Path,
+) -> AppResult<()> {
+    fetch_revision_or_path(client, token, path_display, path_display, target)
+}
+
+/// `source` is what Dropbox is asked for, a path or `rev:<rev>`; `path_display` is what the progress
+/// events and errors name.
+fn fetch_revision_or_path(
+    client: &Client,
+    token: &str,
+    source: &str,
     path_display: &str,
     target: &Path,
 ) -> AppResult<()> {
@@ -184,7 +382,7 @@ fn fetch_and_write_file(
         .bearer_auth(token)
         .header(
             "Dropbox-API-Arg",
-            serde_json::json!({ "path": path_display }).to_string(),
+            serde_json::json!({ "path": source }).to_string(),
         )
         .timeout(Duration::from_secs(300))
         .send()
@@ -339,7 +537,7 @@ const UPLOAD_SESSION_THRESHOLD_BYTES: u64 = 150 * 1024 * 1024;
 /// Chunk size used when streaming a file through the Dropbox upload-session
 /// API (`upload_session/start` + `append_v2` + `finish`). Chosen to bound
 /// peak memory usage regardless of file size.
-const UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+pub(crate) const UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UploadStrategy {
@@ -2631,6 +2829,10 @@ pub(crate) fn record_downloaded_file(
 }
 
 pub(crate) fn download_remote_file_internal(state: &AppState, path_display: &str) -> AppResult<()> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     // The scope check comes BEFORE the token: an excluded path must not cost a keychain read
     // or a network call, and must fail the same way whether or not the user is signed in.
     let relative = key_from_dropbox(path_display);
@@ -2682,6 +2884,10 @@ pub(crate) fn hydrate_remote_folder_internal(
     state: &AppState,
     folder_path_display: &str,
 ) -> AppResult<usize> {
+    // DBSYNC-98: the sync-folder pipeline does not run on macOS (`platform`).
+    if !crate::platform::sidecar_pipeline() {
+        return Err(AppError::Sync(crate::platform::NO_SIDECARS.to_string()));
+    }
     // DBSYNC-114 H5: a manual download of an excluded folder is refused, before the token.
     // (An Ancestor of an include is allowed through: its included children are the point.)
     let folder_rel = key_from_dropbox(folder_path_display);
@@ -2927,6 +3133,29 @@ pub(crate) fn keep_tracing_dispatch_registry_multi() {
                 .finish(),
         )
     });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod session_plan_tests {
+    use super::session_plan;
+
+    /// Every byte is sent once: the appends cover `0..offset`, `finish` carries the rest, never empty.
+    ///
+    /// Proof this test can fail: `len / chunk` appends sends a file of whole chunks with an empty
+    /// `finish` and one append too many.
+    #[test]
+    fn a_session_sends_every_byte_once_and_finishes_with_the_rest() {
+        const C: u64 = 8;
+        for (len, appends, rest) in [(1, 0, 1), (8, 0, 8), (9, 1, 1), (16, 1, 8), (17, 2, 1)] {
+            let (n, offset) = session_plan(len, C);
+            assert_eq!((n, len - offset), (appends, rest), "len {len}");
+            assert_eq!(offset, n * C);
+        }
+        let big = 200 * 1024 * 1024 + 3;
+        let (n, offset) = session_plan(big, 8 * 1024 * 1024);
+        assert_eq!(n, 25);
+        assert_eq!(big - offset, 3);
+    }
 }
 
 #[cfg(test)]
