@@ -293,13 +293,28 @@ fn conflicted_copy_path(path: &str, now: chrono::DateTime<chrono::Utc>) -> Strin
     format!("{parent}/{named}")
 }
 
+/// The last sync anchor the system confirmed, which a delete carries and the host reads for a folder
+/// (DBSYNC-122): the system hands an anchor back to the working set's `enumerateChanges` only once it
+/// applied the changes up to it, so everything at or below `seq` is what Finder shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct Seen {
+    pub generation: i64,
+    pub seq: i64,
+}
+
 /// [`delete`], behind the breaker: what the item weighs is the files it takes with it.
 pub(crate) fn delete_guarded(
     state: &crate::state::AppState,
     dropbox: &dyn DropboxWrites,
     item_id: i64,
     base_version: &str,
+    seen: Option<Seen>,
 ) -> WriteOutcome {
+    // Before the breaker: a folder refused here must not ask the user about a mass deletion, nor count its
+    // files toward the next burst when the user deletes it again.
+    if let Some(refused) = refuse_unseen_folder(&state.db, item_id, seen) {
+        return refused;
+    }
     let (weight, tracked) = match state.db.projection_delete_weight(item_id) {
         Ok(counts) => counts,
         Err(e) => {
@@ -317,12 +332,12 @@ pub(crate) fn delete_guarded(
         &std::thread::sleep,
     );
     match admission {
-        Admission::Proceed => delete(&state.db, dropbox, item_id, base_version),
+        Admission::Proceed => delete(&state.db, dropbox, item_id, base_version, seen),
         Admission::ProceedConfirmed => {
             // Marked before the call, so a duplicate request arriving meanwhile takes the answer too,
             // and cleared once Dropbox answered for good.
             DELETE_GUARD.unfinished(item_id);
-            let outcome = delete(&state.db, dropbox, item_id, base_version);
+            let outcome = delete(&state.db, dropbox, item_id, base_version, seen);
             if !matches!(outcome, WriteOutcome::Retry | WriteOutcome::Failed(_)) {
                 DELETE_GUARD.finished(item_id);
             }
@@ -334,12 +349,16 @@ pub(crate) fn delete_guarded(
 }
 
 /// Deletes the item. `base_version` is the content the system had: a file edited on Dropbox since is
-/// not deleted, and the system restores it with the new content.
+/// not deleted, and the system restores it with the new content. A folder has no such version, so
+/// `seen` stands in for it: a folder that changed after the anchor the system confirmed is not deleted
+/// either. A request without `seen` (an extension that has not confirmed an anchor yet) deletes as
+/// before.
 pub(crate) fn delete(
     db: &Db,
     dropbox: &dyn DropboxWrites,
     item_id: i64,
     base_version: &str,
+    seen: Option<Seen>,
 ) -> WriteOutcome {
     let Some(target) = read_target(db, item_id) else {
         return delete_without_row(db, item_id);
@@ -358,13 +377,22 @@ pub(crate) fn delete(
                 return WriteOutcome::Retry;
             }
         }
+        if let Some(refused) = refuse_unseen_folder(db, item_id, seen) {
+            return refused;
+        }
     }
     let rev = (!target.is_folder).then_some(target.rev.as_str());
     match dropbox.delete(&target.path, rev) {
         Ok(()) => {}
         Err(e) if is_not_found(&e) => {}
         // A file whose rev moved on since: Dropbox keeps it, and so does the system.
-        Err(AppError::Dropbox { status: 409, .. }) => return WriteOutcome::DeletionRejected,
+        Err(AppError::Dropbox {
+            status: 409,
+            message,
+        }) => {
+            crate::error::log_delete_refusal("File Provider", &message);
+            return WriteOutcome::DeletionRejected;
+        }
         Err(e) => return failed("delete", &e),
     }
     let gone = DropboxEntry {
@@ -764,6 +792,39 @@ impl DeleteDecisions for AppDecisions<'_> {
             crate::sync_pipeline::MassDeleteSource::Finder,
         );
     }
+}
+
+/// A folder delete refused because the folder changed after the anchor the system confirmed, or `Retry`
+/// when that cannot be read; `None` to go on (no anchor, not a folder, or nothing newer). On a refusal,
+/// Finder gets the folder back and the signal makes the system catch up, so the extension confirms a newer
+/// anchor and a later delete goes through (DBSYNC-122).
+fn refuse_unseen_folder(db: &Db, item_id: i64, seen: Option<Seen>) -> Option<WriteOutcome> {
+    match folder_changed_unseen(db, item_id, seen?) {
+        Ok(false) => None,
+        Ok(true) => {
+            tracing::info!(
+                item_id,
+                "File Provider write: folder changed since Finder caught up, delete refused"
+            );
+            crate::file_provider::signal_working_set();
+            Some(WriteOutcome::DeletionRejected)
+        }
+        Err(e) => {
+            tracing::warn!(item_id, error = %e, "File Provider write: cannot read the folder");
+            Some(WriteOutcome::Retry)
+        }
+    }
+}
+
+/// Whether the folder changed after what the system confirmed; `false` for an item that is not a folder,
+/// which carries its own content version. An anchor of another generation belongs to a projection
+/// database since recreated (a snapshot or a clear keeps the generation), so nothing it says can be
+/// trusted: changed.
+fn folder_changed_unseen(db: &Db, item_id: i64, seen: Seen) -> AppResult<bool> {
+    let Some(changed) = db.projection_folder_changed_since(item_id, seen.seq)? else {
+        return Ok(false);
+    };
+    Ok(changed || db.projection_state()?.generation != seen.generation)
 }
 
 fn is_not_found(error: &AppError) -> bool {
@@ -1379,7 +1440,10 @@ mod tests {
         let (item_id, base) = with_file(&db);
         let fake = Fake::answering(Ok(entry("file", "/unused", "id:unused")));
 
-        assert_eq!(delete(&db, &fake, item_id, &base), WriteOutcome::Deleted);
+        assert_eq!(
+            delete(&db, &fake, item_id, &base, None),
+            WriteOutcome::Deleted
+        );
 
         assert_eq!(
             *fake.paths.borrow(),
@@ -1398,7 +1462,7 @@ mod tests {
         let fake = Fake::answering(Ok(entry("file", "/unused", "id:unused")));
 
         assert_eq!(
-            delete(&db, &fake, item_id, "c1:stale"),
+            delete(&db, &fake, item_id, "c1:stale", None),
             WriteOutcome::DeletionRejected
         );
 
@@ -1416,7 +1480,7 @@ mod tests {
         }));
 
         assert_eq!(
-            delete(&db, &fake, item_id, &base),
+            delete(&db, &fake, item_id, &base, None),
             WriteOutcome::DeletionRejected
         );
     }
@@ -1431,10 +1495,16 @@ mod tests {
                 r#"files/delete_v2: {"error_summary": "path_lookup/not_found/..", "error": {}}"#
                     .into(),
         }));
-        assert_eq!(delete(&db, &gone, item_id, &base), WriteOutcome::Deleted);
+        assert_eq!(
+            delete(&db, &gone, item_id, &base, None),
+            WriteOutcome::Deleted
+        );
 
         let unknown = Fake::answering_all(vec![]);
-        assert_eq!(delete(&db, &unknown, 9_999, "x"), WriteOutcome::Deleted);
+        assert_eq!(
+            delete(&db, &unknown, 9_999, "x", None),
+            WriteOutcome::Deleted
+        );
         assert!(unknown.paths.borrow().is_empty());
     }
 
@@ -1449,7 +1519,10 @@ mod tests {
         db.project_clear().unwrap();
         let fake = Fake::answering_all(vec![]);
 
-        assert_eq!(delete(&db, &fake, item_id, &base), WriteOutcome::Retry);
+        assert_eq!(
+            delete(&db, &fake, item_id, &base, None),
+            WriteOutcome::Retry
+        );
     }
 
     /// A tombstone is gone on Dropbox: done, with nothing sent. (Inside a removal hold it is asked
@@ -1467,7 +1540,10 @@ mod tests {
         .unwrap();
         let fake = Fake::answering_all(vec![]);
 
-        assert_eq!(delete(&db, &fake, item_id, &base), WriteOutcome::Deleted);
+        assert_eq!(
+            delete(&db, &fake, item_id, &base, None),
+            WriteOutcome::Deleted
+        );
         assert!(fake.paths.borrow().is_empty());
     }
 
@@ -1668,7 +1744,170 @@ mod tests {
         let fake = Fake::answering_all(vec![]);
 
         assert_eq!(
-            delete(&db, &fake, docs(&db), ""),
+            delete(&db, &fake, docs(&db), "", None),
+            WriteOutcome::DeletionRejected
+        );
+        assert!(fake.paths.borrow().is_empty());
+    }
+
+    fn seen_now(db: &Db) -> Seen {
+        let state = db.projection_state().unwrap();
+        Seen {
+            generation: state.generation,
+            seq: state.seq,
+        }
+    }
+
+    /// DBSYNC-122: a folder holding something Dropbox changed after the anchor the system confirmed is not
+    /// deleted, whether the change is a new file or an edit. The system is signalled, so it catches up and
+    /// the user's next delete goes through.
+    ///
+    /// Proof this test can fail: dropping the `seen` check deletes the folder; comparing only the folder's
+    /// own row misses the child; dropping the signal leaves the count unchanged.
+    #[test]
+    fn a_folder_that_changed_after_what_finder_shows_is_not_deleted() {
+        let added = entry("file", "/Docs/new.txt", "id:N");
+        let edited = file_with("/Docs/a.txt", "id:A", "r2", "h2");
+        for (label, change) in [("a file added", added), ("a file edited", edited)] {
+            let (_dir, db) = db();
+            db.project_delta(&[file_with("/Docs/a.txt", "id:A", "r1", "h1")])
+                .unwrap();
+            let seen = seen_now(&db);
+            db.project_delta(&[change]).unwrap();
+            let fake = Fake::answering_all(vec![]);
+            let signals = crate::file_provider::signals_requested_on_this_thread();
+
+            assert_eq!(
+                delete(&db, &fake, docs(&db), "", Some(seen)),
+                WriteOutcome::DeletionRejected,
+                "{label}"
+            );
+            assert!(fake.paths.borrow().is_empty(), "{label}: nothing sent");
+            assert_eq!(
+                crate::file_provider::signals_requested_on_this_thread(),
+                signals + 1,
+                "{label}: the system is asked to catch up"
+            );
+        }
+    }
+
+    /// DBSYNC-122: the folder's own row counts too. Renamed on Dropbox after the anchor, it is not what
+    /// Finder shows, even with nothing under it.
+    ///
+    /// Proof this test can fail: looking only under the folder.
+    #[test]
+    fn a_folder_renamed_after_what_finder_shows_is_not_deleted() {
+        let (_dir, db) = db();
+        let seen = seen_now(&db);
+        db.project_delta(&[entry("folder", "/DOCS", "id:D")])
+            .unwrap();
+        let fake = Fake::answering_all(vec![]);
+
+        assert_eq!(
+            delete(&db, &fake, docs(&db), "", Some(seen)),
+            WriteOutcome::DeletionRejected
+        );
+        assert!(fake.paths.borrow().is_empty());
+    }
+
+    /// DBSYNC-122: nothing changed after the anchor, or no anchor yet (an extension that has not confirmed
+    /// one, or an older one): the folder is deleted as before.
+    ///
+    /// Proof this test can fail: refusing whenever `seen` is present, or whenever it is absent.
+    #[test]
+    fn a_folder_unchanged_since_what_finder_shows_is_deleted() {
+        for seen in [true, false] {
+            let (_dir, db) = db();
+            db.project_delta(&[file_with("/Docs/a.txt", "id:A", "r1", "h1")])
+                .unwrap();
+            let anchor = seen.then(|| seen_now(&db));
+            let fake = Fake::answering_all(vec![Ok(entry("folder", "/Docs", "id:D"))]);
+
+            assert_eq!(
+                delete(&db, &fake, docs(&db), "", anchor),
+                WriteOutcome::Deleted,
+                "seen: {seen}"
+            );
+            assert_eq!(*fake.paths.borrow(), vec!["delete /Docs -".to_string()]);
+        }
+    }
+
+    /// DBSYNC-122: a folder already deleted on Dropbox, not yet in Finder, is answered as before, not
+    /// refused by the anchor check `delete_guarded` runs first.
+    ///
+    /// Proof this test can fail: dropping `state = 0` from the folder lookup.
+    #[test]
+    fn a_folder_already_deleted_on_dropbox_is_not_refused_by_the_anchor() {
+        let (_dir, db) = db();
+        let seen = seen_now(&db);
+        let folder = docs(&db);
+        db.project_delta(&[entry("deleted", "/Docs", "")]).unwrap();
+
+        assert_eq!(refuse_unseen_folder(&db, folder, Some(seen)), None);
+    }
+
+    /// DBSYNC-122: a change next to the folder, under a name that shares its prefix, is not a change in
+    /// it.
+    ///
+    /// Proof this test can fail: dropping the upper bound of the path range.
+    #[test]
+    fn a_change_beside_the_folder_does_not_refuse_its_delete() {
+        let (_dir, db) = db();
+        let seen = seen_now(&db);
+        db.project_delta(&[
+            entry("folder", "/Docs2", "id:D2"),
+            entry("file", "/Docs2/x.txt", "id:X"),
+            entry("file", "/Zeta.txt", "id:Z"),
+        ])
+        .unwrap();
+        let fake = Fake::answering_all(vec![Ok(entry("folder", "/Docs", "id:D"))]);
+
+        assert_eq!(
+            delete(&db, &fake, docs(&db), "", Some(seen)),
+            WriteOutcome::Deleted
+        );
+    }
+
+    /// DBSYNC-122: a file carries its own content version, so the anchor it now also carries is not read
+    /// for it, of another generation or not.
+    ///
+    /// `delete_guarded` asks `refuse_unseen_folder` before it knows what the item is, hence that check too.
+    ///
+    /// Proof this test can fail: reading the generation before knowing the item is a folder.
+    #[test]
+    fn a_file_delete_ignores_the_anchor() {
+        let (_dir, db) = db();
+        let (item_id, base) = with_file(&db);
+        let now = seen_now(&db);
+        let stale = Seen {
+            generation: now.generation + 1,
+            seq: 0,
+        };
+        assert_eq!(refuse_unseen_folder(&db, item_id, Some(stale)), None);
+        let fake = Fake::answering_all(vec![Ok(entry("file", "/Docs/a.txt", "id:A"))]);
+
+        assert_eq!(
+            delete(&db, &fake, item_id, &base, Some(stale)),
+            WriteOutcome::Deleted
+        );
+    }
+
+    /// DBSYNC-122: an anchor from another generation belongs to a projection database since recreated, so
+    /// it proves nothing about what Finder shows.
+    ///
+    /// Proof this test can fail: comparing the sequence only.
+    #[test]
+    fn a_folder_delete_with_an_anchor_of_another_generation_is_refused() {
+        let (_dir, db) = db();
+        let now = seen_now(&db);
+        let stale = Seen {
+            generation: now.generation + 1,
+            seq: now.seq,
+        };
+        let fake = Fake::answering_all(vec![]);
+
+        assert_eq!(
+            delete(&db, &fake, docs(&db), "", Some(stale)),
             WriteOutcome::DeletionRejected
         );
         assert!(fake.paths.borrow().is_empty());
@@ -1720,7 +1959,10 @@ mod tests {
             Some("/papers/a.txt")
         );
 
-        assert_eq!(delete(&db, &fake, file_id, &base), WriteOutcome::Deleted);
+        assert_eq!(
+            delete(&db, &fake, file_id, &base, None),
+            WriteOutcome::Deleted
+        );
         assert_eq!(
             db.projection_row_state(file_id).unwrap(),
             Some(crate::storage::db::projection::STATE_DELETED)

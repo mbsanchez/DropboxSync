@@ -186,6 +186,27 @@ impl AppError {
     }
 }
 
+/// Dropbox's `error_summary`, such as `unsupported_file/..`, out of an error body or a message that also
+/// holds the path. It names the error and never the file.
+pub(crate) fn dropbox_error_summary(message: &str) -> Option<&str> {
+    const KEY: &str = r#""error_summary":"#;
+    let rest = message[message.find(KEY)? + KEY.len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(&rest[..rest.find('"')?])
+}
+
+/// Every 409 that refuses a delete, on either platform, named by its `error_summary` and never by its
+/// path (DBSYNC-122). A `not_found`, which both paths take as done, is not a refusal. The shapes that
+/// tell a stale revision from a busy Dropbox were never captured, so each refusal is logged until they
+/// are. Other lines on the sync-folder path still carry the path and the body; this one does not.
+pub(crate) fn log_delete_refusal(source: &'static str, body: &str) {
+    tracing::warn!(
+        source,
+        summary = dropbox_error_summary(body).unwrap_or("none"),
+        "delete refused by Dropbox (409)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

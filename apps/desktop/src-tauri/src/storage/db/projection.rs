@@ -1682,6 +1682,36 @@ impl Db {
         Ok(hidden > 0)
     }
 
+    /// Whether the folder, or anything under it, changed after `seq`: a child added, edited, moved in or
+    /// deleted on Dropbox, at any visibility. A folder delete is refused on it, because Finder has not
+    /// shown that change and Dropbox would take it with the folder (DBSYNC-122). `None` when the item is
+    /// not a live folder: a folder already deleted or hidden is answered elsewhere, as before.
+    pub(crate) fn projection_folder_changed_since(
+        &self,
+        item_id: i64,
+        seq: i64,
+    ) -> AppResult<Option<bool>> {
+        let conn = self.read_conn()?;
+        let folder: Option<(String, i64)> = conn
+            .prepare_cached(
+                "SELECT path_lower, changed_seq FROM fp_item WHERE item_id = ?1 AND is_folder = 1 AND state = 0",
+            )?
+            .query_row([item_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((path, own)) = folder else {
+            return Ok(None);
+        };
+        if own > seq {
+            return Ok(Some(true));
+        }
+        let newer: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fp_item WHERE path_lower >= ?1 AND path_lower < ?2 AND changed_seq > ?3",
+            params![format!("{path}/"), format!("{path}0"), seq],
+            |r| r.get(0),
+        )?;
+        Ok(Some(newer > 0))
+    }
+
     /// After a folder moved here (a rename or move made in Finder), the rows under its old path take the
     /// new one. Only `path_lower` changes: it is bookkeeping the extension never sees, and the parents
     /// already follow the folder. Without it, a delete or a sweep that matches by path misses them until

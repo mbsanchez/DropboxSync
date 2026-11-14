@@ -2327,7 +2327,12 @@ pub(crate) fn delete_remote_file_internal(
         let body = resp
             .text()
             .unwrap_or_else(|_| "<unreadable body>".to_string());
-        if apply_delete_outcome(state, relative, classify_delete_response(false, &body))? {
+        let outcome = classify_delete_response(false, &body);
+        // Gone already is not a refusal (DBSYNC-122).
+        if status.as_u16() == 409 && outcome != DeleteOutcome::AlreadyGone {
+            crate::error::log_delete_refusal("sync folder", &body);
+        }
+        if apply_delete_outcome(state, relative, outcome)? {
             return Ok(());
         }
         return Err(AppError::Dropbox {
@@ -4304,6 +4309,27 @@ mod tests {
         tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.lock().unwrap().clone();
         String::from_utf8(bytes).expect("tracing output must be valid utf-8")
+    }
+
+    /// DBSYNC-122: a delete 409 is logged by its `error_summary`, so the shapes Dropbox really sends show
+    /// up, and never by its path. Proof this test can fail: logging the body instead names the file;
+    /// dropping the summary field loses the shape.
+    #[test]
+    fn a_delete_refusal_is_logged_by_its_summary_and_never_by_its_path() {
+        let body = r#"delete for /Private/secret.txt: {"error": {".tag": "too_many_write_operations"}, "error_summary": "too_many_write_operations/"}"#;
+
+        let log = captured_tracing_output(|| crate::error::log_delete_refusal("sync folder", body));
+
+        assert!(log.contains("delete refused by Dropbox (409)"), "{log}");
+        assert!(
+            log.contains("summary=\"too_many_write_operations/\""),
+            "{log}"
+        );
+        assert!(log.contains("source=\"sync folder\""), "{log}");
+        assert!(
+            !log.contains("secret"),
+            "the path stays out of the log: {log}"
+        );
     }
 
     #[test]

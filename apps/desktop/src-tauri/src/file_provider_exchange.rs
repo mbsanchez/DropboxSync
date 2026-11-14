@@ -88,6 +88,10 @@ struct Request {
     new_name: Option<String>,
     #[serde(default)]
     content: bool,
+    /// A folder delete: the last sync anchor the system confirmed, absent until the extension has one
+    /// (DBSYNC-122). A host that reads no `seen` deletes the folder as before.
+    #[serde(default)]
+    seen: Option<crate::file_provider_writes::Seen>,
     /// A pin: the domain's folder as the user sees it, from `getUserVisibleURL`, where the host reads the
     /// pinned files so that they download now.
     #[serde(default)]
@@ -367,10 +371,7 @@ fn outcome_for_error(error: &AppError) -> Outcome {
 /// Dropbox's `error_summary`, such as `unsupported_file/..`, out of an error message that also holds the
 /// path. It names the error and never the file.
 pub(crate) fn error_summary(message: &str) -> Option<&str> {
-    const KEY: &str = r#""error_summary":"#;
-    let rest = message[message.find(KEY)? + KEY.len()..].trim_start();
-    let rest = rest.strip_prefix('"')?;
-    Some(&rest[..rest.find('"')?])
+    crate::error::dropbox_error_summary(message)
 }
 
 /// An error for the log. `AppError::Dropbox` carries the path, and the log lives in the container.
@@ -919,6 +920,7 @@ fn handle(state: &AppState, exchange: &Exchange, id: &str, request: &Request) {
                 &dropbox,
                 request.item_id,
                 &request.base_version,
+                request.seen,
             ))
         }
         Op::Pin | Op::Unpin => {
@@ -1768,6 +1770,47 @@ mod tests {
                 })
             )]
         );
+    }
+
+    /// The shape `Exchange.swift` writes for a folder delete once it has a confirmed anchor (DBSYNC-122),
+    /// and the one an older extension writes, without it.
+    ///
+    /// Proof this test can fail: renaming a field on either side, or dropping `serde(default)`.
+    #[test]
+    fn a_folder_delete_carries_the_anchor_the_system_confirmed_when_there_is_one() {
+        for (body, seen) in [
+            (
+                r#"{"version":1,"op":"delete","item_id":7,"base_version":"","seen":{"generation":42,"seq":9}}"#,
+                Some(crate::file_provider_writes::Seen {
+                    generation: 42,
+                    seq: 9,
+                }),
+            ),
+            (
+                r#"{"version":1,"op":"delete","item_id":7,"base_version":""}"#,
+                None,
+            ),
+        ] {
+            let w = world(b"hello");
+            write_request(&w, &format!("{ID}.json"), body);
+
+            let taken = w.exchange.take_pending().unwrap();
+
+            assert_eq!(
+                taken,
+                vec![(
+                    ID.to_string(),
+                    Pending::Serve(Request {
+                        version: 1,
+                        op: Op::Delete,
+                        item_id: 7,
+                        seen,
+                        ..Request::default()
+                    })
+                )],
+                "{body}"
+            );
+        }
     }
 
     #[test]

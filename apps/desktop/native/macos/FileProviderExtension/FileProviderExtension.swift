@@ -16,6 +16,8 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
     private let domain: NSFileProviderDomain
     private let store: ProjectionStore?
     private let exchange: ExchangeClient?
+    /// What the system has applied, which a folder delete carries (DBSYNC-122).
+    private let confirmed = ConfirmedAnchor()
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
@@ -69,14 +71,14 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             // The header's instruction for an extension that does not support trashing items.
             throw CocoaError(.featureUnsupported)
         case .workingSet:
-            return ProjectionEnumerator(store: store, scope: .workingSet)
+            return ProjectionEnumerator(store: store, scope: .workingSet, confirmed: confirmed)
         case .rootContainer:
-            return ProjectionEnumerator(store: store, scope: .folder(projectionRootItem))
+            return ProjectionEnumerator(store: store, scope: .folder(projectionRootItem), confirmed: confirmed)
         default:
             guard let itemId = ItemIdCodec.decode(containerItemIdentifier.rawValue) else {
                 throw noSuchItem(containerItemIdentifier)
             }
-            return ProjectionEnumerator(store: store, scope: .folder(itemId))
+            return ProjectionEnumerator(store: store, scope: .folder(itemId), confirmed: confirmed)
         }
     }
 
@@ -360,10 +362,13 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             return progress
         }
         let store = self.store
+        var isFolder = false
+        if case .live(let row)? = try? requireStore(store).presence(itemId) {
+            isFolder = row.isFolder
+        }
         // A delete that is not recursive must not take children the system has not seen yet, such as
         // files added on Dropbox since the folder was last listed: Dropbox deletes a folder whole.
-        if !options.contains(.recursive),
-           case .live(let row)? = try? requireStore(store).presence(itemId), row.isFolder,
+        if !options.contains(.recursive), isFolder,
            let children = try? requireStore(store).children(of: itemId, afterItem: 0, limit: 1),
            !children.isEmpty {
             completionHandler(NSFileProviderError(.directoryNotEmpty))
@@ -373,7 +378,12 @@ final class DropboxSyncFileProvider: NSObject, NSFileProviderReplicatedExtension
             completionHandler(NSFileProviderError(.serverUnreachable))
             return progress
         }
-        exchange.delete(itemId: itemId, baseVersion: version.contentVersion, isCancelled: { progress.isCancelled }) {
+        // A folder has no content version: the anchor the system confirmed stands in for it (DBSYNC-122).
+        // Sent for every delete, so a failed read above cannot drop it; the host reads it for folders only.
+        let seen = confirmed.value
+        exchange.delete(
+            itemId: itemId, baseVersion: version.contentVersion, seen: seen, isCancelled: { progress.isCancelled }
+        ) {
             outcome in
             fpLog.info("deleteItem \(itemId, privacy: .public): \(outcome.logLabel, privacy: .public)")
             switch outcome {
@@ -654,10 +664,12 @@ final class ProjectionEnumerator: NSObject, NSFileProviderEnumerator {
 
     private let store: ProjectionStore?
     private let scope: Scope
+    private let confirmed: ConfirmedAnchor
 
-    init(store: ProjectionStore?, scope: Scope) {
+    init(store: ProjectionStore?, scope: Scope, confirmed: ConfirmedAnchor) {
         self.store = store
         self.scope = scope
+        self.confirmed = confirmed
         super.init()
     }
 
@@ -701,6 +713,13 @@ final class ProjectionEnumerator: NSObject, NSFileProviderEnumerator {
                 fpLog.info("enumerateChanges: anchor expired")
                 observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
                 return
+            }
+            // Read, so not expired: the system applied everything up to it (DBSYNC-122). Only the working
+            // set's anchor says that for the whole domain; a folder's covers that folder's listing.
+            let workingSet: Bool
+            if case .workingSet = scope { workingSet = true } else { workingSet = false }
+            if workingSet, let from = from {
+                confirmed.confirm(from)
             }
             let plan = ChangePlan.make(rows: read.rows, batch: projectionBatchSize, head: read.head)
             fpLog.info("enumerateChanges updated=\(plan.updated.count, privacy: .public) deleted=\(plan.deletedItemIds.count, privacy: .public)")

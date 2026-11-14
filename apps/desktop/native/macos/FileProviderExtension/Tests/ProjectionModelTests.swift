@@ -51,6 +51,19 @@ struct ProjectionTests {
         check("other generation", anchor.isExpired(against: head(generation: 8)))
         check("below min_valid_seq", ProjectionAnchor(generation: 7, seq: 49).isExpired(against: head()))
         check("past the head", ProjectionAnchor(generation: 7, seq: 101).isExpired(against: head()))
+
+        // DBSYNC-122: what a folder delete carries.
+        let confirmed = ConfirmedAnchor()
+        check("nothing confirmed yet", confirmed.value == nil)
+        confirmed.confirm(ProjectionAnchor(generation: 7, seq: 60))
+        confirmed.confirm(ProjectionAnchor(generation: 7, seq: 40))
+        check("an older anchor of the same generation does not go back",
+              confirmed.value == ProjectionAnchor(generation: 7, seq: 60))
+        confirmed.confirm(ProjectionAnchor(generation: 7, seq: 80))
+        check("a newer one moves it on", confirmed.value == ProjectionAnchor(generation: 7, seq: 80))
+        confirmed.confirm(ProjectionAnchor(generation: 8, seq: 5))
+        check("a new generation replaces it, lower seq and all",
+              confirmed.value == ProjectionAnchor(generation: 8, seq: 5))
     }
 
     static func itemFormat() {
