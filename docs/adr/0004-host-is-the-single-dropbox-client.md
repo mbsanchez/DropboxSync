@@ -355,6 +355,29 @@ there. Nothing is queued on the host: a failure answers the system, which retrie
   folder holding anything selective sync hides or that waits as an orphan: Dropbox deletes a folder whole,
   and that content was never in Finder (the sync folder refuses the same, DBSYNC-114). A delete the system
   does not mark recursive is refused with `directoryNotEmpty` when the projection holds children.
+- **A folder that changed since Finder caught up** (DBSYNC-122). A folder has no content version, and
+  `delete_v2` deletes it whole, so every delete carries `seen`: the highest anchor the system has handed back
+  to the working set's `enumerateChanges`. A folder enumerator's anchor does not count: it covers that
+  folder's listing only. *Inferred, not documented:* the header says only that the system resumes from the
+  latest anchor it was given, and this rule reads that as "applied, so shown in Finder"; an anchor merely
+  served is not trusted. The host refuses (`deletionRejected`) when the live folder, or any row under it at
+  any visibility, has a `changed_seq` above `seen`, or when `seen` is of another generation (a projection
+  database since recreated). It checks before the mass-deletion breaker, so a refused folder neither asks the
+  user nor counts toward the next burst, and again once admitted, for a change that landed while the user
+  answered. On a refusal it signals the working set, through the same gate and removal hold as every other
+  signal: the system catches up and shows the folder as Dropbox has it, and a later delete goes through. A
+  file ignores `seen`, and so does a folder already deleted or hidden, which is answered as before. A request
+  without `seen` (an extension that has not confirmed an anchor since it started, or an older one) deletes as
+  before.
+  - *Confirmed one call late.* The anchor handed back is the one the previous call ended on, so a change
+    delivered by the latest call is confirmed only by the next one. A delete in between is refused once, its
+    signal makes that next call happen, and a delete after it goes through. A change not delivered yet can
+    take two refusals: one call delivers it, the next confirms it, and the removal hold can delay both. The
+    extension does not signal on its own to shorten this, because such a signal would bypass the hold that
+    keeps a split rename from reaching Finder.
+  - *Not covered.* A change Dropbox made that the projection has not received yet (long-poll lag), one landing
+    between the check and `delete_v2`, and a delete before the extension's first confirmed anchor after a
+    restart. All are recoverable from Dropbox's deleted files.
 - **Deleted on Dropbox meanwhile.** An edit or a move of an item that Dropbox deleted answers `noSuchItem`
   for the item (the header's rule: the system deletes it from disk, or re-creates it when it holds an
   edit); a create in, or a move into, a folder that Dropbox deleted answers `noSuchItem` for that folder. While a removal is still held back from the system it answers a transient error instead,

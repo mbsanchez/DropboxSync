@@ -237,6 +237,30 @@ extension ProjectionTests {
     shape.lock()
     expect(sent == #"{"item_id":7,"op":"fetch","version":1,"viewer":true}"#, "a double click is what the host's test parses")
     shape.unlock()
+    // DBSYNC-122: a folder delete with the anchor the system confirmed, and one without.
+    answerNextRequest(with: #"{"version":1,"outcome":"retry"}"#, inspect: { body in
+        shape.lock()
+        sent = body
+        shape.unlock()
+    })
+    _ = finish {
+        client().delete(
+            itemId: 7, baseVersion: Data(), seen: ProjectionAnchor(generation: 42, seq: 9),
+            isCancelled: { false }, done: $0)
+    }
+    shape.lock()
+    expect(sent == #"{"base_version":"","item_id":7,"op":"delete","seen":{"generation":42,"seq":9},"version":1}"#,
+           "a folder delete carries what the host's test parses")
+    shape.unlock()
+    answerNextRequest(with: #"{"version":1,"outcome":"retry"}"#, inspect: { body in
+        shape.lock()
+        sent = body
+        shape.unlock()
+    })
+    _ = finish { client().delete(itemId: 7, baseVersion: Data(), isCancelled: { false }, done: $0) }
+    shape.lock()
+    expect(sent == #"{"base_version":"","item_id":7,"op":"delete","version":1}"#, "no anchor, no field")
+    shape.unlock()
 
     // A create: the bytes go to staging before the request, and the answer names the row.
     let source = base.appendingPathComponent("source.txt")

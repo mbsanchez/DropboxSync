@@ -217,15 +217,22 @@ final class ExchangeClient {
         send(fields, outgoing: contents, isCancelled, done)
     }
 
+    /// `seen` is the anchor the system last confirmed (DBSYNC-122): the host refuses a folder that changed
+    /// after it, and ignores it for a file. Left out when there is none, and the host then deletes as before.
     func delete(
         itemId: Int64,
         baseVersion: Data,
+        seen: ProjectionAnchor? = nil,
         isCancelled: @escaping () -> Bool,
         done: @escaping (ExchangeOutcome) -> Void
     ) {
-        send(
-            ["op": "delete", "item_id": itemId, "base_version": String(decoding: baseVersion, as: UTF8.self)],
-            outgoing: nil, isCancelled, done)
+        var fields: [String: Any] = [
+            "op": "delete", "item_id": itemId, "base_version": String(decoding: baseVersion, as: UTF8.self),
+        ]
+        if let seen = seen {
+            fields["seen"] = ["generation": seen.generation, "seq": seen.seq]
+        }
+        send(fields, outgoing: nil, isCancelled, done)
     }
 
     /// *Make Available Offline* (`pinned`) or *Make Online-Only* on one item (#237). A pin names the

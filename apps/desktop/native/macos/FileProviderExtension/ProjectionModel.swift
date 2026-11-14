@@ -195,6 +195,31 @@ struct ProjectionAnchor: Equatable {
     }
 }
 
+/// The highest anchor the system has handed back to `enumerateChanges`, which a folder delete carries
+/// (DBSYNC-122). The system passes an anchor back only once it applied every change up to it, so the
+/// rows at or below it are what Finder shows; an anchor merely served may not be applied yet. Kept only
+/// for anchors that were read, never for an expired one, and a new generation replaces the old one.
+/// Enumerators and `deleteItem` run on different queues, hence the lock.
+final class ConfirmedAnchor {
+    private let lock = NSLock()
+    private var stored: ProjectionAnchor?
+
+    var value: ProjectionAnchor? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func confirm(_ anchor: ProjectionAnchor) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let current = stored, current.generation == anchor.generation, current.seq >= anchor.seq {
+            return
+        }
+        stored = anchor
+    }
+}
+
 /// The page of an item listing: the last `item_id` served. The system's own initial pages, and anything
 /// else that is not ours, start from the beginning.
 enum PageCodec {
